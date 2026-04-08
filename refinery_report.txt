@@ -1,0 +1,41 @@
+
+======================================================================
+📊 [REFINERY REPORT V19] — Data Refinery & Embeddings
+🕐 2026-04-08 17:48:04  ⏱ 12.1s
+======================================================================
+  MBO  : rich_mbo.csv
+  MBP10: rich_mbp.csv
+
+──────────────────────────────────────────────────────────────────────
+📊 حالة الـ Features (عينة):
+──────────────────────────────────────────────────────────────────────
+  ✅  cvd                          non-zero=   1,745 ( 98.6%)  [-1.439 → 1.829]
+  ✅  obi                          non-zero=   1,769 (100.0%)  [-1.000 → 1.000]
+  ✅  absorption_intensity         non-zero=   1,768 ( 99.9%)  [-0.434 → 8.485]
+  ✅  cancel_ratio                 non-zero=   1,726 ( 97.6%)  [-10.000 → 4.026]
+  ✅  spoofing_ratio               non-zero=   1,769 (100.0%)  [-1.000 → 1.000]
+  ✅  spoofing_duration            non-zero=   1,769 (100.0%)  [-1.000 → 1.000]
+  ✅  liquidity_trap               non-zero=     414 ( 23.4%)  [-10.000 → 10.000]
+  ✅  micro_atr                    non-zero=   1,654 ( 93.5%)  [-10.000 → 1.667]
+  ✅  volume_burst                 non-zero=   1,743 ( 98.5%)  [-0.217 → 9.943]
+  ✅  inter_event_time             non-zero=   1,762 ( 99.6%)  [-1.726 → 10.000]
+  ✅  fisher_signal                non-zero=     445 ( 25.2%)  [-1.000 → 1.000]
+  ✅  anomaly                      non-zero=     112 (  6.3%)  [0.000 → 1.000]
+  ✅  cvd_momentum                 non-zero=   1,767 ( 99.9%)  [-2.599 → 2.088]
+  ✅  cvd_price_divergence         non-zero=   1,570 ( 88.8%)  [-0.500 → 0.500]
+  ✅  trend_strength               non-zero=   1,760 ( 99.5%)  [-1.084 → 1.175]
+  ✅  correction_depth             non-zero=   1,750 ( 98.9%)  [-0.545 → 2.735]
+  ✅  liquidity_sweep              non-zero=     204 ( 11.5%)  [-1.000 → 1.000]
+  ✅  pdh                          non-zero=     600 ( 33.9%)  [-2.114 → 0.000]
+  ✅  pdl                          non-zero=     600 ( 33.9%)  [0.000 → 2.447]
+  ✅  pwh                          non-zero=   1,750 ( 98.9%)  [-1.191 → 1.489]
+  ✅  pwl                          non-zero=   1,750 ( 98.9%)  [-1.191 → 1.489]
+  ✅  dist_to_pdh                  non-zero=   1,151 ( 65.1%)  [-0.971 → 1.647]
+  ✅  price_position               non-zero=   1,734 ( 98.0%)  [-0.230 → 1.057]
+  ✅  kyle_lambda                  non-zero=   1,767 ( 99.9%)  [-1.078 → 3.586]
+  ✅  hawkes_intensity             non-zero=   1,763 ( 99.7%)  [-3.917 → 2.663]
+  🌟  تم تضمين جميع الـ Embeddings بنجاح (emb_0 → emb_7)
+
+──────────────────────────────────────────────────────────────────────
+🚀 python train_v19.py --csv outputs_v19\training_features_ready.csv --output outputs_v19
+======================================================================
