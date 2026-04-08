@@ -1,0 +1,488 @@
+# QuantSystem V19
+
+QuantSystem V19 هو مشروع **quantitative AI trading research system** مبني حول:
+
+1. `prepare_training_data.py`
+   - يحول بيانات السوق الخام `MBO/MBP` إلى dataset جاهز للتدريب
+   - يبني features
+   - يبني labels
+   - يحفظ `LOB tensors`
+
+2. `train_v19.py`
+   - يدرب pipeline ثلاثي المراحل بشكل آمن ضد الـ leakage
+   - Stage 1: `CatBoost + Regime meta-features`
+   - Stage 2: `OOF DeepLOB visual embeddings`
+   - Stage 3: `MetaLearner LSTM`
+
+3. `backtest_v19.py`
+   - يشغل causal replay backtest على dataset V19 الجاهز
+
+4. `walkforward_v19.py`
+   - ينفذ walk-forward evaluation من raw market data
+   - يعيد بناء train/test folds
+   - يطبق release gates
+
+5. `shadow_v19.py` و `paper_v19.py`
+   - لتشغيل طبقات التشغيل غير الحي:
+   - shadow mode
+   - paper mode
+   - rollout control logic بدون broker integration
+
+
+## Architecture
+
+### 1. Raw Data Layer
+- `MBO`: market-by-order / trades / add / cancel
+- `MBP10`: top-10 order book snapshots
+
+### 2. Feature Layer
+يتم استخراج:
+- microstructure features
+- order book features
+- context / rolling / session features
+- autoencoder embeddings
+- `LOB tensors` للـ CNN
+
+### 3. Model Layer
+- `CatBoost advisor`
+- `Regime classifier`
+- `DeepLOB CNN`
+- `MetaLearner LSTM`
+
+### 4. Evaluation Layer
+- causal backtest
+- walk-forward validation
+- monitoring + drift
+- release gates
+
+
+## Project Structure
+
+```text
+QuantSystem V19/
+├── README.md
+├── requirements.txt
+├── prepare_training_data.py
+├── train_v19.py
+├── predict_v19.py
+├── backtest_v19.py
+├── walkforward_v19.py
+├── shadow_v19.py
+├── paper_v19.py
+├── monitor_v19.py
+├── configs/
+│   └── v19/
+│       ├── defaults.yaml
+│       └── release_gates.yaml
+└── modules/
+    ├── labels_v19.py
+    ├── feature_factory_v19.py
+    ├── preprocessing_v19.py
+    ├── oof_stacking.py
+    ├── logging_v19.py
+    ├── monitoring_v19.py
+    ├── failsafe_v19.py
+    ├── manifest_v19.py
+    └── ...
+```
+
+
+## Recommended Environment
+
+### Python
+- يوصى بـ `Python 3.10` أو `Python 3.11`
+
+### Base Dependencies
+الموجودة في [requirements.txt](/Users/abdallah/Downloads/QS_FINAL/requirements.txt):
+- `numpy`
+- `pandas`
+- `tensorflow`
+- `scikit-learn`
+- `matplotlib`
+- `openpyxl`
+- `tqdm`
+
+### Common Optional Dependencies
+بعض أجزاء المشروع تستخدم أو تستفيد من:
+- `catboost`
+- `jupyterlab`
+- `ipykernel`
+- `pyarrow`
+- `hmmlearn`
+
+إذا كنت ستعمل على سيرفر خارجي مع Jupyter Notebook فالأفضل تثبيت:
+
+```bash
+pip install -r requirements.txt
+pip install catboost jupyterlab ipykernel pyarrow hmmlearn
+```
+
+
+## Quick Start
+
+### 1. تجهيز البيانات
+
+```bash
+python3 prepare_training_data.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19 \
+  --label_mode v19
+```
+
+النواتج المهمة:
+- `outputs_v19/training_features_ready.csv`
+- `outputs_v19/scaler_params.json`
+- `outputs_v19/lob_tensors.npy`
+- `outputs_v19/lob_tensor_timestamps.npy`
+- `outputs_v19/refinery_report.txt`
+
+
+### 2. التدريب
+
+```bash
+python3 train_v19.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --output outputs_v19
+```
+
+النواتج المهمة:
+- `catboost_advisor_v19.cbm`
+- `meta_learner_v19.keras`
+- `deeplob_cnn_v19.keras`
+- `feature_schema_v19.json`
+- `manifest.json`
+- `meta_features_oof_v19.npy`
+- `visual_embeddings_v19.npy`
+
+
+### 3. Backtest
+
+```bash
+python3 backtest_v19.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --models outputs_v19 \
+  --output outputs_v19_backtest \
+  --input_scaled \
+  --visual_npy outputs_v19/visual_embeddings_v19.npy
+```
+
+النواتج:
+- `backtest_v19_results.csv`
+- `backtest_v19_trades.csv`
+- `backtest_v19_summary.json`
+
+
+### 4. Walk-Forward
+
+```bash
+python3 walkforward_v19.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19_walkforward
+```
+
+النواتج:
+- `fold_XX/`
+- `walkforward_summary.json`
+- `release_gates_report.json`
+- `manifest.json`
+
+
+## Running On Jupyter Notebook On A Remote Server
+
+هذا هو السيناريو المقترح إذا كنت ستشتغل من لابتوبك لكن التشغيل الفعلي على سيرفر خارجي.
+
+### 1. ادخل إلى السيرفر
+
+```bash
+ssh user@your-server-ip
+```
+
+### 2. انسخ المشروع أو ارفع الملفات
+
+مثلاً:
+
+```bash
+git clone <your-repo-url>
+cd QS_FINAL
+```
+
+أو ارفع المجلد يدوياً ثم:
+
+```bash
+cd /path/to/QS_FINAL
+```
+
+### 3. أنشئ بيئة افتراضية
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+### 4. ثبّت المتطلبات
+
+```bash
+pip install -r requirements.txt
+pip install catboost jupyterlab ipykernel pyarrow hmmlearn
+```
+
+### 5. أضف kernel خاص بالمشروع
+
+```bash
+python -m ipykernel install --user --name quantsystem-v19 --display-name "Python (QuantSystem V19)"
+```
+
+### 6. شغّل Jupyter Lab على السيرفر
+
+```bash
+jupyter lab --no-browser --ip=0.0.0.0 --port=8888
+```
+
+إذا أردت طريقة أكثر أماناً، استخدم:
+
+```bash
+jupyter lab --no-browser --ip=127.0.0.1 --port=8888
+```
+
+### 7. اعمل SSH tunnel من جهازك المحلي
+
+من جهازك المحلي:
+
+```bash
+ssh -L 8888:127.0.0.1:8888 user@your-server-ip
+```
+
+ثم افتح في المتصفح:
+
+```text
+http://127.0.0.1:8888
+```
+
+### 8. اختر Kernel الصحيح
+
+داخل Jupyter اختر:
+
+```text
+Python (QuantSystem V19)
+```
+
+
+## Recommended Notebook Workflow
+
+داخل Jupyter Notebook، يفضّل تقسيم العمل إلى 4 notebooks:
+
+### 1. `01_prepare_data.ipynb`
+يشغل:
+- قراءة raw data paths
+- `prepare_training_data.py`
+- مراجعة التقارير والـ CSV
+
+مثال:
+
+```python
+!python3 prepare_training_data.py \
+  --mbo /data/mbo.csv \
+  --mbp /data/mbp.csv \
+  --output outputs_v19 \
+  --label_mode v19
+```
+
+### 2. `02_train_v19.ipynb`
+يشغل:
+
+```python
+!python3 train_v19.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --output outputs_v19
+```
+
+### 3. `03_backtest_v19.ipynb`
+يشغل:
+
+```python
+!python3 backtest_v19.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --models outputs_v19 \
+  --output outputs_v19_backtest \
+  --input_scaled \
+  --visual_npy outputs_v19/visual_embeddings_v19.npy
+```
+
+ثم:
+
+```python
+import json
+with open("outputs_v19_backtest/backtest_v19_summary.json") as f:
+    summary = json.load(f)
+summary
+```
+
+### 4. `04_walkforward_v19.ipynb`
+يشغل:
+
+```python
+!python3 walkforward_v19.py \
+  --mbo /data/mbo.csv \
+  --mbp /data/mbp.csv \
+  --output outputs_v19_walkforward
+```
+
+
+## Direct Python Usage Inside Notebook
+
+إذا كنت لا تريد تشغيل scripts عبر `!python3`، يمكنك استدعاء بعض الدوال مباشرة.
+
+### Training
+
+```python
+from train_v19 import run_training_pipeline
+
+summary = run_training_pipeline(
+    csv_path="outputs_v19/training_features_ready.csv",
+    output_dir="outputs_v19",
+)
+summary
+```
+
+### Shadow
+
+```python
+from shadow_v19 import run_shadow
+
+summary = run_shadow(
+    csv_path="outputs_v19/training_features_ready.csv",
+    models_dir="outputs_v19",
+    output_dir="outputs_v19_shadow",
+    input_scaled=True,
+)
+summary
+```
+
+### Paper
+
+```python
+from paper_v19 import run_paper
+
+summary = run_paper(
+    csv_path="outputs_v19/training_features_ready.csv",
+    models_dir="outputs_v19",
+    output_dir="outputs_v19_paper",
+    input_scaled=True,
+    run_mode="paper",
+)
+summary
+```
+
+
+## Outputs You Should Track
+
+### Training
+- `feature_schema_v19.json`
+- `manifest.json`
+- `meta_learner_v19_history.json`
+- `stage1_v19_metrics.json`
+- `visual_metrics_v19.json`
+
+### Backtest
+- `backtest_v19_summary.json`
+- `backtest_v19_trades.csv`
+
+### Walk-Forward
+- `walkforward_summary.json`
+- `release_gates_report.json`
+
+### Monitoring / Shadow / Paper
+- `shadow_predictions.jsonl`
+- `shadow_outcomes.jsonl`
+- `paper_orders.jsonl`
+- `paper_fills.jsonl`
+- `paper_trades.jsonl`
+- `monitoring_summary.json`
+- `drift_report.json`
+- `alerts.jsonl`
+
+
+## Recommended Server Specs
+
+الحد الأدنى العملي:
+- CPU: 8 vCPU
+- RAM: 32 GB
+- Disk: SSD
+
+أفضلية للتدريب المريح:
+- CPU: 16+ vCPU
+- RAM: 64 GB
+- GPU: اختياري لكنه مفيد إذا كان `TensorFlow` و`DeepLOB` سيُستخدمان فعلاً
+
+
+## Common Issues
+
+### 1. TensorFlow غير مثبت
+سترى تحذيرات مثل:
+
+```text
+TensorFlow غير مثبّت — MetaLearner غير متاح
+```
+
+الحل:
+
+```bash
+pip install tensorflow
+```
+
+### 2. CatBoost غير مثبت
+
+```bash
+pip install catboost
+```
+
+### 3. مشاكل `OpenMP SHM`
+قد تظهر أحياناً على بعض السيرفرات أو الحاويات.
+
+جرّب:
+
+```bash
+export OMP_NUM_THREADS=1
+export KMP_INIT_AT_FORK=FALSE
+```
+
+ثم أعد تشغيل الـ notebook kernel أو الـ shell.
+
+### 4. ملفات Parquet لا تُقرأ
+
+```bash
+pip install pyarrow
+```
+
+
+## Current Focus
+
+حالياً المشروع مهيأ بشكل ممتاز لـ:
+- offline training
+- backtesting
+- walk-forward evaluation
+- shadow/paper operational layers
+
+وما زلنا **مؤجلين broker/live data integration** لمرحلة لاحقة.
+
+
+## Suggested First Session On A Remote Server
+
+إذا هذه أول مرة تشغل المشروع على سيرفر خارجي، اتبع هذا الترتيب:
+
+1. فعّل البيئة الافتراضية
+2. افتح Jupyter Lab
+3. شغّل `01_prepare_data.ipynb`
+4. تأكد من وجود `training_features_ready.csv`
+5. شغّل `02_train_v19.ipynb`
+6. راجع `manifest.json` و`feature_schema_v19.json`
+7. شغّل `03_backtest_v19.ipynb`
+8. فقط بعد ذلك انتقل إلى `walkforward_v19.py`
+
+
+## Notes
+
+- المرجع الأحدث والوحيد للمشروع الحالي هو هذا الملف: [README.md](/Users/abdallah/Downloads/QS_FINAL/README.md)

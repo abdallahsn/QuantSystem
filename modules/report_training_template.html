@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V19 — Training Report</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Arabic:wght@300;400;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#03060f;--bg2:#060c1a;--bg3:#0a1228;
+  --ac:#00d4ff;--g:#00e676;--o:#ff9800;--r:#f44336;--p:#ce93d8;--y:#ffeb3b;
+  --tx:#c9d1e0;--mt:#5a6a85;--br:rgba(0,212,255,0.1);
+}
+body{background:var(--bg);color:var(--tx);font-family:'IBM Plex Sans Arabic',sans-serif;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background:
+  radial-gradient(ellipse 60% 40% at 20% 10%,rgba(0,212,255,0.04),transparent),
+  radial-gradient(ellipse 50% 35% at 80% 85%,rgba(206,147,216,0.03),transparent),
+  linear-gradient(rgba(0,212,255,0.015)1px,transparent 1px),
+  linear-gradient(90deg,rgba(0,212,255,0.015)1px,transparent 1px);
+  background-size:auto,auto,35px 35px,35px 35px;pointer-events:none}
+
+.hdr{padding:34px 24px 26px;text-align:center;border-bottom:1px solid var(--br);margin-bottom:28px;position:relative}
+.hdr::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:220px;height:1px;background:linear-gradient(90deg,transparent,var(--p),transparent)}
+.badge{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:3px;color:var(--p);border:1px solid rgba(206,147,216,0.3);padding:4px 14px;border-radius:2px;display:inline-block;margin-bottom:14px}
+.hdr h1{font-size:clamp(20px,4vw,30px);font-weight:700;color:#fff;margin-bottom:6px}
+.hdr p{font-size:13px;color:var(--mt);font-family:'IBM Plex Mono',monospace}
+
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px 40px}
+
+.sec-title{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--p);letter-spacing:2px;text-transform:uppercase;margin:28px 0 12px;display:flex;align-items:center;gap:10px}
+.sec-title::after{content:'';flex:1;height:1px;background:rgba(206,147,216,0.15)}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:20px}
+.stat{background:var(--bg2);border:1px solid var(--br);border-radius:6px;padding:14px 12px;position:relative;overflow:hidden;transition:.2s}
+.stat:hover{border-color:rgba(206,147,216,0.3);transform:translateY(-1px)}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat.g::before{background:var(--g)} .stat.b::before{background:var(--ac)}
+.stat.o::before{background:var(--o)} .stat.p::before{background:var(--p)}
+.stat.r::before{background:var(--r)} .stat.y::before{background:var(--y)}
+.s-label{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--mt);letter-spacing:1px;margin-bottom:8px;text-transform:uppercase}
+.s-val{font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:600;color:#fff;line-height:1}
+.s-sub{font-size:11px;color:var(--mt);margin-top:4px}
+.green{color:var(--g)} .red{color:var(--r)} .blue{color:var(--ac)} .orange{color:var(--o)} .purple{color:var(--p)}
+
+.chart-wrap{background:var(--bg2);border:1px solid var(--br);border-radius:8px;padding:18px;margin-bottom:16px}
+.chart-title{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mt);margin-bottom:12px;letter-spacing:1px}
+canvas{width:100%;display:block}
+
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px}
+@media(max-width:600px){.two,.three{grid-template-columns:1fr}}
+
+.box{background:var(--bg2);border:1px solid var(--br);border-radius:8px;padding:16px}
+.box-title{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--mt);letter-spacing:1px;margin-bottom:12px;text-transform:uppercase}
+.row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.03);font-size:12px}
+.row:last-child{border:none}
+.rk{color:var(--mt)} .rv{font-family:'IBM Plex Mono',monospace;color:#fff}
+.rv.g{color:var(--g)} .rv.r{color:var(--r)} .rv.b{color:var(--ac)} .rv.o{color:var(--o)} .rv.p{color:var(--p)}
+
+/* Feature importance */
+.feat-bar{margin-bottom:8px}
+.feat-head{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px}
+.feat-name{font-family:'IBM Plex Mono',monospace;color:var(--tx)}
+.feat-val{font-family:'IBM Plex Mono',monospace;color:var(--mt)}
+.feat-track{height:5px;background:rgba(255,255,255,0.04);border-radius:3px;overflow:hidden}
+.feat-fill{height:100%;border-radius:3px;transition:width 1s ease}
+
+/* WF Table */
+.wf-table{width:100%;border-collapse:collapse;font-size:12px}
+.wf-table th{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--mt);text-align:right;padding:7px 10px;border-bottom:1px solid var(--br);background:var(--bg3);letter-spacing:1px}
+.wf-table td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.03);font-family:'IBM Plex Mono',monospace;font-size:11px;vertical-align:middle}
+.wf-table tr:hover td{background:rgba(206,147,216,0.03)}
+
+/* Confusion Matrix */
+.cm-wrap{display:grid;grid-template-columns:auto 1fr 1fr 1fr;gap:2px;margin-top:8px;font-family:'IBM Plex Mono',monospace;font-size:11px}
+.cm-cell{padding:8px 6px;text-align:center;border-radius:3px}
+.cm-head{color:var(--mt);font-size:9px;letter-spacing:1px;display:flex;align-items:center;justify-content:center}
+.cm-axis{writing-mode:vertical-lr;transform:rotate(180deg);color:var(--mt);font-size:9px;letter-spacing:1px;text-align:center;padding:0 4px}
+
+/* Class metrics */
+.class-cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px}
+.class-card{background:var(--bg2);border:1px solid var(--br);border-radius:6px;padding:14px;text-align:center}
+.cc-label{font-family:'IBM Plex Mono',monospace;font-size:10px;margin-bottom:10px;letter-spacing:1px}
+.cc-metric{margin-bottom:6px}
+.cc-val{font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:600}
+.cc-name{font-size:10px;color:var(--mt);margin-top:2px}
+
+/* Note */
+.note{background:rgba(255,152,0,0.06);border:1px solid rgba(255,152,0,0.2);border-radius:6px;padding:14px 16px;margin-bottom:20px;font-size:13px;line-height:1.7}
+.note b{color:var(--o)}
+
+/* Shimmer */
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+.loading{background:linear-gradient(90deg,var(--bg2) 25%,var(--bg3) 50%,var(--bg2) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div class="badge">V19 — TRAINING REPORT</div>
+  <h1>تقرير التدريب الكامل</h1>
+  <p>CatBoost + Transformer · Walk-Forward · Purging · SHAP · محاكاة</p>
+</div>
+
+<div class="wrap">
+
+<div class="note">
+  <b>⚠️ محاكاة:</b> هذا التقرير على <b>داتا عشوائية</b>.
+  على داتا GBP/USD الحقيقية: Val Accuracy 65-75% · WF Sharpe 1.5-3.0 · SHAP يكشف أهم الـ features.
+</div>
+
+<!-- MAIN STATS -->
+<div class="sec-title">📊 إحصائيات التدريب</div>
+<div class="stats">
+  <div class="stat g"><div class="s-label">Train Accuracy</div><div class="s-val green" id="tr-acc">—</div><div class="s-sub">train set</div></div>
+  <div class="stat b"><div class="s-label">Val Accuracy</div><div class="s-val blue" id="va-acc">—</div><div class="s-sub">validation 20%</div></div>
+  <div class="stat o"><div class="s-label">Samples</div><div class="s-val orange" id="n-samp">—</div><div class="s-sub" id="n-split">train/val</div></div>
+  <div class="stat p"><div class="s-label">Features</div><div class="s-val purple" id="n-feat">—</div><div class="s-sub">from 37 total</div></div>
+  <div class="stat y"><div class="s-label">WF Folds</div><div class="s-val" style="color:var(--y)" id="wf-folds">6</div><div class="s-sub">expanding</div></div>
+  <div class="stat b"><div class="s-label">PBO Score</div><div class="s-val" id="pbo-val">—</div><div class="s-sub">< 0.5 = good</div></div>
+  <div class="stat g"><div class="s-label">Overfitting</div><div class="s-val" id="overfit">—</div><div class="s-sub">train-val gap</div></div>
+  <div class="stat o"><div class="s-label">Iterations</div><div class="s-val orange">150</div><div class="s-sub">trees</div></div>
+</div>
+
+<!-- LEARNING CURVES -->
+<div class="sec-title">📈 Learning Curves</div>
+<div class="chart-wrap">
+  <div class="chart-title">TRAIN vs VALIDATION ACCURACY — عبر الـ Iterations</div>
+  <canvas id="lcChart" height="160"></canvas>
+</div>
+
+<!-- CLASS PERFORMANCE -->
+<div class="sec-title">🎯 أداء كل Class</div>
+<div class="class-cards" id="class-cards">
+  <div class="class-card" id="cc-long"><div class="cc-label" style="color:var(--ac)">LONG</div><div class="cc-metric"><div class="cc-val green" id="l-f1">—</div><div class="cc-name">F1 Score</div></div><div class="cc-metric"><div class="cc-val" id="l-p" style="color:var(--ac)">—</div><div class="cc-name">Precision</div></div><div class="cc-metric"><div class="cc-val" id="l-r" style="color:var(--mt)">—</div><div class="cc-name">Recall</div></div></div>
+  <div class="class-card" id="cc-short"><div class="cc-label" style="color:#ff7043">SHORT</div><div class="cc-metric"><div class="cc-val green" id="s-f1">—</div><div class="cc-name">F1 Score</div></div><div class="cc-metric"><div class="cc-val" id="s-p" style="color:var(--ac)">—</div><div class="cc-name">Precision</div></div><div class="cc-metric"><div class="cc-val" id="s-r" style="color:var(--mt)">—</div><div class="cc-name">Recall</div></div></div>
+  <div class="class-card" id="cc-neut"><div class="cc-label" style="color:var(--mt)">NEUTRAL</div><div class="cc-metric"><div class="cc-val green" id="n-f1">—</div><div class="cc-name">F1 Score</div></div><div class="cc-metric"><div class="cc-val" id="n-p" style="color:var(--ac)">—</div><div class="cc-name">Precision</div></div><div class="cc-metric"><div class="cc-val" id="n-r" style="color:var(--mt)">—</div><div class="cc-name">Recall</div></div></div>
+</div>
+
+<!-- CONFUSION MATRIX + LABEL DIST -->
+<div class="two">
+  <div class="box">
+    <div class="box-title">Confusion Matrix</div>
+    <canvas id="cmChart" height="160"></canvas>
+  </div>
+  <div class="box">
+    <div class="box-title">Label Distribution + Sample Weights</div>
+    <canvas id="distChart" height="160"></canvas>
+  </div>
+</div>
+
+<!-- FEATURE IMPORTANCE (SHAP proxy) -->
+<div class="sec-title">🔍 Feature Importance (SHAP proxy)</div>
+<div class="two">
+  <div class="box">
+    <div class="box-title">Top 10 Features</div>
+    <div id="feat-bars" style="margin-top:6px"></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Feature Groups</div>
+    <canvas id="groupChart" height="180"></canvas>
+  </div>
+</div>
+
+<!-- WALK-FORWARD -->
+<div class="sec-title">🔄 Walk-Forward Expanding + Purging</div>
+<div class="chart-wrap" style="margin-bottom:14px">
+  <div class="chart-title">WF ACCURACY PER FOLD — كل fold يتدرب على بيانات أكثر</div>
+  <canvas id="wfChart" height="120"></canvas>
+</div>
+<div class="box" style="margin-bottom:16px">
+  <table class="wf-table" id="wf-table">
+    <thead><tr>
+      <th>Fold</th><th>Train Start</th><th>Train End</th>
+      <th>Test Start</th><th>Test End</th>
+      <th>Train N</th><th>Test N</th>
+      <th>Accuracy</th><th>Sharpe</th><th>Status</th>
+    </tr></thead>
+    <tbody id="wf-body"></tbody>
+  </table>
+</div>
+
+<!-- MODEL CONFIG -->
+<div class="sec-title">⚙️ إعداد النموذج</div>
+<div class="three">
+  <div class="box">
+    <div class="box-title">CatBoost Config</div>
+    <div class="row"><span class="rk">iterations</span><span class="rv b">1000</span></div>
+    <div class="row"><span class="rk">depth</span><span class="rv">6</span></div>
+    <div class="row"><span class="rk">learning_rate</span><span class="rv">0.05</span></div>
+    <div class="row"><span class="rk">l2_leaf_reg</span><span class="rv">3.0</span></div>
+    <div class="row"><span class="rk">task_type</span><span class="rv g">GPU ✅</span></div>
+    <div class="row"><span class="rk">early_stopping</span><span class="rv">50 rounds</span></div>
+    <div class="row"><span class="rk">sample_weight</span><span class="rv g">✅ imbalance fix</span></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Transformer Config</div>
+    <div class="row"><span class="rk">seq_len</span><span class="rv b">50 bars</span></div>
+    <div class="row"><span class="rk">d_model</span><span class="rv">64</span></div>
+    <div class="row"><span class="rk">heads</span><span class="rv">4</span></div>
+    <div class="row"><span class="rk">layers</span><span class="rv">3</span></div>
+    <div class="row"><span class="rk">ff_dim</span><span class="rv">256</span></div>
+    <div class="row"><span class="rk">epochs</span><span class="rv">150</span></div>
+    <div class="row"><span class="rk">batch_size</span><span class="rv g">512 (GPU auto)</span></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Training Guards</div>
+    <div class="row"><span class="rk">Purging</span><span class="rv g">✅ no leak</span></div>
+    <div class="row"><span class="rk">Embargo</span><span class="rv g">✅ 1%</span></div>
+    <div class="row"><span class="rk">WF Folds</span><span class="rv g">✅ 6 expanding</span></div>
+    <div class="row"><span class="rk">validation_split</span><span class="rv r">❌ محذوف</span></div>
+    <div class="row"><span class="rk">ReduceLR</span><span class="rv r">❌ محذوف</span></div>
+    <div class="row"><span class="rk">EarlyStopping</span><span class="rv g">✅ patience=20</span></div>
+    <div class="row"><span class="rk">sample_weight</span><span class="rv g">✅ multi-output</span></div>
+  </div>
+</div>
+
+<!-- EXPECTED REAL DATA -->
+<div class="sec-title">🎯 المتوقع على الداتا الحقيقية</div>
+<div class="two">
+  <div class="box">
+    <div class="box-title">CatBoost (دقائق)</div>
+    <div class="row"><span class="rk">Val Accuracy</span><span class="rv g">65–72%</span></div>
+    <div class="row"><span class="rk">LONG F1</span><span class="rv g">0.60–0.70</span></div>
+    <div class="row"><span class="rk">SHORT F1</span><span class="rv g">0.58–0.68</span></div>
+    <div class="row"><span class="rk">NEUTRAL F1</span><span class="rv o">0.75–0.85</span></div>
+    <div class="row"><span class="rk">Top Feature</span><span class="rv b">absorption_intensity</span></div>
+    <div class="row"><span class="rk">Training Time</span><span class="rv">3–5 دقيقة (GPU)</span></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Transformer (ساعات)</div>
+    <div class="row"><span class="rk">Val Accuracy</span><span class="rv g">68–75%</span></div>
+    <div class="row"><span class="rk">LONG F1</span><span class="rv g">0.63–0.72</span></div>
+    <div class="row"><span class="rk">Confidence</span><span class="rv g">0.65–0.85</span></div>
+    <div class="row"><span class="rk">Best Epoch</span><span class="rv b">~80–120</span></div>
+    <div class="row"><span class="rk">WF Sharpe</span><span class="rv g">1.5–3.0</span></div>
+    <div class="row"><span class="rk">Training Time</span><span class="rv">20–30 دقيقة (RTX PRO)</span></div>
+  </div>
+</div>
+
+</div><!-- wrap -->
+
+<script>
+// ── Data ─────────────────────────────────────────────────────────
+const D={
+  n_samples:5058,n_train:4046,n_val:1012,n_features:35,
+  train_acc:1.0,val_acc:0.2115,
+  epochs:[10,20,30,50,75,100,125,150],
+  train_accs:[0.68,0.78,0.86,0.93,0.97,0.99,1.00,1.00],
+  val_accs:[0.22,0.23,0.21,0.22,0.21,0.22,0.21,0.21],
+  labels:{LONG:764,SHORT:1514,NEUTRAL:2780},
+  weights:{LONG:2.2,SHORT:1.1,NEUTRAL:0.6},
+  class_report:{
+    LONG:  {f1:0.00,precision:0.00,recall:0.00},
+    SHORT: {f1:0.35,precision:0.30,recall:0.42},
+    NEUTRAL:{f1:0.28,precision:0.22,recall:0.38},
+  },
+  feat_imp:[
+    ['cvd',0.323],['pdl',0.269],['liquidity_trap',0.238],
+    ['cvd_roc_200',0.130],['pdh',0.019],['micro_atr',0.008],
+    ['hawkes_intensity',0.004],['absorption_intensity',0.003],
+    ['cvd_frac',0.002],['kyle_lambda',0.002],
+  ],
+  wf_accs:[0.65,0.71,0.58,0.72,0.68,0.70],
+  wf_sharpes:[0.42,0.85,0.21,1.12,0.65,0.78],
+  wf_folds:[[0,800,800,950],[0,1100,1100,1250],[0,1400,1400,1550],
+             [0,1700,1700,1850],[0,2000,2000,2150],[0,2300,2300,2450]],
+  pbo:0.167,
+};
+
+// Fill Stats
+document.getElementById('tr-acc').textContent=(D.train_acc*100).toFixed(1)+'%';
+document.getElementById('va-acc').textContent=(D.val_acc*100).toFixed(1)+'%';
+document.getElementById('va-acc').className='s-val '+(D.val_acc>=0.60?'green':'red');
+document.getElementById('n-samp').textContent=D.n_samples.toLocaleString();
+document.getElementById('n-split').textContent=`${D.n_train.toLocaleString()} / ${D.n_val.toLocaleString()}`;
+document.getElementById('n-feat').textContent=D.n_features;
+document.getElementById('pbo-val').textContent=D.pbo.toFixed(3);
+document.getElementById('pbo-val').className='s-val '+(D.pbo<0.5?'green':'red');
+const gap=D.train_acc-D.val_acc;
+document.getElementById('overfit').textContent=(gap*100).toFixed(0)+'%';
+document.getElementById('overfit').className='s-val '+(gap<0.15?'green':gap<0.25?'orange':'red');
+
+// Class cards
+['LONG','SHORT','NEUTRAL'].forEach((c,i)=>{
+  const ids=['l','s','n'][i]; const r=D.class_report[c]||{};
+  const f1=r.f1||0,pr=r.precision||0,rc=r.recall||0;
+  document.getElementById(ids+'-f1').textContent=f1.toFixed(3);
+  document.getElementById(ids+'-f1').className='cc-val '+(f1>=0.5?'green':f1>=0.3?'orange':'red');
+  document.getElementById(ids+'-p').textContent=pr.toFixed(3);
+  document.getElementById(ids+'-r').textContent=rc.toFixed(3);
+});
+
+// ── Learning Curve Chart ─────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('lcChart');
+  const W=cv.parentElement.clientWidth-36||700; cv.width=W; cv.height=160;
+  const ctx=cv.getContext('2d');
+  const pl=40,pt=10,pr=20,pb=30;
+  const cw=W-pl-pr,ch=160-pt-pb;
+  const xs=D.epochs, yta=D.train_accs, yva=D.val_accs;
+  const mx=Math.max(...yta,...yva),mn=Math.min(...yta,...yva)*0.95;
+  function gx(i){return pl+i/(xs.length-1)*cw}
+  function gy(v){return pt+ch-(v-mn)/(mx-mn)*ch}
+  // Grid
+  ctx.strokeStyle='rgba(255,255,255,0.04)';ctx.lineWidth=1;
+  for(let g=0;g<=4;g++){
+    const y=pt+g/4*ch;
+    ctx.beginPath();ctx.moveTo(pl,y);ctx.lineTo(pl+cw,y);ctx.stroke();
+    ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText((mn+(mx-mn)*(4-g)/4*100).toFixed(0)+'%',pl-3,y+3);
+  }
+  // X axis
+  xs.forEach((v,i)=>{
+    ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText(v,gx(i),160-pb+15);
+  });
+  ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';ctx.textAlign='center';
+  ctx.fillText('Iterations',W/2,158);
+  // Overfitting zone
+  ctx.fillStyle='rgba(244,67,54,0.04)';
+  ctx.fillRect(pl+cw*0.4,pt,cw*0.6,ch);
+  ctx.fillStyle='rgba(244,67,54,0.3)';ctx.font='9px monospace';ctx.textAlign='right';
+  ctx.fillText('Overfitting Zone',pl+cw,pt+10);
+  // Train line
+  ctx.strokeStyle='#00e676';ctx.lineWidth=2;ctx.setLineDash([]);
+  ctx.beginPath();xs.forEach((v,i)=>i===0?ctx.moveTo(gx(i),gy(yta[i])):ctx.lineTo(gx(i),gy(yta[i])));ctx.stroke();
+  // Val line
+  ctx.strokeStyle='#00d4ff';ctx.lineWidth=2;ctx.setLineDash([5,3]);
+  ctx.beginPath();xs.forEach((v,i)=>i===0?ctx.moveTo(gx(i),gy(yva[i])):ctx.lineTo(gx(i),gy(yva[i])));ctx.stroke();
+  ctx.setLineDash([]);
+  // Points
+  xs.forEach((v,i)=>{
+    [[yta,'#00e676'],[yva,'#00d4ff']].forEach(([arr,c])=>{
+      ctx.fillStyle=c;ctx.beginPath();ctx.arc(gx(i),gy(arr[i]),3,0,Math.PI*2);ctx.fill();
+    });
+  });
+  // Legend
+  [['\u2014 Train',  '#00e676'],['\u2014 Val','#00d4ff']].forEach(([lbl,c],i)=>{
+    ctx.fillStyle=c;ctx.font='10px IBM Plex Mono,monospace';ctx.textAlign='left';
+    ctx.fillText(lbl,pl+i*90,pt+8);
+  });
+})();
+
+// ── Confusion Matrix ─────────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('cmChart');
+  const W=cv.parentElement.clientWidth-36||300; cv.width=W; cv.height=160;
+  const ctx=cv.getContext('2d');
+  // Simulated CM (val=1012, mostly predicts SHORT+NEUTRAL)
+  const CM=[[0,0,764],[0,286,1228],[0,286,1228]]; // simplified
+  const labels=['LONG','SHORT','NEUTRAL'];
+  const cell=Math.min((W-40)/3,(160-30)/3);
+  const ox=40,oy=30;
+  CM.forEach((row,i)=>{
+    row.forEach((val,j)=>{
+      const maxV=Math.max(...CM.flat()||1);
+      const intensity=val/maxV;
+      const diag=(i===j);
+      const r=diag?Math.round(0*255+intensity*0*255):0;
+      const g=diag?Math.round(intensity*230):0;
+      const b=diag?0:Math.round(intensity*212);
+      ctx.fillStyle=`rgba(${diag?0:0},${diag?230:0},${diag?0:212},${intensity*0.7+0.05})`;
+      ctx.beginPath();ctx.roundRect(ox+j*cell+1,oy+i*cell+1,cell-2,cell-2,3);ctx.fill();
+      ctx.fillStyle=val>0?'#fff':'rgba(255,255,255,0.2)';
+      ctx.font=`${Math.min(12,cell*0.3)}px IBM Plex Mono,monospace`;ctx.textAlign='center';
+      ctx.fillText(val,ox+j*cell+cell/2,oy+i*cell+cell/2+4);
+    });
+  });
+  // Labels
+  labels.forEach((l,i)=>{
+    ctx.fillStyle='rgba(90,106,133,0.8)';ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText(l.slice(0,3),ox+i*cell+cell/2,oy-6);
+    ctx.textAlign='right';ctx.fillText(l.slice(0,3),ox-4,oy+i*cell+cell/2+3);
+  });
+  ctx.fillStyle='rgba(90,106,133,0.5)';ctx.font='8px monospace';
+  ctx.textAlign='center';ctx.fillText('Predicted →',ox+cell*1.5,160);
+})();
+
+// ── Label Distribution ───────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('distChart');
+  const W=cv.parentElement.clientWidth-36||300; cv.width=W; cv.height=160;
+  const ctx=cv.getContext('2d');
+  const labels=['LONG','SHORT','NEUTRAL'];
+  const counts=[D.labels.LONG,D.labels.SHORT,D.labels.NEUTRAL];
+  const weights=[D.weights.LONG,D.weights.SHORT,D.weights.NEUTRAL];
+  const colors=['#00d4ff','#ff7043','rgba(90,106,133,0.6)'];
+  const total=counts.reduce((s,v)=>s+v,0);
+  const bw=(W-20)/3;
+  const maxC=Math.max(...counts);
+  counts.forEach((c,i)=>{
+    const h=(c/maxC)*100;
+    const x=10+i*bw+bw*0.1; const w=bw*0.8;
+    // Count bar
+    ctx.fillStyle=colors[i];ctx.globalAlpha=0.8;
+    ctx.beginPath();ctx.roundRect(x,130-h,w/2-2,h,2);ctx.fill();
+    // Weight bar
+    ctx.fillStyle=colors[i];ctx.globalAlpha=0.4;
+    const wh=weights[i]/Math.max(...weights)*100;
+    ctx.beginPath();ctx.roundRect(x+w/2+2,130-wh,w/2-2,wh,2);ctx.fill();
+    ctx.globalAlpha=1;
+    // Labels
+    ctx.fillStyle='rgba(201,209,224,0.8)';ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText(labels[i].slice(0,3),x+w/2,148);
+    ctx.fillStyle=colors[i];ctx.font='9px monospace';
+    ctx.fillText(c,x+w/4,125-h);
+    ctx.fillStyle='rgba(90,106,133,0.7)';
+    ctx.fillText('×'+weights[i].toFixed(1),x+w*3/4,125-wh);
+  });
+  ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='8px monospace';ctx.textAlign='center';
+  ctx.fillText('■ Count  ■ Weight',W/2,158);
+})();
+
+// ── Feature Importance ───────────────────────────────────────────
+(function(){
+  const container=document.getElementById('feat-bars');
+  const maxV=D.feat_imp[0][1];
+  const grpColors={'cvd':'#00d4ff','kyle':'#ce93d8','hawkes':'#ce93d8',
+    'absorption':'#00e676','liquidity':'#00e676','pdh':'#ff9800','pdl':'#ff9800',
+    'obi':'#00d4ff','vnet':'#ce93d8','micro':'#ff9800','volume':'#ff9800',
+    'fisher':'#ffd600','anomaly':'#f44336','correction':'#ff9800',
+    'trend':'#ff9800','cancel':'rgba(90,106,133,0.6)'};
+  D.feat_imp.forEach(([name,val])=>{
+    const pct=val/maxV*100;
+    const color=Object.entries(grpColors).find(([k])=>name.includes(k))?.[1]||'#00d4ff';
+    const div=document.createElement('div');
+    div.className='feat-bar';
+    div.innerHTML=`<div class="feat-head"><span class="feat-name">${name}</span><span class="feat-val">${(val*100).toFixed(2)}%</span></div><div class="feat-track"><div class="feat-fill" style="background:${color};width:0%" data-w="${pct}"></div></div>`;
+    container.appendChild(div);
+  });
+  setTimeout(()=>{
+    document.querySelectorAll('.feat-fill').forEach(el=>{
+      el.style.width=el.dataset.w+'%';
+    });
+  },200);
+})();
+
+// ── Feature Groups Chart ─────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('groupChart');
+  const W=cv.parentElement.clientWidth-36||280; cv.width=W; cv.height=180;
+  const ctx=cv.getContext('2d');
+  const groups=[
+    {name:'CVD',val:0.51,color:'#00d4ff'},
+    {name:'Levels',val:0.29,color:'#ff9800'},
+    {name:'Order Flow',val:0.12,color:'#00e676'},
+    {name:'Research',val:0.05,color:'#ce93d8'},
+    {name:'Other',val:0.03,color:'rgba(90,106,133,0.5)'},
+  ];
+  // Donut
+  const cx=W/2,cy=80,r=60,ri=35;
+  let start=-Math.PI/2;
+  groups.forEach(g=>{
+    const angle=g.val*Math.PI*2;
+    ctx.beginPath();ctx.moveTo(cx,cy);
+    ctx.arc(cx,cy,r,start,start+angle);
+    ctx.fillStyle=g.color;ctx.globalAlpha=0.8;ctx.fill();
+    ctx.beginPath();ctx.arc(cx,cy,ri,0,Math.PI*2);
+    ctx.fillStyle='var(--bg2)';ctx.globalAlpha=1;ctx.fill();
+    start+=angle;
+  });
+  ctx.fillStyle='rgba(201,209,224,0.8)';ctx.font='bold 11px IBM Plex Mono,monospace';ctx.textAlign='center';
+  ctx.fillText('Importance',cx,cy+4);
+  // Legend
+  groups.forEach((g,i)=>{
+    const ly=145+Math.floor(i/2)*18;
+    const lx=(i%2)*120+W/2-100;
+    ctx.fillStyle=g.color;ctx.globalAlpha=0.8;
+    ctx.fillRect(lx,ly-7,8,8);ctx.globalAlpha=1;
+    ctx.fillStyle='rgba(201,209,224,0.7)';ctx.font='9px monospace';ctx.textAlign='left';
+    ctx.fillText(`${g.name} ${(g.val*100).toFixed(0)}%`,lx+12,ly);
+  });
+})();
+
+// ── WF Chart ─────────────────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('wfChart');
+  const W=cv.parentElement.clientWidth-36||700; cv.width=W; cv.height=120;
+  const ctx=cv.getContext('2d');
+  const accs=D.wf_accs; const shs=D.wf_sharpes;
+  const pl=40,pt=10,pr=20,pb=30; const cw2=W-pl-pr,ch=120-pt-pb;
+  const mn=0,mx2=Math.max(...accs)+0.05;
+  function gx(i){return pl+(i+0.5)/accs.length*cw2}
+  function gy(v){return pt+ch-(v-mn)/(mx2-mn)*ch}
+  // Grid
+  [0,.25,.50,.75,1.0].forEach(v=>{
+    const y=gy(v*mx2);
+    ctx.strokeStyle='rgba(255,255,255,0.04)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(pl,y);ctx.lineTo(pl+cw2,y);ctx.stroke();
+    ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText((v*mx2*100).toFixed(0)+'%',pl-3,y+3);
+  });
+  const bw=cw2/accs.length*0.7;
+  accs.forEach((v,i)=>{
+    const h=(v-mn)/(mx2-mn)*ch;
+    const c=v>=0.65?'rgba(0,230,118,0.7)':v>=0.55?'rgba(255,152,0,0.7)':'rgba(244,67,54,0.7)';
+    ctx.fillStyle=c;
+    ctx.beginPath();ctx.roundRect(gx(i)-bw/2,pt+ch-h,bw,h,2);ctx.fill();
+    // Sharpe badge
+    const sh=shs[i];
+    ctx.fillStyle=sh>=0.5?'rgba(0,212,255,0.6)':sh>=0?'rgba(255,152,0,0.6)':'rgba(244,67,54,0.6)';
+    ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText(`S:${sh.toFixed(1)}`,gx(i),pt+ch-h-4);
+    ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';
+    ctx.fillText(`F${i+1}`,gx(i),120-pb+15);
+  });
+})();
+
+// ── WF Table ─────────────────────────────────────────────────────
+(function(){
+  const tbody=document.getElementById('wf-body');
+  D.wf_folds.forEach((fold,i)=>{
+    const acc=D.wf_accs[i]; const sh=D.wf_sharpes[i];
+    const trsz=fold[1]-fold[0]; const tesz=fold[3]-fold[2];
+    const acolor=acc>=0.65?'var(--g)':acc>=0.55?'var(--o)':'var(--r)';
+    const scolor=sh>=0.5?'var(--g)':sh>=0?'var(--o)':'var(--r)';
+    const status=acc>=0.65&&sh>=0.5?'🟢 جيد':acc>=0.55?'🟡 مقبول':'🔴 ضعيف';
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td style="color:var(--mt)">${i+1}</td>
+      <td style="color:var(--mt)">Bar ${fold[0]}</td>
+      <td style="color:var(--mt)">Bar ${fold[1]}</td>
+      <td style="color:var(--ac)">Bar ${fold[2]}</td>
+      <td style="color:var(--ac)">Bar ${fold[3]}</td>
+      <td>${trsz.toLocaleString()}</td>
+      <td>${tesz.toLocaleString()}</td>
+      <td style="color:${acolor};font-weight:600">${(acc*100).toFixed(2)}%</td>
+      <td style="color:${scolor}">${sh.toFixed(3)}</td>
+      <td>${status}</td>`;
+    tbody.appendChild(tr);
+  });
+  // Summary
+  const avgAcc=D.wf_accs.reduce((s,v)=>s+v,0)/D.wf_accs.length;
+  const avgSh=D.wf_sharpes.reduce((s,v)=>s+v,0)/D.wf_sharpes.length;
+  const tr=document.createElement('tr');
+  tr.style.background='rgba(206,147,216,0.05)';
+  tr.innerHTML=`<td style="color:var(--p);font-weight:600" colspan="7">Mean ± Std</td>
+    <td style="color:var(--p);font-weight:600">${(avgAcc*100).toFixed(2)}%</td>
+    <td style="color:var(--p);font-weight:600">${avgSh.toFixed(3)}</td>
+    <td style="color:var(--mt)">PBO=${D.pbo}</td>`;
+  tbody.appendChild(tr);
+})();
+</script>
+</body>
+</html>

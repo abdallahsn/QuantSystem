@@ -1,0 +1,484 @@
+"""
+predict_v19.py - QuantSystem V19 inference engine
+=================================================
+V19 inference uses the exact feature schema and scaler artifacts produced by
+the training pipeline, then reconstructs the same step vector used in training:
+
+  [25 scaled statistical features] + [3 CatBoost probs] +
+  [4 regime one-hot] + [8 visual embeddings if available]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from collections import deque
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
+from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
+from modules.meta_learner import MetaLearnerLSTM
+from modules.oof_stacking import align_probability_columns
+from modules.preprocessing_v19 import V19FeaturePreprocessor
+from modules.regime_classifier import RegimeClassifier, REGIME_NAMES
+from modules.slippage_model import DailyLossGuard
+try:
+    from modules.deeplob_cnn import DeepLOBCNN
+    DEEPLOB_AVAILABLE = True
+except ImportError:
+    DEEPLOB_AVAILABLE = False
+
+try:
+    from catboost import CatBoostClassifier
+    CB_AVAILABLE = True
+except ImportError:
+    CB_AVAILABLE = False
+
+BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
+N_CLUSTERS = 4
+N_CB_PROBS = 3
+
+
+class V19PredictionEngine:
+    def __init__(
+        self,
+        models_dir: str = 'outputs_v19',
+        run_mode: str = 'live',
+        event_writer: EventLogWriter | None = None,
+        manifest_path: str | None = None,
+        symbol: str = '',
+        failsafe_policy: dict | None = None,
+    ):
+        self.models_dir = models_dir
+        self.run_mode = run_mode
+        self.manifest_path = manifest_path or os.path.join(models_dir, 'manifest.json')
+        self.symbol = symbol
+        self.failsafe_policy = failsafe_policy or {}
+        print(f"\n🔧 V19 Engine — loading artifacts from: {models_dir}")
+
+        self.pre = V19FeaturePreprocessor(models_dir)
+        self.factory = self.pre.factory
+        self.seq_len = self.factory.seq_len
+        self.stat_features = self.factory.stat_features
+        self.meta_features = self.factory.meta_features
+        self.visual_features = self.factory.visual_features
+        self.input_dim = self.factory.input_dim
+        artifacts = self.factory.schema.get('artifacts', {})
+        meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))
+        self.visual_emb_path = os.path.join(models_dir, artifacts.get('visual_embeddings', 'visual_embeddings_v19.npy'))
+
+        self.cb_advisor = None
+        cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
+        self.cb_classes = None
+        cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
+        if os.path.exists(cb_classes_path):
+            try:
+                with open(cb_classes_path, 'r') as f:
+                    self.cb_classes = json.load(f).get('classes')
+            except Exception:
+                self.cb_classes = None
+        if CB_AVAILABLE and os.path.exists(cb_path):
+            self.cb_advisor = CatBoostClassifier()
+            self.cb_advisor.load_model(cb_path)
+            print(f"  ✅ CatBoost V19: {cb_path}")
+        else:
+            print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
+
+        self.regime_clf = RegimeClassifier(n_regimes=N_CLUSTERS)
+        regime_ok = self.regime_clf.load(models_dir)
+        if regime_ok:
+            print("  ✅ Regime classifier loaded")
+        else:
+            print("  ⚠️ Regime classifier missing")
+
+        deeplob_path = os.path.join(models_dir, artifacts.get('deeplob_model', 'deeplob_cnn_v19.keras'))
+        if DEEPLOB_AVAILABLE and os.path.exists(deeplob_path):
+            self.cnn = DeepLOBCNN(brain_file=deeplob_path)
+            if self.cnn is not None and not self.cnn._fitted:
+                self.cnn = None
+        else:
+            self.cnn = None
+        if self.cnn is None:
+            print("  ⚠️ DeepLOB V19 missing or not fitted")
+        else:
+            print("  ✅ DeepLOB V19 loaded")
+
+        if os.path.exists(meta_path):
+            self.meta = MetaLearnerLSTM(
+                seq_len=self.seq_len,
+                n_stat_feat=len(self.stat_features),
+                n_visual_emb=len(self.visual_features),
+                brain_file=meta_path,
+            )
+        else:
+            self.meta = None
+
+        if self.meta is None or not self.meta._fitted:
+            self.meta = None
+            print("  ⚠️ MetaLearner V19 missing or not fitted")
+        else:
+            print("  ✅ MetaLearner V19 loaded")
+
+        self.loss_guard = DailyLossGuard(
+            max_daily_loss_pct=0.02,
+            max_daily_trades=20,
+            max_drawdown_pct=0.05,
+        )
+
+        self._seq_buffer = deque(maxlen=self.seq_len)
+        self.event_writer = event_writer
+        schema_version = str(self.factory.schema.get('version', 'v19'))
+        self.pred_logger = PredictionLogger(event_writer, run_mode=run_mode, manifest_path=self.manifest_path, model_version='v19', schema_version=schema_version, symbol=symbol)
+        self.risk_logger = RiskLogger(event_writer, run_mode=run_mode, manifest_path=self.manifest_path, model_version='v19', schema_version=schema_version, symbol=symbol)
+        self.data_logger = DataQualityLogger(event_writer, run_mode=run_mode, manifest_path=self.manifest_path, model_version='v19', schema_version=schema_version, symbol=symbol)
+        print(f"  ✅ V19 Engine ready | seq_len={self.seq_len} | dim={self.input_dim}\n")
+
+    def reset_state(self):
+        self._seq_buffer.clear()
+        self.loss_guard.reset_daily()
+
+    def get_runtime_status(self) -> dict:
+        return {
+            'catboost_available': self.cb_advisor is not None,
+            'regime_available': bool(self.regime_clf._fitted),
+            'visual_available': self.cnn is not None,
+            'meta_available': self.meta is not None,
+            'manifest_exists': os.path.exists(self.manifest_path),
+            'schema_exists': os.path.exists(os.path.join(self.models_dir, 'feature_schema_v19.json')),
+            'run_mode': self.run_mode,
+        }
+
+    def _get_cb_probs(self, X_stat: np.ndarray) -> np.ndarray:
+        n = X_stat.shape[0]
+        if self.cb_advisor is None:
+            return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
+        try:
+            probs = self.cb_advisor.predict_proba(X_stat)
+            return align_probability_columns(
+                probs,
+                N_CB_PROBS,
+                classes=getattr(self.cb_advisor, 'classes_', None) or self.cb_classes,
+            )
+        except Exception:
+            return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
+
+    def _get_regime_one_hot(self, stat_df: pd.DataFrame) -> np.ndarray:
+        n = len(stat_df)
+        out = np.zeros((n, N_CLUSTERS), dtype=np.float32)
+        if not self.regime_clf._fitted:
+            out[:, 0] = 1.0
+            return out
+        try:
+            labels = self.regime_clf.predict(stat_df)
+            for i, lbl in enumerate(labels):
+                lbl = int(lbl)
+                if 0 <= lbl < N_CLUSTERS:
+                    out[i, lbl] = 1.0
+                else:
+                    out[i, 0] = 1.0
+        except Exception:
+            out[:, 0] = 1.0
+        return out
+
+    def _get_visual_embeddings(self, n: int, lob_tensor: np.ndarray = None) -> np.ndarray:
+        if len(self.visual_features) == 0:
+            return np.zeros((n, 0), dtype=np.float32)
+
+        if lob_tensor is None or self.cnn is None:
+            return self.factory.zero_visual_embeddings(n)
+
+        try:
+            emb = self.cnn.get_embeddings(lob_tensor)
+            emb = np.asarray(emb, dtype=np.float32)
+            if emb.ndim == 1:
+                emb = emb.reshape(1, -1)
+            if emb.shape[1] < len(self.visual_features):
+                pad = np.zeros((emb.shape[0], len(self.visual_features) - emb.shape[1]), dtype=np.float32)
+                emb = np.concatenate([emb, pad], axis=1)
+            return emb[:, :len(self.visual_features)]
+        except Exception:
+            return self.factory.zero_visual_embeddings(n)
+
+    def _build_step_vectors(
+        self,
+        stat_df: pd.DataFrame,
+        visual_emb: np.ndarray | None = None,
+        meta_override: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        X_stat = stat_df[self.stat_features].values.astype(np.float32)
+        if meta_override is not None:
+            meta_override = np.asarray(meta_override, dtype=np.float32)
+            if meta_override.ndim == 1:
+                meta_override = meta_override.reshape(1, -1)
+            expected_dim = len(self.meta_features)
+            if meta_override.shape[1] < expected_dim:
+                pad = np.zeros((meta_override.shape[0], expected_dim - meta_override.shape[1]), dtype=np.float32)
+                meta_override = np.concatenate([meta_override, pad], axis=1)
+            meta_override = meta_override[:, :expected_dim]
+            cb_probs = meta_override[:, :N_CB_PROBS]
+            regime_oh = meta_override[:, N_CB_PROBS:N_CB_PROBS + N_CLUSTERS]
+        else:
+            cb_probs = self._get_cb_probs(X_stat)
+            regime_oh = self._get_regime_one_hot(stat_df)
+        if visual_emb is None:
+            visual_emb = np.zeros((len(stat_df), len(self.visual_features)), dtype=np.float32)
+        X_step = np.concatenate([X_stat, cb_probs, regime_oh, visual_emb], axis=1).astype(np.float32)
+        return X_step, cb_probs, regime_oh
+
+    def _meta_decision(self, seq: np.ndarray) -> dict:
+        if self.meta is None:
+            last_step = seq[-1]
+            offset = len(self.stat_features)
+            probs = last_step[offset:offset + N_CB_PROBS]
+            bias_idx = int(np.argmax(probs))
+            return {
+                'bias': BIAS_LABELS[bias_idx],
+                'bias_idx': bias_idx,
+                'confidence': float(probs[bias_idx]),
+                'uncertainty': 0.5,
+                'tradeable': float(probs[bias_idx]) >= 0.60 and bias_idx != 2,
+                'source': 'CatBoost_Fallback_V19',
+            }
+        result = self.meta.predict(seq)
+        result['source'] = 'MetaLearner_V19'
+        return result
+
+    def predict_step(self,
+                     stat_features: dict,
+                     visual_embedding: np.ndarray | None = None,
+                     meta_override: np.ndarray | None = None,
+                     lob_tensor: np.ndarray = None,
+                     ts=None,
+                     already_scaled: bool = False) -> dict:
+        t0 = time.perf_counter()
+        can_trade, reason = self.loss_guard.can_trade(ts)
+        if not can_trade:
+            result = {
+                'bias': 'NEUTRAL',
+                'confidence': 0.0,
+                'tradeable': False,
+                'reason': reason,
+                'sequence_ready': len(self._seq_buffer) >= self.seq_len,
+                'feature_hash': feature_hash_from_dict(stat_features or {}),
+            }
+            result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+            self.risk_logger.log_block(reason, ts=ts, extra={'loss_guard_status': self.loss_guard.status()})
+            self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
+            return result
+
+        stat_df = self.factory.prepare_row(
+            stat_features,
+            ts=ts,
+            already_scaled=already_scaled,
+            include_meta=True,
+        )
+        health = evaluate_system_health(
+            models_dir=self.models_dir,
+            engine_status=self.get_runtime_status(),
+            feature_row=stat_features,
+            ts=ts,
+            policy=self.failsafe_policy,
+            manifest_path=self.manifest_path,
+            loss_guard_status=self.loss_guard.status(),
+        )
+        runtime_mode = decide_runtime_mode(health, self.failsafe_policy)
+        if not runtime_mode.get('allow_shadow', True):
+            result = {
+                'bias': 'NEUTRAL',
+                'confidence': 0.0,
+                'tradeable': False,
+                'reason': runtime_mode.get('reason', 'Failsafe blocked'),
+                'sequence_ready': False,
+                'feature_hash': feature_hash_from_dict(stat_features or {}),
+            }
+            result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode, event_type='rollout_guard_triggered')
+            self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
+            return result
+
+        if 'visual_branch_unavailable' in runtime_mode.get('degraded_components', []):
+            self.data_logger.log_data_issue('visual_branch_unavailable', reason='visual branch unavailable, using stat+meta only', ts=ts, extra=runtime_mode)
+        if 'regime_fallback' in runtime_mode.get('degraded_components', []):
+            self.data_logger.log_data_issue('regime_fallback_used', reason='regime model unavailable, defaulting to cluster_0', ts=ts, extra=runtime_mode)
+        if health.get('missing_critical_features'):
+            self.data_logger.log_data_issue('feature_missing', reason='critical features missing/imputed', ts=ts, extra={'missing_critical_features': health.get('missing_critical_features')})
+        if 'timestamp_stale' in runtime_mode.get('blocking_issues', []):
+            self.data_logger.log_data_issue('data_gap_detected', reason='timestamp stale for incoming row', ts=ts, extra=runtime_mode)
+
+        if visual_embedding is not None:
+            visual_emb = self.factory.prepare_visual_embeddings(visual_embedding, n_rows=len(stat_df))
+        else:
+            visual_emb = self._get_visual_embeddings(len(stat_df), lob_tensor=lob_tensor)
+        step_rows, cb_probs, regime_oh = self._build_step_vectors(
+            stat_df,
+            visual_emb=visual_emb,
+            meta_override=meta_override,
+        )
+        self._seq_buffer.append(step_rows[0])
+
+        if len(self._seq_buffer) < self.seq_len:
+            result = {
+                'bias': 'NEUTRAL',
+                'confidence': 0.0,
+                'tradeable': False,
+                'reason': f'Warming up ({len(self._seq_buffer)}/{self.seq_len})',
+                'sequence_ready': False,
+                'feature_hash': feature_hash_from_dict(stat_features or {}),
+            }
+            result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+            self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
+            return result
+
+        seq = np.array(list(self._seq_buffer), dtype=np.float32)
+        result = self._meta_decision(seq)
+        if self.run_mode == 'rollout' and not runtime_mode.get('allow_rollout', False):
+            result['tradeable'] = False
+            result['reason'] = runtime_mode.get('reason', 'Rollout blocked')
+            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode, event_type='rollout_guard_triggered')
+        elif self.run_mode == 'paper' and not runtime_mode.get('allow_paper', False):
+            result['tradeable'] = False
+            result['reason'] = runtime_mode.get('reason', 'Paper blocked')
+            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode)
+        cluster = int(np.argmax(regime_oh[0]))
+        result['cb_probs'] = {
+            'LONG': round(float(cb_probs[0, 0]), 4),
+            'SHORT': round(float(cb_probs[0, 1]), 4),
+            'NEUTRAL': round(float(cb_probs[0, 2]), 4),
+        }
+        if len(self.visual_features):
+            result['visual_norm'] = round(float(np.linalg.norm(visual_emb[0])), 4)
+        result['cluster'] = cluster
+        result['cluster_name'] = REGIME_NAMES.get(cluster, f'Cluster_{cluster}')
+        result['sequence_ready'] = True
+        result['feature_hash'] = feature_hash_from_dict(stat_features or {})
+        result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+        self.pred_logger.log_prediction(
+            result,
+            features=stat_features or {},
+            ts=ts,
+            input_source='predict_step',
+            latency_ms=result['latency_ms'],
+        )
+        return result
+
+    def predict_live(self, stat_features: dict, lob_tensor: np.ndarray = None, ts=None, already_scaled: bool = False) -> dict:
+        return self.predict_step(
+            stat_features,
+            visual_embedding=None,
+            lob_tensor=lob_tensor,
+            ts=ts,
+            already_scaled=already_scaled,
+        )
+
+    def run_backtest(
+        self,
+        df: pd.DataFrame,
+        already_scaled: bool = False,
+        visual_embeddings: np.ndarray | None = None,
+        meta_features: np.ndarray | None = None,
+    ) -> list[dict]:
+        print(f"\n📊 V19 Backtest: {len(df):,} rows | already_scaled={already_scaled}")
+        self.reset_state()
+        source_has_labels = 'bias_label' in df.columns
+        canonical_df = self.factory.prepare_frame(df, already_scaled=already_scaled, include_meta=True)
+        if visual_embeddings is None and len(self.visual_features) and os.path.exists(self.visual_emb_path):
+            try:
+                vis = np.load(self.visual_emb_path)
+                if len(vis) >= len(canonical_df):
+                    visual_embeddings = np.asarray(vis[:len(canonical_df)], dtype=np.float32)
+                    print(f"  Visual Embeddings loaded: {visual_embeddings.shape}")
+            except Exception:
+                visual_embeddings = None
+        if visual_embeddings is None:
+            visual_embeddings = self.factory.zero_visual_embeddings(len(canonical_df))
+        if meta_features is not None:
+            meta_features = np.asarray(meta_features, dtype=np.float32)
+            if len(meta_features) != len(canonical_df):
+                raise ValueError(
+                    f'❌ meta features rows ({len(meta_features)}) do not match CSV rows ({len(canonical_df)})'
+                )
+
+        y_bias = canonical_df['bias_label'].values.astype(np.int32) if source_has_labels else None
+
+        results = []
+        for i, (_, row) in enumerate(canonical_df.iterrows()):
+            pred = self.predict_step(
+                row.to_dict(),
+                visual_embedding=visual_embeddings[i] if len(self.visual_features) else None,
+                meta_override=meta_features[i] if meta_features is not None else None,
+                ts=canonical_df['ts_event'].iloc[i] if 'ts_event' in canonical_df.columns else None,
+                already_scaled=True,
+            )
+            if pred.get('reason', '').startswith('Warming up'):
+                continue
+
+            pred['idx'] = i
+            if len(self.visual_features):
+                pred['visual_norm'] = round(float(np.linalg.norm(visual_embeddings[i])), 4)
+
+            if y_bias is not None:
+                pred['true_bias'] = int(y_bias[i])
+                pred['true_label'] = BIAS_LABELS.get(int(y_bias[i]), '?')
+                pred['correct'] = pred.get('bias_idx') == int(y_bias[i])
+
+            results.append(pred)
+
+        if results and y_bias is not None:
+            acc = float(np.mean([r.get('correct', False) for r in results]))
+            tradeable = int(sum(1 for r in results if r.get('tradeable', False)))
+            print(f"  Bias Accuracy: {acc:.2%}")
+            print(f"  Tradeable:     {tradeable:,}/{len(results):,} ({tradeable/max(len(results),1):.1%})")
+        return results
+
+
+def main():
+    p = argparse.ArgumentParser(description='QuantSystem V19 prediction engine')
+    p.add_argument('--models', default='outputs_v19')
+    p.add_argument('--csv', default=None, help='optional CSV for backtest mode')
+    p.add_argument('--mode', choices=['backtest', 'live'], default='backtest')
+    p.add_argument('--output', default='outputs_v19')
+    p.add_argument('--visual_npy', default=None, help='optional precomputed visual embeddings for the same rows')
+    p.add_argument('--input_scaled', action='store_true',
+                   help='set this when using training_features_ready.csv (already scaled)')
+    args = p.parse_args()
+
+    engine = V19PredictionEngine(args.models)
+
+    if args.mode == 'backtest':
+        if not args.csv:
+            raise ValueError('❌ --csv مطلوب في backtest mode')
+        df = pd.read_csv(args.csv, low_memory=False)
+        visual_embeddings = None
+        if args.visual_npy and os.path.exists(args.visual_npy):
+            visual_embeddings = np.load(args.visual_npy)
+        results = engine.run_backtest(df, already_scaled=args.input_scaled, visual_embeddings=visual_embeddings)
+
+        os.makedirs(args.output, exist_ok=True)
+        out_csv = os.path.join(args.output, 'v19_backtest_results.csv')
+        pd.DataFrame(results).to_csv(out_csv, index=False)
+        print(f"\n✅ Backtest results: {out_csv}")
+
+        if results and 'correct' in results[0]:
+            df_r = pd.DataFrame(results)
+            summary = {
+                'total': int(len(df_r)),
+                'tradeable': int(df_r['tradeable'].sum()),
+                'accuracy': round(float(df_r['correct'].mean()), 4),
+                'long': int((df_r['bias'] == 'LONG').sum()),
+                'short': int((df_r['bias'] == 'SHORT').sum()),
+                'neutral': int((df_r['bias'] == 'NEUTRAL').sum()),
+            }
+            with open(os.path.join(args.output, 'v19_summary.json'), 'w') as f:
+                json.dump(summary, f, indent=2)
+            print(f"  Summary: {summary}")
+
+
+if __name__ == '__main__':
+    main()

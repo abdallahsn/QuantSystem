@@ -1,0 +1,11 @@
+{
+  "metrics": {
+    "mean_accuracy": { "min": 0.38 },
+    "mean_trade_accuracy": { "min": 0.38 },
+    "mean_win_rate": { "min": 0.45 },
+    "total_trades": { "min": 10 },
+    "mean_trade_sharpe": { "min": 0.0 },
+    "max_drawdown_pct": { "max": 0.25 },
+    "total_pnl_dollars": { "min": 0.0 }
+  }
+}

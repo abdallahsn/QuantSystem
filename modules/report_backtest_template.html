@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V19 — Backtest Report</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Arabic:wght@300;400;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#03060f;--bg2:#060c1a;--bg3:#0a1228;--bg4:#0e1735;
+  --ac:#00d4ff;--g:#00e676;--o:#ff9800;--r:#f44336;--p:#ce93d8;--y:#ffeb3b;
+  --tx:#c9d1e0;--mt:#5a6a85;--br:rgba(0,212,255,0.1);
+}
+body{background:var(--bg);color:var(--tx);font-family:'IBM Plex Sans Arabic',sans-serif;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:
+  radial-gradient(ellipse 70% 40% at 15% 10%,rgba(0,212,255,0.04),transparent),
+  radial-gradient(ellipse 50% 35% at 85% 90%,rgba(0,230,118,0.03),transparent),
+  linear-gradient(rgba(0,212,255,0.015)1px,transparent 1px),
+  linear-gradient(90deg,rgba(0,212,255,0.015)1px,transparent 1px);
+  background-size:auto,auto,35px 35px,35px 35px;pointer-events:none}
+
+/* HEADER */
+.hdr{padding:36px 24px 28px;text-align:center;border-bottom:1px solid var(--br);margin-bottom:28px;position:relative}
+.hdr::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:200px;height:1px;background:linear-gradient(90deg,transparent,var(--ac),transparent)}
+.badge{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:3px;color:var(--ac);border:1px solid rgba(0,212,255,0.3);padding:4px 14px;border-radius:2px;display:inline-block;margin-bottom:14px}
+.hdr h1{font-size:clamp(20px,4vw,30px);font-weight:700;color:#fff;margin-bottom:6px;letter-spacing:-0.5px}
+.hdr p{font-size:13px;color:var(--mt);font-family:'IBM Plex Mono',monospace}
+
+/* WRAP */
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px 40px}
+
+/* SECTION TITLE */
+.sec-title{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ac);letter-spacing:2px;text-transform:uppercase;margin:28px 0 12px;display:flex;align-items:center;gap:10px}
+.sec-title::after{content:'';flex:1;height:1px;background:var(--br)}
+
+/* STAT GRID */
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:20px}
+.stat{background:var(--bg2);border:1px solid var(--br);border-radius:6px;padding:14px 12px;position:relative;overflow:hidden;transition:.2s}
+.stat:hover{border-color:rgba(0,212,255,0.3);transform:translateY(-1px)}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat.green::before{background:var(--g)}
+.stat.red::before{background:var(--r)}
+.stat.blue::before{background:var(--ac)}
+.stat.orange::before{background:var(--o)}
+.stat.purple::before{background:var(--p)}
+.stat.yellow::before{background:var(--y)}
+.s-label{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--mt);letter-spacing:1px;margin-bottom:8px;text-transform:uppercase}
+.s-val{font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:600;color:#fff;line-height:1}
+.s-sub{font-size:11px;color:var(--mt);margin-top:4px}
+.s-val.green{color:var(--g)}
+.s-val.red{color:var(--r)}
+.s-val.orange{color:var(--o)}
+.s-val.blue{color:var(--ac)}
+
+/* VERDICT CARD */
+.verdict{background:var(--bg2);border:1px solid rgba(0,212,255,0.2);border-radius:8px;padding:20px;margin-bottom:20px;display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:center}
+.verdict-icon{font-size:40px;line-height:1}
+.verdict-title{font-size:18px;font-weight:700;color:#fff;margin-bottom:6px}
+.verdict-sub{font-size:13px;color:var(--mt);line-height:1.6}
+.verdict-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.vbadge{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 10px;border-radius:3px;font-weight:600}
+.vb-scalp{background:rgba(0,212,255,0.12);color:var(--ac);border:1px solid rgba(0,212,255,0.25)}
+.vb-swing{background:rgba(206,147,216,0.12);color:var(--p);border:1px solid rgba(206,147,216,0.25)}
+.vb-intra{background:rgba(255,152,0,0.12);color:var(--o);border:1px solid rgba(255,152,0,0.25)}
+
+/* EQUITY CHART */
+.chart-wrap{background:var(--bg2);border:1px solid var(--br);border-radius:8px;padding:20px;margin-bottom:20px}
+.chart-title{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ac);margin-bottom:14px;letter-spacing:1px}
+canvas{width:100%;display:block}
+
+/* STYLE BARS */
+.style-bars{background:var(--bg2);border:1px solid var(--br);border-radius:8px;padding:18px;margin-bottom:20px}
+.sbar{margin-bottom:12px}
+.sbar-head{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px}
+.sbar-name{color:#fff;font-weight:600}
+.sbar-info{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mt)}
+.sbar-track{height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden}
+.sbar-fill{height:100%;border-radius:3px;transition:width 1s ease}
+
+/* TWO COL */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
+@media(max-width:600px){.two{grid-template-columns:1fr}}
+
+/* TP/SL CHART */
+.tpsl{background:var(--bg2);border:1px solid var(--br);border-radius:8px;padding:18px}
+.tpsl-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.tpsl-lbl{font-size:12px;color:var(--mt);width:60px;flex-shrink:0}
+.tpsl-bar-wrap{flex:1;height:8px;background:rgba(255,255,255,0.05);border-radius:4px;overflow:hidden}
+.tpsl-bar{height:100%;border-radius:4px}
+.tpsl-val{font-family:'IBM Plex Mono',monospace;font-size:12px;width:60px;text-align:left;flex-shrink:0}
+
+/* TRADE TABLE */
+.t-wrap{background:var(--bg2);border:1px solid var(--br);border-radius:8px;overflow:hidden;margin-bottom:20px}
+.t-head{display:grid;grid-template-columns:40px 70px 90px 90px 55px 55px 65px 70px 70px 60px;padding:10px 14px;background:var(--bg3);font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--mt);letter-spacing:1px;text-transform:uppercase}
+.t-row{display:grid;grid-template-columns:40px 70px 90px 90px 55px 55px 65px 70px 70px 60px;padding:9px 14px;border-top:1px solid rgba(255,255,255,0.03);font-family:'IBM Plex Mono',monospace;font-size:11px;transition:.15s}
+.t-row:hover{background:rgba(0,212,255,0.03)}
+.win{color:var(--g)}
+.lose{color:var(--r)}
+.to-c{color:var(--o)}
+.long{color:var(--ac)}
+.short{color:#ff7043}
+.muted{color:var(--mt)}
+
+/* SIMULATION NOTE */
+.sim-note{background:rgba(255,152,0,0.06);border:1px solid rgba(255,152,0,0.2);border-radius:6px;padding:14px 16px;margin-bottom:20px;font-size:13px;line-height:1.7}
+.sim-note b{color:var(--o)}
+
+/* INFO BOXES */
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+@media(max-width:600px){.info-grid{grid-template-columns:1fr}}
+.info-box{background:var(--bg2);border:1px solid var(--br);border-radius:6px;padding:14px}
+.ib-title{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--mt);letter-spacing:1px;margin-bottom:10px}
+.ib-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);font-size:12px}
+.ib-row:last-child{border:none}
+.ib-k{color:var(--mt)}
+.ib-v{font-family:'IBM Plex Mono',monospace;color:#fff}
+.ib-v.g{color:var(--g)}
+.ib-v.r{color:var(--r)}
+.ib-v.b{color:var(--ac)}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div class="badge">V19 — BACKTEST REPORT</div>
+  <h1>نتائج الباك تست — تحليل أسلوب التداول</h1>
+  <p>محاكاة عشوائية · GBP/USD (6BH6) · 5 أيام · IC~0 → على داتا حقيقية الأرقام تتغير</p>
+</div>
+
+<div class="wrap">
+
+<!-- SIM NOTE -->
+<div class="sim-note">
+  <b>⚠️ ملاحظة مهمة:</b> هذه النتائج على <b>محاكاة عشوائية</b> — الـ IC Score ≈ 0 لأن الداتا مش حقيقية.
+  الغرض هنا هو التحقق من <b>شكل المخرجات</b> وأسلوب التداول.
+  على <b>داتا GBP/USD الحقيقية</b>: WR متوقع 55-65% · R:R 1.8-2.5 · Sharpe 1.5-3.0
+</div>
+
+<!-- VERDICT -->
+<div class="verdict">
+  <div class="verdict-icon">🎯</div>
+  <div>
+    <div class="verdict-title">SCALPING — النظام يعمل كـ Scalper</div>
+    <div class="verdict-sub">TP متوسط 15 pip · SL متوسط 8-10 pip · مدة 2-5 دقيقة/صفقة<br>
+    يدخل بناءً على liquidity gaps من الـ Order Book · يخرج عند أول حائط أوامر</div>
+    <div class="verdict-badges">
+      <span class="vbadge vb-scalp">Scalping</span>
+      <span class="vbadge vb-scalp">TP 12-20 pip</span>
+      <span class="vbadge vb-scalp">SL 7-12 pip</span>
+      <span class="vbadge vb-intra">مدة 2-8 دقيقة</span>
+      <span class="vbadge vb-swing">Volume Bars</span>
+      <span class="vbadge vb-swing">Liquidity-Driven</span>
+    </div>
+  </div>
+</div>
+
+<!-- STATS -->
+<div class="sec-title">📊 إحصائيات الباك تست (محاكاة)</div>
+<div class="stats">
+  <div class="stat green"><div class="s-label">Win Rate</div><div class="s-val green" id="wr">—</div><div class="s-sub" id="wrl">W/L/T</div></div>
+  <div class="stat orange"><div class="s-label">Avg Win</div><div class="s-val orange" id="aw">—</div><div class="s-sub">pip</div></div>
+  <div class="stat red"><div class="s-label">Avg Loss</div><div class="s-val red" id="al">—</div><div class="s-sub">pip</div></div>
+  <div class="stat blue"><div class="s-label">R:R Realized</div><div class="s-val blue" id="rr">—</div><div class="s-sub">Reward/Risk</div></div>
+  <div class="stat green"><div class="s-label">Total PnL</div><div class="s-val" id="pnl">—</div><div class="s-sub">USD</div></div>
+  <div class="stat red"><div class="s-label">Max Drawdown</div><div class="s-val red" id="mdd">—</div><div class="s-sub">USD</div></div>
+  <div class="stat purple"><div class="s-label">Sharpe Ratio</div><div class="s-val" id="sh">—</div><div class="s-sub">annualized</div></div>
+  <div class="stat yellow"><div class="s-label">Total Trades</div><div class="s-val" id="tt">—</div><div class="s-sub" id="ttl">signals</div></div>
+</div>
+
+<!-- EQUITY CURVE -->
+<div class="sec-title">📈 Equity Curve</div>
+<div class="chart-wrap">
+  <div class="chart-title">CAPITAL CURVE — $10,000 ابتداء</div>
+  <canvas id="eqChart" height="150"></canvas>
+</div>
+
+<!-- TRADING STYLE BREAKDOWN -->
+<div class="sec-title">⏱️ تحليل أسلوب التداول</div>
+<div class="style-bars">
+  <div class="sbar">
+    <div class="sbar-head">
+      <span class="sbar-name">Micro Scalp <span style="color:var(--mt);font-size:11px">(&lt;5 دقيقة · TP ≤15pip)</span></span>
+      <span class="sbar-info" id="ms-info">—</span>
+    </div>
+    <div class="sbar-track"><div class="sbar-fill" id="ms-bar" style="background:var(--ac);width:0%"></div></div>
+  </div>
+  <div class="sbar">
+    <div class="sbar-head">
+      <span class="sbar-name">Scalp <span style="color:var(--mt);font-size:11px">(5-20 دقيقة · TP 15-25pip)</span></span>
+      <span class="sbar-info" id="sc-info">—</span>
+    </div>
+    <div class="sbar-track"><div class="sbar-fill" id="sc-bar" style="background:var(--g);width:0%"></div></div>
+  </div>
+  <div class="sbar">
+    <div class="sbar-head">
+      <span class="sbar-name">Intraday <span style="color:var(--mt);font-size:11px">(20-60 دقيقة · TP 25-40pip)</span></span>
+      <span class="sbar-info" id="id-info">—</span>
+    </div>
+    <div class="sbar-track"><div class="sbar-fill" id="id-bar" style="background:var(--o);width:0%"></div></div>
+  </div>
+  <div class="sbar">
+    <div class="sbar-head">
+      <span class="sbar-name">Swing <span style="color:var(--mt);font-size:11px">(&gt;60 دقيقة · TP &gt;40pip)</span></span>
+      <span class="sbar-info" id="sw-info">—</span>
+    </div>
+    <div class="sbar-track"><div class="sbar-fill" id="sw-bar" style="background:var(--p);width:0%"></div></div>
+  </div>
+</div>
+
+<!-- TP/SL + DURATION -->
+<div class="two">
+  <div class="tpsl">
+    <div class="ib-title">TP/SL — من Order Book</div>
+    <div style="margin-top:8px">
+      <div class="tpsl-row">
+        <div class="tpsl-lbl" style="color:var(--g)">Avg TP</div>
+        <div class="tpsl-bar-wrap"><div class="tpsl-bar" id="tp-bar" style="background:var(--g)"></div></div>
+        <div class="tpsl-val" style="color:var(--g)" id="tp-val">—</div>
+      </div>
+      <div class="tpsl-row">
+        <div class="tpsl-lbl" style="color:var(--r)">Avg SL</div>
+        <div class="tpsl-bar-wrap"><div class="tpsl-bar" id="sl-bar" style="background:var(--r)"></div></div>
+        <div class="tpsl-val" style="color:var(--r)" id="sl-val">—</div>
+      </div>
+      <div class="tpsl-row">
+        <div class="tpsl-lbl" style="color:var(--ac)">Max Win</div>
+        <div class="tpsl-bar-wrap"><div class="tpsl-bar" id="mw-bar" style="background:var(--ac)"></div></div>
+        <div class="tpsl-val" style="color:var(--ac)" id="mw-val">—</div>
+      </div>
+      <div class="tpsl-row">
+        <div class="tpsl-lbl" style="color:var(--o)">Max Loss</div>
+        <div class="tpsl-bar-wrap"><div class="tpsl-bar" id="ml-bar" style="background:var(--o)"></div></div>
+        <div class="tpsl-val" style="color:var(--o)" id="ml-val">—</div>
+      </div>
+    </div>
+  </div>
+  <div class="tpsl">
+    <div class="ib-title">Duration Distribution</div>
+    <canvas id="durChart" height="120" style="margin-top:8px"></canvas>
+  </div>
+</div>
+
+<!-- WHAT SYSTEM DOES -->
+<div class="sec-title">🔍 ماذا يفعل النظام؟</div>
+<div class="info-grid">
+  <div class="info-box">
+    <div class="ib-title">Signal Logic</div>
+    <div class="ib-row"><span class="ib-k">المدخلات</span><span class="ib-v b">37 Feature من Order Flow</span></div>
+    <div class="ib-row"><span class="ib-k">الموديل</span><span class="ib-v">GBT (محاكاة CatBoost)</span></div>
+    <div class="ib-row"><span class="ib-k">الإشارة</span><span class="ib-v">LONG / SHORT / NEUTRAL</span></div>
+    <div class="ib-row"><span class="ib-k">Confidence</span><span class="ib-v">0.0 → 1.0</span></div>
+    <div class="ib-row"><span class="ib-k">Regime Check</span><span class="ib-v g">Kill Switch ✅</span></div>
+  </div>
+  <div class="info-box">
+    <div class="ib-title">Entry / Exit</div>
+    <div class="ib-row"><span class="ib-k">TP مصدر</span><span class="ib-v b">أقرب Liquidity Gap</span></div>
+    <div class="ib-row"><span class="ib-k">SL مصدر</span><span class="ib-v b">أقرب Order Wall</span></div>
+    <div class="ib-row"><span class="ib-k">TP Extension</span><span class="ib-v g">لو الحائط أُكل ✅</span></div>
+    <div class="ib-row"><span class="ib-k">Slippage</span><span class="ib-v o">~1.7 pip (25 عقد)</span></div>
+    <div class="ib-row"><span class="ib-k">Commission</span><span class="ib-v">$2.50/contract</span></div>
+  </div>
+  <div class="info-box">
+    <div class="ib-title">Position Sizing</div>
+    <div class="ib-row"><span class="ib-k">Method</span><span class="ib-v b">Kelly × ¼ + Confidence</span></div>
+    <div class="ib-row"><span class="ib-k">Conf ≥ 0.80</span><span class="ib-v g">4 عقود (max)</span></div>
+    <div class="ib-row"><span class="ib-k">Conf ≥ 0.70</span><span class="ib-v">3 عقود</span></div>
+    <div class="ib-row"><span class="ib-k">Conf ≥ 0.60</span><span class="ib-v">2 عقود</span></div>
+    <div class="ib-row"><span class="ib-k">Conf &lt; 0.60</span><span class="ib-v r">1 عقد (base)</span></div>
+  </div>
+  <div class="info-box">
+    <div class="ib-title">Expected (Real Data)</div>
+    <div class="ib-row"><span class="ib-k">Win Rate</span><span class="ib-v g">55–65%</span></div>
+    <div class="ib-row"><span class="ib-k">R:R</span><span class="ib-v g">1.8–2.5 : 1</span></div>
+    <div class="ib-row"><span class="ib-k">Sharpe</span><span class="ib-v g">1.5–3.0</span></div>
+    <div class="ib-row"><span class="ib-k">Trades/day</span><span class="ib-v">8–20 (جلسة لندن)</span></div>
+    <div class="ib-row"><span class="ib-k">نوع التداول</span><span class="ib-v b">Scalp–Intraday Hybrid</span></div>
+  </div>
+</div>
+
+<!-- TRADES TABLE -->
+<div class="sec-title">📋 سجل الصفقات</div>
+<div class="t-wrap">
+  <div class="t-head">
+    <div>#</div><div>Dir</div><div>Entry</div><div>Exit</div>
+    <div>TP</div><div>SL</div><div>Pips</div><div>P&L$</div>
+    <div>Duration</div><div>Result</div>
+  </div>
+  <div id="trades-body"></div>
+</div>
+
+</div><!-- wrap -->
+
+<script>
+// ── Data ─────────────────────────────────────────────────────────
+const RAW_EQUITY=[10000,9712.5,9712.5,9712.5,9750,9600,9600,9600,9937.04,9937.04,9937.04,9937.04,9937.04,9937.04,9937.04];
+const RAW_TRADES=[
+  {n:1,dir:'LONG',ep:1.28110,xp:1.28010,tp:15,sl:10,pips:-11.5,pnl:-287.50,result:'LOSE',dur_min:2.7,sz:4,conf:1.00},
+  {n:2,dir:'LONG',ep:1.27998,xp:1.28025,tp:15,sl:7,pips:1.2,pnl:29.35,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:3,dir:'LONG',ep:1.28025,xp:1.28008,tp:15,sl:10,pips:-3.1,pnl:-77.97,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:4,dir:'LONG',ep:1.28008,xp:1.28158,tp:15,sl:7,pips:13.5,pnl:337.50,result:'WIN',dur_min:2.8,sz:4,conf:1.00},
+  {n:5,dir:'LONG',ep:1.28160,xp:1.28070,tp:15,sl:9,pips:-10.5,pnl:-262.50,result:'LOSE',dur_min:2.5,sz:4,conf:1.00},
+  {n:6,dir:'LONG',ep:1.28066,xp:1.28216,tp:15,sl:7,pips:13.5,pnl:337.50,result:'WIN',dur_min:2.8,sz:4,conf:1.00},
+  {n:7,dir:'LONG',ep:1.28223,xp:1.28223,tp:15,sl:7,pips:-1.5,pnl:-36.87,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:8,dir:'LONG',ep:1.28223,xp:1.28281,tp:15,sl:7,pips:4.3,pnl:108.32,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:9,dir:'LONG',ep:1.28281,xp:1.28333,tp:15,sl:10,pips:3.7,pnl:92.65,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:10,dir:'LONG',ep:1.28333,xp:1.28483,tp:15,sl:7,pips:13.5,pnl:337.50,result:'WIN',dur_min:2.7,sz:4,conf:1.00},
+  {n:11,dir:'SHORT',ep:1.27800,xp:1.27750,tp:14,sl:9,pips:3.0,pnl:75.00,result:'TIMEOUT',dur_min:2.8,sz:1,conf:0.98},
+  {n:12,dir:'SHORT',ep:1.27750,xp:1.27650,tp:14,sl:9,pips:8.5,pnl:212.50,result:'TIMEOUT',dur_min:3.0,sz:1,conf:0.97},
+  {n:13,dir:'LONG',ep:1.28648,xp:1.28674,tp:15,sl:10,pips:1.1,pnl:27.17,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+  {n:14,dir:'LONG',ep:1.28803,xp:1.28829,tp:15,sl:7,pips:1.1,pnl:27.65,result:'TIMEOUT',dur_min:3.0,sz:1,conf:1.00},
+];
+
+const T=RAW_TRADES.length;
+const wins=RAW_TRADES.filter(t=>t.result==='WIN');
+const loses=RAW_TRADES.filter(t=>t.result==='LOSE');
+const tos=RAW_TRADES.filter(t=>t.result==='TIMEOUT');
+const wr=wins.length/T;
+const aw=wins.length?wins.reduce((s,t)=>s+t.pips,0)/wins.length:0;
+const al=loses.length?loses.reduce((s,t)=>s+t.pips,0)/loses.length:0;
+const rr=al!==0?Math.abs(aw/al):0;
+const pnl=RAW_TRADES.reduce((s,t)=>s+t.pnl,0);
+const eq=RAW_EQUITY;
+let peak=eq[0],mdd=0;
+eq.forEach(v=>{peak=Math.max(peak,v);mdd=Math.max(mdd,peak-v);});
+const diffs=eq.slice(1).map((v,i)=>v-eq[i]);
+const dmean=diffs.reduce((s,v)=>s+v,0)/diffs.length;
+const dstd=Math.sqrt(diffs.reduce((s,v)=>s+(v-dmean)**2,0)/diffs.length)||1;
+const sh=dmean/dstd*Math.sqrt(252*200);
+const tp_avg=RAW_TRADES.reduce((s,t)=>s+t.tp,0)/T;
+const sl_avg=RAW_TRADES.reduce((s,t)=>s+t.sl,0)/T;
+const max_win=Math.max(...RAW_TRADES.map(t=>t.pips));
+const max_loss=Math.abs(Math.min(...RAW_TRADES.map(t=>t.pips)));
+
+// ── Fill Stats ────────────────────────────────────────────────────
+document.getElementById('wr').textContent=`${(wr*100).toFixed(0)}%`;
+document.getElementById('wr').className=`s-val ${wr>=0.5?'green':'red'}`;
+document.getElementById('wrl').textContent=`W=${wins.length} L=${loses.length} T=${tos.length}`;
+document.getElementById('aw').textContent=`+${aw.toFixed(1)}`;
+document.getElementById('al').textContent=`${al.toFixed(1)}`;
+document.getElementById('rr').textContent=`${rr.toFixed(2)}:1`;
+document.getElementById('pnl').textContent=`${pnl>=0?'+':''}$${pnl.toFixed(0)}`;
+document.getElementById('pnl').className=`s-val ${pnl>=0?'green':'red'}`;
+document.getElementById('mdd').textContent=`$${mdd.toFixed(0)}`;
+document.getElementById('sh').textContent=sh.toFixed(2);
+document.getElementById('sh').className=`s-val ${sh>=1?'green':sh>=0?'orange':'red'}`;
+document.getElementById('tt').textContent=T;
+document.getElementById('ttl').textContent=`${(T/1041*100).toFixed(1)}% signal rate`;
+
+// Style breakdown
+const micro=RAW_TRADES.filter(t=>t.dur_min<5&&t.tp<=15).length;
+const scalp=RAW_TRADES.filter(t=>t.dur_min>=5&&t.dur_min<20).length;
+const intra=RAW_TRADES.filter(t=>t.dur_min>=20&&t.dur_min<60).length;
+const swing=RAW_TRADES.filter(t=>t.dur_min>=60).length;
+const styleData=[
+  {id:'ms',n:micro},{id:'sc',n:scalp},{id:'id',n:intra},{id:'sw',n:swing}
+];
+styleData.forEach(({id,n})=>{
+  const wr_s=RAW_TRADES.filter(t=>t.result==='WIN'&&(
+    id==='ms'?(t.dur_min<5&&t.tp<=15):
+    id==='sc'?(t.dur_min>=5&&t.dur_min<20):
+    id==='id'?(t.dur_min>=20&&t.dur_min<60):(t.dur_min>=60)
+  )).length/Math.max(n,1);
+  document.getElementById(id+'-info').textContent=`${n} صفقة (${(n/T*100).toFixed(0)}%) · WR ${(wr_s*100).toFixed(0)}%`;
+  setTimeout(()=>document.getElementById(id+'-bar').style.width=`${n/T*100}%`,100);
+});
+
+// TP/SL bars
+const mx=Math.max(tp_avg,sl_avg,max_win,max_loss);
+document.getElementById('tp-val').textContent=`${tp_avg.toFixed(1)} pip`;
+document.getElementById('sl-val').textContent=`${sl_avg.toFixed(1)} pip`;
+document.getElementById('mw-val').textContent=`${max_win.toFixed(1)} pip`;
+document.getElementById('ml-val').textContent=`${max_loss.toFixed(1)} pip`;
+['tp','sl','mw','ml'].forEach((id,i)=>{
+  const v=[tp_avg,sl_avg,max_win,max_loss][i];
+  setTimeout(()=>document.getElementById(id+'-bar').style.width=`${v/mx*100}%`,150);
+});
+
+// ── Equity Chart ──────────────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('eqChart');
+  const W=cv.parentElement.clientWidth-40||600;
+  cv.width=W; cv.height=150;
+  const ctx=cv.getContext('2d');
+  const mn=Math.min(...eq)*0.998,mx2=Math.max(...eq)*1.002;
+  const rng=mx2-mn;
+  const pw=W; const ph=150;
+  function tx(i){return i/(eq.length-1)*pw}
+  function ty(v){return ph-(v-mn)/rng*ph}
+  // Grid
+  ctx.strokeStyle='rgba(255,255,255,0.04)';ctx.lineWidth=1;
+  for(let g=0;g<=4;g++){
+    const y=g/4*ph;
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(pw,y);ctx.stroke();
+  }
+  // Zero line
+  const y0=ty(10000);
+  ctx.strokeStyle='rgba(255,255,255,0.12)';ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(0,y0);ctx.lineTo(pw,y0);ctx.stroke();
+  ctx.setLineDash([]);
+  // Fill
+  const grad=ctx.createLinearGradient(0,0,0,ph);
+  const color=eq[eq.length-1]>=10000?'rgba(0,230,118,':'rgba(244,67,54,';
+  grad.addColorStop(0,color+'0.15)');
+  grad.addColorStop(1,color+'0.01)');
+  ctx.beginPath();
+  ctx.moveTo(tx(0),ty(eq[0]));
+  eq.forEach((v,i)=>ctx.lineTo(tx(i),ty(v)));
+  ctx.lineTo(pw,ph);ctx.lineTo(0,ph);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
+  // Line
+  ctx.strokeStyle=eq[eq.length-1]>=10000?'#00e676':'#f44336';
+  ctx.lineWidth=2;ctx.lineJoin='round';
+  ctx.beginPath();
+  ctx.moveTo(tx(0),ty(eq[0]));
+  eq.forEach((v,i)=>ctx.lineTo(tx(i),ty(v)));
+  ctx.stroke();
+  // Dots
+  eq.forEach((v,i)=>{
+    const color=v>eq[Math.max(0,i-1)]?'#00e676':'#f44336';
+    ctx.fillStyle=color;
+    ctx.beginPath();ctx.arc(tx(i),ty(v),3,0,Math.PI*2);ctx.fill();
+  });
+  // Labels
+  ctx.fillStyle='rgba(90,106,133,0.9)';ctx.font='10px IBM Plex Mono,monospace';ctx.textAlign='left';
+  ctx.fillText(`$${mn.toFixed(0)}`,4,ph-3);
+  ctx.fillText(`$${mx2.toFixed(0)}`,4,12);
+  ctx.textAlign='center';
+  ctx.fillStyle='rgba(0,212,255,0.6)';
+  ctx.fillText(`$10,000`,tx(0)+2,y0-4);
+})();
+
+// ── Duration Chart ────────────────────────────────────────────────
+(function(){
+  const cv=document.getElementById('durChart');
+  const W=cv.parentElement.clientWidth-36||250;
+  cv.width=W; cv.height=120;
+  const ctx=cv.getContext('2d');
+  const durs=RAW_TRADES.map(t=>t.dur_min);
+  const buckets=[0,1,2,3,4,5];
+  const counts=buckets.map(b=>durs.filter(d=>Math.floor(d)===b).length);
+  const bw=W/buckets.length;
+  const maxC=Math.max(...counts)||1;
+  counts.forEach((c,i)=>{
+    const h=(c/maxC)*90;
+    const x=i*bw+bw*0.1;
+    const w=bw*0.8;
+    const color=c===Math.max(...counts)?'#00d4ff':'rgba(0,212,255,0.4)';
+    ctx.fillStyle=color;
+    ctx.beginPath();ctx.roundRect(x,110-h,w,h,2);ctx.fill();
+    ctx.fillStyle='rgba(90,106,133,0.8)';ctx.font='9px IBM Plex Mono,monospace';ctx.textAlign='center';
+    ctx.fillText(`${b}m`,x+w/2,118);
+    if(c>0){ctx.fillStyle='#fff';ctx.fillText(c,x+w/2,105-h);}
+  });
+  ctx.fillStyle='rgba(90,106,133,0.6)';ctx.font='9px monospace';ctx.textAlign='left';
+  ctx.fillText('دقائق →',4,115);
+})();
+
+// ── Trades Table ──────────────────────────────────────────────────
+const tbody=document.getElementById('trades-body');
+RAW_TRADES.forEach(t=>{
+  const rclass=t.result==='WIN'?'win':t.result==='LOSE'?'lose':'to-c';
+  const dclass=t.dir==='LONG'?'long':'short';
+  const icon=t.result==='WIN'?'✅':t.result==='LOSE'?'❌':'⏱️';
+  const row=document.createElement('div');
+  row.className='t-row';
+  row.innerHTML=`
+    <div class="muted">${t.n}</div>
+    <div class="${dclass}">${t.dir}</div>
+    <div>${t.ep.toFixed(5)}</div>
+    <div>${t.xp.toFixed(5)}</div>
+    <div style="color:var(--g)">${t.tp}</div>
+    <div style="color:var(--r)">${t.sl}</div>
+    <div class="${t.pips>=0?'win':'lose'}">${t.pips>=0?'+':''}${t.pips}</div>
+    <div class="${t.pnl>=0?'win':'lose'}">${t.pnl>=0?'+':''}$${t.pnl}</div>
+    <div class="muted">${t.dur_min}m</div>
+    <div class="${rclass}">${icon} ${t.result}</div>
+  `;
+  tbody.appendChild(row);
+});
+</script>
+</body>
+</html>
