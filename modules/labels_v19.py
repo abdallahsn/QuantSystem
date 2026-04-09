@@ -88,7 +88,7 @@ def build_causal_event_labels(
         errors='coerce',
     ).dt.tz_localize(None)
 
-    prices = pd.to_numeric(out.get('price', pd.Series(np.zeros(n))), errors='coerce').fillna(method='ffill').fillna(0).values.astype(np.float64)
+    prices = pd.to_numeric(out.get('price', pd.Series(np.zeros(n))), errors='coerce').ffill().fillna(0).values.astype(np.float64)
     vol_raw = pd.to_numeric(out.get('micro_atr', pd.Series(np.zeros(n))), errors='coerce').fillna(0).abs().values.astype(np.float64)
 
     fallback_vol = float(np.nanmedian(vol_raw[vol_raw > 0])) if np.any(vol_raw > 0) else 0.0

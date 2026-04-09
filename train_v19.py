@@ -291,6 +291,9 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
         if os.path.exists(src):
+            if os.path.abspath(src) == os.path.abspath(dst):
+                copied[name] = dst
+                continue
             shutil.copy2(src, dst)
             copied[name] = dst
     return copied

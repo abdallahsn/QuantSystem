@@ -290,6 +290,7 @@ class MetaLearnerLSTM:
                              for k, c in enumerate(counts)}
 
         sample_w = np.array([class_weights[y] for y in yb_tr], dtype=np.float32)
+        conf_w = np.ones_like(yc_tr, dtype=np.float32)
         n_tr = len(X_tr)
         n_val = len(X_val)
 
@@ -315,7 +316,10 @@ class MetaLearnerLSTM:
                 {'bias_out': yb_val, 'conf_out': yc_val}),
             epochs=epochs,
             batch_size=batch,
-            sample_weight={'bias_out': sample_w},
+            sample_weight={
+                'bias_out': sample_w,
+                'conf_out': conf_w,
+            },
             callbacks=cbs,
             verbose=1,
         )
@@ -332,6 +336,7 @@ class MetaLearnerLSTM:
         bp    = np.argmax(preds['bias_out'], axis=1)
         rep   = classification_report(
             yb_val, bp,
+            labels=[0, 1, 2],
             target_names=['LONG', 'SHORT', 'NEUTRAL'],
             zero_division=0)
         print(f"\n📊 MetaLearner Validation:\n{rep}")

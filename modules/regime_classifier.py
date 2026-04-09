@@ -43,7 +43,7 @@ def _build_regime_features(df: pd.DataFrame) -> np.ndarray:
         features['volatility'] = df.get('volume_burst', pd.Series(np.zeros(len(df))))
 
     vol = df.get('volume', df.get('volume_burst', pd.Series(np.ones(len(df)))))
-    roll_mean = vol.shift(1).rolling(20, min_periods=1).mean().fillna(method='bfill').fillna(1.0)
+    roll_mean = vol.shift(1).rolling(20, min_periods=1).mean().bfill().fillna(1.0)
     features['volume_ratio'] = (vol / roll_mean.clip(lower=1e-8)).clip(0, 5)
 
     cvd = df.get('cvd_delta', df.get('cvd', pd.Series(np.zeros(len(df)))))
