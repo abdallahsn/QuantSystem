@@ -864,7 +864,7 @@ def run_training_pipeline(
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
-    t0 = datetime.datetime.now()
+    started_at = datetime.datetime.now()
 
     print('=' * 65)
     print('🚀 QuantSystem V19 — Leakage-Safe Training Foundation')
@@ -896,7 +896,7 @@ def run_training_pipeline(
         if os.path.exists(guess_ts):
             lob_ts_path = guess_ts
 
-    splits, t0, t1 = build_time_splits(
+    splits, split_t0, split_t1 = build_time_splits(
         df,
         n_folds=n_folds,
         test_size=test_size,
@@ -916,8 +916,8 @@ def run_training_pipeline(
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
-            t0=t0,
-            t1=t1,
+            t0=split_t0,
+            t1=split_t1,
             inference_scaler_params=inference_scaler_params,
         )
     else:
@@ -952,7 +952,7 @@ def run_training_pipeline(
             train_frac=train_frac,
         )
 
-    elapsed = (datetime.datetime.now() - t0).total_seconds()
+    elapsed = (datetime.datetime.now() - started_at).total_seconds()
     summary = {
         'rows': int(len(df)),
         'meta_shape': list(meta_features.shape),
