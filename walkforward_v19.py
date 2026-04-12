@@ -13,7 +13,7 @@ import pandas as pd
 
 from backtest_v19 import _load_csv, run_causal_backtest
 from modules.config_v19 import load_release_gates, load_v19_config
-from modules.manifest_v19 import to_jsonable, write_manifest
+from modules.manifest_v19 import write_manifest
 from modules.raw_replay_v19 import build_replay_dataset, normalize_ts, read_market_data
 from modules.release_gates_v19 import evaluate_release_gates, save_gate_report
 from train_v19 import _align_lob_to_rows, _load_lob_inputs, run_training_pipeline
@@ -219,7 +219,7 @@ def run_walkforward(
         }
         fold_reports.append(fold_report)
         with open(os.path.join(fold_dir, 'fold_report.json'), 'w') as f:
-            json.dump(to_jsonable(fold_report), f, indent=2)
+            json.dump(fold_report, f, indent=2)
 
     aggregate = aggregate_fold_metrics(fold_reports)
     gate_report = evaluate_release_gates(aggregate, gates)
@@ -241,7 +241,7 @@ def run_walkforward(
         'release_gates_report': gates_path,
     }
     with open(os.path.join(output_dir, 'walkforward_summary.json'), 'w') as f:
-        json.dump(to_jsonable(out), f, indent=2)
+        json.dump(out, f, indent=2)
     return out
 
 
@@ -264,8 +264,8 @@ def main():
         gates=gates,
     )
     print("\n✅ Walk-forward complete")
-    print(json.dumps(to_jsonable(summary['aggregate']), indent=2))
-    print(json.dumps(to_jsonable(summary['release_gates']), indent=2))
+    print(json.dumps(summary['aggregate'], indent=2))
+    print(json.dumps(summary['release_gates'], indent=2))
 
 
 if __name__ == '__main__':

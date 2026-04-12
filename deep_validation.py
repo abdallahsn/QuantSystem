@@ -15,7 +15,7 @@ np.random.seed(42)
 from prepare_training_data import (
     _process_mbo, _process_mbp10, _merge,
     _add_rolling_context, _label_sessions,
-    _normalize_and_save, FEATURE_COLS
+    _normalize_and_save, MODEL_FEATURE_COLS
 )
 from modules.fractional_diff   import apply_fractional_diff
 from modules.context_features  import compute_daily_weekly_levels
@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory() as tmp:
     df = pd.read_csv(path)
 
 # التأكد من إزالة المتغيرات عديمة التباين (Zero-variance)
-feat_cols = [c for c in FEATURE_COLS if c in df.columns and df[c].std() > 1e-8]
+feat_cols = [c for c in MODEL_FEATURE_COLS if c in df.columns and df[c].std() > 1e-8]
 y = df['bias_label'].values.astype(int)
 X = df[feat_cols].fillna(0).values
 

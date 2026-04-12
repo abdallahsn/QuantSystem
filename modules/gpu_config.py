@@ -33,6 +33,9 @@ def detect_gpu() -> dict:
         'tf_device':   '/CPU:0',
     }
 
+    if os.environ.get('QUANTSYSTEM_SKIP_GPU_DETECT', '').strip() == '1':
+        return info
+
     # 1. TensorFlow GPU Check
     try:
         import tensorflow as tf
@@ -150,5 +153,5 @@ def print_gpu_report():
     print('─'*50 + '\n')
     return info
 
-# التشغيل التلقائي لاستكشاف العتاد مبكراً
-_GPU_INFO = detect_gpu()
+# نتجنب استكشاف العتاد أثناء الاستيراد حتى لا يفرض TensorFlow side effects
+_GPU_INFO = None

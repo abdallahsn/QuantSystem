@@ -66,24 +66,44 @@ class AutoCalibrator:
     def summary(self) -> str:
         return f"\n  🔧 Auto-Calibrator [{self.symbol}] | Tick: {self.tick_size:.4f} | Vol: {self.volatility:.4f}"
 
-    def build_engines(self) -> dict:
-        from modules.microstructure          import AbsorptionIntensityEngine, CancelRatioEngine
-        from modules.context_features        import MomentumContextEngine, LiquiditySweepDetector
-        from modules.fisher_alpha            import FastFisherAlpha
-        from modules.fim_anomaly             import FastFIMDetector
-        from modules.orderbook               import SpoofingDetector
-        from modules.market_research_features import (KylesLambdaEngine, HawkesIntensityEngine, LiquidityGapsEngine, VNETEngine)
+    def build_engines(self, include_extended: bool = False) -> dict:
+        from modules.microstructure import AbsorptionIntensityEngine, CancelRatioEngine
+        from modules.context_features import MomentumContextEngine, LiquiditySweepDetector
 
         absorb = AbsorptionIntensityEngine(min_price_move=self.min_price_move)
         cancel = CancelRatioEngine(large_mult=2.0)
         momentum = MomentumContextEngine(momentum_window=100, swing_window=200)
         sweep = LiquiditySweepDetector(sweep_threshold=max(0.1, min(self.volatility * 2, 0.3)))
-        fisher = FastFisherAlpha(threshold=max(0.15, min(self.volatility / self.mean_price * 50, 0.5)))
-        fim = FastFIMDetector(threshold_multiplier=2.0)
-        spoofing = SpoofingDetector(large_mult=1.5)
-        kyle = KylesLambdaEngine(window=50)
-        hawkes = HawkesIntensityEngine(alpha=0.7, beta=0.5)
-        gaps = LiquidityGapsEngine(levels=10, gap_threshold=2.0)
-        vnet = VNETEngine(window=100, large_mult=2.0)
+        engines = {
+            'absorb': absorb,
+            'cancel': cancel,
+            'momentum': momentum,
+            'sweep': sweep,
+        }
 
-        return {'absorb': absorb, 'cancel': cancel, 'momentum': momentum, 'sweep': sweep, 'fisher': fisher, 'fim': fim, 'spoofing': spoofing, 'kyle': kyle, 'hawkes': hawkes, 'gaps': gaps, 'vnet': vnet}
+        if not include_extended:
+            return engines
+
+        from modules.fisher_alpha import FastFisherAlpha
+        from modules.fim_anomaly import FastFIMDetector
+        from modules.orderbook import SpoofingDetector
+        from modules.market_research_features import (
+            KylesLambdaEngine,
+            HawkesIntensityEngine,
+            LiquidityGapsEngine,
+            VNETEngine,
+        )
+
+        mean_price = max(self.mean_price, self.tick_size, 1e-8)
+        engines.update({
+            'fisher': FastFisherAlpha(
+                threshold=max(0.15, min(self.volatility / mean_price * 50, 0.5))
+            ),
+            'fim': FastFIMDetector(threshold_multiplier=2.0),
+            'spoofing': SpoofingDetector(large_mult=1.5),
+            'kyle': KylesLambdaEngine(window=50),
+            'hawkes': HawkesIntensityEngine(alpha=0.7, beta=0.5),
+            'gaps': LiquidityGapsEngine(levels=10, gap_threshold=2.0),
+            'vnet': VNETEngine(window=100, large_mult=2.0),
+        })
+        return engines

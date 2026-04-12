@@ -8,6 +8,7 @@ from collections import deque
 def compute_daily_weekly_levels(df_all: pd.DataFrame, price_col: str = 'price', ts_col: str = 'ts_event') -> pd.DataFrame:
     df = df_all.copy()
     ts_series = pd.to_datetime(df[ts_col], utc=True, errors='coerce')
+    ts_series = ts_series.dt.tz_localize(None)
     dates = ts_series.dt.date
     weeks = ts_series.dt.to_period('W')
 

@@ -34,7 +34,6 @@ from modules.market_research_features import (KylesLambdaEngine,
                                                LiquidityGapsEngine,
                                                VNETEngine)
 from modules.fractional_diff         import apply_fractional_diff
-from modules.autoencoder_extractor   import AutoencoderExtractor # 🔴 الـ Deep Autoencoder
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
@@ -44,12 +43,13 @@ from modules.session_features        import add_session_features, SESSION_FEATUR
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
 # ── V19: DeepLOB Tensor Builder ──────────────────────────────────
-try:
-    from modules.deeplob_cnn import LOBTensorBuilder, build_lob_tensor_dataset, N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS
-    DEEPLOB_AVAILABLE = True
-except ImportError:
-    DEEPLOB_AVAILABLE = False
-    print("  ⚠️ DeepLOB module غير متاح")
+DEEPLOB_AVAILABLE = False
+LOBTensorBuilder = None
+build_lob_tensor_dataset = None
+N_TIME_STEPS = 0
+N_PRICE_LEVELS = 0
+N_CHANNELS = 0
+_DEEPLOB_IMPORT_ATTEMPTED = False
 
 try:
     from modules.labels_v19 import build_causal_event_labels
@@ -100,34 +100,28 @@ TEMPORAL_DROP_COLS = SESSION_LEAK_COLS + [
 ]
 
 FEATURE_COLS = [
-    # ── Microstructure ──────────────────────────────────
+    # ── Legacy/Test Surface (23 features) ───────────────
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
     'micro_atr', 'volume_burst', 'inter_event_time',
     'fisher_signal', 'anomaly',
-    # ── Context & Momentum ──────────────────────────────
     'cvd_momentum', 'cvd_price_divergence',
     'trend_strength', 'correction_depth', 'liquidity_sweep',
-    # ── Daily/Weekly Levels (lagged = safe) ─────────────
     'pdh', 'pdl', 'pwh', 'pwl',
     'dist_to_pdh', 'price_position',
-    # ── Research Features ────────────────────────────────
+]
+
+MODEL_FEATURE_COLS = FEATURE_COLS + [
+    # ── Extended Model Inputs ───────────────────────────
     'kyle_lambda', 'hawkes_intensity',
     'liquidity_gaps', 'vnet',
-    # ── Rolling CVD ──────────────────────────────────────
     'cvd_roc_10', 'cvd_roc_50', 'cvd_roc_200',
     'cvd_accel', 'volume_accel',
-    # ── Fractional Diff ──────────────────────────────────
     'cvd_frac', 'kyle_frac', 'hawkes_frac', 'vnet_frac',
-    # ── Anomaly ──────────────────────────────────────────
     'dl_anomaly_score',
-    # ── Liquidity Walls ──────────────────────────────────
     'dist_to_bid_wall', 'dist_to_ask_wall',
-    # ── Daily Context ────────────────────────────────────
     'ib_status', 'remaining_fuel', 'fuel_exhausted',
-    # ── VWAP Real-Time (safe: tick-by-tick, no look-ahead)
     'current_vwap', 'vwap_z_score', 'vwap_slope',
-    # ── Deep Embeddings ──────────────────────────────────
 ] + EMBEDDING_COLS
 
 BINARY_FEATURES = {'fisher_signal', 'anomaly', 'fuel_exhausted'}
@@ -193,6 +187,7 @@ def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if 'ts_event' in df.columns:
         df['ts_event'] = pd.to_datetime(df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+        df = df[df['ts_event'].notna()].reset_index(drop=True)
 
     if 'action' in df.columns:
         df['action'] = df['action'].astype(str).str.strip().str.upper()
@@ -210,7 +205,23 @@ def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df['price'].notna() & (df['price'] > 0)].reset_index(drop=True)
         df['price'] = df['price'].astype('float32')
     else:
-        print('  ⚠️ لا يوجد عمود price!')
+        bid0 = pd.to_numeric(df['bid_px_00'], errors='coerce') if 'bid_px_00' in df.columns else None
+        ask0 = pd.to_numeric(df['ask_px_00'], errors='coerce') if 'ask_px_00' in df.columns else None
+
+        if bid0 is not None or ask0 is not None:
+            if bid0 is not None and ask0 is not None:
+                df['price'] = ((bid0.where(bid0 > 0, np.nan) + ask0.where(ask0 > 0, np.nan)) / 2.0)
+                df['price'] = df['price'].fillna(bid0.where(bid0 > 0, np.nan)).fillna(ask0.where(ask0 > 0, np.nan))
+            elif bid0 is not None:
+                df['price'] = bid0.where(bid0 > 0, np.nan)
+            else:
+                df['price'] = ask0.where(ask0 > 0, np.nan)
+
+            df['price'] = pd.to_numeric(df['price'], errors='coerce')
+            df = df[df['price'].notna() & (df['price'] > 0)].reset_index(drop=True)
+            df['price'] = df['price'].astype('float32')
+        else:
+            print('  ⚠️ لا يوجد عمود price!')
 
     if 'size' not in df.columns:
         for alt in ['qty', 'quantity', 'volume']:
@@ -347,7 +358,7 @@ def _process_mbo_chunk(args):
 def _process_mbo(df_mbo, n_workers: int = None):
     print("  🔧 Auto-Calibration...")
     cal     = AutoCalibrator(n_ticks=2000).fit(df_mbo)
-    engines = cal.build_engines()
+    engines = cal.build_engines(include_extended=True)
 
     cal_params = {
         'tick_size':      cal.tick_size,
@@ -504,6 +515,16 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         except: ts=pd.Timestamp.now()
         
         row_d   = row._asdict()
+        if price <= 0:
+            bid0 = float(row_d.get('bid_px_00', 0) or 0)
+            ask0 = float(row_d.get('ask_px_00', 0) or 0)
+            if bid0 > 0 and ask0 > 0:
+                price = (bid0 + ask0) / 2.0
+            elif bid0 > 0:
+                price = bid0
+            elif ask0 > 0:
+                price = ask0
+
         obi     = ob.compute_obi(row_d)
         sr, sd  = sp.process_snapshot(row_d, action)
         gap_val = gaps.update(row_d, tick_size=tick_size)
@@ -523,11 +544,25 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
 
 def _merge(df_mbo, df_mbp):
     print("  🔗 merge_asof MBO + MBP10...")
-    df_mbo = df_mbo.sort_values('ts_event').reset_index(drop=True)
-    df_mbp = df_mbp.sort_values('ts_event').reset_index(drop=True)
-    
-    df = pd.merge_asof(df_mbo, df_mbp, on='ts_event',
-                       direction='backward', tolerance=pd.Timedelta('5s'))
+    df_mbo = df_mbo.copy()
+    df_mbp = df_mbp.copy()
+
+    df_mbo['ts_event'] = pd.to_datetime(df_mbo.get('ts_event'), errors='coerce')
+    df_mbp['ts_event'] = pd.to_datetime(df_mbp.get('ts_event'), errors='coerce')
+
+    df_mbo = df_mbo[df_mbo['ts_event'].notna()].sort_values('ts_event').reset_index(drop=True)
+    df_mbp = df_mbp[df_mbp['ts_event'].notna()].sort_values('ts_event').reset_index(drop=True)
+
+    if len(df_mbo) == 0:
+        raise ValueError('MBO data has no valid ts_event rows after normalization')
+
+    if len(df_mbp) == 0:
+        df = df_mbo.copy()
+        for c in ['obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall']:
+            df[c] = 0.0
+    else:
+        df = pd.merge_asof(df_mbo, df_mbp, on='ts_event',
+                           direction='backward', tolerance=pd.Timedelta('5s'))
                        
     for c in ['obi','spoofing_ratio','spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall']:
         df[c] = df[c].fillna(0.0)
@@ -663,7 +698,7 @@ def _compute_rolling_stats(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
     roll_cols = []
     
     # لا نقوم بعمل Rolling للـ Embeddings
-    base_features = [c for c in FEATURE_COLS if not c.startswith('emb_')]
+    base_features = [c for c in MODEL_FEATURE_COLS if not c.startswith('emb_')]
     
     new_roll_dfs = []
     for col in base_features:
@@ -698,6 +733,7 @@ def _normalize_and_save(
 ):
     print("\n📐 Normalization (RobustScaler — train-only fit)...")
     df = df.copy()
+    fit_aux_models = fit_aux_models and os.environ.get('QUANTSYSTEM_SKIP_HEAVY_ML', '').strip() != '1'
 
     # Preserve raw model inputs so train_v19.py can fit fold-specific scalers
     # instead of inheriting a globally pre-scaled CSV.
@@ -721,7 +757,7 @@ def _normalize_and_save(
         scaler_params = _load_scaler_params_from_path(external_scaler_path)
         print(f"  ✅ Using external scaler params: {external_scaler_path}")
 
-    base_features = [c for c in FEATURE_COLS if not c.startswith('emb_')]
+    base_features = [c for c in MODEL_FEATURE_COLS if not c.startswith('emb_')]
     for col in base_features:
         if col not in df.columns:
             df[col] = 0.0; continue
@@ -782,6 +818,8 @@ def _normalize_and_save(
     # ══════════════════════════════════════════════════════════
     print(f"\n🧠 Deep Autoencoder (Extracting {EMBEDDINGS_DIM} Embeddings — train-only fit)...")
     if fit_aux_models and len(roll_col_list) >= 10:
+        from modules.autoencoder_extractor import AutoencoderExtractor
+
         X_roll = df[roll_col_list].fillna(0).values.astype('float32')
         n_ae   = len(X_roll)
         ae_train_end = int(n_ae * 0.80)
@@ -804,7 +842,7 @@ def _normalize_and_save(
     # ANTI-LEAKAGE FIX [mRMR]: feature selection على train split فقط
     # ══════════════════════════════════════════════════════════
     print("\n🔍 mRMR Feature Selection (train-only)...")
-    feat_cols_available = [c for c in FEATURE_COLS if c in df.columns]
+    feat_cols_available = [c for c in MODEL_FEATURE_COLS if c in df.columns]
     n_mrmr    = len(df)
     mrmr_end  = int(n_mrmr * 0.80)
     df_train  = df.iloc[:mrmr_end]
@@ -849,12 +887,12 @@ def _normalize_and_save(
                  'session', 'liq_score', 'regime_label',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps'] + session_meta
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
-    out_cols  = [c for c in meta_cols + raw_stat_cols + FEATURE_COLS + roll_cols if c in df.columns]
+    out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
     
     path = os.path.join(output_dir, 'training_features_ready.csv')
     df[out_cols].to_csv(path, index=False)
 
-    print(f"  ✅ CSV: {len(FEATURE_COLS)} raw + {len(roll_cols)} rolling + meta")
+    print(f"  ✅ CSV: {len(MODEL_FEATURE_COLS)} raw + {len(roll_cols)} rolling + meta")
     return df, path, roll_cols
 
 def _report(df, mbo_p, mbp_p, elapsed, output_dir):
@@ -867,7 +905,7 @@ def _report(df, mbo_p, mbp_p, elapsed, output_dir):
     L("="*70); L(f"  MBO  : {mbo_p}"); L(f"  MBP10: {mbp_p}")
     L(); L("─"*70); L("📊 حالة الـ Features (عينة):"); L("─"*70)
     
-    sample_cols = [c for c in FEATURE_COLS if c in df.columns and (not c.startswith('emb_') or c == 'emb_0')]
+    sample_cols = [c for c in MODEL_FEATURE_COLS if c in df.columns and (not c.startswith('emb_') or c == 'emb_0')]
     for col in sample_cols[:25]:
         nz=int((df[col]!=0).sum()); pct=nz/max(total,1)*100
         icon="✅" if nz>0 else "🔴 DEAD"
@@ -1005,7 +1043,7 @@ def run_refinery(
     # ── V19 Step 3e: LOB Tensor Dataset ──────────────────────────
     lob_tensors    = None
     lob_timestamps = []
-    if DEEPLOB_AVAILABLE:
+    if _load_deeplob_components():
         print("\n⚙️  Step 3e — Building LOB Tensor Dataset (V19)...")
         try:
             # نحتاج df_mbo و df_mbp الأصليين — نعيد قراءتهما
@@ -1066,6 +1104,38 @@ def run_refinery(
     elapsed = (datetime.datetime.now()-t0).total_seconds()
     _report(df_final, mbo_path, mbp_path, elapsed, output_dir)
     return df_final
+
+
+def _load_deeplob_components() -> bool:
+    global DEEPLOB_AVAILABLE, LOBTensorBuilder, build_lob_tensor_dataset
+    global N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS, _DEEPLOB_IMPORT_ATTEMPTED
+
+    if os.environ.get('QUANTSYSTEM_SKIP_HEAVY_ML', '').strip() == '1':
+        return False
+
+    if _DEEPLOB_IMPORT_ATTEMPTED:
+        return DEEPLOB_AVAILABLE
+
+    _DEEPLOB_IMPORT_ATTEMPTED = True
+    try:
+        from modules.deeplob_cnn import (
+            LOBTensorBuilder as _LOBTensorBuilder,
+            build_lob_tensor_dataset as _build_lob_tensor_dataset,
+            N_TIME_STEPS as _N_TIME_STEPS,
+            N_PRICE_LEVELS as _N_PRICE_LEVELS,
+            N_CHANNELS as _N_CHANNELS,
+        )
+        LOBTensorBuilder = _LOBTensorBuilder
+        build_lob_tensor_dataset = _build_lob_tensor_dataset
+        N_TIME_STEPS = _N_TIME_STEPS
+        N_PRICE_LEVELS = _N_PRICE_LEVELS
+        N_CHANNELS = _N_CHANNELS
+        DEEPLOB_AVAILABLE = True
+    except ImportError:
+        DEEPLOB_AVAILABLE = False
+        print("  ⚠️ DeepLOB module غير متاح")
+
+    return DEEPLOB_AVAILABLE
 
 if __name__=='__main__':
     p = argparse.ArgumentParser(description='QuantSystem V19 Data Refinery')

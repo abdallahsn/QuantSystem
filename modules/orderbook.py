@@ -43,15 +43,8 @@ class OrderBookSnapshotEngine:
         if total == 0:
             return 0.0
 
-        raw_obi = (w_bid - w_ask) / total
+        raw_obi = float(np.clip((w_bid - w_ask) / total, -1.0, 1.0))
         self._obi_history.append(raw_obi)
-
-        if len(self._obi_history) >= 20:
-            arr  = np.array(self._obi_history)
-            mu   = float(np.mean(arr))
-            sigma = float(np.std(arr)) + 1e-8
-            zscore = (raw_obi - mu) / sigma
-            return float(np.clip(zscore, -4, 4))
 
         return raw_obi
 

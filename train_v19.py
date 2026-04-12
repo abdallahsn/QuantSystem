@@ -44,6 +44,7 @@ from modules.feature_factory_v19 import (
     apply_scaler_params_to_frame,
     prepare_feature_frame,
 )
+from modules.gpu_config import detect_gpu
 from modules.manifest_v19 import write_manifest
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import (
@@ -65,6 +66,16 @@ BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 3
 SEQ_LEN = 50
+PHASE_FULL = 'full'
+PHASE_CATBOOST = 'catboost'
+PHASE_VISUAL = 'visual'
+PHASE_TRAIN = 'train'
+STAGE_TO_PHASE = {
+    0: PHASE_FULL,
+    1: PHASE_CATBOOST,
+    2: PHASE_VISUAL,
+    3: PHASE_TRAIN,
+}
 META_FEATURE_NAMES = [
     'cb_prob_long', 'cb_prob_short', 'cb_prob_neutral',
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
@@ -85,6 +96,35 @@ TRAINING_PASSTHROUGH_COLS = [
         'label_horizon_steps',
     }
 ]
+
+
+def _resolve_phase(stage: int = 0, phase: str | None = None) -> str:
+    if phase is not None:
+        phase = str(phase).strip().lower()
+        aliases = {
+            'all': PHASE_FULL,
+            'full': PHASE_FULL,
+            'catboost': PHASE_CATBOOST,
+            'cb': PHASE_CATBOOST,
+            'visual': PHASE_VISUAL,
+            'deeplob': PHASE_VISUAL,
+            'train': PHASE_TRAIN,
+            'meta': PHASE_TRAIN,
+            'training': PHASE_TRAIN,
+        }
+        if phase not in aliases:
+            raise ValueError(f"Unknown phase: {phase}")
+        return aliases[phase]
+    return STAGE_TO_PHASE.get(int(stage), PHASE_FULL)
+
+
+def _phase_banner(phase: str) -> str:
+    return {
+        PHASE_FULL: 'full pipeline',
+        PHASE_CATBOOST: 'catboost-only',
+        PHASE_VISUAL: 'visual-only',
+        PHASE_TRAIN: 'train-only',
+    }.get(phase, phase)
 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -227,7 +267,14 @@ def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.
     else:
         s = pd.Series(pd.date_range('2026-01-01', periods=len(df), freq='s'))
 
-    s = s.ffill().bfill()
+    s = s.ffill()
+    if s.isna().any():
+        first_valid = s.first_valid_index()
+        if first_valid is not None:
+            first_pos = s.index.get_loc(first_valid)
+            first_ts = s.iloc[first_pos]
+            for pos in range(first_pos - 1, -1, -1):
+                s.iloc[pos] = first_ts - pd.Timedelta(seconds=(first_pos - pos))
     if s.isna().any():
         base = pd.Timestamp('2026-01-01')
         s = pd.Series([base + pd.Timedelta(seconds=i) for i in range(len(df))])
@@ -385,6 +432,10 @@ def stage1_oof_meta(
         )
 
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
+    gpu_info = detect_gpu()
+    cb_task_type = 'GPU' if gpu_info.get('available') else 'CPU'
+    cb_devices = '0' if gpu_info.get('available') else None
+    print(f"  CatBoost device: {cb_task_type}")
 
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
@@ -423,6 +474,8 @@ def stage1_oof_meta(
                 use_best_model=inner_val is not None,
                 verbose=0,
                 random_seed=42 + fold_no,
+                task_type=cb_task_type,
+                devices=cb_devices,
             )
             tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
             eval_set = None
@@ -485,6 +538,8 @@ def stage1_oof_meta(
             use_best_model=False,
             verbose=50,
             random_seed=42,
+            task_type=cb_task_type,
+            devices=cb_devices,
         )
         final_model.fit(Pool(X_final, y, weight=final_sw, feature_names=CATBOOST_ADVISOR_FEATURES), plot=False)
         final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
@@ -849,6 +904,49 @@ def stage3_meta_learner_v19(
         print("  ✅ MetaLearner V19 history + schema محفوظان")
 
 
+def _load_required_stage1_artifacts(output_dir: str) -> tuple[np.ndarray, np.ndarray]:
+    meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
+    coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
+    required_files = [
+        meta_path,
+        coverage_path,
+        os.path.join(output_dir, 'catboost_advisor_v19.cbm'),
+        os.path.join(output_dir, 'catboost_classes_v19.json'),
+        os.path.join(output_dir, 'regime_classifier.pkl'),
+    ]
+    missing = [path for path in required_files if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(
+            '❌ CatBoost stage artifacts missing. '
+            'شغّل المرحلة الثانية أولاً:\n'
+            'python train_v19.py --csv <training_features_ready.csv> --output <dir> --phase catboost\n'
+            f'Missing: {missing}'
+        )
+
+    meta_features = np.load(meta_path)
+    coverage = np.load(coverage_path).astype(bool)
+    return meta_features, coverage
+
+
+def _load_or_init_visual_artifacts(output_dir: str, n_rows: int) -> tuple[np.ndarray, np.ndarray, str]:
+    visual_path = os.path.join(output_dir, 'visual_embeddings_v19.npy')
+    visual_live_path = os.path.join(output_dir, 'visual_embeddings_live_v19.npy')
+    visual_cov_path = os.path.join(output_dir, 'visual_coverage_v19.npy')
+
+    if os.path.exists(visual_path) and os.path.exists(visual_cov_path):
+        visual = np.load(visual_path).astype(np.float32)
+        visual_cov = np.load(visual_cov_path).astype(bool)
+        if len(visual) == n_rows and len(visual_cov) == n_rows:
+            return visual, visual_cov, 'cache'
+
+    visual = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
+    visual_cov = np.zeros(n_rows, dtype=bool)
+    np.save(visual_path, visual)
+    np.save(visual_live_path, visual)
+    np.save(visual_cov_path, visual_cov.astype(np.uint8))
+    return visual, visual_cov, 'zeros'
+
+
 def run_training_pipeline(
     csv_path: str,
     output_dir: str = 'outputs_v19',
@@ -861,14 +959,17 @@ def run_training_pipeline(
     embargo_pct: float = 0.02,
     train_frac: float = 0.80,
     stage: int = 0,
+    phase: str | None = None,
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     started_at = datetime.datetime.now()
+    resolved_phase = _resolve_phase(stage=stage, phase=phase)
 
     print('=' * 65)
     print('🚀 QuantSystem V19 — Leakage-Safe Training Foundation')
     print(f'   Output: {output_dir}')
+    print(f'   Phase: {_phase_banner(resolved_phase)}')
     print('=' * 65)
 
     df = load_training_csv(csv_path)
@@ -908,7 +1009,9 @@ def run_training_pipeline(
     visual_path = os.path.join(output_dir, 'visual_embeddings_v19.npy')
     visual_cov_path = os.path.join(output_dir, 'visual_coverage_v19.npy')
 
-    if stage in (0, 1) or not (os.path.exists(meta_path) and os.path.exists(coverage_path)):
+    if resolved_phase in (PHASE_FULL, PHASE_CATBOOST) or (
+        resolved_phase == PHASE_VISUAL and not (os.path.exists(meta_path) and os.path.exists(coverage_path))
+    ):
         meta_features, coverage = stage1_oof_meta(
             df,
             output_dir,
@@ -921,12 +1024,55 @@ def run_training_pipeline(
             inference_scaler_params=inference_scaler_params,
         )
     else:
-        meta_features = np.load(meta_path)
-        coverage = np.load(coverage_path).astype(bool)
-        print(f'✅ Stage 1 محمّل من cache: {meta_features.shape}')
+        meta_features, coverage = _load_required_stage1_artifacts(output_dir)
+        print(f'✅ CatBoost artifacts loaded from cache: {meta_features.shape}')
+
+    if resolved_phase == PHASE_CATBOOST:
+        elapsed = (datetime.datetime.now() - started_at).total_seconds()
+        summary = {
+            'rows': int(len(df)),
+            'meta_shape': list(meta_features.shape),
+            'meta_coverage_ratio': float(np.mean(coverage)),
+            'visual_shape': None,
+            'visual_coverage_ratio': None,
+            'scaler_train_rows': int(scaler_info['scaler_train_rows']),
+            'elapsed_seconds': float(elapsed),
+            'stage': int(stage),
+            'phase': resolved_phase,
+        }
+        manifest_path = write_manifest(
+            output_dir=output_dir,
+            kind='train_v19_catboost',
+            config=config_snapshot or {
+                'epochs': epochs,
+                'batch': batch,
+                'n_folds': n_folds,
+                'test_size': test_size,
+                'embargo_pct': embargo_pct,
+                'train_frac': train_frac,
+                'stage': stage,
+                'phase': resolved_phase,
+            },
+            inputs={
+                'csv': csv_path,
+                'lob': lob_path,
+                'lob_ts': lob_ts_path,
+            },
+            metrics=summary,
+        )
+        print('\n' + '=' * 65)
+        print('✅ CatBoost stage completed independently')
+        print(f'📄 Manifest: {manifest_path}')
+        print('=' * 65)
+        return {
+            **summary,
+            'output_dir': output_dir,
+            'manifest': manifest_path,
+            'meta_features': meta_path,
+        }
 
     lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
-    if stage in (0, 2) or not (os.path.exists(visual_path) and os.path.exists(visual_cov_path)):
+    if resolved_phase in (PHASE_FULL, PHASE_VISUAL):
         visual_embeddings, visual_coverage = stage2_oof_visual_embeddings(
             df,
             output_dir,
@@ -935,11 +1081,54 @@ def run_training_pipeline(
             lob_timestamps=lob_timestamps,
         )
     else:
-        visual_embeddings = np.load(visual_path)
-        visual_coverage = np.load(visual_cov_path).astype(bool)
-        print(f'✅ Stage 2 محمّل من cache: {visual_embeddings.shape}')
+        visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(df))
+        print(f'✅ Visual embeddings ready: {visual_embeddings.shape} | source={visual_source}')
 
-    if stage in (0, 3):
+    if resolved_phase == PHASE_VISUAL:
+        elapsed = (datetime.datetime.now() - started_at).total_seconds()
+        summary = {
+            'rows': int(len(df)),
+            'meta_shape': list(meta_features.shape),
+            'meta_coverage_ratio': float(np.mean(coverage)),
+            'visual_shape': list(visual_embeddings.shape),
+            'visual_coverage_ratio': float(np.mean(visual_coverage)),
+            'scaler_train_rows': int(scaler_info['scaler_train_rows']),
+            'elapsed_seconds': float(elapsed),
+            'stage': int(stage),
+            'phase': resolved_phase,
+        }
+        manifest_path = write_manifest(
+            output_dir=output_dir,
+            kind='train_v19_visual',
+            config=config_snapshot or {
+                'epochs': epochs,
+                'batch': batch,
+                'n_folds': n_folds,
+                'test_size': test_size,
+                'embargo_pct': embargo_pct,
+                'train_frac': train_frac,
+                'stage': stage,
+                'phase': resolved_phase,
+            },
+            inputs={
+                'csv': csv_path,
+                'lob': lob_path,
+                'lob_ts': lob_ts_path,
+            },
+            metrics=summary,
+        )
+        print('\n' + '=' * 65)
+        print('✅ Visual stage completed independently')
+        print(f'📄 Manifest: {manifest_path}')
+        print('=' * 65)
+        return {
+            **summary,
+            'output_dir': output_dir,
+            'manifest': manifest_path,
+            'visual_embeddings': visual_path,
+        }
+
+    if resolved_phase in (PHASE_FULL, PHASE_TRAIN):
         stage3_meta_learner_v19(
             df,
             meta_features,
@@ -962,6 +1151,7 @@ def run_training_pipeline(
         'scaler_train_rows': int(scaler_info['scaler_train_rows']),
         'elapsed_seconds': float(elapsed),
         'stage': int(stage),
+        'phase': resolved_phase,
     }
     manifest_path = write_manifest(
         output_dir=output_dir,
@@ -974,6 +1164,7 @@ def run_training_pipeline(
             'embargo_pct': embargo_pct,
             'train_frac': train_frac,
             'stage': stage,
+            'phase': resolved_phase,
         },
         inputs={
             'csv': csv_path,
@@ -1010,6 +1201,7 @@ def main():
     p.add_argument('--embargo_pct', type=float, default=float(defaults.get('embargo_pct', 0.02)))
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
+    p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -1026,6 +1218,7 @@ def main():
         embargo_pct=args.embargo_pct,
         train_frac=args.train_frac,
         stage=args.stage,
+        phase=args.phase,
         config_snapshot=cfg,
     )
 

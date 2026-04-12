@@ -14,6 +14,24 @@ QuantSystem V19 هو مشروع **quantitative AI trading research system** مب
    - Stage 2: `OOF DeepLOB visual embeddings`
    - Stage 3: `MetaLearner LSTM`
 
+### Recommended Operational Phases
+
+للتشغيل العملي المبسط، يُفضّل تقسيم المشروع إلى 3 مراحل واضحة:
+
+1. `stage1_refinery.py`
+   - يبني dataset التدريب من الخام
+   - يحفظ `training_features_ready.csv`
+
+2. `stage2_catboost.py`
+   - يدرب `CatBoost + Regime`
+   - يحفظ `meta_features_oof_v19.npy`
+   - يحفظ `catboost_advisor_v19.cbm`
+
+3. `stage3_train.py`
+   - يدرب `MetaLearner`
+   - يعتمد على نواتج المرحلة الثانية
+   - يستخدم الـ visual embeddings من الكاش إن وُجدت، وإلا يكمل بأصفار
+
 3. `backtest_v19.py`
    - يشغل causal replay backtest على dataset V19 الجاهز
 
@@ -123,7 +141,7 @@ pip install catboost jupyterlab ipykernel pyarrow hmmlearn
 ### 1. تجهيز البيانات
 
 ```bash
-python3 prepare_training_data.py \
+python3 stage1_refinery.py \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
   --output outputs_v19 \
@@ -138,25 +156,56 @@ python3 prepare_training_data.py \
 - `outputs_v19/refinery_report.txt`
 
 
-### 2. التدريب
+### 2. CatBoost Stage
 
 ```bash
-python3 train_v19.py \
+python3 stage2_catboost.py \
   --csv outputs_v19/training_features_ready.csv \
   --output outputs_v19
 ```
 
 النواتج المهمة:
 - `catboost_advisor_v19.cbm`
+- `catboost_classes_v19.json`
+- `regime_classifier.pkl`
+- `meta_features_oof_v19.npy`
+- `meta_coverage_v19.npy`
+
+
+### 3. Final Training Stage
+
+```bash
+python3 stage3_train.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --output outputs_v19
+```
+
+النواتج المهمة:
 - `meta_learner_v19.keras`
-- `deeplob_cnn_v19.keras`
 - `feature_schema_v19.json`
 - `manifest.json`
-- `meta_features_oof_v19.npy`
-- `visual_embeddings_v19.npy`
 
 
-### 3. Backtest
+### 4. Full Pipeline Shortcut
+
+إذا أردت تشغيل كل شيء دفعة واحدة كما في السلوك القديم:
+
+```bash
+python3 train_v19.py \
+  --csv outputs_v19/training_features_ready.csv \
+  --output outputs_v19 \
+  --phase full
+```
+
+يمكن أيضًا تشغيل CatBoost فقط أو التدريب فقط من نفس الملف:
+
+```bash
+python3 train_v19.py --csv outputs_v19/training_features_ready.csv --output outputs_v19 --phase catboost
+python3 train_v19.py --csv outputs_v19/training_features_ready.csv --output outputs_v19 --phase train
+```
+
+
+### 5. Backtest
 
 ```bash
 python3 backtest_v19.py \
@@ -173,7 +222,7 @@ python3 backtest_v19.py \
 - `backtest_v19_summary.json`
 
 
-### 4. Walk-Forward
+### 6. Walk-Forward
 
 ```bash
 python3 walkforward_v19.py \

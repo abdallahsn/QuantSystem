@@ -8,14 +8,6 @@ import datetime as _dt
 import hashlib
 import json
 import os
-from typing import Any
-
-import numpy as np
-
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover - keep helper usable in lighter contexts
-    pd = None
 
 
 def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
@@ -46,38 +38,6 @@ def collect_artifacts(root_dir: str) -> list[dict]:
     return artifacts
 
 
-def to_jsonable(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, dict):
-        return {str(k): to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(v) for v in value]
-    if pd is not None:
-        if value is pd.NaT or value is pd.NA:
-            return None
-        if isinstance(value, (pd.Timestamp, pd.Timedelta)):
-            return value.isoformat()
-        if isinstance(value, (pd.Series, pd.Index)):
-            return [to_jsonable(v) for v in value.tolist()]
-        if isinstance(value, pd.DataFrame):
-            return [to_jsonable(row) for row in value.to_dict(orient='records')]
-    if isinstance(value, np.ndarray):
-        return to_jsonable(value.tolist())
-    if isinstance(value, np.generic):
-        return to_jsonable(value.item())
-    if hasattr(value, 'isoformat'):
-        try:
-            return value.isoformat()
-        except Exception:
-            return str(value)
-    try:
-        json.dumps(value)
-        return value
-    except Exception:
-        return str(value)
-
-
 def write_manifest(
     output_dir: str,
     kind: str,
@@ -100,5 +60,5 @@ def write_manifest(
     }
     path = os.path.join(output_dir, filename)
     with open(path, 'w') as f:
-        json.dump(to_jsonable(manifest), f, indent=2)
+        json.dump(manifest, f, indent=2)
     return path
