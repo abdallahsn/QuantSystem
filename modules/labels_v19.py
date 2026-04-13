@@ -28,6 +28,14 @@ SETUP_OBI = 2
 SETUP_MIXED = 3
 
 
+def _directional_efficiency(prices: np.ndarray, window: int = 12) -> np.ndarray:
+    s = pd.Series(prices)
+    gross = s.diff().abs().rolling(window, min_periods=2).sum()
+    net = s.diff(window).abs()
+    eff = (net / gross.clip(lower=1e-8)).fillna(0.0).clip(0.0, 1.0)
+    return eff.values.astype(np.float32)
+
+
 def _infer_setup_labels(df: pd.DataFrame) -> np.ndarray:
     absorb = df.get('absorption_intensity', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
     spoof = df.get('spoofing_ratio', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
@@ -97,6 +105,15 @@ def build_causal_event_labels(
         fallback_vol = float(np.nanmedian(price_diff[price_diff > 0])) if np.any(price_diff > 0) else tick_size
     fallback_vol = max(fallback_vol, tick_size)
     vols = np.where(vol_raw > tick_size, vol_raw, fallback_vol)
+    liq_score = _liquidity_score(out).astype(np.float64)
+    efficiency = _directional_efficiency(
+        prices,
+        window=max(6, min(24, max(2, horizon // 2))),
+    )
+    liq_positive = liq_score[liq_score > 0]
+    liq_anchor = float(np.nanmedian(liq_positive)) if liq_positive.size else 1.0
+    liq_low_cutoff = float(np.nanquantile(liq_positive, 0.30)) if liq_positive.size >= 5 else liq_anchor * 0.75
+    liq_low_cutoff = max(liq_low_cutoff, 1e-6)
 
     bias = np.full(n, BIAS_NEUTRAL, dtype=np.int8)
     conf = np.zeros(n, dtype=np.float32)
@@ -118,30 +135,68 @@ def build_causal_event_labels(
         upper = p0 + tp_mult * vol
         lower = p0 - sl_mult * vol
         future_path = prices[i + 1:end_idx + 1]
+        future_deltas = np.diff(np.concatenate([[p0], future_path]))
+        path_noise = float(np.abs(future_deltas).sum())
+        max_up = float(future_path.max() - p0)
+        max_down = float(p0 - future_path.min())
+        path_range = max_up + max_down
 
         hit_up = np.where(future_path >= upper)[0]
         hit_down = np.where(future_path <= lower)[0]
 
         final_ret = future_path[-1] - p0
         forward_return[i] = float(final_ret)
+        directionality = float(abs(final_ret) / max(path_noise, tick_size))
+        local_eff = float(efficiency[i])
+        local_liq = float(liq_score[i])
+        low_liq = local_liq <= liq_low_cutoff
+        range_like = (path_range < 1.75 * vol) or (max(local_eff, directionality) < 0.35)
+
         neutral_band = neutral_mult * vol
+        if low_liq:
+            neutral_band = max(neutral_band, 0.60 * vol)
+        if range_like:
+            neutral_band = max(neutral_band, 0.75 * vol)
+
+        strict_terminal = low_liq or range_like
+        dir_gate = 0.50 if strict_terminal else 0.30
+        liq_ratio = min(local_liq / max(liq_anchor, 1e-6), 1.5)
+
+        def _confidence(move_strength: float, breakout: bool) -> float:
+            move_score = min(move_strength / max(vol, tick_size), 2.5) / 2.5
+            breakout_bonus = 0.15 if breakout else 0.0
+            raw = (
+                0.35 * move_score +
+                0.35 * max(local_eff, directionality) +
+                0.20 * min(liq_ratio, 1.0) +
+                breakout_bonus
+            )
+            return float(np.clip(raw, 0.0, 1.0))
 
         if hit_up.size and (not hit_down.size or hit_up[0] <= hit_down[0]):
-            bias[i] = BIAS_LONG
-            conf[i] = 1.0
-            is_expansion[i] = 1
+            breakout_ret = float(future_path[hit_up[0]] - p0)
+            if strict_terminal and breakout_ret < 1.40 * vol and max(local_eff, directionality) < 0.55:
+                bias[i] = BIAS_NEUTRAL
+            else:
+                bias[i] = BIAS_LONG
+                conf[i] = _confidence(max(final_ret, breakout_ret), breakout=True)
+                is_expansion[i] = int((not low_liq) or breakout_ret >= 2.0 * vol)
         elif hit_down.size:
-            bias[i] = BIAS_SHORT
-            conf[i] = 1.0
-            is_expansion[i] = 1
-        elif final_ret > neutral_band:
+            breakout_ret = float(p0 - future_path[hit_down[0]])
+            if strict_terminal and breakout_ret < 1.40 * vol and max(local_eff, directionality) < 0.55:
+                bias[i] = BIAS_NEUTRAL
+            else:
+                bias[i] = BIAS_SHORT
+                conf[i] = _confidence(max(-final_ret, breakout_ret), breakout=True)
+                is_expansion[i] = int((not low_liq) or breakout_ret >= 2.0 * vol)
+        elif final_ret > neutral_band and max(local_eff, directionality) >= dir_gate:
             bias[i] = BIAS_LONG
-            conf[i] = float(abs(final_ret) >= vol)
-            is_expansion[i] = int(abs(final_ret) >= neutral_band)
-        elif final_ret < -neutral_band:
+            conf[i] = _confidence(abs(final_ret), breakout=False)
+            is_expansion[i] = int(abs(final_ret) >= max(vol, neutral_band) and max(local_eff, directionality) >= 0.45)
+        elif final_ret < -neutral_band and max(local_eff, directionality) >= dir_gate:
             bias[i] = BIAS_SHORT
-            conf[i] = float(abs(final_ret) >= vol)
-            is_expansion[i] = int(abs(final_ret) >= neutral_band)
+            conf[i] = _confidence(abs(final_ret), breakout=False)
+            is_expansion[i] = int(abs(final_ret) >= max(vol, neutral_band) and max(local_eff, directionality) >= 0.45)
         else:
             bias[i] = BIAS_NEUTRAL
             conf[i] = 0.0
@@ -151,7 +206,7 @@ def build_causal_event_labels(
     out['setup_label'] = _infer_setup_labels(out)
     out['conf_label'] = conf.astype(np.float32)
     out['is_expansion'] = is_expansion.astype(np.int8)
-    out['liq_score'] = _liquidity_score(out)
+    out['liq_score'] = liq_score.astype(np.float32)
     out['label_end_ts'] = pd.to_datetime(label_end_ts)
     out['forward_return'] = forward_return.astype(np.float32)
     out['label_horizon_steps'] = horizon_steps.astype(np.int32)

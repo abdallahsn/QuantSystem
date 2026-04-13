@@ -724,6 +724,55 @@ def _load_scaler_params_from_path(path: str) -> dict:
         return json.load(f)
 
 
+def _build_refinery_split_context(
+    df: pd.DataFrame,
+    train_frac: float = 0.80,
+) -> dict:
+    n = len(df)
+    if n == 0:
+        return {
+            'split_idx': 0,
+            'split_time': pd.NaT,
+            'label_end': pd.Series(dtype='datetime64[ns]'),
+            'train_row_ok': np.array([], dtype=bool),
+            'holdout_row_ok': np.array([], dtype=bool),
+            'purged_row_ok': np.array([], dtype=bool),
+            'train_idx': np.array([], dtype=np.int32),
+        }
+
+    ts = pd.to_datetime(df.get('ts_event', pd.Series(pd.RangeIndex(n))), utc=True, errors='coerce').dt.tz_localize(None)
+    ts = ts.ffill()
+    if ts.isna().any():
+        base = pd.Timestamp('2026-01-01')
+        ts = pd.Series([base + pd.Timedelta(seconds=i) for i in range(n)], index=df.index)
+
+    split_idx = min(max(int(n * train_frac), 1), max(n - 1, 1))
+    split_time = ts.iloc[min(split_idx, n - 1)]
+    label_end = pd.to_datetime(df.get('label_end_ts', ts), utc=True, errors='coerce').dt.tz_localize(None).fillna(ts)
+
+    row_ids = np.arange(n)
+    train_row_ok = (row_ids < split_idx) & (label_end.values < split_time.to_datetime64())
+    holdout_row_ok = row_ids >= split_idx
+    purged_row_ok = (~train_row_ok) & (~holdout_row_ok)
+    train_idx = np.flatnonzero(train_row_ok)
+
+    if train_idx.size == 0:
+        train_idx = np.arange(min(split_idx, n), dtype=np.int32)
+        train_row_ok = np.zeros(n, dtype=bool)
+        train_row_ok[train_idx] = True
+        purged_row_ok = (~train_row_ok) & (~holdout_row_ok)
+
+    return {
+        'split_idx': int(split_idx),
+        'split_time': split_time,
+        'label_end': label_end,
+        'train_row_ok': train_row_ok.astype(bool),
+        'holdout_row_ok': holdout_row_ok.astype(bool),
+        'purged_row_ok': purged_row_ok.astype(bool),
+        'train_idx': train_idx.astype(np.int32),
+    }
+
+
 def _normalize_and_save(
     df,
     output_dir,
@@ -748,8 +797,37 @@ def _normalize_and_save(
     # TRANSFORM على كامل الداتا (train + val)
     # احفظ params للـ live trading لضمان consistency
     # ══════════════════════════════════════════════════════════
-    n_total   = len(df)
-    train_end = int(n_total * 0.80)  # 80% للتدريب
+    split_ctx = _build_refinery_split_context(df, train_frac=0.80)
+    train_mask = split_ctx['train_row_ok']
+    train_idx = split_ctx['train_idx']
+    split_time = split_ctx['split_time']
+    n_total = len(df)
+
+    df['is_train_slice'] = train_mask.astype(np.int8)
+    df['is_holdout_slice'] = split_ctx['holdout_row_ok'].astype(np.int8)
+    df['is_purged_slice'] = split_ctx['purged_row_ok'].astype(np.int8)
+    df['dataset_slice'] = np.where(
+        split_ctx['holdout_row_ok'],
+        'holdout',
+        np.where(train_mask, 'train', 'purged')
+    )
+
+    split_meta = {
+        'split_idx': int(split_ctx['split_idx']),
+        'split_time': None if pd.isna(split_time) else str(split_time),
+        'train_rows': int(train_mask.sum()),
+        'holdout_rows': int(split_ctx['holdout_row_ok'].sum()),
+        'purged_rows': int(split_ctx['purged_row_ok'].sum()),
+    }
+    with open(os.path.join(output_dir, 'refinery_split.json'), 'w') as f:
+        json.dump(split_meta, f, indent=2)
+    print(
+        "  ✅ Split Context: "
+        f"train={split_meta['train_rows']:,} | "
+        f"holdout={split_meta['holdout_rows']:,} | "
+        f"purged={split_meta['purged_rows']:,} | "
+        f"split_time={split_meta['split_time']}"
+    )
 
     scaler_params = {}  # يُحفظ لاحقاً للـ live trading
     using_external_scaler = bool(external_scaler_path and os.path.exists(external_scaler_path))
@@ -783,7 +861,7 @@ def _normalize_and_save(
                 continue
 
             # FIT على train فقط
-            s_train = s.iloc[:train_end]
+            s_train = s.iloc[train_idx]
             median_  = float(s_train.median())
             q1, q3   = float(s_train.quantile(0.25)), float(s_train.quantile(0.75))
             iqr      = q3 - q1
@@ -821,11 +899,14 @@ def _normalize_and_save(
         from modules.autoencoder_extractor import AutoencoderExtractor
 
         X_roll = df[roll_col_list].fillna(0).values.astype('float32')
-        n_ae   = len(X_roll)
-        ae_train_end = int(n_ae * 0.80)
+        n_ae = len(X_roll)
+        X_roll_train = X_roll[train_idx]
+        if len(X_roll_train) == 0:
+            X_roll_train = X_roll[:max(1, min(n_ae, split_ctx['split_idx']))]
+        ae_train_end = len(X_roll_train)
 
         ae = AutoencoderExtractor(input_dim=len(roll_col_list), bottleneck=EMBEDDINGS_DIM)
-        ae.fit(X_roll[:ae_train_end], epochs=20, batch_size=512, output_dir=output_dir)
+        ae.fit(X_roll_train, epochs=20, batch_size=512, output_dir=output_dir)
 
         # transform على كامل الداتا (train + val)
         df['dl_anomaly_score'] = ae.score(X_roll).astype('float32')
@@ -843,9 +924,9 @@ def _normalize_and_save(
     # ══════════════════════════════════════════════════════════
     print("\n🔍 mRMR Feature Selection (train-only)...")
     feat_cols_available = [c for c in MODEL_FEATURE_COLS if c in df.columns]
-    n_mrmr    = len(df)
-    mrmr_end  = int(n_mrmr * 0.80)
-    df_train  = df.iloc[:mrmr_end]
+    df_train  = df.iloc[train_idx].copy()
+    if df_train.empty:
+        df_train = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
     target    = df_train.get('bias_label', pd.Series(np.zeros(len(df_train))))
 
     try:
@@ -854,7 +935,7 @@ def _normalize_and_save(
         if len(feat_cols_available) - len(filtered) > 0: print(f"  Spearman: حذف {len(feat_cols_available) - len(filtered)} feature متكررة")
 
         selected = mrmr_selection(df_train[filtered], target, n_features=min(40, len(filtered)), protected=set(protected_in_data))
-        print(f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature (على {mrmr_end:,} train rows)")
+        print(f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature (على {len(df_train):,} train rows)")
 
         with open(os.path.join(output_dir, 'selected_features.txt'), 'w') as f: f.write('\n'.join(selected))
 
@@ -868,12 +949,13 @@ def _normalize_and_save(
     print("\n🎯 Regime Classification (train-only fit)...")
     try:
         if fit_aux_models:
-            n_reg      = len(df)
-            regime_end = int(n_reg * 0.80)
+            train_regime_df = df.iloc[train_idx].copy()
+            if train_regime_df.empty:
+                train_regime_df = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
             regime_clf = RegimeClassifier(n_regimes=4)
-            regime_clf.fit(df.iloc[:regime_end], output_dir=output_dir)
+            regime_clf.fit(train_regime_df, output_dir=output_dir)
             df['regime_label'] = regime_clf.predict(df).astype(np.int8)
-            print(f"  ✅ Regime: fit على {regime_end:,} | predict على {n_reg:,}")
+            print(f"  ✅ Regime: fit على {len(train_regime_df):,} | predict على {len(df):,}")
         else:
             df['regime_label'] = 0
             print("  ✅ Regime skipped intentionally for evaluation slice")
@@ -883,9 +965,10 @@ def _normalize_and_save(
 
     # SESSION_LEAK_COLS تُحفظ كـ metadata للتحليل لكن لا تدخل FEATURE_COLS
     session_meta = [c for c in SESSION_LEAK_COLS if c in df.columns]
-    meta_cols = ['bias_label', 'setup_label', 'conf_label', 'is_expansion',
+    meta_cols = ['price', 'size', 'bias_label', 'setup_label', 'conf_label', 'is_expansion',
                  'session', 'liq_score', 'regime_label',
-                 'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps'] + session_meta
+                 'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
+                 'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
     
@@ -1082,7 +1165,7 @@ def run_refinery(
             horizon=50,
             tp_mult=1.5,
             sl_mult=1.0,
-            neutral_mult=0.35,
+            neutral_mult=0.45,
             tick_size=_tick,
         )
     else:
