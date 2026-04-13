@@ -22,6 +22,7 @@ deeplob_cnn.py — DeepLOB Visual Engine (V19)
 import numpy as np
 import os
 import pickle
+import math
 from collections import deque
 
 try:
@@ -89,12 +90,25 @@ class LOBTensorBuilder:
         يستلم snapshot من MBP10 ويحسب depth channel.
         row: dict مثل {'bid_px_00': 1.2505, 'bid_sz_00': 10, ...}
         """
-        self._last_mbp = row
+        bid_sizes = [float(row.get(f'bid_sz_{i:02d}', 0) or 0) for i in range(self.L)]
+        ask_sizes = [float(row.get(f'ask_sz_{i:02d}', 0) or 0) for i in range(self.L)]
+        bid0 = float(row.get('bid_px_00', 0) or 0)
+        ask0 = float(row.get('ask_px_00', 0) or 0)
+        self.update_mbp_levels(bid0, ask0, bid_sizes, ask_sizes)
+
+    def update_mbp_levels(self,
+                          bid0: float,
+                          ask0: float,
+                          bid_sizes,
+                          ask_sizes) -> None:
+        """
+        نسخة خفيفة من update_mbp تستقبل arrays/scalars مباشرة
+        لتجنب بناء dict لكل snapshot في المسارات الكبيرة.
+        """
+        self._last_mbp = {'bid_px_00': bid0, 'ask_px_00': ask0}
         L = self.L
 
         # استخراج mid price للـ price grid
-        bid0 = float(row.get('bid_px_00', 0) or 0)
-        ask0 = float(row.get('ask_px_00', 0) or 0)
         if bid0 > 0 and ask0 > 0:
             self._cur_ref_price = (bid0 + ask0) / 2.0
         elif bid0 > 0:
@@ -107,9 +121,9 @@ class LOBTensorBuilder:
         depth = np.zeros(self.P, dtype=np.float32)
         for i in range(L):
             # bid levels: index 0..9 (L-1-i للعكس: L0 في المنتصف)
-            depth[L - 1 - i] = float(row.get(f'bid_sz_0{i}', 0) or 0)
+            depth[L - 1 - i] = float(bid_sizes[i] or 0)
             # ask levels: index 10..19 (i0 في المنتصف)
-            depth[L + i]     = float(row.get(f'ask_sz_0{i}', 0) or 0)
+            depth[L + i]     = float(ask_sizes[i] or 0)
 
         # تسجيل الـ snapshot وتصفير الـ footprint للـ bar الجديد
         self._depth_buf.append(depth)
@@ -197,6 +211,56 @@ class LOBTensorBuilder:
             'sell':  list(self._sell_buf),
             'ref_price': self._cur_ref_price,
         }
+
+
+def estimate_lob_tensor_bytes(n_tensors: int,
+                              time_steps: int = N_TIME_STEPS,
+                              price_levels: int = N_PRICE_LEVELS,
+                              channels: int = N_CHANNELS,
+                              dtype=np.float32) -> int:
+    return int(n_tensors) * int(time_steps) * int(price_levels) * int(channels) * np.dtype(dtype).itemsize
+
+
+def _prepare_sorted_frame(df, ts_col: str = 'ts_event'):
+    import pandas as pd
+
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    out = df.copy(deep=False)
+    out[ts_col] = pd.to_datetime(out.get(ts_col), utc=True, errors='coerce').dt.tz_localize(None)
+    out = out[out[ts_col].notna()]
+    if len(out) == 0:
+        return out.reset_index(drop=True)
+
+    if not out[ts_col].is_monotonic_increasing:
+        out = out.sort_values(ts_col)
+    return out.reset_index(drop=True)
+
+
+def _build_snapshot_sampling_plan(n_snapshots: int,
+                                  time_steps: int,
+                                  snapshot_stride: int | None = None,
+                                  max_tensors: int | None = None) -> dict:
+    if n_snapshots <= 0:
+        return {'stride': 1, 'first_emit_pos': 0, 'planned_tensors': 0}
+
+    stride = max(1, int(snapshot_stride or 1))
+    if max_tensors and max_tensors > 0:
+        stride = max(stride, int(math.ceil(n_snapshots / max_tensors)))
+
+    min_ready_pos = max(time_steps - 1, 0)
+    first_emit_pos = int(math.ceil(min_ready_pos / stride) * stride)
+    if first_emit_pos >= n_snapshots:
+        planned = 0
+    else:
+        planned = int(((n_snapshots - 1 - first_emit_pos) // stride) + 1)
+
+    return {
+        'stride': stride,
+        'first_emit_pos': first_emit_pos,
+        'planned_tensors': planned,
+    }
 
 
 def _zscore_normalize(arr: np.ndarray, history: deque) -> np.ndarray:
@@ -421,57 +485,128 @@ class DeepLOBCNN:
 def build_lob_tensor_dataset(
         df_mbo:    'pd.DataFrame',
         df_mbp:    'pd.DataFrame',
-        time_steps: int = N_TIME_STEPS) -> 'np.ndarray':
+        time_steps: int = N_TIME_STEPS,
+        output_path: str | None = None,
+        timestamps_path: str | None = None,
+        snapshot_stride: int | None = None,
+        max_tensors: int | None = None) -> dict:
     """
-    يبني مصفوفة من الـ 3D Tensors لكامل الـ dataset.
+    يبني مصفوفة من الـ 3D Tensors بشكل streaming وآمن للذاكرة.
 
     Returns:
-        X_lob: (N, T, P, C) — N = عدد الـ snapshots الكاملة
-        ts_idx: list of timestamps لكل tensor (للـ alignment مع الـ labels)
+        dict يحتوي metadata عن الملفات الناتجة والتخطيط المستخدم.
     """
     import pandas as pd
-
-    builder = LOBTensorBuilder(time_steps=time_steps)
-    tensors = []
-    ts_list = []
-
-    # دمج MBO trades مع MBP snapshots بترتيب زمني
-    df_mbo = df_mbo.copy()
-    df_mbp = df_mbp.copy()
-
-    df_mbo['_src'] = 'mbo'
-    df_mbp['_src'] = 'mbp'
-
-    # خلط بترتيب زمني
-    ts_col = 'ts_event'
-    df_combined = pd.concat([df_mbo, df_mbp], ignore_index=True, sort=False)
-    df_combined = df_combined.sort_values(ts_col).reset_index(drop=True)
-
+    from numpy.lib.format import open_memmap
     from modules.microstructure import TRADE_ACTIONS
 
-    for row in df_combined.itertuples(index=False):
-        src    = getattr(row, '_src', 'mbp')
-        action = str(getattr(row, 'action', '')).upper()
-        price  = float(getattr(row, 'price', 0) or 0)
-        size   = int(getattr(row, 'size', 0) or 0)
-        side   = str(getattr(row, 'side', '')).upper()
-        ts     = getattr(row, ts_col, None)
+    ts_col = 'ts_event'
+    df_mbo = _prepare_sorted_frame(df_mbo, ts_col=ts_col)
+    df_mbp = _prepare_sorted_frame(df_mbp, ts_col=ts_col)
 
-        if src == 'mbp':
-            row_d = {col: getattr(row, col, 0) for col in df_mbp.columns
-                     if col not in ('_src',)}
-            builder.update_mbp(row_d)
+    plan = _build_snapshot_sampling_plan(
+        len(df_mbp),
+        time_steps=time_steps,
+        snapshot_stride=snapshot_stride,
+        max_tensors=max_tensors,
+    )
+    planned_tensors = int(plan['planned_tensors'])
 
+    metadata = {
+        'n_mbo_rows': int(len(df_mbo)),
+        'n_mbp_rows': int(len(df_mbp)),
+        'time_steps': int(time_steps),
+        'snapshot_stride': int(plan['stride']),
+        'planned_tensors': planned_tensors,
+        'estimated_tensor_bytes': estimate_lob_tensor_bytes(planned_tensors, time_steps=time_steps),
+        'output_path': output_path,
+        'timestamps_path': timestamps_path,
+    }
+
+    empty_tensors = np.zeros((0, time_steps, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32)
+    empty_ts = np.array([], dtype=np.int64)
+    if len(df_mbp) == 0 or planned_tensors <= 0:
+        if output_path:
+            np.save(output_path, empty_tensors)
+        if timestamps_path:
+            np.save(timestamps_path, empty_ts)
+        metadata['built_tensors'] = 0
+        return metadata
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        tensor_store = open_memmap(
+            output_path,
+            mode='w+',
+            dtype=np.float32,
+            shape=(planned_tensors, time_steps, N_PRICE_LEVELS, N_CHANNELS),
+        )
+    else:
+        tensor_store = np.empty((planned_tensors, time_steps, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32)
+    ts_store = np.empty(planned_tensors, dtype=np.int64)
+
+    builder = LOBTensorBuilder(time_steps=time_steps)
+
+    mbo_ts = df_mbo[ts_col].to_numpy(dtype='datetime64[ns]', copy=False) if len(df_mbo) else np.empty(0, dtype='datetime64[ns]')
+    mbo_action = df_mbo.get('action', pd.Series('', index=df_mbo.index)).astype(str).str.upper().to_numpy(copy=False) if len(df_mbo) else np.array([], dtype=object)
+    mbo_price = pd.to_numeric(df_mbo.get('price', pd.Series(0, index=df_mbo.index)), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32, copy=False) if len(df_mbo) else np.empty(0, dtype=np.float32)
+    mbo_size = pd.to_numeric(df_mbo.get('size', pd.Series(0, index=df_mbo.index)), errors='coerce').fillna(0).to_numpy(dtype=np.int32, copy=False) if len(df_mbo) else np.empty(0, dtype=np.int32)
+    mbo_side = df_mbo.get('side', pd.Series('', index=df_mbo.index)).astype(str).str.upper().to_numpy(copy=False) if len(df_mbo) else np.array([], dtype=object)
+
+    mbp_ts = df_mbp[ts_col].to_numpy(dtype='datetime64[ns]', copy=False)
+    bid_px = [pd.to_numeric(df_mbp.get(f'bid_px_{i:02d}', pd.Series(0, index=df_mbp.index)), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32, copy=False) for i in range(N_PRICE_LEVELS // 2)]
+    ask_px = [pd.to_numeric(df_mbp.get(f'ask_px_{i:02d}', pd.Series(0, index=df_mbp.index)), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32, copy=False) for i in range(N_PRICE_LEVELS // 2)]
+    bid_sz = [pd.to_numeric(df_mbp.get(f'bid_sz_{i:02d}', pd.Series(0, index=df_mbp.index)), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32, copy=False) for i in range(N_PRICE_LEVELS // 2)]
+    ask_sz = [pd.to_numeric(df_mbp.get(f'ask_sz_{i:02d}', pd.Series(0, index=df_mbp.index)), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32, copy=False) for i in range(N_PRICE_LEVELS // 2)]
+
+    i_mbo = 0
+    i_mbp = 0
+    mbp_pos = -1
+    next_emit_pos = int(plan['first_emit_pos'])
+    write_pos = 0
+
+    while i_mbo < len(df_mbo) or i_mbp < len(df_mbp):
+        use_mbo = (
+            i_mbo < len(df_mbo) and (
+                i_mbp >= len(df_mbp) or mbo_ts[i_mbo] <= mbp_ts[i_mbp]
+            )
+        )
+
+        if use_mbo:
+            action = mbo_action[i_mbo]
+            price = float(mbo_price[i_mbo])
+            if action in TRADE_ACTIONS and price > 0:
+                builder.update_trade(
+                    price,
+                    int(mbo_size[i_mbo]),
+                    mbo_side[i_mbo] in ('B', 'BID'),
+                )
+            i_mbo += 1
+            continue
+
+        bid0 = float(bid_px[0][i_mbp]) if bid_px else 0.0
+        ask0 = float(ask_px[0][i_mbp]) if ask_px else 0.0
+        bid_sizes = [arr[i_mbp] for arr in bid_sz]
+        ask_sizes = [arr[i_mbp] for arr in ask_sz]
+        builder.update_mbp_levels(bid0, ask0, bid_sizes, ask_sizes)
+
+        mbp_pos += 1
+        if mbp_pos == next_emit_pos:
             tensor = builder.get_tensor()
-            if tensor is not None:
-                tensors.append(tensor)
-                ts_list.append(ts)
+            if tensor is not None and write_pos < planned_tensors:
+                tensor_store[write_pos] = tensor
+                ts_store[write_pos] = mbp_ts[i_mbp].astype('datetime64[ns]').astype(np.int64)
+                write_pos += 1
+            next_emit_pos += int(plan['stride'])
 
-        elif src == 'mbo' and action in TRADE_ACTIONS and price > 0:
-            is_buy = side in ('B', 'BID')
-            builder.update_trade(price, size, is_buy)
+        i_mbp += 1
 
-    if not tensors:
-        return np.zeros((0, time_steps, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32), []
+    if output_path and hasattr(tensor_store, 'flush'):
+        tensor_store.flush()
+    if timestamps_path:
+        np.save(timestamps_path, ts_store[:write_pos])
 
-    return np.array(tensors, dtype=np.float32), ts_list
+    metadata['built_tensors'] = int(write_pos)
+    metadata['tensor_timestamps_saved'] = int(write_pos)
+    metadata['estimated_tensor_bytes'] = estimate_lob_tensor_bytes(write_pos, time_steps=time_steps)
+    return metadata
