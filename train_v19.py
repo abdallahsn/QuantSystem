@@ -32,12 +32,7 @@ from prepare_training_data import (
     RAW_STAT_PREFIX,
     TEMPORAL_DROP_COLS,
 )
-try:
-    from modules.deeplob_cnn import DeepLOBCNN, VISUAL_EMB_DIM
-    DEEPLOB_IMPORT_OK = True
-except ImportError:
-    DEEPLOB_IMPORT_OK = False
-    VISUAL_EMB_DIM = 8
+VISUAL_EMB_DIM = 8
 from modules.config_v19 import load_v19_config
 from modules.feature_factory_v19 import (
     DEFAULT_PASSTHROUGH_COLS,
@@ -46,7 +41,6 @@ from modules.feature_factory_v19 import (
 )
 from modules.gpu_config import detect_gpu
 from modules.manifest_v19 import write_manifest
-from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import (
     align_probability_columns,
     fill_uncovered_one_hot,
@@ -125,6 +119,36 @@ def _phase_banner(phase: str) -> str:
         PHASE_VISUAL: 'visual-only',
         PHASE_TRAIN: 'train-only',
     }.get(phase, phase)
+
+
+def _load_meta_learner_class():
+    from modules.meta_learner import MetaLearnerLSTM
+
+    return MetaLearnerLSTM
+
+
+def _load_deeplob_runtime():
+    try:
+        from modules.deeplob_cnn import DeepLOBCNN
+
+        return DeepLOBCNN, True
+    except ImportError:
+        return None, False
+
+
+def _resolve_catboost_device(catboost_device: str = 'auto') -> tuple[str, str | None]:
+    mode = str(catboost_device or 'auto').strip().lower()
+    env_mode = os.environ.get('QUANTSYSTEM_CATBOOST_DEVICE', '').strip().lower()
+    if mode == 'auto' and env_mode in {'cpu', 'gpu'}:
+        mode = env_mode
+
+    if mode == 'gpu':
+        return 'GPU', '0'
+    if mode == 'cpu':
+        return 'CPU', None
+
+    gpu_info = detect_gpu()
+    return ('GPU', '0') if gpu_info.get('available') else ('CPU', None)
 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -408,6 +432,7 @@ def stage1_oof_meta(
     t0: pd.Series | None = None,
     t1: pd.Series | None = None,
     inference_scaler_params: dict | None = None,
+    catboost_device: str = 'auto',
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + Regime Meta-Features")
@@ -432,139 +457,133 @@ def stage1_oof_meta(
         )
 
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
-    gpu_info = detect_gpu()
-    cb_task_type = 'GPU' if gpu_info.get('available') else 'CPU'
-    cb_devices = '0' if gpu_info.get('available') else None
+    cb_task_type, cb_devices = _resolve_catboost_device(catboost_device)
     print(f"  CatBoost device: {cb_task_type}")
 
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
 
     if not CB_AVAILABLE:
-        print("  ⚠️ CatBoost غير متاح — سيتم استخدام priors فقط")
-        oof_probs = np.repeat(priors.reshape(1, -1), n, axis=0)
-        regime_oh = np.zeros((n, N_CLUSTERS), dtype=np.float32)
-        regime_oh[:, 0] = 1.0
-        coverage = np.zeros(n, dtype=bool)
-        np.save(
-            os.path.join(output_dir, 'meta_features_live_v19.npy'),
-            np.concatenate([oof_probs, regime_oh], axis=1).astype(np.float32),
+        raise RuntimeError(
+            "❌ CatBoost غير مثبّت. هذه المرحلة لم تتدرب فعليًا.\n"
+            "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
+            "pip install catboost"
         )
-    else:
-        regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
-        os.makedirs(regime_tmp_dir, exist_ok=True)
 
-        def _cb_predict(train_idx, test_idx, fold_no):
-            inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
-            fit_idx = inner_train if inner_train is not None else train_idx
-            fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
-            X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
-            X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
+    regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
+    os.makedirs(regime_tmp_dir, exist_ok=True)
 
-            cw = _class_weights(y[fit_idx])
-            sw = np.array([cw[label] for label in y[fit_idx]], dtype=np.float32)
-            model = CatBoostClassifier(
-                iterations=400,
-                depth=6,
-                learning_rate=0.05,
-                l2_leaf_reg=3.0,
-                loss_function='MultiClass',
-                eval_metric='Accuracy',
-                early_stopping_rounds=50 if inner_val is not None else None,
-                use_best_model=inner_val is not None,
-                verbose=0,
-                random_seed=42 + fold_no,
-                task_type=cb_task_type,
-                devices=cb_devices,
-            )
-            tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
-            eval_set = None
-            if inner_val is not None:
-                X_val = _apply_scaler_to_stat_frame(raw_stat.iloc[inner_val], fold_scaler).values.astype(np.float32)
-                eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
-            model.fit(tr_pool, eval_set=eval_set, plot=False)
-            present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
-            preds = align_probability_columns(
-                model.predict_proba(X_test),
-                N_CB_PROBS,
-                classes=present_classes,
-            )
-            acc = float(np.mean(np.argmax(preds, axis=1) == y[test_idx]))
-            return preds, {'accuracy': acc}
+    def _cb_predict(train_idx, test_idx, fold_no):
+        inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
+        fit_idx = inner_train if inner_train is not None else train_idx
+        fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
+        X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
 
-        oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
-            n, N_CB_PROBS, splits, _cb_predict
-        )
-        oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
-
-        def _regime_predict(train_idx, test_idx, fold_no):
-            clf = RegimeClassifier(n_regimes=N_CLUSTERS)
-            clf.fit(df.iloc[train_idx].copy(), output_dir=regime_tmp_dir)
-            labels = clf.predict(df.iloc[test_idx].copy())
-            out = np.zeros((len(test_idx), N_CLUSTERS), dtype=np.float32)
-            for i, label in enumerate(labels):
-                if 0 <= int(label) < N_CLUSTERS:
-                    out[i, int(label)] = 1.0
-                else:
-                    out[i, 0] = 1.0
-            return out, {'cluster_counts': np.bincount(labels.astype(np.int32), minlength=N_CLUSTERS).tolist()}
-
-        regime_raw, regime_covered, regime_reports = run_sequential_oof(
-            n, N_CLUSTERS, splits, _regime_predict
-        )
-        regime_oh = fill_uncovered_one_hot(regime_raw, regime_covered, default_class=0)
-        coverage = prob_covered & regime_covered
-
-        fold_metrics = {
-            'catboost_folds': prob_reports,
-            'regime_folds': regime_reports,
-            'coverage_ratio': float(coverage.mean()),
-        }
-        with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
-            json.dump(fold_metrics, f, indent=2)
-
-        final_scaler = inference_scaler_params or _fit_scaler_params_from_frame(raw_stat)
-        X_final = _apply_scaler_to_stat_frame(raw_stat, final_scaler).values.astype(np.float32)
-        final_cw = _class_weights(y)
-        final_sw = np.array([final_cw[label] for label in y], dtype=np.float32)
-        final_model = CatBoostClassifier(
-            iterations=500,
+        cw = _class_weights(y[fit_idx])
+        sw = np.array([cw[label] for label in y[fit_idx]], dtype=np.float32)
+        model = CatBoostClassifier(
+            iterations=400,
             depth=6,
             learning_rate=0.05,
             l2_leaf_reg=3.0,
             loss_function='MultiClass',
             eval_metric='Accuracy',
-            early_stopping_rounds=50,
-            use_best_model=False,
-            verbose=50,
-            random_seed=42,
+            early_stopping_rounds=50 if inner_val is not None else None,
+            use_best_model=inner_val is not None,
+            verbose=0,
+            random_seed=42 + fold_no,
             task_type=cb_task_type,
             devices=cb_devices,
         )
-        final_model.fit(Pool(X_final, y, weight=final_sw, feature_names=CATBOOST_ADVISOR_FEATURES), plot=False)
-        final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
-        final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y)), dtype=np.int32).tolist()
-        with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
-            json.dump({'classes': final_cb_classes}, f, indent=2)
-
-        final_regime = RegimeClassifier(n_regimes=N_CLUSTERS)
-        final_regime.fit(df.copy(), output_dir=output_dir)
-        live_probs = align_probability_columns(
-            final_model.predict_proba(X_final),
+        tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+        eval_set = None
+        if inner_val is not None:
+            X_val = _apply_scaler_to_stat_frame(raw_stat.iloc[inner_val], fold_scaler).values.astype(np.float32)
+            eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
+        model.fit(tr_pool, eval_set=eval_set, plot=False)
+        present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
+        preds = align_probability_columns(
+            model.predict_proba(X_test),
             N_CB_PROBS,
-            classes=final_cb_classes,
+            classes=present_classes,
         )
-        live_regime_labels = final_regime.predict(df.copy())
-        live_regime_oh = np.zeros((n, N_CLUSTERS), dtype=np.float32)
-        for i, label in enumerate(live_regime_labels):
+        acc = float(np.mean(np.argmax(preds, axis=1) == y[test_idx]))
+        return preds, {'accuracy': acc}
+
+    oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
+        n, N_CB_PROBS, splits, _cb_predict
+    )
+    oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
+
+    def _regime_predict(train_idx, test_idx, fold_no):
+        clf = RegimeClassifier(n_regimes=N_CLUSTERS)
+        clf.fit(df.iloc[train_idx].copy(), output_dir=regime_tmp_dir)
+        labels = clf.predict(df.iloc[test_idx].copy())
+        out = np.zeros((len(test_idx), N_CLUSTERS), dtype=np.float32)
+        for i, label in enumerate(labels):
             if 0 <= int(label) < N_CLUSTERS:
-                live_regime_oh[i, int(label)] = 1.0
+                out[i, int(label)] = 1.0
             else:
-                live_regime_oh[i, 0] = 1.0
-        np.save(
-            os.path.join(output_dir, 'meta_features_live_v19.npy'),
-            np.concatenate([live_probs, live_regime_oh], axis=1).astype(np.float32),
-        )
+                out[i, 0] = 1.0
+        return out, {'cluster_counts': np.bincount(labels.astype(np.int32), minlength=N_CLUSTERS).tolist()}
+
+    regime_raw, regime_covered, regime_reports = run_sequential_oof(
+        n, N_CLUSTERS, splits, _regime_predict
+    )
+    regime_oh = fill_uncovered_one_hot(regime_raw, regime_covered, default_class=0)
+    coverage = prob_covered & regime_covered
+
+    fold_metrics = {
+        'catboost_folds': prob_reports,
+        'regime_folds': regime_reports,
+        'coverage_ratio': float(coverage.mean()),
+    }
+    with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
+        json.dump(fold_metrics, f, indent=2)
+
+    final_scaler = inference_scaler_params or _fit_scaler_params_from_frame(raw_stat)
+    X_final = _apply_scaler_to_stat_frame(raw_stat, final_scaler).values.astype(np.float32)
+    final_cw = _class_weights(y)
+    final_sw = np.array([final_cw[label] for label in y], dtype=np.float32)
+    final_model = CatBoostClassifier(
+        iterations=500,
+        depth=6,
+        learning_rate=0.05,
+        l2_leaf_reg=3.0,
+        loss_function='MultiClass',
+        eval_metric='Accuracy',
+        early_stopping_rounds=50,
+        use_best_model=False,
+        verbose=50,
+        random_seed=42,
+        task_type=cb_task_type,
+        devices=cb_devices,
+    )
+    final_model.fit(Pool(X_final, y, weight=final_sw, feature_names=CATBOOST_ADVISOR_FEATURES), plot=False)
+    final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
+    final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y)), dtype=np.int32).tolist()
+    with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
+        json.dump({'classes': final_cb_classes}, f, indent=2)
+
+    final_regime = RegimeClassifier(n_regimes=N_CLUSTERS)
+    final_regime.fit(df.copy(), output_dir=output_dir)
+    live_probs = align_probability_columns(
+        final_model.predict_proba(X_final),
+        N_CB_PROBS,
+        classes=final_cb_classes,
+    )
+    live_regime_labels = final_regime.predict(df.copy())
+    live_regime_oh = np.zeros((n, N_CLUSTERS), dtype=np.float32)
+    for i, label in enumerate(live_regime_labels):
+        if 0 <= int(label) < N_CLUSTERS:
+            live_regime_oh[i, int(label)] = 1.0
+        else:
+            live_regime_oh[i, 0] = 1.0
+    np.save(
+        os.path.join(output_dir, 'meta_features_live_v19.npy'),
+        np.concatenate([live_probs, live_regime_oh], axis=1).astype(np.float32),
+    )
 
     meta = np.concatenate([oof_probs, regime_oh], axis=1).astype(np.float32)
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
@@ -652,6 +671,7 @@ def stage2_oof_visual_embeddings(
         np.save(os.path.join(output_dir, 'visual_coverage_v19.npy'), zero_cov.astype(np.uint8))
         return zero_emb, zero_cov
 
+    DeepLOBCNN, DEEPLOB_IMPORT_OK = _load_deeplob_runtime()
     if not DEEPLOB_IMPORT_OK:
         print("  ⚠️ DeepLOB import غير متاح — visual embeddings = 0")
         np.save(os.path.join(output_dir, 'visual_embeddings_v19.npy'), zero_emb)
@@ -835,6 +855,7 @@ def stage3_meta_learner_v19(
     print("\n" + "═" * 65)
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
+    MetaLearnerLSTM = _load_meta_learner_class()
 
     X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
@@ -960,6 +981,7 @@ def run_training_pipeline(
     train_frac: float = 0.80,
     stage: int = 0,
     phase: str | None = None,
+    catboost_device: str = 'auto',
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
@@ -1022,6 +1044,7 @@ def run_training_pipeline(
             t0=split_t0,
             t1=split_t1,
             inference_scaler_params=inference_scaler_params,
+            catboost_device=catboost_device,
         )
     else:
         meta_features, coverage = _load_required_stage1_artifacts(output_dir)
@@ -1052,6 +1075,7 @@ def run_training_pipeline(
                 'train_frac': train_frac,
                 'stage': stage,
                 'phase': resolved_phase,
+                'catboost_device': catboost_device,
             },
             inputs={
                 'csv': csv_path,
@@ -1109,6 +1133,7 @@ def run_training_pipeline(
                 'train_frac': train_frac,
                 'stage': stage,
                 'phase': resolved_phase,
+                'catboost_device': catboost_device,
             },
             inputs={
                 'csv': csv_path,
@@ -1129,6 +1154,13 @@ def run_training_pipeline(
         }
 
     if resolved_phase in (PHASE_FULL, PHASE_TRAIN):
+        try:
+            _load_meta_learner_class()
+        except Exception as e:
+            raise RuntimeError(
+                "❌ TensorFlow/MetaLearner غير متاح. المرحلة الثالثة لا يمكن تشغيلها الآن.\n"
+                "ثبّت TensorFlow أولًا أو شغّل المرحلة الثالثة على Linux/WSL2."
+            ) from e
         stage3_meta_learner_v19(
             df,
             meta_features,
@@ -1165,6 +1197,7 @@ def run_training_pipeline(
             'train_frac': train_frac,
             'stage': stage,
             'phase': resolved_phase,
+            'catboost_device': catboost_device,
         },
         inputs={
             'csv': csv_path,
@@ -1202,6 +1235,7 @@ def main():
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
+    p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -1219,6 +1253,7 @@ def main():
         train_frac=args.train_frac,
         stage=args.stage,
         phase=args.phase,
+        catboost_device=args.catboost_device,
         config_snapshot=cfg,
     )
 

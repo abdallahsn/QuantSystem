@@ -6,6 +6,15 @@ from __future__ import annotations
 
 import argparse
 
+try:
+    import tensorflow  # noqa: F401
+except ImportError as e:
+    raise SystemExit(
+        "❌ TensorFlow غير مثبّت في هذه البيئة.\n"
+        "نفّذ أولًا:\n"
+        "pip install tensorflow"
+    ) from e
+
 from modules.config_v19 import load_v19_config
 from train_v19 import run_training_pipeline
 

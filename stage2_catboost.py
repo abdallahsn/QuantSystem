@@ -6,6 +6,15 @@ from __future__ import annotations
 
 import argparse
 
+try:
+    import catboost  # noqa: F401
+except ImportError as e:
+    raise SystemExit(
+        "❌ CatBoost غير مثبّت في هذه البيئة.\n"
+        "نفّذ أولًا:\n"
+        "pip install catboost"
+    ) from e
+
 from modules.config_v19 import load_v19_config
 from train_v19 import run_training_pipeline
 
@@ -21,6 +30,7 @@ def main():
     p.add_argument('--test_size', type=float, default=float(defaults.get('test_size', 0.10)))
     p.add_argument('--embargo_pct', type=float, default=float(defaults.get('embargo_pct', 0.02)))
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
+    p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'])
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
 
@@ -34,6 +44,7 @@ def main():
         test_size=args.test_size,
         embargo_pct=args.embargo_pct,
         train_frac=args.train_frac,
+        catboost_device=args.catboost_device,
         phase='catboost',
         config_snapshot=cfg,
     )
