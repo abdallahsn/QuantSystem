@@ -83,7 +83,10 @@ TRAINING_PASSTHROUGH_COLS = [
         'price',
         'bias_label',
         'conf_label',
+        'signal_quality',
         'regime_label',
+        'regime_cluster',
+        'event_flag',
         'is_expansion',
         'liq_score',
         'forward_return',
@@ -153,7 +156,8 @@ def _resolve_catboost_device(catboost_device: str = 'auto') -> tuple[str, str | 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     protected = {
-        'bias_label', 'setup_label', 'conf_label', 'regime_label', 'is_expansion',
+        'bias_label', 'setup_label', 'conf_label', 'signal_quality',
+        'regime_label', 'regime_cluster', 'event_flag', 'is_expansion',
         'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps', 'liq_score',
     }
     dropped = [c for c in TEMPORAL_DROP_COLS if c in df.columns and c not in protected]

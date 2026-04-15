@@ -21,7 +21,10 @@ DEFAULT_PASSTHROUGH_COLS = [
     'bias_label',
     'setup_label',
     'conf_label',
+    'signal_quality',
     'regime_label',
+    'regime_cluster',
+    'event_flag',
     'is_expansion',
     'liq_score',
     'forward_return',
@@ -30,7 +33,10 @@ DEFAULT_PASSTHROUGH_COLS = [
 DEFAULT_INT_COLS = {
     'bias_label',
     'setup_label',
+    'signal_quality',
     'regime_label',
+    'regime_cluster',
+    'event_flag',
     'is_expansion',
 }
 

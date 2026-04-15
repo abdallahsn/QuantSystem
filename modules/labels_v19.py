@@ -1,16 +1,13 @@
 """
-labels_v19.py - Causal event labels for QuantSystem V19
-=======================================================
-V19 stops using session-level labels that depend on the future path of an
-entire day/session. Instead, each row receives an event-time label defined by:
+labels_v19.py - Unified causal labels for QuantSystem
+=====================================================
+Compatibility wrapper around the dynamic order-book labeling pipeline.
 
-  1. Current price at time t
-  2. Current volatility proxy (micro_atr fallback to local price noise)
-  3. Fixed forward horizon in ticks/events
-  4. Upper/lower barriers derived from the current volatility only
+External callers still use `build_causal_event_labels(...)`, but internally the
+labels now come from:
 
-This keeps the labeling problem causal from the perspective of feature
-construction while still allowing supervised learning against future outcomes.
+  order book scan -> dynamic levels -> feature engineering -> event filter
+  -> forward scan -> direction/quality/regime labels
 """
 
 from __future__ import annotations
@@ -18,9 +15,25 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-BIAS_LONG = 0
-BIAS_SHORT = 1
-BIAS_NEUTRAL = 2
+from modules.dynamic_labels import (
+    DIR_LONG,
+    DIR_NEUTRAL,
+    DIR_SHORT,
+    LABEL_CANCEL,
+    QUALITY_NONE,
+    QUALITY_STRONG,
+    QUALITY_WEAK,
+    REGIME_RANGING,
+    append_dynamic_orderbook_features,
+    build_event_filter,
+    engineer_features,
+    label_with_forward_scan,
+)
+
+
+BIAS_LONG = DIR_LONG
+BIAS_SHORT = DIR_SHORT
+BIAS_NEUTRAL = DIR_NEUTRAL
 
 SETUP_ABSORPTION = 0
 SETUP_SPOOFING = 1
@@ -28,18 +41,10 @@ SETUP_OBI = 2
 SETUP_MIXED = 3
 
 
-def _directional_efficiency(prices: np.ndarray, window: int = 12) -> np.ndarray:
-    s = pd.Series(prices)
-    gross = s.diff().abs().rolling(window, min_periods=2).sum()
-    net = s.diff(window).abs()
-    eff = (net / gross.clip(lower=1e-8)).fillna(0.0).clip(0.0, 1.0)
-    return eff.values.astype(np.float32)
-
-
 def _infer_setup_labels(df: pd.DataFrame) -> np.ndarray:
-    absorb = df.get('absorption_intensity', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
-    spoof = df.get('spoofing_ratio', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
-    obi = df.get('obi', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
+    absorb = pd.to_numeric(df.get("absorption_intensity", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).abs().values
+    spoof = pd.to_numeric(df.get("spoofing_ratio", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).abs().values
+    obi = pd.to_numeric(df.get("obi", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).abs().values
 
     absorb_sig = absorb > 0.30
     spoof_sig = spoof > 0.20
@@ -54,12 +59,41 @@ def _infer_setup_labels(df: pd.DataFrame) -> np.ndarray:
 
 
 def _liquidity_score(df: pd.DataFrame) -> np.ndarray:
-    volume_burst = df.get('volume_burst', pd.Series(np.zeros(len(df)))).fillna(0).clip(lower=0).values
-    absorption = df.get('absorption_intensity', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
-    obi = df.get('obi', pd.Series(np.zeros(len(df)))).fillna(0).abs().values
+    volume = pd.to_numeric(df.get("volume", df.get("size", pd.Series(np.zeros(len(df))))), errors="coerce").fillna(0.0).clip(lower=0.0).values
+    depth = pd.to_numeric(df.get("liquidity_density", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).clip(lower=0.0).values
+    gap = pd.to_numeric(df.get("gap_size", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).clip(lower=0.0).values
+    wall_bid = pd.to_numeric(df.get("bid_wall_strength", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).clip(lower=0.0).values
+    wall_ask = pd.to_numeric(df.get("ask_wall_strength", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).clip(lower=0.0).values
+    obi = pd.to_numeric(df.get("obi", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0).abs().values
 
-    score = np.log1p(volume_burst) * (1.0 + absorption) * (1.0 + obi)
-    return np.clip(score, 0.0, 100.0).astype(np.float32)
+    wall = np.maximum(wall_bid, wall_ask)
+    raw = np.log1p(volume) * (1.0 + obi) * (1.0 + wall) + 0.25 * depth + 0.10 * gap
+    return np.clip(raw, 0.0, 100.0).astype(np.float32)
+
+
+def _quality_to_conf(signal_quality: pd.Series | np.ndarray) -> np.ndarray:
+    q = pd.Series(signal_quality).fillna(QUALITY_NONE).astype(np.int8)
+    out = np.zeros(len(q), dtype=np.float32)
+    out[q.values == QUALITY_WEAK] = 0.5
+    out[q.values == QUALITY_STRONG] = 1.0
+    return out
+
+
+def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
+    out["bias_label"] = np.array([], dtype=np.int8)
+    out["setup_label"] = np.array([], dtype=np.int8)
+    out["conf_label"] = np.array([], dtype=np.float32)
+    out["signal_quality"] = np.array([], dtype=np.int8)
+    out["is_expansion"] = np.array([], dtype=np.int8)
+    out["liq_score"] = np.array([], dtype=np.float32)
+    out["regime_label"] = np.array([], dtype=np.int8)
+    out["label_end_ts"] = pd.to_datetime([])
+    out["forward_return"] = np.array([], dtype=np.float32)
+    out["label_horizon_steps"] = np.array([], dtype=np.int32)
+    out["long_label"] = np.array([], dtype=np.int8)
+    out["short_label"] = np.array([], dtype=np.int8)
+    out["event_flag"] = np.array([], dtype=np.int8)
+    return out
 
 
 def build_causal_event_labels(
@@ -71,143 +105,104 @@ def build_causal_event_labels(
     tick_size: float = 1e-4,
 ) -> pd.DataFrame:
     """
-    Build causal event labels with forward barriers over a fixed event horizon.
+    Build causal labels using unified order-book features and dynamic barriers.
 
-    The label for row i uses only the row-i state to set barriers, then inspects
-    the future path over `horizon` events to determine which barrier hits first.
+    Signature kept for backwards compatibility with the current refinery.
     """
+
     out = df.copy()
     n = len(out)
-
     if n == 0:
-        out['bias_label'] = np.array([], dtype=np.int8)
-        out['setup_label'] = np.array([], dtype=np.int8)
-        out['conf_label'] = np.array([], dtype=np.float32)
-        out['is_expansion'] = np.array([], dtype=np.int8)
-        out['liq_score'] = np.array([], dtype=np.float32)
-        out['label_end_ts'] = pd.to_datetime([])
-        out['forward_return'] = np.array([], dtype=np.float32)
-        out['label_horizon_steps'] = np.array([], dtype=np.int32)
-        return out
+        return _empty_output(out)
+
+    price_col = "price" if "price" in out.columns else ("close" if "close" in out.columns else "micro_price")
+    out[price_col] = pd.to_numeric(out.get(price_col, pd.Series(np.zeros(n))), errors="coerce").ffill().fillna(0.0).astype(np.float32)
+    out["close"] = out[price_col].astype(np.float32)
+    out["volume"] = pd.to_numeric(out.get("size", out.get("volume", pd.Series(np.zeros(n)))), errors="coerce").fillna(0.0).astype(np.float32)
+    out["cvd"] = pd.to_numeric(out.get("cvd", pd.Series(np.zeros(n))), errors="coerce").fillna(0.0).astype(np.float32)
+
+    min_tp_pips = max(6.0, 10.0 * float(tp_mult))
+    max_sl_pips = max(8.0, 10.0 * float(max(sl_mult, 0.8)))
+    dynamic_cols = [
+        "micro_price", "bid_wall_strength", "ask_wall_strength",
+        "distance_to_wall", "gap_size", "liquidity_density",
+        "long_tp", "long_sl", "short_tp", "short_sl", "long_rr", "short_rr",
+    ]
+    has_dynamic_context = all(col in out.columns for col in dynamic_cols)
+    has_depth = any(col.startswith("bid_px_") for col in out.columns) and any(col.startswith("ask_px_") for col in out.columns)
+
+    if (not has_dynamic_context) and has_depth:
+        out = append_dynamic_orderbook_features(
+            out,
+            tick_size=tick_size,
+            price_col=price_col,
+            cvd_col="cvd",
+            volume_col="volume",
+            min_tp_pips=min_tp_pips,
+            max_sl_pips=max_sl_pips,
+        )
+    else:
+        for col in dynamic_cols:
+            if col not in out.columns:
+                out[col] = 0.0
+        if "micro_price" in out.columns:
+            out["micro_price"] = pd.to_numeric(out["micro_price"], errors="coerce").fillna(out["close"]).astype(np.float32)
+
+    roll_window = max(12, min(64, max(6, int(horizon // 2) if horizon > 0 else 20)))
+    out = engineer_features(out, roll_window=roll_window)
+
+    vol_mult = float(np.clip(1.0 + neutral_mult, 1.15, 1.80))
+    obi_thr = float(np.clip(neutral_mult, 0.15, 0.40))
+    wall_thr = float(np.clip(0.80 + neutral_mult * 0.5, 0.90, 1.20))
+    event_mask = build_event_filter(out, vol_mult=vol_mult, obi_thr=obi_thr, wall_str_thr=wall_thr)
+    labeled = label_with_forward_scan(out, out, max_bars_forward=horizon, tick_size=tick_size)
+
+    quiet_rows = ~event_mask.fillna(False)
+    if quiet_rows.any():
+        labeled.loc[quiet_rows, "bias_label"] = BIAS_NEUTRAL
+        labeled.loc[quiet_rows, "signal_quality"] = QUALITY_NONE
+        labeled.loc[quiet_rows, "long_label"] = LABEL_CANCEL
+        labeled.loc[quiet_rows, "short_label"] = LABEL_CANCEL
 
     ts = pd.to_datetime(
-        out.get('ts_event', pd.Series(pd.RangeIndex(n))),
+        labeled.get("ts_event", pd.Series(pd.RangeIndex(n))),
         utc=True,
-        errors='coerce',
+        errors="coerce",
     ).dt.tz_localize(None)
+    if ts.isna().all():
+        ts = pd.Series(pd.date_range("2026-01-01", periods=n, freq="s"))
+    else:
+        ts = ts.ffill().bfill()
 
-    prices = pd.to_numeric(out.get('price', pd.Series(np.zeros(n))), errors='coerce').ffill().fillna(0).values.astype(np.float64)
-    vol_raw = pd.to_numeric(out.get('micro_atr', pd.Series(np.zeros(n))), errors='coerce').fillna(0).abs().values.astype(np.float64)
+    end_idx = np.minimum(np.arange(n) + max(int(horizon), 1), n - 1).astype(np.int32)
+    prices = labeled["close"].astype(np.float64).values
 
-    fallback_vol = float(np.nanmedian(vol_raw[vol_raw > 0])) if np.any(vol_raw > 0) else 0.0
-    if fallback_vol <= 0:
-        price_diff = np.abs(np.diff(prices))
-        fallback_vol = float(np.nanmedian(price_diff[price_diff > 0])) if np.any(price_diff > 0) else tick_size
-    fallback_vol = max(fallback_vol, tick_size)
-    vols = np.where(vol_raw > tick_size, vol_raw, fallback_vol)
-    liq_score = _liquidity_score(out).astype(np.float64)
-    efficiency = _directional_efficiency(
-        prices,
-        window=max(6, min(24, max(2, horizon // 2))),
+    labeled["setup_label"] = _infer_setup_labels(labeled)
+    labeled["conf_label"] = _quality_to_conf(labeled["signal_quality"])
+    labeled["is_expansion"] = (
+        (labeled["bias_label"].astype(np.int8) != BIAS_NEUTRAL)
+        & (labeled["signal_quality"].astype(np.int8) == QUALITY_STRONG)
+    ).astype(np.int8)
+    labeled["liq_score"] = _liquidity_score(labeled)
+    labeled["regime_label"] = pd.to_numeric(labeled.get("regime", REGIME_RANGING), errors="coerce").fillna(REGIME_RANGING).astype(np.int8)
+    labeled["label_end_ts"] = pd.to_datetime(ts.iloc[end_idx].to_numpy())
+    labeled["forward_return"] = (prices[end_idx] - prices).astype(np.float32)
+    labeled["label_horizon_steps"] = (end_idx - np.arange(n)).astype(np.int32)
+    labeled["event_flag"] = event_mask.fillna(False).astype(np.int8)
+
+    total = max(len(labeled), 1)
+    bias_counts = labeled["bias_label"].value_counts()
+    qual_counts = labeled["signal_quality"].value_counts()
+    print(
+        f"  Final Bias: LONG={bias_counts.get(BIAS_LONG, 0)}({bias_counts.get(BIAS_LONG, 0) / total:.0%}) "
+        f"SHORT={bias_counts.get(BIAS_SHORT, 0)}({bias_counts.get(BIAS_SHORT, 0) / total:.0%}) "
+        f"NEUTRAL={bias_counts.get(BIAS_NEUTRAL, 0)}({bias_counts.get(BIAS_NEUTRAL, 0) / total:.0%})"
     )
-    liq_positive = liq_score[liq_score > 0]
-    liq_anchor = float(np.nanmedian(liq_positive)) if liq_positive.size else 1.0
-    liq_low_cutoff = float(np.nanquantile(liq_positive, 0.30)) if liq_positive.size >= 5 else liq_anchor * 0.75
-    liq_low_cutoff = max(liq_low_cutoff, 1e-6)
+    print(
+        f"  Final Quality: STRONG={qual_counts.get(QUALITY_STRONG, 0)} "
+        f"WEAK={qual_counts.get(QUALITY_WEAK, 0)} "
+        f"NONE={qual_counts.get(QUALITY_NONE, 0)} "
+        f"| Events={int(labeled['event_flag'].sum())}/{total}"
+    )
 
-    bias = np.full(n, BIAS_NEUTRAL, dtype=np.int8)
-    conf = np.zeros(n, dtype=np.float32)
-    is_expansion = np.zeros(n, dtype=np.int8)
-    forward_return = np.zeros(n, dtype=np.float32)
-    horizon_steps = np.zeros(n, dtype=np.int32)
-    label_end_ts = np.empty(n, dtype='datetime64[ns]')
-
-    for i in range(n):
-        end_idx = min(n - 1, i + horizon)
-        label_end_ts[i] = np.datetime64(ts.iloc[end_idx], 'ns')
-        horizon_steps[i] = end_idx - i
-
-        if i >= n - 1 or end_idx <= i:
-            continue
-
-        p0 = prices[i]
-        vol = max(vols[i], tick_size)
-        upper = p0 + tp_mult * vol
-        lower = p0 - sl_mult * vol
-        future_path = prices[i + 1:end_idx + 1]
-        future_deltas = np.diff(np.concatenate([[p0], future_path]))
-        path_noise = float(np.abs(future_deltas).sum())
-        max_up = float(future_path.max() - p0)
-        max_down = float(p0 - future_path.min())
-        path_range = max_up + max_down
-
-        hit_up = np.where(future_path >= upper)[0]
-        hit_down = np.where(future_path <= lower)[0]
-
-        final_ret = future_path[-1] - p0
-        forward_return[i] = float(final_ret)
-        directionality = float(abs(final_ret) / max(path_noise, tick_size))
-        local_eff = float(efficiency[i])
-        local_liq = float(liq_score[i])
-        low_liq = local_liq <= liq_low_cutoff
-        range_like = (path_range < 1.75 * vol) or (max(local_eff, directionality) < 0.35)
-
-        neutral_band = neutral_mult * vol
-        if low_liq:
-            neutral_band = max(neutral_band, 0.60 * vol)
-        if range_like:
-            neutral_band = max(neutral_band, 0.75 * vol)
-
-        strict_terminal = low_liq or range_like
-        dir_gate = 0.50 if strict_terminal else 0.30
-        liq_ratio = min(local_liq / max(liq_anchor, 1e-6), 1.5)
-
-        def _confidence(move_strength: float, breakout: bool) -> float:
-            move_score = min(move_strength / max(vol, tick_size), 2.5) / 2.5
-            breakout_bonus = 0.15 if breakout else 0.0
-            raw = (
-                0.35 * move_score +
-                0.35 * max(local_eff, directionality) +
-                0.20 * min(liq_ratio, 1.0) +
-                breakout_bonus
-            )
-            return float(np.clip(raw, 0.0, 1.0))
-
-        if hit_up.size and (not hit_down.size or hit_up[0] <= hit_down[0]):
-            breakout_ret = float(future_path[hit_up[0]] - p0)
-            if strict_terminal and breakout_ret < 1.40 * vol and max(local_eff, directionality) < 0.55:
-                bias[i] = BIAS_NEUTRAL
-            else:
-                bias[i] = BIAS_LONG
-                conf[i] = _confidence(max(final_ret, breakout_ret), breakout=True)
-                is_expansion[i] = int((not low_liq) or breakout_ret >= 2.0 * vol)
-        elif hit_down.size:
-            breakout_ret = float(p0 - future_path[hit_down[0]])
-            if strict_terminal and breakout_ret < 1.40 * vol and max(local_eff, directionality) < 0.55:
-                bias[i] = BIAS_NEUTRAL
-            else:
-                bias[i] = BIAS_SHORT
-                conf[i] = _confidence(max(-final_ret, breakout_ret), breakout=True)
-                is_expansion[i] = int((not low_liq) or breakout_ret >= 2.0 * vol)
-        elif final_ret > neutral_band and max(local_eff, directionality) >= dir_gate:
-            bias[i] = BIAS_LONG
-            conf[i] = _confidence(abs(final_ret), breakout=False)
-            is_expansion[i] = int(abs(final_ret) >= max(vol, neutral_band) and max(local_eff, directionality) >= 0.45)
-        elif final_ret < -neutral_band and max(local_eff, directionality) >= dir_gate:
-            bias[i] = BIAS_SHORT
-            conf[i] = _confidence(abs(final_ret), breakout=False)
-            is_expansion[i] = int(abs(final_ret) >= max(vol, neutral_band) and max(local_eff, directionality) >= 0.45)
-        else:
-            bias[i] = BIAS_NEUTRAL
-            conf[i] = 0.0
-            is_expansion[i] = 0
-
-    out['bias_label'] = bias
-    out['setup_label'] = _infer_setup_labels(out)
-    out['conf_label'] = conf.astype(np.float32)
-    out['is_expansion'] = is_expansion.astype(np.int8)
-    out['liq_score'] = liq_score.astype(np.float32)
-    out['label_end_ts'] = pd.to_datetime(label_end_ts)
-    out['forward_return'] = forward_return.astype(np.float32)
-    out['label_horizon_steps'] = horizon_steps.astype(np.int32)
-    return out
+    return labeled

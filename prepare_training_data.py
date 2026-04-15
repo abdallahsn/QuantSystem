@@ -34,6 +34,7 @@ from modules.market_research_features import (KylesLambdaEngine,
                                                LiquidityGapsEngine,
                                                VNETEngine)
 from modules.fractional_diff         import apply_fractional_diff
+from modules.dynamic_labels         import OrderWallScanner, compute_dynamic_levels
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
@@ -104,10 +105,12 @@ TEMPORAL_DROP_COLS = SESSION_LEAK_COLS + [
 ]
 
 FEATURE_COLS = [
-    # ── Legacy/Test Surface (23 features) ───────────────
+    # ── Core Statistical Surface + Dynamic Order-Book Context ───────────
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
     'micro_atr', 'volume_burst', 'inter_event_time',
+    'micro_price', 'bid_wall_strength', 'ask_wall_strength',
+    'distance_to_wall', 'gap_size', 'liquidity_density',
     'fisher_signal', 'anomaly',
     'cvd_momentum', 'cvd_price_divergence',
     'trend_strength', 'correction_depth', 'liquidity_sweep',
@@ -119,6 +122,7 @@ MODEL_FEATURE_COLS = FEATURE_COLS + [
     # ── Extended Model Inputs ───────────────────────────
     'kyle_lambda', 'hawkes_intensity',
     'liquidity_gaps', 'vnet',
+    'long_rr', 'short_rr',
     'cvd_roc_10', 'cvd_roc_50', 'cvd_roc_200',
     'cvd_accel', 'volume_accel',
     'cvd_frac', 'kyle_frac', 'hawkes_frac', 'vnet_frac',
@@ -134,6 +138,8 @@ PROTECTED_FEATURES = {
     # Microstructure core — لا تُحذف من mRMR أبداً
     'cvd', 'absorption_intensity', 'kyle_lambda', 'hawkes_intensity',
     'pdh', 'pdl', 'pwh', 'pwl', 'obi', 'spoofing_ratio', 'liquidity_trap',
+    'micro_price', 'bid_wall_strength', 'ask_wall_strength',
+    'distance_to_wall', 'gap_size', 'liquidity_density',
     # VWAP real-time — safe, محمية
     'vwap_z_score', 'vwap_slope', 'current_vwap',
     'dist_to_bid_wall', 'dist_to_ask_wall',
@@ -148,19 +154,21 @@ SESSIONS = [
     ('ny_main',  16,  0, 21,  0),
 ]
 
-# ── V19: الـ 25 Feature الكلاسيكية للـ CatBoost Advisor ──────────
+# ── V19: CatBoost Advisor feature surface (extended with dynamic labels context) ──
 # هذه هي المدخلات للمرحلة الأولى (CatBoost Statistical Advisor)
 CATBOOST_ADVISOR_FEATURES = [
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
     'micro_atr', 'volume_burst', 'inter_event_time',
+    'micro_price', 'bid_wall_strength', 'ask_wall_strength',
+    'distance_to_wall', 'gap_size', 'liquidity_density',
     'fisher_signal', 'anomaly',
     'cvd_momentum', 'cvd_price_divergence',
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'kyle_lambda', 'hawkes_intensity', 'vnet',
     'vwap_z_score',
-]  # N = 25
+]  # N = 31
 
 RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]
@@ -505,6 +513,7 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
     ob   = OrderBookSnapshotEngine()
     sp   = SpoofingDetector(large_mult=1.5)
     gaps = LiquidityGapsEngine(levels=10, gap_threshold=1.0)
+    scanner = OrderWallScanner(wall_mult=3.0, gap_mult=2.0, levels=10)
     
     # 🔴 محرك حيطان السيولة
     walls_eng = LiquidityWallsEngine(depth_levels=10, wall_threshold_multiplier=3.0)
@@ -539,10 +548,38 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         
         dist_bid_wall, dist_ask_wall = walls_eng.update(price, bids, asks)
         
-        out.append({'ts_event':ts, 'obi':obi,
-                    'spoofing_ratio':sr, 'spoofing_duration':sd,
-                    'liquidity_gaps':gap_val,
-                    'dist_to_bid_wall': dist_bid_wall, 'dist_to_ask_wall': dist_ask_wall})
+        scan = scanner.scan(row_d, tick_size=tick_size, cvd=0.0, volume=0.0)
+        dyn_levels = compute_dynamic_levels(scan, current_price=price, tick_size=tick_size)
+
+        out.append({
+            'ts_event': ts,
+            'obi': obi,
+            'spoofing_ratio': sr,
+            'spoofing_duration': sd,
+            'liquidity_gaps': gap_val,
+            'dist_to_bid_wall': dist_bid_wall,
+            'dist_to_ask_wall': dist_ask_wall,
+            'mid_price': scan.get('mid_price', price),
+            'micro_price': scan.get('micro_price', price),
+            'spread': scan.get('spread', 0.0),
+            'bid_wall_px': scan.get('bid_wall_px'),
+            'ask_wall_px': scan.get('ask_wall_px'),
+            'bid_gap_px': scan.get('bid_gap_px'),
+            'ask_gap_px': scan.get('ask_gap_px'),
+            'bid_gap_size': scan.get('bid_gap_size', 0.0),
+            'ask_gap_size': scan.get('ask_gap_size', 0.0),
+            'bid_wall_strength': scan.get('bid_wall_strength', scan.get('bid_wall_str', 0.0)),
+            'ask_wall_strength': scan.get('ask_wall_strength', scan.get('ask_wall_str', 0.0)),
+            'distance_to_wall': scan.get('distance_to_wall', 0.0),
+            'gap_size': scan.get('gap_size', 0.0),
+            'liquidity_density': scan.get('liquidity_density', 0.0),
+            'long_tp': dyn_levels.get('long_tp', 0.0),
+            'long_sl': dyn_levels.get('long_sl', 0.0),
+            'short_tp': dyn_levels.get('short_tp', 0.0),
+            'short_sl': dyn_levels.get('short_sl', 0.0),
+            'long_rr': dyn_levels.get('long_rr', 0.0),
+            'short_rr': dyn_levels.get('short_rr', 0.0),
+        })
 
     return pd.DataFrame(out)
 
@@ -562,13 +599,25 @@ def _merge(df_mbo, df_mbp):
 
     if len(df_mbp) == 0:
         df = df_mbo.copy()
-        for c in ['obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall']:
+        for c in [
+            'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
+            'mid_price', 'micro_price', 'spread',
+            'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
+            'distance_to_wall', 'gap_size', 'liquidity_density',
+            'long_tp', 'long_sl', 'short_tp', 'short_sl', 'long_rr', 'short_rr',
+        ]:
             df[c] = 0.0
     else:
         df = pd.merge_asof(df_mbo, df_mbp, on='ts_event',
                            direction='backward', tolerance=pd.Timedelta('5s'))
                        
-    for c in ['obi','spoofing_ratio','spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall']:
+    for c in [
+        'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
+        'mid_price', 'micro_price', 'spread',
+        'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
+        'distance_to_wall', 'gap_size', 'liquidity_density',
+        'long_tp', 'long_sl', 'short_tp', 'short_sl', 'long_rr', 'short_rr',
+    ]:
         df[c] = df[c].fillna(0.0)
 
     liq = LiquidityTrapDetector()
@@ -986,19 +1035,26 @@ def _normalize_and_save(
                 train_regime_df = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
             regime_clf = RegimeClassifier(n_regimes=4)
             regime_clf.fit(train_regime_df, output_dir=output_dir)
-            df['regime_label'] = regime_clf.predict(df).astype(np.int8)
+            df['regime_cluster'] = regime_clf.predict(df).astype(np.int8)
+            if 'regime_label' not in df.columns:
+                df['regime_label'] = df['regime_cluster'].astype(np.int8)
             print(f"  ✅ Regime: fit على {len(train_regime_df):,} | predict على {len(df):,}")
         else:
-            df['regime_label'] = 0
+            df['regime_cluster'] = 0
+            if 'regime_label' not in df.columns:
+                df['regime_label'] = 0
             print("  ✅ Regime skipped intentionally for evaluation slice")
     except Exception as e:
-        df['regime_label'] = 0
+        df['regime_cluster'] = 0
+        if 'regime_label' not in df.columns:
+            df['regime_label'] = 0
         print(f"  ⚠️ Regime skipped: {e}")
 
     # SESSION_LEAK_COLS تُحفظ كـ metadata للتحليل لكن لا تدخل FEATURE_COLS
     session_meta = [c for c in SESSION_LEAK_COLS if c in df.columns]
-    meta_cols = ['price', 'size', 'bias_label', 'setup_label', 'conf_label', 'is_expansion',
-                 'session', 'liq_score', 'regime_label',
+    meta_cols = ['price', 'size', 'bias_label', 'setup_label', 'conf_label', 'signal_quality',
+                 'is_expansion', 'event_flag',
+                 'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
