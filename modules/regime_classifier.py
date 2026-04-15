@@ -84,6 +84,42 @@ def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     return features.fillna(0.0).astype(np.float64)
 
 
+def _pct_rank(series: pd.Series) -> pd.Series:
+    series = pd.to_numeric(series, errors='coerce').fillna(0.0)
+    if len(series) == 0:
+        return pd.Series(dtype=np.float64)
+    return series.rank(method='average', pct=True).astype(np.float64)
+
+
+def _build_rule_scores(X: pd.DataFrame) -> pd.DataFrame:
+    vol_rank = _pct_rank(X['volatility'])
+    activity_rank = _pct_rank(X['activity'])
+    volume_rank = _pct_rank(X['volume_ratio'])
+    cvd_rank = _pct_rank(X['cvd_strength'])
+    trend_rank = _pct_rank(X['trend_efficiency'])
+    imbalance_rank = _pct_rank(X['imbalance'])
+
+    scores = pd.DataFrame(index=X.index)
+    scores['volatile_score'] = (
+        0.55 * vol_rank
+        + 0.20 * activity_rank
+        + 0.15 * volume_rank
+        + 0.10 * imbalance_rank
+    )
+    scores['trend_score'] = (
+        0.55 * trend_rank
+        + 0.25 * cvd_rank
+        + 0.10 * activity_rank
+        + 0.10 * imbalance_rank
+    )
+    scores['low_liq_score'] = (
+        0.60 * (1.0 - activity_rank)
+        + 0.30 * (1.0 - volume_rank)
+        + 0.10 * (1.0 - cvd_rank)
+    )
+    return scores.fillna(0.0).astype(np.float64)
+
+
 class RegimeClassifier:
     def __init__(self, n_regimes: int = 4, model_type: str = 'auto'):
         self.n_regimes  = n_regimes
@@ -163,16 +199,19 @@ class RegimeClassifier:
         self.model = model
 
     def _fit_rules(self, X: pd.DataFrame):
+        scores = _build_rule_scores(X)
         self.rule_stats = {
             'low_activity_q': float(X['activity'].quantile(0.30)),
             'low_volume_q': float(X['volume_ratio'].quantile(0.30)),
             'high_vol_q': float(X['volatility'].quantile(0.75)),
             'extreme_vol_q': float(X['volatility'].quantile(0.90)),
-            'trend_q': float(X['trend_efficiency'].quantile(0.65)),
-            'cvd_q': float(X['cvd_strength'].quantile(0.60)),
-            'imbalance_q': float(X['imbalance'].quantile(0.65)),
+            'trend_eff_q': float(X['trend_efficiency'].quantile(0.45)),
+            'cvd_q': float(X['cvd_strength'].quantile(0.45)),
             'activity_med': float(X['activity'].median()),
             'volume_med': float(X['volume_ratio'].median()),
+            'volatile_score_q': float(scores['volatile_score'].quantile(0.82)),
+            'trend_score_q': float(scores['trend_score'].quantile(0.58)),
+            'low_liq_score_q': float(scores['low_liq_score'].quantile(0.80)),
         }
 
     def _predict_rules(self, X: pd.DataFrame) -> np.ndarray:
@@ -180,37 +219,45 @@ class RegimeClassifier:
             return np.zeros(0, dtype=np.int8)
 
         stats = self.rule_stats or {}
+        scores = _build_rule_scores(X)
+
         low_activity_q = float(stats.get('low_activity_q', X['activity'].quantile(0.30)))
         low_volume_q = float(stats.get('low_volume_q', X['volume_ratio'].quantile(0.30)))
         high_vol_q = float(stats.get('high_vol_q', X['volatility'].quantile(0.75)))
         extreme_vol_q = float(stats.get('extreme_vol_q', X['volatility'].quantile(0.90)))
-        trend_q = float(stats.get('trend_q', X['trend_efficiency'].quantile(0.65)))
-        cvd_q = float(stats.get('cvd_q', X['cvd_strength'].quantile(0.60)))
+        trend_eff_q = float(stats.get('trend_eff_q', X['trend_efficiency'].quantile(0.45)))
+        cvd_q = float(stats.get('cvd_q', X['cvd_strength'].quantile(0.45)))
         activity_med = float(stats.get('activity_med', X['activity'].median()))
         volume_med = float(stats.get('volume_med', X['volume_ratio'].median()))
+        volatile_score_q = float(stats.get('volatile_score_q', scores['volatile_score'].quantile(0.82)))
+        trend_score_q = float(stats.get('trend_score_q', scores['trend_score'].quantile(0.58)))
+        low_liq_score_q = float(stats.get('low_liq_score_q', scores['low_liq_score'].quantile(0.80)))
 
-        low_liq = (
-            (X['activity'] <= max(low_activity_q, 1e-6)) &
-            (X['volume_ratio'] <= max(low_volume_q, 1e-6))
-        )
         volatile = (
-            (X['volatility'] >= max(high_vol_q, 1e-6)) &
+            (scores['volatile_score'] >= volatile_score_q) &
             (
                 (X['activity'] >= max(activity_med, 1e-6)) |
                 (X['volume_ratio'] >= max(volume_med, 1e-6))
             )
         ) | (X['volatility'] >= max(extreme_vol_q, 1e-6))
         trending = (
-            (X['trend_efficiency'] >= max(trend_q, 0.35)) &
-            (X['cvd_strength'] >= max(cvd_q, 1e-6) * 0.85) &
+            (scores['trend_score'] >= trend_score_q) &
+            (X['trend_efficiency'] >= max(trend_eff_q, 0.25)) &
+            (X['cvd_strength'] >= max(cvd_q, 1e-6) * 0.95) &
             (X['activity'] > max(low_activity_q, 1e-6)) &
             (X['volume_ratio'] > max(low_volume_q, 1e-6))
+        )
+        low_liq = (
+            (scores['low_liq_score'] >= low_liq_score_q) &
+            (X['activity'] <= max(activity_med, 1e-6)) &
+            (X['volume_ratio'] <= max(volume_med, 1e-6)) &
+            (X['volatility'] <= max(high_vol_q, 1e-6))
         )
 
         labels = np.full(len(X), 1, dtype=np.int8)
         labels[volatile.values] = 2
-        labels[(trending & ~volatile).values] = 0
-        labels[low_liq.values] = 3
+        labels[(low_liq & ~volatile).values] = 3
+        labels[(trending & ~volatile & ~low_liq).values] = 0
         return labels
 
     def _print_distribution(self, labels: np.ndarray):

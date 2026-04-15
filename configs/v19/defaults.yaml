@@ -6,7 +6,9 @@
     "n_folds": 6,
     "test_size": 0.10,
     "embargo_pct": 0.02,
+    "min_train_pct": 0.20,
     "train_frac": 0.80,
+    "min_seq_coverage": 0.80,
     "stage": 0
   },
   "refinery": {

@@ -29,7 +29,9 @@ def main():
     p.add_argument('--n_folds', type=int, default=int(defaults.get('n_folds', 6)))
     p.add_argument('--test_size', type=float, default=float(defaults.get('test_size', 0.10)))
     p.add_argument('--embargo_pct', type=float, default=float(defaults.get('embargo_pct', 0.02)))
+    p.add_argument('--min_train_pct', type=float, default=float(defaults.get('min_train_pct', 0.20)))
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
+    p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'])
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
@@ -43,7 +45,9 @@ def main():
         n_folds=args.n_folds,
         test_size=args.test_size,
         embargo_pct=args.embargo_pct,
+        min_train_pct=args.min_train_pct,
         train_frac=args.train_frac,
+        min_seq_coverage=args.min_seq_coverage,
         catboost_device=args.catboost_device,
         phase='catboost',
         config_snapshot=cfg,

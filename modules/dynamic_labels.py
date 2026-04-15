@@ -1,13 +1,13 @@
 """
 dynamic_labels.py — V2: Unified Pipeline (OrderBook → Features → Labels)
 ========================================================================
-This module upgrades the old dynamic labeling path into a unified pipeline:
+This module upgrades the old labeling path into a unified pipeline:
 
-  1. OrderWallScanner returns a dense feature vector, not just TP/SL anchors
+  1. OrderWallScanner returns a dense feature vector
   2. Labels are multi-layered: direction + quality + regime
   3. Event-based filtering suppresses quiet/noisy rows before window building
   4. Feature engineering happens on the full frame before slicing windows
-  5. TP/SL fallbacks adapt to current liquidity context rather than fixed levels
+  5. Direction/quality are derived from realized price movement, not TP/SL
 """
 
 from __future__ import annotations
@@ -429,15 +429,32 @@ def _direction_from_future_return(
     return DIR_NEUTRAL
 
 
-def _quality_from_move_strength(
-    move_strength: float,
+def _build_quality_thresholds(
+    move_strengths: np.ndarray,
+    directional_mask: np.ndarray,
     tick_size: float = 0.0001,
-    strong_ticks: float = 10.0,
-) -> int:
-    threshold = max(float(tick_size or 0.0), 1e-9) * float(strong_ticks)
-    if float(move_strength) > threshold:
-        return QUALITY_STRONG
-    return QUALITY_WEAK
+    strong_quantile: float = 0.70,
+    fallback_ticks: float = 10.0,
+    min_history: int = 32,
+    lookback: int = 256,
+) -> np.ndarray:
+    """
+    Build causal, adaptive thresholds for STRONG vs WEAK moves.
+
+    The threshold is based on the rolling quantile of previously realized
+    directional moves so the quality layer adapts to volatility without using
+    future rows from the same sample.
+    """
+
+    base_thr = max(float(tick_size or 0.0), 1e-9) * float(fallback_ticks)
+    floor_thr = max(base_thr * 0.80, 1e-9)
+    strengths = pd.Series(np.asarray(move_strengths, dtype=np.float64))
+    directional = pd.Series(np.asarray(directional_mask, dtype=bool), index=strengths.index)
+    hist = strengths.where(directional).shift(1)
+
+    rolling_q = hist.rolling(window=max(int(lookback), int(min_history)), min_periods=max(8, int(min_history))).quantile(strong_quantile)
+    thresholds = rolling_q.fillna(base_thr).clip(lower=floor_thr)
+    return thresholds.to_numpy(dtype=np.float64, copy=False)
 
 
 def label_with_forward_scan(
@@ -467,6 +484,8 @@ def label_with_forward_scan(
     short_labels = np.full(n, LABEL_CANCEL, dtype=np.int8)
     bias = np.full(n, DIR_NEUTRAL, dtype=np.int8)
     quality_arr = np.full(n, QUALITY_NONE, dtype=np.int8)
+    future_returns = np.zeros(n, dtype=np.float64)
+    move_strengths = np.zeros(n, dtype=np.float64)
 
     for t in range(n - 1):
         entry = prices[t]
@@ -478,16 +497,31 @@ def label_with_forward_scan(
         future_return = float(future[-1] - entry)
         direction = _direction_from_future_return(future_return, tick_size=tick_size, threshold_ticks=5.0)
         move_strength = abs(future_return)
+        future_returns[t] = future_return
+        move_strengths[t] = move_strength
 
         bias[t] = direction
         if direction == DIR_LONG:
             long_labels[t] = LABEL_WIN
             short_labels[t] = LABEL_LOSE
-            quality_arr[t] = _quality_from_move_strength(move_strength, tick_size=tick_size, strong_ticks=10.0)
         elif direction == DIR_SHORT:
             long_labels[t] = LABEL_LOSE
             short_labels[t] = LABEL_WIN
-            quality_arr[t] = _quality_from_move_strength(move_strength, tick_size=tick_size, strong_ticks=10.0)
+
+    directional_mask = bias != DIR_NEUTRAL
+    quality_thresholds = _build_quality_thresholds(
+        move_strengths,
+        directional_mask,
+        tick_size=tick_size,
+        strong_quantile=0.70,
+        fallback_ticks=10.0,
+        min_history=max(24, int(max_bars_forward)),
+        lookback=max(96, int(max_bars_forward) * 6),
+    )
+    strong_mask = directional_mask & (move_strengths >= quality_thresholds)
+    weak_mask = directional_mask & ~strong_mask
+    quality_arr[strong_mask] = QUALITY_STRONG
+    quality_arr[weak_mask] = QUALITY_WEAK
 
     result = df_trades.copy()
     result["long_label"] = long_labels
@@ -537,6 +571,7 @@ def build_training_dataset(
 
     df_aug = append_dynamic_orderbook_features(df, tick_size=tick_size)
     df_eng = engineer_features(df_aug, roll_window=20)
+    labeled = label_with_forward_scan(df_eng, df_eng, max_bars_forward=horizon, tick_size=tick_size)
 
     base_cols = [c for c in MarketFeatureVector.feature_names() if c in df_eng.columns]
     derived = [
@@ -558,19 +593,12 @@ def build_training_dataset(
         if win.shape[0] < window:
             continue
 
-        entry = float(pd.to_numeric(df_eng[price_col].iloc[i], errors="coerce") or 0.0)
-        future_px = pd.to_numeric(df_eng[price_col].iloc[i + 1:i + 1 + horizon], errors="coerce").ffill().fillna(0.0).values.astype(np.float64)
-        future_return = float(future_px[-1] - entry) if len(future_px) else 0.0
-        direction = _direction_from_future_return(future_return, tick_size=tick_size, threshold_ticks=5.0)
+        direction = int(labeled["bias_label"].iloc[i])
         if direction == DIR_NEUTRAL and drop_neutral:
             continue
 
-        quality = (
-            QUALITY_NONE
-            if direction == DIR_NEUTRAL
-            else _quality_from_move_strength(abs(future_return), tick_size=tick_size, strong_ticks=10.0)
-        )
-        regime = int(df_eng["regime"].iloc[i]) if "regime" in df_eng.columns else REGIME_RANGING
+        quality = int(labeled["signal_quality"].iloc[i]) if direction != DIR_NEUTRAL else QUALITY_NONE
+        regime = int(labeled["regime"].iloc[i]) if "regime" in labeled.columns else REGIME_RANGING
 
         X_list.append(win.astype(np.float32))
         y_list.append([direction, quality, regime])

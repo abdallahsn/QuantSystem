@@ -28,7 +28,9 @@ def main():
     p.add_argument('--output', default=defaults.get('output_dir', 'outputs_v19'))
     p.add_argument('--epochs', type=int, default=int(defaults.get('epochs', 100)))
     p.add_argument('--batch', type=int, default=int(defaults.get('batch', 64)))
+    p.add_argument('--min_train_pct', type=float, default=float(defaults.get('min_train_pct', 0.20)))
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
+    p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
 
@@ -40,7 +42,9 @@ def main():
         lob_ts_path=args.lob_ts,
         epochs=args.epochs,
         batch=args.batch,
+        min_train_pct=args.min_train_pct,
         train_frac=args.train_frac,
+        min_seq_coverage=args.min_seq_coverage,
         phase='train',
         config_snapshot=cfg,
     )

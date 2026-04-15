@@ -379,6 +379,7 @@ def build_time_splits(
     n_folds: int = 6,
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
+    min_train_pct: float = 0.20,
 ):
     n = len(df)
     t0 = _time_series(df, 'ts_event')
@@ -391,6 +392,7 @@ def build_time_splits(
             embargo_pct=embargo_pct,
             t0=t0,
             t1=t1,
+            min_train_pct=min_train_pct,
         )
     )
     if not splits:
@@ -433,6 +435,7 @@ def stage1_oof_meta(
     n_folds: int = 6,
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
+    min_train_pct: float = 0.20,
     t0: pd.Series | None = None,
     t1: pd.Series | None = None,
     inference_scaler_params: dict | None = None,
@@ -451,6 +454,7 @@ def stage1_oof_meta(
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
+            min_train_pct=min_train_pct,
         )
     elif t0 is None or t1 is None:
         _, t0, t1 = build_time_splits(
@@ -458,6 +462,7 @@ def stage1_oof_meta(
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
+            min_train_pct=min_train_pct,
         )
 
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
@@ -792,6 +797,7 @@ def build_safe_sequences(
     coverage_mask: np.ndarray,
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
+    min_seq_coverage: float = 0.80,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     n = len(df)
     split_ctx = _sequence_split_context(df, seq_len=seq_len, train_frac=train_frac)
@@ -807,11 +813,19 @@ def build_safe_sequences(
     X_tr, yb_tr, yc_tr = [], [], []
     X_val, yb_val, yc_val = [], [], []
 
+    def _coverage_ok(window_cov: np.ndarray) -> bool:
+        cov = np.asarray(window_cov, dtype=bool)
+        if cov.size == 0:
+            return False
+        if not bool(cov[-1]):
+            return False
+        return float(np.mean(cov)) >= float(min_seq_coverage)
+
     for end_idx in range(seq_len - 1, split_idx):
         start_idx = end_idx - seq_len + 1
         if not train_row_ok[end_idx]:
             continue
-        if not coverage_mask[start_idx:end_idx + 1].all():
+        if not _coverage_ok(coverage_mask[start_idx:end_idx + 1]):
             continue
         X_tr.append(X_rows[start_idx:end_idx + 1])
         yb_tr.append(y_bias[end_idx])
@@ -823,7 +837,7 @@ def build_safe_sequences(
             continue
         if not val_row_ok[end_idx]:
             continue
-        if not coverage_mask[start_idx:end_idx + 1].all():
+        if not _coverage_ok(coverage_mask[start_idx:end_idx + 1]):
             continue
         X_val.append(X_rows[start_idx:end_idx + 1])
         yb_val.append(y_bias[end_idx])
@@ -841,6 +855,7 @@ def build_safe_sequences(
         'split_time': str(split_time),
         'train_sequences': int(len(X_tr)),
         'val_sequences': int(len(X_val)),
+        'min_seq_coverage': float(min_seq_coverage),
     }
     return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
 
@@ -855,6 +870,7 @@ def stage3_meta_learner_v19(
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
+    min_seq_coverage: float = 0.80,
 ) -> None:
     print("\n" + "═" * 65)
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
@@ -865,7 +881,12 @@ def stage3_meta_learner_v19(
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
 
     X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, split_stats = build_safe_sequences(
-        df, X_rows, coverage_mask=coverage_mask, seq_len=SEQ_LEN, train_frac=train_frac
+        df,
+        X_rows,
+        coverage_mask=coverage_mask,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        min_seq_coverage=min_seq_coverage,
     )
     if len(X_tr) == 0 or len(X_val) == 0:
         raise RuntimeError(
@@ -982,7 +1003,9 @@ def run_training_pipeline(
     n_folds: int = 6,
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
+    min_train_pct: float = 0.20,
     train_frac: float = 0.80,
+    min_seq_coverage: float = 0.80,
     stage: int = 0,
     phase: str | None = None,
     catboost_device: str = 'auto',
@@ -1028,6 +1051,7 @@ def run_training_pipeline(
         n_folds=n_folds,
         test_size=test_size,
         embargo_pct=embargo_pct,
+        min_train_pct=min_train_pct,
     )
 
     meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
@@ -1045,6 +1069,7 @@ def run_training_pipeline(
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
+            min_train_pct=min_train_pct,
             t0=split_t0,
             t1=split_t1,
             inference_scaler_params=inference_scaler_params,
@@ -1175,6 +1200,7 @@ def run_training_pipeline(
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,
+            min_seq_coverage=min_seq_coverage,
         )
 
     elapsed = (datetime.datetime.now() - started_at).total_seconds()
@@ -1198,7 +1224,9 @@ def run_training_pipeline(
             'n_folds': n_folds,
             'test_size': test_size,
             'embargo_pct': embargo_pct,
+            'min_train_pct': min_train_pct,
             'train_frac': train_frac,
+            'min_seq_coverage': min_seq_coverage,
             'stage': stage,
             'phase': resolved_phase,
             'catboost_device': catboost_device,
@@ -1236,7 +1264,9 @@ def main():
     p.add_argument('--n_folds', type=int, default=int(defaults.get('n_folds', 6)))
     p.add_argument('--test_size', type=float, default=float(defaults.get('test_size', 0.10)))
     p.add_argument('--embargo_pct', type=float, default=float(defaults.get('embargo_pct', 0.02)))
+    p.add_argument('--min_train_pct', type=float, default=float(defaults.get('min_train_pct', 0.20)))
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
+    p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
@@ -1254,7 +1284,9 @@ def main():
         n_folds=args.n_folds,
         test_size=args.test_size,
         embargo_pct=args.embargo_pct,
+        min_train_pct=args.min_train_pct,
         train_frac=args.train_frac,
+        min_seq_coverage=args.min_seq_coverage,
         stage=args.stage,
         phase=args.phase,
         catboost_device=args.catboost_device,

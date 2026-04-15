@@ -38,14 +38,25 @@ def embargo_observations(train_idx: np.ndarray, test_idx: np.ndarray, embargo_pc
 # 2. Walk-Forward Expanding Window
 # ══════════════════════════════════════════════════════════════════
 
-def walk_forward_expanding(n_samples: int, n_folds: int = 6, test_size: float = 0.1, embargo_pct: float = 0.01,
-                           t0: pd.Series = None, t1: pd.Series = None) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+def walk_forward_expanding(
+    n_samples: int,
+    n_folds: int = 6,
+    test_size: float = 0.1,
+    embargo_pct: float = 0.01,
+    t0: pd.Series = None,
+    t1: pd.Series = None,
+    min_train_pct: float = 0.20,
+    min_train_rows: int = 200,
+) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
     test_n = max(1, int(n_samples * test_size))
-    min_train = int(n_samples * 0.3)
+    min_train = max(int(n_samples * min_train_pct), int(min_train_rows))
+    min_train = min(min_train, max(test_n + 50, n_samples - test_n))
+    tail_n = max(0, n_samples - min_train)
+    effective_folds = max(int(n_folds), int(np.ceil(tail_n / max(test_n, 1))))
 
-    step = max(1, (n_samples - min_train - test_n) // max(n_folds - 1, 1))
+    step = max(1, (n_samples - min_train - test_n) // max(effective_folds - 1, 1))
 
-    for f in range(n_folds):
+    for f in range(effective_folds):
         test_start = min_train + f * step
         test_end = min(test_start + test_n, n_samples)
         
