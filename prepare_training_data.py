@@ -34,7 +34,7 @@ from modules.market_research_features import (KylesLambdaEngine,
                                                LiquidityGapsEngine,
                                                VNETEngine)
 from modules.fractional_diff         import apply_fractional_diff
-from modules.dynamic_labels         import OrderWallScanner, compute_dynamic_levels
+from modules.dynamic_labels         import OrderWallScanner
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
@@ -122,7 +122,6 @@ MODEL_FEATURE_COLS = FEATURE_COLS + [
     # ── Extended Model Inputs ───────────────────────────
     'kyle_lambda', 'hawkes_intensity',
     'liquidity_gaps', 'vnet',
-    'long_rr', 'short_rr',
     'cvd_roc_10', 'cvd_roc_50', 'cvd_roc_200',
     'cvd_accel', 'volume_accel',
     'cvd_frac', 'kyle_frac', 'hawkes_frac', 'vnet_frac',
@@ -549,7 +548,6 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         dist_bid_wall, dist_ask_wall = walls_eng.update(price, bids, asks)
         
         scan = scanner.scan(row_d, tick_size=tick_size, cvd=0.0, volume=0.0)
-        dyn_levels = compute_dynamic_levels(scan, current_price=price, tick_size=tick_size)
 
         out.append({
             'ts_event': ts,
@@ -573,12 +571,6 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
             'distance_to_wall': scan.get('distance_to_wall', 0.0),
             'gap_size': scan.get('gap_size', 0.0),
             'liquidity_density': scan.get('liquidity_density', 0.0),
-            'long_tp': dyn_levels.get('long_tp', 0.0),
-            'long_sl': dyn_levels.get('long_sl', 0.0),
-            'short_tp': dyn_levels.get('short_tp', 0.0),
-            'short_sl': dyn_levels.get('short_sl', 0.0),
-            'long_rr': dyn_levels.get('long_rr', 0.0),
-            'short_rr': dyn_levels.get('short_rr', 0.0),
         })
 
     return pd.DataFrame(out)
@@ -604,7 +596,6 @@ def _merge(df_mbo, df_mbp):
             'mid_price', 'micro_price', 'spread',
             'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
             'distance_to_wall', 'gap_size', 'liquidity_density',
-            'long_tp', 'long_sl', 'short_tp', 'short_sl', 'long_rr', 'short_rr',
         ]:
             df[c] = 0.0
     else:
@@ -616,7 +607,6 @@ def _merge(df_mbo, df_mbp):
         'mid_price', 'micro_price', 'spread',
         'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
         'distance_to_wall', 'gap_size', 'liquidity_density',
-        'long_tp', 'long_sl', 'short_tp', 'short_sl', 'long_rr', 'short_rr',
     ]:
         df[c] = df[c].fillna(0.0)
 

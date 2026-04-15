@@ -103,6 +103,47 @@ class OrderWallScanner:
         self._size_hist = deque(maxlen=hist_size)
         self._vol_hist = deque(maxlen=hist_size)
 
+    def _detect_gap(
+        self,
+        px_levels: list[float],
+        sz_levels: list[float],
+        tick: float,
+        mean_sz: float,
+    ) -> tuple[float | None, float]:
+        """
+        Detect both hard price gaps and softer liquidity voids.
+
+        Sample books often have perfect 1-tick spacing, so a pure price-gap rule
+        can leave `gap_size` dead. We therefore augment the signal with a
+        size-scarcity score between adjacent levels.
+        """
+
+        gap_px = None
+        gap_size = 0.0
+        if len(px_levels) < 2:
+            return gap_px, gap_size
+
+        local_thr = max(float(self.gap_mult), 1.60)
+        for i in range(len(px_levels) - 1):
+            spacing_ticks = abs(float(px_levels[i]) - float(px_levels[i + 1])) / tick
+            cur_sz = float(sz_levels[i])
+            nxt_sz = float(sz_levels[i + 1])
+            min_pair = min(cur_sz, nxt_sz)
+            avg_pair = (cur_sz + nxt_sz) / 2.0
+
+            scarcity = max(0.0, 1.0 - (min_pair / max(mean_sz, 1e-9)))
+            void_ratio = max(0.0, 1.0 - (avg_pair / max(mean_sz, 1e-9)))
+            effective_gap = spacing_ticks + 0.80 * scarcity + 0.60 * void_ratio
+
+            is_hard_gap = spacing_ticks >= float(self.gap_mult)
+            is_soft_gap = (spacing_ticks >= 1.0) and (scarcity >= 0.65) and (effective_gap >= local_thr)
+            if is_hard_gap or is_soft_gap:
+                gap_px = float(px_levels[i + 1])
+                gap_size = max(gap_size, effective_gap)
+                break
+
+        return gap_px, gap_size
+
     def scan(
         self,
         row: dict,
@@ -164,23 +205,8 @@ class OrderWallScanner:
                 ask_wall_str = float(sz) / mean_sz
                 break
 
-        bid_gap_px = None
-        bid_gap_size = 0.0
-        for i in range(len(bid_px) - 1):
-            gap = abs(float(bid_px[i]) - float(bid_px[i + 1]))
-            if gap > tick * self.gap_mult:
-                bid_gap_px = float(bid_px[i + 1])
-                bid_gap_size = gap / tick
-                break
-
-        ask_gap_px = None
-        ask_gap_size = 0.0
-        for i in range(len(ask_px) - 1):
-            gap = abs(float(ask_px[i]) - float(ask_px[i + 1]))
-            if gap > tick * self.gap_mult:
-                ask_gap_px = float(ask_px[i + 1])
-                ask_gap_size = gap / tick
-                break
+        bid_gap_px, bid_gap_size = self._detect_gap(bid_px, bid_sz, tick=tick, mean_sz=mean_sz)
+        ask_gap_px, ask_gap_size = self._detect_gap(ask_px, ask_sz, tick=tick, mean_sz=mean_sz)
 
         dist_bid = (mid - bid_wall_px) / tick if bid_wall_px else 0.0
         dist_ask = (ask_wall_px - mid) / tick if ask_wall_px else 0.0
@@ -329,68 +355,6 @@ def build_event_filter(
     return (cond_vol | cond_obi | cond_wall | cond_shift).astype(bool)
 
 
-def compute_dynamic_levels(
-    scan_result: dict,
-    current_price: float,
-    tick_size: float = 0.0001,
-    min_tp_pips: float = 15.0,
-    max_sl_pips: float = 20.0,
-) -> dict:
-    """
-    Dynamic TP/SL anchored to walls, gaps, and current liquidity.
-    """
-
-    mid = float(current_price or 0.0)
-    pip = max(float(tick_size or 0.0), 1e-9)
-
-    bid_wall_str = float(scan_result.get("bid_wall_strength", scan_result.get("bid_wall_str", 0.0)) or 0.0)
-    ask_wall_str = float(scan_result.get("ask_wall_strength", scan_result.get("ask_wall_str", 0.0)) or 0.0)
-
-    if scan_result.get("ask_gap_px") and float(scan_result["ask_gap_px"]) > mid:
-        long_tp_raw = float(scan_result["ask_gap_px"]) - mid
-        gap_bonus = float(scan_result.get("ask_gap_size", 0.0) or 0.0) * pip * 0.1
-        long_tp = long_tp_raw + gap_bonus
-    else:
-        long_tp = pip * float(min_tp_pips)
-
-    if scan_result.get("bid_wall_px") and float(scan_result["bid_wall_px"]) < mid:
-        raw_sl = mid - float(scan_result["bid_wall_px"])
-        str_factor = 1.0 + bid_wall_str * 0.05
-        long_sl = raw_sl * str_factor
-    else:
-        long_sl = pip * (float(min_tp_pips) * 0.5)
-
-    if scan_result.get("bid_gap_px") and float(scan_result["bid_gap_px"]) < mid:
-        short_tp_raw = mid - float(scan_result["bid_gap_px"])
-        gap_bonus = float(scan_result.get("bid_gap_size", 0.0) or 0.0) * pip * 0.1
-        short_tp = short_tp_raw + gap_bonus
-    else:
-        short_tp = pip * float(min_tp_pips)
-
-    if scan_result.get("ask_wall_px") and float(scan_result["ask_wall_px"]) > mid:
-        raw_sl = float(scan_result["ask_wall_px"]) - mid
-        str_factor = 1.0 + ask_wall_str * 0.05
-        short_sl = raw_sl * str_factor
-    else:
-        short_sl = pip * (float(min_tp_pips) * 0.5)
-
-    long_sl = min(long_sl, pip * float(max_sl_pips))
-    short_sl = min(short_sl, pip * float(max_sl_pips))
-    long_tp = max(long_tp, pip * float(min_tp_pips) * 0.5)
-    short_tp = max(short_tp, pip * float(min_tp_pips) * 0.5)
-
-    return {
-        "long_tp": round(float(long_tp), 6),
-        "long_sl": round(float(long_sl), 6),
-        "short_tp": round(float(short_tp), 6),
-        "short_sl": round(float(short_sl), 6),
-        "long_rr": round(float(long_tp / max(long_sl, 1e-8)), 3),
-        "short_rr": round(float(short_tp / max(short_sl, 1e-8)), 3),
-        "long_wall_size": round(float(bid_wall_str), 4),
-        "short_wall_size": round(float(ask_wall_str), 4),
-    }
-
-
 def append_dynamic_orderbook_features(
     df: pd.DataFrame,
     tick_size: float = 0.0001,
@@ -400,11 +364,9 @@ def append_dynamic_orderbook_features(
     wall_mult: float = 3.0,
     gap_mult: float = 2.0,
     levels: int = 10,
-    min_tp_pips: float = 15.0,
-    max_sl_pips: float = 20.0,
 ) -> pd.DataFrame:
     """
-    Append scanner features + dynamic target levels to a frame.
+    Append order-book scanner features to a frame.
     """
 
     out = df.copy()
@@ -419,13 +381,6 @@ def append_dynamic_orderbook_features(
             tick_size=tick_size,
             cvd=float(row_d.get(cvd_col, 0.0) or 0.0),
             volume=float(row_d.get(volume_col, 0.0) or 0.0),
-        )
-        dyn = compute_dynamic_levels(
-            scan_result,
-            current_price=current_price if current_price > 0 else float(scan_result.get("mid_price", 0.0) or 0.0),
-            tick_size=tick_size,
-            min_tp_pips=min_tp_pips,
-            max_sl_pips=max_sl_pips,
         )
         fv = scan_result["feature_vector"]
         records.append(
@@ -449,7 +404,6 @@ def append_dynamic_orderbook_features(
                 "distance_to_wall": float(fv.distance_to_wall),
                 "gap_size": float(fv.gap_size),
                 "liquidity_density": float(fv.liquidity_density),
-                **dyn,
             }
         )
 
@@ -462,30 +416,28 @@ def append_dynamic_orderbook_features(
     return out
 
 
-def _detect_quality(df: pd.DataFrame, t: int, direction: int, window: int = 10) -> int:
-    """
-    Quality based on imbalance persistence and CVD alignment.
-    """
+def _direction_from_future_return(
+    future_return: float,
+    tick_size: float = 0.0001,
+    threshold_ticks: float = 5.0,
+) -> int:
+    threshold = max(float(tick_size or 0.0), 1e-9) * float(threshold_ticks)
+    if future_return > threshold:
+        return DIR_LONG
+    if future_return < -threshold:
+        return DIR_SHORT
+    return DIR_NEUTRAL
 
-    if direction == DIR_NEUTRAL:
-        return QUALITY_NONE
 
-    if "obi" not in df.columns or "cvd" not in df.columns:
-        return QUALITY_WEAK
-
-    start = max(0, int(t) - int(window))
-    if t <= start:
-        return QUALITY_WEAK
-
-    obi_mean = pd.to_numeric(df["obi"].iloc[start:t], errors="coerce").fillna(0.0).mean()
-    cvd_trend = pd.to_numeric(df["cvd"].iloc[start:t], errors="coerce").fillna(0.0).diff().fillna(0.0).mean()
-
-    if direction == DIR_LONG:
-        strong = (obi_mean > 0.2) and (cvd_trend > 0.0)
-    else:
-        strong = (obi_mean < -0.2) and (cvd_trend < 0.0)
-
-    return QUALITY_STRONG if strong else QUALITY_WEAK
+def _quality_from_move_strength(
+    move_strength: float,
+    tick_size: float = 0.0001,
+    strong_ticks: float = 10.0,
+) -> int:
+    threshold = max(float(tick_size or 0.0), 1e-9) * float(strong_ticks)
+    if float(move_strength) > threshold:
+        return QUALITY_STRONG
+    return QUALITY_WEAK
 
 
 def label_with_forward_scan(
@@ -495,7 +447,7 @@ def label_with_forward_scan(
     tick_size: float = 0.0001,
 ) -> pd.DataFrame:
     """
-    Strict forward barrier scan with three-layer label outputs.
+    Price-only forward scan with three-layer label outputs.
     """
 
     if len(df_trades) == 0:
@@ -513,27 +465,8 @@ def label_with_forward_scan(
 
     long_labels = np.full(n, LABEL_CANCEL, dtype=np.int8)
     short_labels = np.full(n, LABEL_CANCEL, dtype=np.int8)
-
-    ltp_arr = (
-        pd.to_numeric(df_levels["long_tp"], errors="coerce").fillna(tick_size * 15).values.astype(np.float64)
-        if "long_tp" in df_levels.columns
-        else np.full(n, tick_size * 15, dtype=np.float64)
-    )
-    lsl_arr = (
-        pd.to_numeric(df_levels["long_sl"], errors="coerce").fillna(tick_size * 10).values.astype(np.float64)
-        if "long_sl" in df_levels.columns
-        else np.full(n, tick_size * 10, dtype=np.float64)
-    )
-    stp_arr = (
-        pd.to_numeric(df_levels["short_tp"], errors="coerce").fillna(tick_size * 15).values.astype(np.float64)
-        if "short_tp" in df_levels.columns
-        else np.full(n, tick_size * 15, dtype=np.float64)
-    )
-    ssl_arr = (
-        pd.to_numeric(df_levels["short_sl"], errors="coerce").fillna(tick_size * 10).values.astype(np.float64)
-        if "short_sl" in df_levels.columns
-        else np.full(n, tick_size * 10, dtype=np.float64)
-    )
+    bias = np.full(n, DIR_NEUTRAL, dtype=np.int8)
+    quality_arr = np.full(n, QUALITY_NONE, dtype=np.int8)
 
     for t in range(n - 1):
         entry = prices[t]
@@ -542,46 +475,24 @@ def label_with_forward_scan(
         if len(future) == 0:
             continue
 
-        long_target = entry + float(ltp_arr[t])
-        long_stop = entry - float(lsl_arr[t])
-        short_target = entry - float(stp_arr[t])
-        short_stop = entry + float(ssl_arr[t])
+        future_return = float(future[-1] - entry)
+        direction = _direction_from_future_return(future_return, tick_size=tick_size, threshold_ticks=5.0)
+        move_strength = abs(future_return)
 
-        lw_idx = np.where(future >= long_target)[0]
-        ll_idx = np.where(future <= long_stop)[0]
-        sw_idx = np.where(future <= short_target)[0]
-        sl_idx = np.where(future >= short_stop)[0]
-
-        lw = lw_idx[0] if len(lw_idx) > 0 else np.inf
-        ll = ll_idx[0] if len(ll_idx) > 0 else np.inf
-        sw = sw_idx[0] if len(sw_idx) > 0 else np.inf
-        sl = sl_idx[0] if len(sl_idx) > 0 else np.inf
-
-        if lw < ll:
+        bias[t] = direction
+        if direction == DIR_LONG:
             long_labels[t] = LABEL_WIN
-        elif ll < lw:
-            long_labels[t] = LABEL_LOSE
-
-        if sw < sl:
-            short_labels[t] = LABEL_WIN
-        elif sl < sw:
             short_labels[t] = LABEL_LOSE
+            quality_arr[t] = _quality_from_move_strength(move_strength, tick_size=tick_size, strong_ticks=10.0)
+        elif direction == DIR_SHORT:
+            long_labels[t] = LABEL_LOSE
+            short_labels[t] = LABEL_WIN
+            quality_arr[t] = _quality_from_move_strength(move_strength, tick_size=tick_size, strong_ticks=10.0)
 
     result = df_trades.copy()
     result["long_label"] = long_labels
     result["short_label"] = short_labels
-
-    bias = np.full(n, DIR_NEUTRAL, dtype=np.int8)
-    long_only = (long_labels == LABEL_WIN) & (short_labels != LABEL_WIN)
-    short_only = (short_labels == LABEL_WIN) & (long_labels != LABEL_WIN)
-    bias[long_only] = DIR_LONG
-    bias[short_only] = DIR_SHORT
     result["bias_label"] = bias
-
-    quality_arr = np.full(n, QUALITY_NONE, dtype=np.int8)
-    for t in range(n):
-        if bias[t] != DIR_NEUTRAL:
-            quality_arr[t] = _detect_quality(result, t, int(bias[t]))
     result["signal_quality"] = quality_arr
 
     if "regime" not in result.columns:
@@ -597,10 +508,10 @@ def label_with_forward_scan(
     sq = result["signal_quality"].value_counts()
 
     print(
-        f"  Labels (Long):  WIN={lw}({lw / total:.0%}) "
+        f"  Labels (Long view):  WIN={lw}({lw / total:.0%}) "
         f"LOSE={ll}({ll / total:.0%}) CANCEL={lc}({lc / total:.0%})"
     )
-    print(f"  Labels (Short): WIN={sw}({sw / total:.0%})")
+    print(f"  Labels (Short view): WIN={sw}({sw / total:.0%})")
     print(
         f"  Bias: LONG={bc.get(DIR_LONG, 0)}({bc.get(DIR_LONG, 0) / total:.0%}) "
         f"SHORT={bc.get(DIR_SHORT, 0)}({bc.get(DIR_SHORT, 0) / total:.0%}) "
@@ -648,32 +559,17 @@ def build_training_dataset(
             continue
 
         entry = float(pd.to_numeric(df_eng[price_col].iloc[i], errors="coerce") or 0.0)
-        tp_long = float(df_eng["long_tp"].iloc[i]) if "long_tp" in df_eng.columns else tick_size * 15
-        sl_long = float(df_eng["long_sl"].iloc[i]) if "long_sl" in df_eng.columns else tick_size * 10
-        tp_short = float(df_eng["short_tp"].iloc[i]) if "short_tp" in df_eng.columns else tick_size * 15
-        sl_short = float(df_eng["short_sl"].iloc[i]) if "short_sl" in df_eng.columns else tick_size * 10
         future_px = pd.to_numeric(df_eng[price_col].iloc[i + 1:i + 1 + horizon], errors="coerce").ffill().fillna(0.0).values.astype(np.float64)
+        future_return = float(future_px[-1] - entry) if len(future_px) else 0.0
+        direction = _direction_from_future_return(future_return, tick_size=tick_size, threshold_ticks=5.0)
+        if direction == DIR_NEUTRAL and drop_neutral:
+            continue
 
-        lw = np.where(future_px >= entry + tp_long)[0]
-        ll = np.where(future_px <= entry - sl_long)[0]
-        sw = np.where(future_px <= entry - tp_short)[0]
-        sl = np.where(future_px >= entry + sl_short)[0]
-
-        l_win = lw[0] if len(lw) > 0 else np.inf
-        l_lose = ll[0] if len(ll) > 0 else np.inf
-        s_win = sw[0] if len(sw) > 0 else np.inf
-        s_lose = sl[0] if len(sl) > 0 else np.inf
-
-        if l_win < l_lose:
-            direction = DIR_LONG
-        elif s_win < s_lose:
-            direction = DIR_SHORT
-        else:
-            if drop_neutral:
-                continue
-            direction = DIR_NEUTRAL
-
-        quality = _detect_quality(df_eng, i, direction)
+        quality = (
+            QUALITY_NONE
+            if direction == DIR_NEUTRAL
+            else _quality_from_move_strength(abs(future_return), tick_size=tick_size, strong_ticks=10.0)
+        )
         regime = int(df_eng["regime"].iloc[i]) if "regime" in df_eng.columns else REGIME_RANGING
 
         X_list.append(win.astype(np.float32))

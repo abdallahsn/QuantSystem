@@ -1,12 +1,12 @@
 """
 labels_v19.py - Unified causal labels for QuantSystem
 =====================================================
-Compatibility wrapper around the dynamic order-book labeling pipeline.
+Compatibility wrapper around the unified order-book + price-action labeling pipeline.
 
 External callers still use `build_causal_event_labels(...)`, but internally the
 labels now come from:
 
-  order book scan -> dynamic levels -> feature engineering -> event filter
+  order book scan -> feature engineering -> event filter
   -> forward scan -> direction/quality/regime labels
 """
 
@@ -105,7 +105,7 @@ def build_causal_event_labels(
     tick_size: float = 1e-4,
 ) -> pd.DataFrame:
     """
-    Build causal labels using unified order-book features and dynamic barriers.
+    Build causal labels using unified order-book features and price-only future direction.
 
     Signature kept for backwards compatibility with the current refinery.
     """
@@ -121,12 +121,9 @@ def build_causal_event_labels(
     out["volume"] = pd.to_numeric(out.get("size", out.get("volume", pd.Series(np.zeros(n)))), errors="coerce").fillna(0.0).astype(np.float32)
     out["cvd"] = pd.to_numeric(out.get("cvd", pd.Series(np.zeros(n))), errors="coerce").fillna(0.0).astype(np.float32)
 
-    min_tp_pips = max(6.0, 10.0 * float(tp_mult))
-    max_sl_pips = max(8.0, 10.0 * float(max(sl_mult, 0.8)))
     dynamic_cols = [
         "micro_price", "bid_wall_strength", "ask_wall_strength",
         "distance_to_wall", "gap_size", "liquidity_density",
-        "long_tp", "long_sl", "short_tp", "short_sl", "long_rr", "short_rr",
     ]
     has_dynamic_context = all(col in out.columns for col in dynamic_cols)
     has_depth = any(col.startswith("bid_px_") for col in out.columns) and any(col.startswith("ask_px_") for col in out.columns)
@@ -138,8 +135,6 @@ def build_causal_event_labels(
             price_col=price_col,
             cvd_col="cvd",
             volume_col="volume",
-            min_tp_pips=min_tp_pips,
-            max_sl_pips=max_sl_pips,
         )
     else:
         for col in dynamic_cols:
