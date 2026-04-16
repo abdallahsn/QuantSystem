@@ -220,6 +220,60 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
     }
 
 
+def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
+    hover_y = ((bars["high"] + bars["low"]) / 2.0).fillna(bars["close"]).astype(float)
+    customdata = np.column_stack(
+        [
+            bars["open"].astype(float).values,
+            bars["high"].astype(float).values,
+            bars["low"].astype(float).values,
+            bars["close"].astype(float).values,
+            bars["event_count"].fillna(0).astype(int).values,
+            bars["volume"].fillna(0.0).astype(float).values,
+            bars["cb_direction"].fillna("NEUTRAL").astype(str).values,
+            bars["cb_confidence"].fillna(0.0).astype(float).values,
+            bars["cb_prob_long"].fillna(0.0).astype(float).values,
+            bars["cb_prob_short"].fillna(0.0).astype(float).values,
+            bars["cb_prob_neutral"].fillna(0.0).astype(float).values,
+            bars["cvd_delta"].fillna(0.0).astype(float).values,
+            bars["obi"].fillna(0.0).astype(float).values,
+            bars["absorption_intensity"].fillna(0.0).astype(float).values,
+            bars["kyle_lambda"].fillna(0.0).astype(float).values,
+            bars["hawkes_intensity"].fillna(0.0).astype(float).values,
+            bars["regime_label"].fillna("Ranging").astype(str).values,
+        ]
+    )
+    return go.Scatter(
+        x=bars["ts_event"],
+        y=hover_y,
+        mode="markers",
+        name="Candle Data",
+        showlegend=False,
+        marker=dict(size=18, color="rgba(0,0,0,0)"),
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Open=%{customdata[0]:,.5f}<br>"
+            "High=%{customdata[1]:,.5f}<br>"
+            "Low=%{customdata[2]:,.5f}<br>"
+            "Close=%{customdata[3]:,.5f}<br>"
+            "Ticks=%{customdata[4]}<br>"
+            "Volume=%{customdata[5]:,.2f}<br>"
+            "Signal=%{customdata[6]}<br>"
+            "Confidence=%{customdata[7]:.3f}<br>"
+            "P(LONG)=%{customdata[8]:.3f}<br>"
+            "P(SHORT)=%{customdata[9]:.3f}<br>"
+            "P(NEUTRAL)=%{customdata[10]:.3f}<br>"
+            "CVD Δ=%{customdata[11]:.3f}<br>"
+            "OBI=%{customdata[12]:.3f}<br>"
+            "Absorption=%{customdata[13]:.3f}<br>"
+            "Kyle λ=%{customdata[14]:.3f}<br>"
+            "Hawkes=%{customdata[15]:.3f}<br>"
+            "Regime=%{customdata[16]}<extra></extra>"
+        ),
+    )
+
+
 def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None = None) -> go.Figure:
     ts = bars["ts_event"]
 
@@ -227,7 +281,7 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
         rows=6,
         cols=1,
         shared_xaxes=True,
-        row_heights=[0.36, 0.13, 0.13, 0.12, 0.12, 0.14],
+        row_heights=[0.48, 0.10, 0.10, 0.10, 0.10, 0.12],
         vertical_spacing=0.02,
         subplot_titles=[
             "① 5m Candles + CatBoost Overlay",
@@ -255,6 +309,7 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
         row=1,
         col=1,
     )
+    fig.add_trace(_build_price_hover_trace(bars), row=1, col=1)
 
     for row in bars[bars["cb_change_flag"] == 1].itertuples(index=False):
         fig.add_vline(
@@ -288,21 +343,29 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                 name=f"CatBoost {label} ({int(mask.sum())})",
                 customdata=np.stack(
                     [
+                        bars.loc[mask, "open"].values,
+                        bars.loc[mask, "high"].values,
+                        bars.loc[mask, "low"].values,
                         bars.loc[mask, "close"].values,
                         bars.loc[mask, "cb_confidence"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_long"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_short"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_neutral"].fillna(0.0).values,
+                        bars.loc[mask, "regime_label"].fillna("Ranging").astype(str).values,
                     ],
                     axis=1,
                 ),
                 hovertemplate=(
                     f"CatBoost {label}<br>%{{x}}<br>"
-                    "Close=%{customdata[0]:.5f}<br>"
-                    "Confidence=%{customdata[1]:.3f}<br>"
-                    "P(LONG)=%{customdata[2]:.3f}<br>"
-                    "P(SHORT)=%{customdata[3]:.3f}<br>"
-                    "P(NEUTRAL)=%{customdata[4]:.3f}<extra></extra>"
+                    "Open=%{customdata[0]:,.5f}<br>"
+                    "High=%{customdata[1]:,.5f}<br>"
+                    "Low=%{customdata[2]:,.5f}<br>"
+                    "Close=%{customdata[3]:,.5f}<br>"
+                    "Confidence=%{customdata[4]:.3f}<br>"
+                    "P(LONG)=%{customdata[5]:.3f}<br>"
+                    "P(SHORT)=%{customdata[6]:.3f}<br>"
+                    "P(NEUTRAL)=%{customdata[7]:.3f}<br>"
+                    "Regime=%{customdata[8]}<extra></extra>"
                 ),
             ),
             row=1,
@@ -454,6 +517,33 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
         font=dict(size=11, color="#c8d8e8", family="IBM Plex Mono"),
     )
 
+    if not bars.empty:
+        last_close = float(bars["close"].iloc[-1])
+        last_open = float(bars["open"].iloc[-1])
+        price_color = "#00e896" if last_close >= last_open else "#ff4d6d"
+        fig.add_hline(
+            y=last_close,
+            line_dash="dot",
+            line_color=price_color,
+            line_width=1,
+            opacity=0.9,
+            row=1,
+            col=1,
+        )
+        fig.add_annotation(
+            x=bars["ts_event"].iloc[-1],
+            y=last_close,
+            text=f"{last_close:,.5f}",
+            showarrow=False,
+            xshift=44,
+            bgcolor=price_color,
+            bordercolor=price_color,
+            font=dict(size=11, color="#ffffff", family="IBM Plex Mono"),
+            align="left",
+            row=1,
+            col=1,
+        )
+
     fig.update_layout(
         title=dict(
             text="QS V19 — 5m CatBoost Visualization Dashboard",
@@ -461,12 +551,12 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
             x=0.02,
         ),
         paper_bgcolor="#060a0f",
-        plot_bgcolor="#0d1520",
+        plot_bgcolor="#0b0f14",
         font=dict(color="#c8d8e8", family="IBM Plex Mono"),
-        height=1280,
+        height=1380,
         showlegend=True,
         legend=dict(
-            bgcolor="rgba(13,21,32,0.90)",
+            bgcolor="rgba(8,11,16,0.92)",
             bordercolor="#1e3048",
             borderwidth=1,
             font=dict(size=10),
@@ -474,13 +564,48 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
             y=1.0,
             orientation="h",
         ),
-        hovermode="x unified",
+        margin=dict(l=20, r=92, t=58, b=22),
+        dragmode="pan",
+        hovermode="x",
+        hoverdistance=20,
+        spikedistance=1000,
         xaxis=dict(rangeslider=dict(visible=False), type="date"),
+        hoverlabel=dict(
+            bgcolor="rgba(10,14,20,0.96)",
+            bordercolor="#223248",
+            font=dict(size=11, color="#dbe7f3", family="IBM Plex Mono"),
+        ),
     )
 
     for i in range(1, 7):
-        fig.update_xaxes(showgrid=True, gridcolor="#1e3048", gridwidth=0.5, zeroline=False, row=i, col=1)
-        fig.update_yaxes(showgrid=True, gridcolor="#1e3048", gridwidth=0.5, zeroline=False, row=i, col=1)
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.07)",
+            gridwidth=0.5,
+            zeroline=False,
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+            spikecolor="rgba(255,255,255,0.28)",
+            spikethickness=1,
+            row=i,
+            col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.07)",
+            gridwidth=0.5,
+            zeroline=False,
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+            spikecolor="rgba(255,255,255,0.18)",
+            spikethickness=1,
+            side="right",
+            tickformat=",.5f" if i == 1 else None,
+            row=i,
+            col=1,
+        )
 
     return fig
 
@@ -602,13 +727,36 @@ def generate_catboost_5m_report(
     with open(html_path, "w", encoding="utf-8") as f:
         f.write("<html><head><meta charset='utf-8'>")
         f.write("<title>QS V19 5m CatBoost Visualizer</title>")
-        f.write("<style>body{background:#060a0f;margin:0;padding:10px;}</style>")
+        f.write(
+            "<style>"
+            "body{background:#060a0f;margin:0;padding:0;font-family:'IBM Plex Mono',monospace;}"
+            ".shell{padding:10px 12px 18px 12px;}"
+            "</style>"
+        )
         f.write("</head><body>")
-        f.write(fig_main.to_html(full_html=False, include_plotlyjs="cdn"))
+        f.write("<div class='shell'>")
+        f.write(
+            fig_main.to_html(
+                full_html=False,
+                include_plotlyjs="cdn",
+                config={
+                    "displaylogo": False,
+                    "responsive": True,
+                    "scrollZoom": True,
+                    "doubleClick": "reset+autosize",
+                },
+            )
+        )
         if fig_conf is not None:
             f.write("<br>")
-            f.write(fig_conf.to_html(full_html=False, include_plotlyjs=False))
-        f.write("</body></html>")
+            f.write(
+                fig_conf.to_html(
+                    full_html=False,
+                    include_plotlyjs=False,
+                    config={"displaylogo": False, "responsive": True},
+                )
+            )
+        f.write("</div></body></html>")
 
     summary = {
         "rows": int(len(pred_df)),
