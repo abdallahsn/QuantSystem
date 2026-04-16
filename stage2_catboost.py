@@ -16,7 +16,7 @@ except ImportError as e:
     ) from e
 
 from modules.config_v19 import load_v19_config
-from modules.hourly_catboost_report import generate_hourly_catboost_report
+from modules.catboost_5m_report import generate_catboost_5m_report
 from train_v19 import run_training_pipeline
 
 
@@ -55,20 +55,20 @@ def main():
     )
 
     try:
-        summary = generate_hourly_catboost_report(
+        summary = generate_catboost_5m_report(
             csv_path=args.csv,
             models_dir=args.output,
             output_dir=args.output,
-            freq='1H',
-            report_name='hourly_catboost',
+            freq='5min',
+            report_name='catboost_5m',
         )
-        print("\n📊 Hourly CatBoost report generated")
+        print("\n📊 5m CatBoost dashboard generated")
         for key, path in summary.get('files', {}).items():
             print(f"  {key}: {path}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
         print(f"  transitions: {summary.get('transitions', 0)}")
     except Exception as e:
-        print(f"\n⚠️ تعذر توليد الرسم/التقرير الساعي: {e}")
+        print(f"\n⚠️ تعذر توليد Dashboard الـ 5m: {e}")
 
 
 if __name__ == '__main__':
