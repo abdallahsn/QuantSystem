@@ -93,8 +93,10 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
     if not fold_reports:
         return {
             'n_folds': 0,
-            'mean_accuracy': 0.0,
-            'mean_trade_accuracy': 0.0,
+            'mean_directional_precision': 0.0,
+            'mean_directional_recall': 0.0,
+            'mean_directional_f1': 0.0,
+            'mean_event_gate_rate': 0.0,
             'mean_win_rate': 0.0,
             'mean_trade_sharpe': 0.0,
             'max_drawdown_pct': 0.0,
@@ -104,8 +106,10 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
 
     return {
         'n_folds': int(len(fold_reports)),
-        'mean_accuracy': float(np.mean([r['backtest'].get('accuracy', 0.0) for r in fold_reports])),
-        'mean_trade_accuracy': float(np.mean([r['backtest'].get('trade_accuracy', 0.0) for r in fold_reports])),
+        'mean_directional_precision': float(np.mean([r['backtest'].get('directional_precision_macro', 0.0) for r in fold_reports])),
+        'mean_directional_recall': float(np.mean([r['backtest'].get('directional_recall_macro', 0.0) for r in fold_reports])),
+        'mean_directional_f1': float(np.mean([r['backtest'].get('directional_f1_macro', 0.0) for r in fold_reports])),
+        'mean_event_gate_rate': float(np.mean([r['backtest'].get('event_gate_rate', 0.0) for r in fold_reports])),
         'mean_win_rate': float(np.mean([r['backtest'].get('win_rate', 0.0) for r in fold_reports])),
         'mean_trade_sharpe': float(np.mean([r['backtest'].get('trade_sharpe', 0.0) for r in fold_reports])),
         'max_drawdown_pct': float(np.max([r['backtest'].get('max_drawdown_pct', 0.0) for r in fold_reports])),
@@ -156,6 +160,10 @@ def run_walkforward(
             chunksize=int(ref_cfg.get('chunksize', 0) or 0),
             n_workers=ref_cfg.get('n_workers'),
             target_bars=int(ref_cfg.get('target_bars', 500)),
+            label_horizon=int(ref_cfg.get('label_horizon', 50)),
+            event_roll_window=int(ref_cfg.get('event_roll_window', 50)),
+            direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 5.0)),
+            lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
         )
         train_summary = run_training_pipeline(
             csv_path=train_build['csv'],
@@ -167,8 +175,13 @@ def run_walkforward(
             n_folds=int(train_cfg.get('n_folds', 6)),
             test_size=float(train_cfg.get('test_size', 0.10)),
             embargo_pct=float(train_cfg.get('embargo_pct', 0.02)),
+            min_train_pct=float(train_cfg.get('min_train_pct', 0.20)),
             train_frac=float(train_cfg.get('train_frac', 0.80)),
+            min_seq_coverage=float(train_cfg.get('min_seq_coverage', 0.80)),
             stage=int(train_cfg.get('stage', 0)),
+            training_mode=str(train_cfg.get('mode', 'event_binary')),
+            quality_weight_strong=float(train_cfg.get('quality_weight_strong', 2.0)),
+            quality_weight_weak=float(train_cfg.get('quality_weight_weak', 1.0)),
             config_snapshot=config,
         )
 
@@ -182,6 +195,10 @@ def run_walkforward(
             chunksize=int(ref_cfg.get('chunksize', 0) or 0),
             n_workers=ref_cfg.get('n_workers'),
             target_bars=int(ref_cfg.get('target_bars', 500)),
+            label_horizon=int(ref_cfg.get('label_horizon', 50)),
+            event_roll_window=int(ref_cfg.get('event_roll_window', 50)),
+            direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 5.0)),
+            lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
             external_scaler_path=os.path.join(model_dir, 'scaler_params.json'),
             fit_aux_models=False,
         )

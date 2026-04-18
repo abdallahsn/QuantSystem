@@ -34,6 +34,7 @@ QUALITY_NONE = 0
 
 REGIME_TRENDING = 1
 REGIME_RANGING = 0
+EVENT_SHIFT_COLS = ("obi", "cvd", "micro_price", "liquidity_density")
 
 
 @dataclass
@@ -308,51 +309,185 @@ def engineer_features(df: pd.DataFrame, roll_window: int = 20) -> pd.DataFrame:
     return df
 
 
+def _numeric_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    return pd.to_numeric(
+        df.get(col, pd.Series(np.full(len(df), default), index=df.index)),
+        errors="coerce",
+    ).fillna(default)
+
+
+def _rolling_zscore(series: pd.Series, roll_window: int) -> pd.Series:
+    roll_window = max(int(roll_window), 1)
+    roll_mean = series.rolling(roll_window, min_periods=1).mean()
+    roll_std = series.rolling(roll_window, min_periods=1).std().replace(0, 1e-9)
+    return ((series - roll_mean) / roll_std).fillna(0.0)
+
+
 def build_event_filter(
     df: pd.DataFrame,
     vol_mult: float = 1.5,
     obi_thr: float = 0.3,
     wall_str_thr: float = 1.0,
+    roll_window: int = 50,
+    shift_z_thr: float = 0.75,
+    return_details: bool = False,
 ) -> pd.Series:
     """
     Important-event mask driven by current activity, imbalance, and wall strength.
     """
 
     if "volume" in df.columns:
-        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+        volume = _numeric_series(df, "volume")
     elif "size" in df.columns:
-        volume = pd.to_numeric(df["size"], errors="coerce").fillna(0.0)
+        volume = _numeric_series(df, "size")
     else:
         volume = pd.Series(np.zeros(len(df), dtype=np.float32), index=df.index)
 
-    roll_vol = volume.rolling(50, min_periods=1).mean()
+    roll_vol = volume.rolling(max(int(roll_window), 1), min_periods=1).mean()
     cond_vol = volume > (roll_vol * float(vol_mult))
 
     if "obi" in df.columns:
-        cond_obi = pd.to_numeric(df["obi"], errors="coerce").fillna(0.0).abs() > float(obi_thr)
+        cond_obi = _numeric_series(df, "obi").abs() > float(obi_thr)
     else:
         cond_obi = pd.Series(False, index=df.index)
 
     if "bid_wall_strength" in df.columns and "ask_wall_strength" in df.columns:
-        bid_wall = pd.to_numeric(df["bid_wall_strength"], errors="coerce").fillna(0.0)
-        ask_wall = pd.to_numeric(df["ask_wall_strength"], errors="coerce").fillna(0.0)
+        bid_wall = _numeric_series(df, "bid_wall_strength")
+        ask_wall = _numeric_series(df, "ask_wall_strength")
         cond_wall = (bid_wall > float(wall_str_thr)) | (ask_wall > float(wall_str_thr))
     else:
         cond_wall = pd.Series(False, index=df.index)
 
-    zscore_cols = [
-        col
-        for col in ("obi_zscore", "cvd_zscore", "micro_price_zscore", "liquidity_density_zscore")
-        if col in df.columns
-    ]
-    if zscore_cols:
-        cond_shift = pd.Series(False, index=df.index)
-        for col in zscore_cols:
-            cond_shift = cond_shift | (pd.to_numeric(df[col], errors="coerce").fillna(0.0).abs() > 0.75)
-    else:
-        cond_shift = pd.Series(False, index=df.index)
+    cond_shift = pd.Series(False, index=df.index)
+    for col in EVENT_SHIFT_COLS:
+        z_col = f"{col}_zscore"
+        if z_col in df.columns:
+            zscore = _numeric_series(df, z_col)
+        elif col in df.columns:
+            zscore = _rolling_zscore(_numeric_series(df, col), roll_window=roll_window)
+        else:
+            continue
+        cond_shift = cond_shift | (zscore.abs() > float(shift_z_thr))
 
-    return (cond_vol | cond_obi | cond_wall | cond_shift).astype(bool)
+    mask = (cond_vol | cond_obi | cond_wall | cond_shift).astype(bool)
+    if not return_details:
+        return mask
+
+    details = pd.DataFrame(
+        {
+            "event_flag": mask.astype(np.int8),
+            "cond_vol": cond_vol.astype(np.int8),
+            "cond_obi": cond_obi.astype(np.int8),
+            "cond_wall": cond_wall.astype(np.int8),
+            "cond_shift": cond_shift.astype(np.int8),
+        },
+        index=df.index,
+    )
+    return mask, details
+
+
+class EventGate:
+    """
+    Online deterministic replica of the offline event filter.
+    """
+
+    def __init__(
+        self,
+        roll_window: int = 50,
+        vol_mult: float = 1.45,
+        obi_thr: float = 0.40,
+        wall_str_thr: float = 1.025,
+        shift_z_thr: float = 0.75,
+    ):
+        self.roll_window = max(int(roll_window), 1)
+        self.vol_mult = float(vol_mult)
+        self.obi_thr = float(obi_thr)
+        self.wall_str_thr = float(wall_str_thr)
+        self.shift_z_thr = float(shift_z_thr)
+        self._volume_hist = deque(maxlen=self.roll_window)
+        self._shift_hist = {col: deque(maxlen=self.roll_window) for col in EVENT_SHIFT_COLS}
+
+    def reset(self) -> None:
+        self._volume_hist.clear()
+        for hist in self._shift_hist.values():
+            hist.clear()
+
+    @staticmethod
+    def _as_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None or pd.isna(value):
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _pick(self, row: dict, *keys: str, default: float = 0.0) -> float:
+        for key in keys:
+            if key in row:
+                value = self._as_float(row.get(key), default=np.nan)
+                if not np.isnan(value):
+                    return float(value)
+        return float(default)
+
+    def _current_zscore(self, col: str, current: float) -> float:
+        values = list(self._shift_hist[col])
+        values.append(float(current))
+        if len(values) < 2:
+            return 0.0
+        arr = np.asarray(values, dtype=np.float64)
+        std = float(arr.std())
+        if std <= 1e-9:
+            return 0.0
+        return float((current - float(arr.mean())) / std)
+
+    def evaluate(self, row: dict) -> dict:
+        row = row or {}
+        volume = self._pick(row, "size", "volume", default=0.0)
+        obi = self._pick(row, "raw__obi", "obi", default=0.0)
+        bid_wall = self._pick(row, "raw__bid_wall_strength", "bid_wall_strength", default=0.0)
+        ask_wall = self._pick(row, "raw__ask_wall_strength", "ask_wall_strength", default=0.0)
+
+        vol_values = list(self._volume_hist)
+        vol_values.append(volume)
+        vol_mean = float(np.mean(vol_values)) if vol_values else 0.0
+        cond_vol = bool(volume > (vol_mean * self.vol_mult)) if vol_mean > 0 else bool(volume > 0)
+        cond_obi = bool(abs(obi) > self.obi_thr)
+        cond_wall = bool((bid_wall > self.wall_str_thr) or (ask_wall > self.wall_str_thr))
+
+        shift_hits = []
+        for col in EVENT_SHIFT_COLS:
+            current = self._pick(row, f"raw__{col}", col, default=0.0)
+            if abs(self._current_zscore(col, current)) > self.shift_z_thr:
+                shift_hits.append(col)
+        cond_shift = bool(shift_hits)
+
+        self._volume_hist.append(volume)
+        for col in EVENT_SHIFT_COLS:
+            current = self._pick(row, f"raw__{col}", col, default=0.0)
+            self._shift_hist[col].append(current)
+
+        reasons = []
+        if cond_vol:
+            reasons.append("vol")
+        if cond_obi:
+            reasons.append("obi")
+        if cond_wall:
+            reasons.append("wall")
+        if cond_shift:
+            reasons.append("shift")
+
+        passed = bool(cond_vol or cond_obi or cond_wall or cond_shift)
+        return {
+            "passed": passed,
+            "reason": "|".join(reasons) if reasons else "quiet",
+            "details": {
+                "cond_vol": cond_vol,
+                "cond_obi": cond_obi,
+                "cond_wall": cond_wall,
+                "cond_shift": cond_shift,
+                "shift_hits": shift_hits,
+            },
+        }
 
 
 def append_dynamic_orderbook_features(
@@ -462,6 +597,7 @@ def label_with_forward_scan(
     df_levels: pd.DataFrame,
     max_bars_forward: int = 50,
     tick_size: float = 0.0001,
+    direction_threshold_ticks: float = 5.0,
 ) -> pd.DataFrame:
     """
     Price-only forward scan with three-layer label outputs.
@@ -495,7 +631,11 @@ def label_with_forward_scan(
             continue
 
         future_return = float(future[-1] - entry)
-        direction = _direction_from_future_return(future_return, tick_size=tick_size, threshold_ticks=5.0)
+        direction = _direction_from_future_return(
+            future_return,
+            tick_size=tick_size,
+            threshold_ticks=direction_threshold_ticks,
+        )
         move_strength = abs(future_return)
         future_returns[t] = future_return
         move_strengths[t] = move_strength
@@ -564,6 +704,8 @@ def build_training_dataset(
     vol_mult: float = 1.5,
     obi_thr: float = 0.3,
     drop_neutral: bool = True,
+    event_roll_window: int = 50,
+    direction_threshold_ticks: float = 5.0,
 ) -> Tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Unified dataset builder for sequence models.
@@ -571,7 +713,13 @@ def build_training_dataset(
 
     df_aug = append_dynamic_orderbook_features(df, tick_size=tick_size)
     df_eng = engineer_features(df_aug, roll_window=20)
-    labeled = label_with_forward_scan(df_eng, df_eng, max_bars_forward=horizon, tick_size=tick_size)
+    labeled = label_with_forward_scan(
+        df_eng,
+        df_eng,
+        max_bars_forward=horizon,
+        tick_size=tick_size,
+        direction_threshold_ticks=direction_threshold_ticks,
+    )
 
     base_cols = [c for c in MarketFeatureVector.feature_names() if c in df_eng.columns]
     derived = [
@@ -580,7 +728,12 @@ def build_training_dataset(
         if c.endswith("_diff") or c.endswith("_zscore") or c.endswith("_rmean")
     ]
     feature_cols = base_cols + derived
-    event_mask = build_event_filter(df_eng, vol_mult=vol_mult, obi_thr=obi_thr)
+    event_mask = build_event_filter(
+        df_eng,
+        vol_mult=vol_mult,
+        obi_thr=obi_thr,
+        roll_window=event_roll_window,
+    )
 
     X_list, y_list = [], []
     price_col = "close" if "close" in df_eng.columns else ("price" if "price" in df_eng.columns else "micro_price")

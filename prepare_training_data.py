@@ -34,7 +34,10 @@ from modules.market_research_features import (KylesLambdaEngine,
                                                LiquidityGapsEngine,
                                                VNETEngine)
 from modules.fractional_diff         import apply_fractional_diff
-from modules.dynamic_labels         import OrderWallScanner
+from modules.dynamic_labels         import (DIR_NEUTRAL,
+                                              OrderWallScanner,
+                                              QUALITY_STRONG,
+                                              QUALITY_WEAK)
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
@@ -55,6 +58,7 @@ _DEEPLOB_IMPORT_ATTEMPTED = False
 DEEPLOB_MAX_EVENTS_DEFAULT = 5_000_000
 DEEPLOB_MAX_TENSORS_DEFAULT = 25_000
 DEEPLOB_MAX_GB_DEFAULT = 0.30
+LOB_EVENT_SAMPLE_DEFAULT = 100_000
 
 try:
     from modules.labels_v19 import build_causal_event_labels
@@ -174,9 +178,9 @@ RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_F
 
 # V19 Meta-Features — مخرجات CatBoost تُضاف للـ LSTM
 META_FEATURE_COLS = [
-    'cb_prob_long', 'cb_prob_short', 'cb_prob_neutral',    # 3 احتمالات CatBoost
+    'cb_prob_long', 'cb_prob_short',                       # 2 احتمالات CatBoost
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',   # 4 One-Hot Cluster
-]  # N = 7
+]  # N = 6
 
 # V19 Visual Features — مخرجات CNN
 VISUAL_EMB_COLS = [f'vis_emb_{i}' for i in range(8)]  # N = 8
@@ -767,7 +771,7 @@ def _load_scaler_params_from_path(path: str) -> dict:
         return json.load(f)
 
 
-def _deeplob_runtime_limits() -> dict:
+def _deeplob_runtime_limits(lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT) -> dict:
     max_events = int(os.environ.get('QUANTSYSTEM_MAX_LOB_EVENTS', DEEPLOB_MAX_EVENTS_DEFAULT))
     max_tensors = int(os.environ.get('QUANTSYSTEM_MAX_LOB_TENSORS', DEEPLOB_MAX_TENSORS_DEFAULT))
     max_gb = float(os.environ.get('QUANTSYSTEM_MAX_LOB_GB', DEEPLOB_MAX_GB_DEFAULT))
@@ -778,6 +782,7 @@ def _deeplob_runtime_limits() -> dict:
         'max_bytes': int(max_gb * (1024 ** 3)),
         'max_gb': max_gb,
         'force': force,
+        'lob_event_sample': int(max(lob_event_sample, 1)),
     }
 
 
@@ -793,6 +798,74 @@ def _lob_source_frame(df: pd.DataFrame, kind: str) -> pd.DataFrame:
             cols.extend([f'bid_px_{i:02d}', f'bid_sz_{i:02d}', f'ask_px_{i:02d}', f'ask_sz_{i:02d}'])
     cols = [c for c in cols if c in df.columns]
     return df.loc[:, cols].copy(deep=False)
+
+
+def _select_event_rich_lob_emit_positions(
+    df_labeled: pd.DataFrame,
+    lob_mbp_src: pd.DataFrame,
+    max_events: int = LOB_EVENT_SAMPLE_DEFAULT,
+) -> tuple[np.ndarray, dict]:
+    if (
+        df_labeled is None or len(df_labeled) == 0 or
+        lob_mbp_src is None or len(lob_mbp_src) == 0
+    ):
+        return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
+
+    label_cols = ['ts_event', 'event_flag', 'bias_label', 'signal_quality']
+    candidates = df_labeled.loc[:, [c for c in label_cols if c in df_labeled.columns]].copy()
+    if len(candidates) == 0 or 'ts_event' not in candidates.columns:
+        return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
+
+    candidates['ts_event'] = pd.to_datetime(candidates['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    candidates = candidates.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    candidates['event_flag'] = pd.to_numeric(candidates.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    candidates['bias_label'] = pd.to_numeric(candidates.get('bias_label', DIR_NEUTRAL), errors='coerce').fillna(DIR_NEUTRAL).astype(np.int8)
+    candidates['signal_quality'] = pd.to_numeric(candidates.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
+    candidates = candidates[
+        (candidates['event_flag'] == 1) &
+        (candidates['bias_label'] != DIR_NEUTRAL)
+    ].reset_index(drop=True)
+    if len(candidates) == 0:
+        return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
+
+    max_events = int(max(max_events, 1))
+    strong = candidates[candidates['signal_quality'] == QUALITY_STRONG].copy()
+    weak = candidates[candidates['signal_quality'] == QUALITY_WEAK].copy()
+
+    selected_parts = []
+    if len(strong):
+        selected_parts.append(strong.iloc[:max_events].copy())
+    remaining = max_events - sum(len(part) for part in selected_parts)
+    if remaining > 0 and len(weak):
+        selected_parts.append(weak.iloc[:remaining].copy())
+    if not selected_parts:
+        return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
+
+    selected = pd.concat(selected_parts, axis=0, ignore_index=True).sort_values('ts_event').drop_duplicates('ts_event')
+    mbp_df = lob_mbp_src[['ts_event']].copy()
+    mbp_df['ts_event'] = pd.to_datetime(mbp_df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    mbp_df = mbp_df.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    mbp_df['mbp_pos'] = np.arange(len(mbp_df), dtype=np.int32)
+    if len(mbp_df) == 0:
+        return np.array([], dtype=np.int32), {'selected_events': int(len(selected)), 'selected_emit_positions': 0}
+
+    aligned = pd.merge_asof(
+        selected[['ts_event']].sort_values('ts_event'),
+        mbp_df[['ts_event', 'mbp_pos']],
+        on='ts_event',
+        direction='backward',
+    ).dropna(subset=['mbp_pos'])
+    emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
+    meta = {
+        'directional_events_available': int(len(candidates)),
+        'strong_available': int(len(strong)),
+        'weak_available': int(len(weak)),
+        'selected_events': int(len(selected)),
+        'selected_emit_positions': int(len(emit_positions)),
+        'selected_strong': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_STRONG) if selected_parts else 0),
+        'selected_weak': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_WEAK) if selected_parts else 0),
+    }
+    return emit_positions, meta
 
 
 def _build_refinery_split_context(
@@ -977,7 +1050,7 @@ def _normalize_and_save(
         ae_train_end = len(X_roll_train)
 
         ae = AutoencoderExtractor(input_dim=len(roll_col_list), bottleneck=EMBEDDINGS_DIM)
-        ae.fit(X_roll_train, epochs=20, batch_size=512, output_dir=output_dir)
+        ae.fit(X_roll_train, epochs=40, batch_size=512, output_dir=output_dir)
 
         # transform على كامل الداتا (train + val)
         df['dl_anomaly_score'] = ae.score(X_roll).astype('float32')
@@ -1129,6 +1202,10 @@ def run_refinery(
     label_mode='v19',
     n_workers=None,
     target_bars=500,
+    label_horizon: int = 50,
+    event_roll_window: int = 50,
+    direction_threshold_ticks: float = 5.0,
+    lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
 ):
@@ -1167,7 +1244,7 @@ def run_refinery(
     print("\n⚙️  Step 1 — MBO (Context & Microstructure)...")
     df_mbo = _normalize_databento_columns(df_mbo)
     deeplob_enabled = _load_deeplob_components() and mbp_exists
-    lob_limits = _deeplob_runtime_limits()
+    lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
     lob_mbo_src = _lob_source_frame(df_mbo, 'mbo') if deeplob_enabled else None
     lob_mbp_src = None
     df_mbo_p = _process_mbo(df_mbo, n_workers=n_workers)
@@ -1207,9 +1284,25 @@ def run_refinery(
     print("\n⚙️  Step 3d — Daily/Weekly Levels...")
     df_merged = compute_daily_weekly_levels(df_merged)
 
-    # ── V19 Step 3e: LOB Tensor Dataset ──────────────────────────
+    if label_mode == 'v19' and V19_LABELS_AVAILABLE:
+        print("\n⚙️  Step 4 — V19 Causal Event Labels...")
+        df_labeled = build_causal_event_labels(
+            df_merged,
+            horizon=label_horizon,
+            event_roll_window=event_roll_window,
+            direction_threshold_ticks=direction_threshold_ticks,
+            tp_mult=1.5,
+            sl_mult=1.0,
+            neutral_mult=0.45,
+            tick_size=_tick,
+        )
+    else:
+        print("\n⚙️  Step 4 — Fallback Session Labeling...")
+        df_labeled = _label_sessions(df_merged)
+
+    # ── V19 Step 3e: LOB Tensor Dataset (event-rich emit positions) ─────
     if deeplob_enabled and lob_mbp_src is not None and len(lob_mbp_src) > 0:
-        print("\n⚙️  Step 3e — Building LOB Tensor Dataset (V19)...")
+        print("\n⚙️  Step 3e — Building Event-Rich LOB Tensor Dataset (V19)...")
         try:
             lob_path = os.path.join(output_dir, 'lob_tensors.npy')
             ts_path = os.path.join(output_dir, 'lob_tensor_timestamps.npy')
@@ -1223,6 +1316,12 @@ def run_refinery(
             effective_max_tensors = lob_limits['max_tensors']
             if max_tensors_by_bytes > 0:
                 effective_max_tensors = min(effective_max_tensors, max_tensors_by_bytes)
+            sample_cap = int(min(lob_limits['lob_event_sample'], max(effective_max_tensors, 0) or lob_limits['lob_event_sample']))
+            emit_positions, emit_meta = _select_event_rich_lob_emit_positions(
+                df_labeled,
+                lob_mbp_src,
+                max_events=sample_cap,
+            )
             build_plan = {
                 'force': lob_limits['force'],
                 'max_events': lob_limits['max_events'],
@@ -1230,9 +1329,11 @@ def run_refinery(
                 'max_tensors_by_bytes': int(max_tensors_by_bytes),
                 'effective_max_tensors': int(effective_max_tensors),
                 'max_gb': lob_limits['max_gb'],
+                'lob_event_sample': int(lob_limits['lob_event_sample']),
                 'mbo_rows': mbo_rows,
                 'mbp_rows': mbp_rows,
                 'total_events': total_lob_events,
+                **emit_meta,
             }
             skip_large = (
                 (total_lob_events > lob_limits['max_events']) or
@@ -1256,15 +1357,27 @@ def run_refinery(
                     f"events={total_lob_events:,}, budget_tensors={effective_max_tensors:,}. "
                     "استخدم QUANTSYSTEM_FORCE_LOB=1 لو أردت تشغيله يدويًا."
                 )
+            elif len(emit_positions) == 0:
+                np.save(lob_path, empty_lob)
+                np.save(ts_path, empty_ts)
+                with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
+                    json.dump({
+                        **build_plan,
+                        'status': 'empty_event_sample',
+                        'built_tensors': 0,
+                        'reason': 'no_event_emit_positions',
+                    }, f, indent=2)
+                print("  ⚠️ لا توجد event-rich positions كافية لبناء LOB tensors")
             else:
                 lob_meta = build_lob_tensor_dataset(
                     lob_mbo_src,
                     lob_mbp_src,
-                    time_steps=50,
+                    time_steps=N_TIME_STEPS,
                     output_path=lob_path,
                     timestamps_path=ts_path,
-                    max_tensors=effective_max_tensors,
+                    emit_positions=emit_positions,
                 )
+                lob_meta = {**build_plan, **lob_meta}
                 with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
                     json.dump(lob_meta, f, indent=2)
 
@@ -1273,13 +1386,13 @@ def run_refinery(
                     print(
                         "  ✅ LOB Tensors built "
                         f"({lob_meta.get('built_tensors', 0):,} tensors, "
-                        f"stride={lob_meta.get('snapshot_stride', 1)}, "
+                        f"selected_emit_positions={len(emit_positions):,}, "
                         f"~{est_gb:.2f} GB on disk)"
                     )
                     print(f"  ✅ LOB Tensor file: {lob_path}")
                     print(f"  ✅ LOB Timestamp file: {ts_path}")
                 else:
-                    print("  ⚠️ LOB Tensors فارغة بعد sampling — visual embeddings ستعود للصفر")
+                    print("  ⚠️ LOB Tensors فارغة بعد event sampling — visual embeddings ستعود للصفر")
         except Exception as e:
             np.save(os.path.join(output_dir, 'lob_tensors.npy'), np.zeros((0, N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32))
             np.save(os.path.join(output_dir, 'lob_tensor_timestamps.npy'), np.array([], dtype=np.int64))
@@ -1287,20 +1400,6 @@ def run_refinery(
                 json.dump({'status': 'failed', 'built_tensors': 0, 'error': str(e)}, f, indent=2)
             print(f"  ⚠️ LOB Tensor build failed: {e}")
     del lob_mbo_src, lob_mbp_src
-
-    if label_mode == 'v19' and V19_LABELS_AVAILABLE:
-        print("\n⚙️  Step 4 — V19 Causal Event Labels...")
-        df_labeled = build_causal_event_labels(
-            df_merged,
-            horizon=50,
-            tp_mult=1.5,
-            sl_mult=1.0,
-            neutral_mult=0.45,
-            tick_size=_tick,
-        )
-    else:
-        print("\n⚙️  Step 4 — Fallback Session Labeling...")
-        df_labeled = _label_sessions(df_merged)
 
     # ⑦ FIX: del df_merged بعد انتهاء كل المسارات
     del df_merged

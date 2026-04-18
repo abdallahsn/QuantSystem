@@ -6,7 +6,7 @@ meta_learner.py — LSTM Meta-Learner (V19 Core Brain)
   Input A — Visual (CNN):    مصفوفة (50, 20, 3) → 8 Visual Embeddings
   Input B — Statistical:     مصفوفة (50, N_STAT) تشمل:
     • الـ 25 Feature الكلاسيكية (CVD, OBI, Absorption...)
-    • 3 احتمالات من CatBoost   (P_LONG, P_SHORT, P_NEUTRAL)
+    • 2 احتمالات من CatBoost   (P_LONG, P_SHORT)
     • 4 One-Hot للـ Cluster     (Cluster 0..3)
 
 Architecture:
@@ -14,7 +14,8 @@ Architecture:
   Stat Branch:  Input(50,N_STAT) → LayerNorm
   Fusion:       Concat([stat, visual_per_step]) → (50, N_STAT+8)
   LSTM Stack:   LSTM(128) → LSTM(64) → Attention → Dense
-  Output:       Softmax(3) → LONG/SHORT/NEUTRAL + Confidence
+  Output:       Softmax(2) → LONG/SHORT + Confidence
+                no-trade / NEUTRAL يُحسم خارج النموذج عبر EventGate
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -34,7 +35,7 @@ from sklearn.metrics import classification_report
 
 BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
-N_CB_PROBS   = 3   # P_LONG, P_SHORT, P_NEUTRAL
+N_CB_PROBS   = 2   # P_LONG, P_SHORT
 
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
@@ -66,11 +67,11 @@ class MetaLearnerLSTM:
     LSTM يقرأ "القصة الكاملة" للسوق عبر الزمن ويصدر القرار النهائي.
 
     يستقبل في كل خطوة زمنية:
-      - الفيتشرز الإحصائية (25)
-      - احتمالات CatBoost (3)
+      - الفيتشرز الإحصائية (n_stat)
+      - احتمالات CatBoost (2)
       - One-Hot Cluster (4)
       - Visual Embeddings من CNN (8)
-      المجموع: 25 + 3 + 4 + 8 = 40 feature per timestep
+      المجموع: n_stat + 2 + 4 + 8 feature per timestep
     """
 
     def __init__(self,
@@ -86,8 +87,8 @@ class MetaLearnerLSTM:
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
         self.n_visual     = n_visual_emb
-        self.n_meta       = N_CB_PROBS + N_CLUSTERS          # 3 + 4 = 7
-        self.n_total      = n_stat_feat + self.n_meta + n_visual_emb  # 40
+        self.n_meta       = N_CB_PROBS + N_CLUSTERS          # 2 + 4 = 6
+        self.n_total      = n_stat_feat + self.n_meta + n_visual_emb
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1
         self.lstm2        = lstm_units_2
@@ -167,10 +168,10 @@ class MetaLearnerLSTM:
         shared = layers.Dropout(self.drop)(shared)
 
         # ── Output Heads ─────────────────────────────────────────
-        # 1. Bias Head (LONG/SHORT/NEUTRAL)
+        # 1. Bias Head (LONG/SHORT)
         b = layers.Dense(64, activation='gelu')(shared)
         b = layers.Dropout(0.2)(b)
-        bias_out = layers.Dense(3, activation='softmax', name='bias_out')(b)
+        bias_out = layers.Dense(2, activation='softmax', name='bias_out')(b)
 
         # 2. Confidence Head
         c = layers.Dense(32, activation='gelu')(shared)
@@ -194,7 +195,6 @@ class MetaLearnerLSTM:
                 'conf_out': 'binary_crossentropy',
             },
             loss_weights={'bias_out': 1.0, 'conf_out': 0.3},
-            metrics={'bias_out': ['accuracy']},
         )
 
     # ── Build Input ──────────────────────────────────────────────
@@ -208,7 +208,7 @@ class MetaLearnerLSTM:
 
         Args:
             X_stat:   (N, seq_len, n_stat)   — الفيتشرز الإحصائية
-            cb_probs: (N, seq_len, 3)         — احتمالات CatBoost
+            cb_probs: (N, seq_len, 2)         — احتمالات CatBoost
             clusters: (N, seq_len, 4)         — One-Hot Cluster
             vis_embs: (N, seq_len, 8)         — Visual Embeddings من CNN
         Returns:
@@ -283,29 +283,21 @@ class MetaLearnerLSTM:
         if not os.path.isabs(brain_path) and not os.path.dirname(brain_path):
             brain_path = os.path.join(output_dir, brain_path)
 
-        # Class weights
-        if class_weights is None:
-            counts = np.bincount(yb_tr, minlength=3)
-            class_weights = {k: len(yb_tr) / (3 * max(c, 1))
-                             for k, c in enumerate(counts)}
-
-        sample_w = np.array([class_weights[y] for y in yb_tr], dtype=np.float32)
-        conf_w = np.ones_like(yc_tr, dtype=np.float32)
+        sample_w = np.where(np.asarray(yc_tr, dtype=np.float32) > 0.5, 2.0, 1.0).astype(np.float32)
+        conf_w = sample_w.copy()
         n_tr = len(X_tr)
         n_val = len(X_val)
 
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
-        print(f"   Weights: LONG={class_weights.get(0,1):.2f} "
-              f"SHORT={class_weights.get(1,1):.2f} "
-              f"NEUTRAL={class_weights.get(2,1):.2f}")
+        print("   Quality Weights: STRONG=2.00 WEAK=1.00")
 
         cbs = [
-            EarlyStopping(monitor='val_bias_out_accuracy',
-                          patience=15, mode='max',
+            EarlyStopping(monitor='val_loss',
+                          patience=15, mode='min',
                           restore_best_weights=True, verbose=1),
             ModelCheckpoint(brain_path,
-                            monitor='val_bias_out_accuracy',
-                            save_best_only=True, mode='max', verbose=1),
+                            monitor='val_loss',
+                            save_best_only=True, mode='min', verbose=1),
         ]
 
         history = self.model.fit(
@@ -336,8 +328,8 @@ class MetaLearnerLSTM:
         bp    = np.argmax(preds['bias_out'], axis=1)
         rep   = classification_report(
             yb_val, bp,
-            labels=[0, 1, 2],
-            target_names=['LONG', 'SHORT', 'NEUTRAL'],
+            labels=[0, 1],
+            target_names=['LONG', 'SHORT'],
             zero_division=0)
         print(f"\n📊 MetaLearner Validation:\n{rep}")
         path = os.path.join(output_dir, 'meta_learner_report.txt')
@@ -364,10 +356,10 @@ class MetaLearnerLSTM:
         X_tiled = np.tile(X_meta, (n_mc, 1, 1))
         out = self.model(X_tiled, training=True)  # Dropout active
 
-        bp    = out['bias_out'].numpy()    # (n_mc, 3)
+        bp    = out['bias_out'].numpy()    # (n_mc, 2)
         conf  = out['conf_out'].numpy().flatten()   # (n_mc,)
 
-        bias_mean = np.mean(bp.reshape(n_mc, -1, 3), axis=0)[0]  # (3,)
+        bias_mean = np.mean(bp.reshape(n_mc, -1, 2), axis=0)[0]  # (2,)
         conf_mean = float(np.mean(conf))
         conf_std  = float(np.std(conf))
 
@@ -378,8 +370,7 @@ class MetaLearnerLSTM:
             'bias_probs':  bias_mean.tolist(),
             'confidence':  round(conf_mean, 4),
             'uncertainty': round(conf_std, 4),
-            'tradeable':   (conf_mean >= self.conf_thresh
-                            and BIAS_LABELS[bias_idx] != 'NEUTRAL'),
+            'tradeable':   (conf_mean >= self.conf_thresh),
         }
 
     def save(self, output_dir: str = 'outputs'):

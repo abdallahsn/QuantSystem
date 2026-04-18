@@ -28,8 +28,8 @@ try:
 except ImportError:
     CB_AVAILABLE = False
 
-
-BIAS_LABELS = {0: "LONG", 1: "SHORT", 2: "NEUTRAL"}
+BIAS_LABELS = {0: "LONG", 1: "SHORT"}
+DIRECTION_PROB_COLS = ["cb_prob_long", "cb_prob_short"]
 REGIME_LABELS = {
     0: "Trending",
     1: "Ranging",
@@ -106,16 +106,15 @@ def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
     classes = _load_catboost_classes(models_dir)
     probs = align_probability_columns(
         model.predict_proba(X_stat),
-        3,
+        2,
         classes=classes or getattr(model, "classes_", None),
     )
 
     out = df.copy()
     out["cb_prob_long"] = probs[:, 0]
     out["cb_prob_short"] = probs[:, 1]
-    out["cb_prob_neutral"] = probs[:, 2]
     out["cb_direction_idx"] = np.argmax(probs, axis=1).astype(np.int8)
-    out["cb_direction"] = pd.Series(out["cb_direction_idx"]).map(BIAS_LABELS).values
+    out["cb_direction"] = pd.Series(out["cb_direction_idx"]).map(BIAS_LABELS).fillna("UNKNOWN").values
     out["cb_confidence"] = probs.max(axis=1).astype(np.float32)
     return out
 
@@ -164,16 +163,16 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     hawkes = pd.to_numeric(frame.get("hawkes_intensity", 0.0), errors="coerce").resample(freq).mean().rename("hawkes_intensity")
     regime = frame.get("regime_label", pd.Series(1, index=frame.index)).resample(freq).apply(lambda s: _mode_or_default(s, 1)).rename("regime_label")
 
-    cb_probs = frame[["cb_prob_long", "cb_prob_short", "cb_prob_neutral"]].resample(freq).mean()
+    cb_probs = frame[DIRECTION_PROB_COLS].resample(freq).mean()
 
     bars = pd.concat(
         [ohlc, volume, event_count, cvd_last, cvd_delta, obi, absorption, kyle, hawkes, regime, cb_probs],
         axis=1,
     ).dropna(subset=["open", "high", "low", "close"])
 
-    prob_matrix = bars[["cb_prob_long", "cb_prob_short", "cb_prob_neutral"]].fillna(0.0).values
+    prob_matrix = bars[DIRECTION_PROB_COLS].fillna(0.0).values
     bars["cb_direction_idx"] = np.argmax(prob_matrix, axis=1).astype(int)
-    bars["cb_direction"] = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("NEUTRAL")
+    bars["cb_direction"] = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("UNKNOWN")
     bars["cb_confidence"] = prob_matrix.max(axis=1).astype(float)
     bars["cb_change_flag"] = (bars["cb_direction"] != bars["cb_direction"].shift(1)).astype(int)
     bars["signal_time"] = pd.to_datetime(bars.index) + offset
@@ -187,15 +186,12 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
 
     n_long = int(bc.get(0, 0))
     n_short = int(bc.get(1, 0))
-    n_neutral = int(bc.get(2, 0))
 
     correct_long = correct_short = total_long = total_short = 0
     closes = bars["close"].values.astype(float)
     labels = bars["cb_direction_idx"].values.astype(int)
     for i in range(len(bars) - future_bars):
         lbl = labels[i]
-        if lbl == 2:
-            continue
         future_return = closes[i + future_bars] - closes[i]
         if lbl == 0:
             total_long += 1
@@ -210,12 +206,10 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
         "total": total,
         "n_long": n_long,
         "n_short": n_short,
-        "n_neutral": n_neutral,
         "pct_long": n_long / max(total, 1) * 100,
         "pct_short": n_short / max(total, 1) * 100,
-        "pct_neutral": n_neutral / max(total, 1) * 100,
-        "long_acc": correct_long / max(total_long, 1) * 100,
-        "short_acc": correct_short / max(total_short, 1) * 100,
+        "long_hit_rate": correct_long / max(total_long, 1) * 100,
+        "short_hit_rate": correct_short / max(total_short, 1) * 100,
         "regime_dist": bars["regime_label"].value_counts().to_dict() if "regime_label" in bars.columns else {},
     }
 
@@ -230,11 +224,10 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             bars["close"].astype(float).values,
             bars["event_count"].fillna(0).astype(int).values,
             bars["volume"].fillna(0.0).astype(float).values,
-            bars["cb_direction"].fillna("NEUTRAL").astype(str).values,
+            bars["cb_direction"].fillna("UNKNOWN").astype(str).values,
             bars["cb_confidence"].fillna(0.0).astype(float).values,
             bars["cb_prob_long"].fillna(0.0).astype(float).values,
             bars["cb_prob_short"].fillna(0.0).astype(float).values,
-            bars["cb_prob_neutral"].fillna(0.0).astype(float).values,
             bars["cvd_delta"].fillna(0.0).astype(float).values,
             bars["obi"].fillna(0.0).astype(float).values,
             bars["absorption_intensity"].fillna(0.0).astype(float).values,
@@ -263,13 +256,12 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             "Confidence=%{customdata[7]:.3f}<br>"
             "P(LONG)=%{customdata[8]:.3f}<br>"
             "P(SHORT)=%{customdata[9]:.3f}<br>"
-            "P(NEUTRAL)=%{customdata[10]:.3f}<br>"
-            "CVD Δ=%{customdata[11]:.3f}<br>"
-            "OBI=%{customdata[12]:.3f}<br>"
-            "Absorption=%{customdata[13]:.3f}<br>"
-            "Kyle λ=%{customdata[14]:.3f}<br>"
-            "Hawkes=%{customdata[15]:.3f}<br>"
-            "Regime=%{customdata[16]}<extra></extra>"
+            "CVD Δ=%{customdata[10]:.3f}<br>"
+            "OBI=%{customdata[11]:.3f}<br>"
+            "Absorption=%{customdata[12]:.3f}<br>"
+            "Kyle λ=%{customdata[13]:.3f}<br>"
+            "Hawkes=%{customdata[14]:.3f}<br>"
+            "Regime=%{customdata[15]}<extra></extra>"
         ),
     )
 
@@ -324,7 +316,6 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
     for label, idx, y_col, symbol, color, edge in (
         ("LONG", 0, "low", "diamond", "#00e896", "#008f63"),
         ("SHORT", 1, "high", "diamond-wide", "#ff4d6d", "#b91c3f"),
-        ("NEUTRAL", 2, "close", "square", "rgba(200,216,232,0.40)", "#94a3b8"),
     ):
         mask = bars["cb_direction_idx"] == idx
         if not bool(mask.any()):
@@ -339,7 +330,7 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                 x=bars.loc[mask, "signal_time"],
                 y=y_values,
                 mode="markers",
-                marker=dict(symbol=symbol, size=12 if idx != 2 else 6, color=color, line=dict(color=edge, width=1)),
+                marker=dict(symbol=symbol, size=12, color=color, line=dict(color=edge, width=1)),
                 name=f"CatBoost {label} ({int(mask.sum())})",
                 customdata=np.stack(
                     [
@@ -350,7 +341,6 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                         bars.loc[mask, "cb_confidence"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_long"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_short"].fillna(0.0).values,
-                        bars.loc[mask, "cb_prob_neutral"].fillna(0.0).values,
                         bars.loc[mask, "regime_label"].fillna("Ranging").astype(str).values,
                     ],
                     axis=1,
@@ -364,8 +354,7 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                     "Confidence=%{customdata[4]:.3f}<br>"
                     "P(LONG)=%{customdata[5]:.3f}<br>"
                     "P(SHORT)=%{customdata[6]:.3f}<br>"
-                    "P(NEUTRAL)=%{customdata[7]:.3f}<br>"
-                    "Regime=%{customdata[8]}<extra></extra>"
+                    "Regime=%{customdata[7]}<extra></extra>"
                 ),
             ),
             row=1,
@@ -499,9 +488,8 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
 
     stats_text = (
         f"<b>5m CatBoost Statistics</b><br>"
-        f"LONG: {stats['n_long']:,} ({stats['pct_long']:.1f}%) | Fwd Acc: {stats['long_acc']:.0f}%<br>"
-        f"SHORT: {stats['n_short']:,} ({stats['pct_short']:.1f}%) | Fwd Acc: {stats['short_acc']:.0f}%<br>"
-        f"NEUTRAL: {stats['n_neutral']:,} ({stats['pct_neutral']:.1f}%)"
+        f"LONG: {stats['n_long']:,} ({stats['pct_long']:.1f}%) | Fwd Hit Rate: {stats['long_hit_rate']:.0f}%<br>"
+        f"SHORT: {stats['n_short']:,} ({stats['pct_short']:.1f}%) | Fwd Hit Rate: {stats['short_hit_rate']:.0f}%"
     )
     fig.add_annotation(
         text=stats_text,
@@ -637,7 +625,7 @@ def _build_confusion_chart(bars: pd.DataFrame, future_bars: int = 4) -> go.Figur
         return None
 
     res_df = pd.DataFrame(results)
-    fig = make_subplots(rows=1, cols=2, subplot_titles=["Return Distribution (5m CatBoost)", "Rolling CatBoost Accuracy"])
+    fig = make_subplots(rows=1, cols=2, subplot_titles=["Return Distribution (5m CatBoost)", "Rolling Directional Hit Rate"])
 
     for lbl, color in (("LONG", "#00e896"), ("SHORT", "#ff4d6d")):
         subset = res_df[res_df["label"] == lbl]
@@ -656,7 +644,7 @@ def _build_confusion_chart(bars: pd.DataFrame, future_bars: int = 4) -> go.Figur
             y=res_df["rolling_acc"],
             mode="lines",
             line=dict(color="#ffd060", width=2),
-            name="Accuracy (rolling 30)",
+            name="Hit Rate (rolling 30)",
         ),
         row=1,
         col=2,
@@ -666,7 +654,7 @@ def _build_confusion_chart(bars: pd.DataFrame, future_bars: int = 4) -> go.Figur
         paper_bgcolor="#060a0f",
         plot_bgcolor="#0d1520",
         font=dict(color="#c8d8e8", family="IBM Plex Mono"),
-        title=dict(text="5m CatBoost Quality Analysis", font=dict(color="#ffffff", size=16)),
+        title=dict(text="5m CatBoost Directional Quality Analysis", font=dict(color="#ffffff", size=16)),
         height=430,
         barmode="overlay",
     )
@@ -674,7 +662,7 @@ def _build_confusion_chart(bars: pd.DataFrame, future_bars: int = 4) -> go.Figur
 
 
 def _build_turns_table(bars: pd.DataFrame) -> pd.DataFrame:
-    direction_names = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("NEUTRAL")
+    direction_names = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("UNKNOWN")
     change_mask = direction_names != direction_names.shift(1)
     out = bars.loc[change_mask, ["ts_event", "signal_time", "open", "high", "low", "close"]].copy()
     out["direction"] = direction_names.loc[change_mask].values
@@ -682,7 +670,6 @@ def _build_turns_table(bars: pd.DataFrame) -> pd.DataFrame:
     out["confidence"] = bars.loc[change_mask, "cb_confidence"].values
     out["cb_prob_long"] = bars.loc[change_mask, "cb_prob_long"].values
     out["cb_prob_short"] = bars.loc[change_mask, "cb_prob_short"].values
-    out["cb_prob_neutral"] = bars.loc[change_mask, "cb_prob_neutral"].values
     return out.reset_index(drop=True)
 
 

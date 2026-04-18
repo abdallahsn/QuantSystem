@@ -4,7 +4,7 @@ predict_v19.py - QuantSystem V19 inference engine
 V19 inference uses the exact feature schema and scaler artifacts produced by
 the training pipeline, then reconstructs the same step vector used in training:
 
-  [25 scaled statistical features] + [3 CatBoost probs] +
+  [25 scaled statistical features] + [2 CatBoost probs] +
   [4 regime one-hot] + [8 visual embeddings if available]
 """
 
@@ -19,10 +19,12 @@ from collections import deque
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
+from modules.dynamic_labels import EventGate
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -43,7 +45,37 @@ except ImportError:
 
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
-N_CB_PROBS = 3
+N_CB_PROBS = 2
+
+
+def _directional_metrics_from_rows(rows: list[dict]) -> dict:
+    if not rows:
+        return {
+            'directional_precision_macro': 0.0,
+            'directional_recall_macro': 0.0,
+            'directional_f1_macro': 0.0,
+        }
+    df_r = pd.DataFrame(rows)
+    if 'true_bias' not in df_r.columns or 'bias_idx' not in df_r.columns:
+        return {
+            'directional_precision_macro': 0.0,
+            'directional_recall_macro': 0.0,
+            'directional_f1_macro': 0.0,
+        }
+    y_true = pd.to_numeric(df_r['true_bias'], errors='coerce').fillna(2).astype(int).values
+    y_pred = pd.to_numeric(df_r['bias_idx'], errors='coerce').fillna(2).astype(int).values
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        average='macro',
+        zero_division=0,
+    )
+    return {
+        'directional_precision_macro': round(float(precision), 4),
+        'directional_recall_macro': round(float(recall), 4),
+        'directional_f1_macro': round(float(f1), 4),
+    }
 
 
 class V19PredictionEngine:
@@ -70,6 +102,14 @@ class V19PredictionEngine:
         self.meta_features = self.factory.meta_features
         self.visual_features = self.factory.visual_features
         self.input_dim = self.factory.input_dim
+        gate_cfg = self.factory.schema.get('event_gate', {}) or {}
+        self.event_gate = EventGate(
+            roll_window=int(gate_cfg.get('roll_window', 50)),
+            vol_mult=float(gate_cfg.get('vol_mult', 1.45)),
+            obi_thr=float(gate_cfg.get('obi_thr', 0.40)),
+            wall_str_thr=float(gate_cfg.get('wall_str_thr', 1.025)),
+            shift_z_thr=float(gate_cfg.get('shift_z_thr', 0.75)),
+        )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))
         self.visual_emb_path = os.path.join(models_dir, artifacts.get('visual_embeddings', 'visual_embeddings_v19.npy'))
@@ -142,6 +182,7 @@ class V19PredictionEngine:
 
     def reset_state(self):
         self._seq_buffer.clear()
+        self.event_gate.reset()
         self.loss_guard.reset_daily()
 
     def get_runtime_status(self) -> dict:
@@ -150,9 +191,33 @@ class V19PredictionEngine:
             'regime_available': bool(self.regime_clf._fitted),
             'visual_available': self.cnn is not None,
             'meta_available': self.meta is not None,
+            'event_gate_available': self.event_gate is not None,
             'manifest_exists': os.path.exists(self.manifest_path),
             'schema_exists': os.path.exists(os.path.join(self.models_dir, 'feature_schema_v19.json')),
             'run_mode': self.run_mode,
+        }
+
+    def _neutral_result(
+        self,
+        *,
+        reason: str,
+        sequence_ready: bool,
+        feature_hash: str,
+        event_gate_passed: bool = False,
+        event_gate_reason: str = 'quiet',
+    ) -> dict:
+        return {
+            'bias': 'NEUTRAL',
+            'bias_idx': 2,
+            'confidence': 0.0,
+            'uncertainty': 1.0,
+            'tradeable': False,
+            'reason': reason,
+            'sequence_ready': bool(sequence_ready),
+            'feature_hash': feature_hash,
+            'event_gate_passed': bool(event_gate_passed),
+            'event_gate_reason': event_gate_reason,
+            'direction_probs': {'LONG': 0.0, 'SHORT': 0.0},
         }
 
     def _get_cb_probs(self, X_stat: np.ndarray) -> np.ndarray:
@@ -241,9 +306,10 @@ class V19PredictionEngine:
             return {
                 'bias': BIAS_LABELS[bias_idx],
                 'bias_idx': bias_idx,
+                'bias_probs': probs.tolist(),
                 'confidence': float(probs[bias_idx]),
                 'uncertainty': 0.5,
-                'tradeable': float(probs[bias_idx]) >= 0.60 and bias_idx != 2,
+                'tradeable': float(probs[bias_idx]) >= 0.60,
                 'source': 'CatBoost_Fallback_V19',
             }
         result = self.meta.predict(seq)
@@ -258,16 +324,14 @@ class V19PredictionEngine:
                      ts=None,
                      already_scaled: bool = False) -> dict:
         t0 = time.perf_counter()
+        feature_hash = feature_hash_from_dict(stat_features or {})
         can_trade, reason = self.loss_guard.can_trade(ts)
         if not can_trade:
-            result = {
-                'bias': 'NEUTRAL',
-                'confidence': 0.0,
-                'tradeable': False,
-                'reason': reason,
-                'sequence_ready': len(self._seq_buffer) >= self.seq_len,
-                'feature_hash': feature_hash_from_dict(stat_features or {}),
-            }
+            result = self._neutral_result(
+                reason=reason,
+                sequence_ready=len(self._seq_buffer) >= self.seq_len,
+                feature_hash=feature_hash,
+            )
             result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
             self.risk_logger.log_block(reason, ts=ts, extra={'loss_guard_status': self.loss_guard.status()})
             self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
@@ -290,14 +354,11 @@ class V19PredictionEngine:
         )
         runtime_mode = decide_runtime_mode(health, self.failsafe_policy)
         if not runtime_mode.get('allow_shadow', True):
-            result = {
-                'bias': 'NEUTRAL',
-                'confidence': 0.0,
-                'tradeable': False,
-                'reason': runtime_mode.get('reason', 'Failsafe blocked'),
-                'sequence_ready': False,
-                'feature_hash': feature_hash_from_dict(stat_features or {}),
-            }
+            result = self._neutral_result(
+                reason=runtime_mode.get('reason', 'Failsafe blocked'),
+                sequence_ready=False,
+                feature_hash=feature_hash,
+            )
             result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
             self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode, event_type='rollout_guard_triggered')
             self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
@@ -312,6 +373,19 @@ class V19PredictionEngine:
         if 'timestamp_stale' in runtime_mode.get('blocking_issues', []):
             self.data_logger.log_data_issue('data_gap_detected', reason='timestamp stale for incoming row', ts=ts, extra=runtime_mode)
 
+        gate_result = self.event_gate.evaluate(stat_features or {})
+        if not gate_result.get('passed', False):
+            result = self._neutral_result(
+                reason=f"Event gate blocked ({gate_result.get('reason', 'quiet')})",
+                sequence_ready=len(self._seq_buffer) >= self.seq_len,
+                feature_hash=feature_hash,
+                event_gate_passed=False,
+                event_gate_reason=gate_result.get('reason', 'quiet'),
+            )
+            result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+            self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
+            return result
+
         if visual_embedding is not None:
             visual_emb = self.factory.prepare_visual_embeddings(visual_embedding, n_rows=len(stat_df))
         else:
@@ -324,14 +398,13 @@ class V19PredictionEngine:
         self._seq_buffer.append(step_rows[0])
 
         if len(self._seq_buffer) < self.seq_len:
-            result = {
-                'bias': 'NEUTRAL',
-                'confidence': 0.0,
-                'tradeable': False,
-                'reason': f'Warming up ({len(self._seq_buffer)}/{self.seq_len})',
-                'sequence_ready': False,
-                'feature_hash': feature_hash_from_dict(stat_features or {}),
-            }
+            result = self._neutral_result(
+                reason=f'Warming up ({len(self._seq_buffer)}/{self.seq_len})',
+                sequence_ready=False,
+                feature_hash=feature_hash,
+                event_gate_passed=True,
+                event_gate_reason=gate_result.get('reason', 'event'),
+            )
             result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
             self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
             return result
@@ -347,17 +420,24 @@ class V19PredictionEngine:
             result['reason'] = runtime_mode.get('reason', 'Paper blocked')
             self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode)
         cluster = int(np.argmax(regime_oh[0]))
+        bias_probs = np.asarray(result.get('bias_probs', cb_probs[0]), dtype=np.float32).reshape(-1)
+        direction_probs = {
+            'LONG': round(float(bias_probs[0]) if len(bias_probs) > 0 else 0.0, 4),
+            'SHORT': round(float(bias_probs[1]) if len(bias_probs) > 1 else 0.0, 4),
+        }
+        result['direction_probs'] = direction_probs
         result['cb_probs'] = {
             'LONG': round(float(cb_probs[0, 0]), 4),
             'SHORT': round(float(cb_probs[0, 1]), 4),
-            'NEUTRAL': round(float(cb_probs[0, 2]), 4),
         }
         if len(self.visual_features):
             result['visual_norm'] = round(float(np.linalg.norm(visual_emb[0])), 4)
         result['cluster'] = cluster
         result['cluster_name'] = REGIME_NAMES.get(cluster, f'Cluster_{cluster}')
         result['sequence_ready'] = True
-        result['feature_hash'] = feature_hash_from_dict(stat_features or {})
+        result['feature_hash'] = feature_hash
+        result['event_gate_passed'] = True
+        result['event_gate_reason'] = gate_result.get('reason', 'event')
         result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
         self.pred_logger.log_prediction(
             result,
@@ -431,9 +511,14 @@ class V19PredictionEngine:
             results.append(pred)
 
         if results and y_bias is not None:
-            acc = float(np.mean([r.get('correct', False) for r in results]))
+            metrics = _directional_metrics_from_rows(results)
             tradeable = int(sum(1 for r in results if r.get('tradeable', False)))
-            print(f"  Bias Accuracy: {acc:.2%}")
+            print(
+                "  Directional Metrics: "
+                f"P={metrics['directional_precision_macro']:.2%} "
+                f"R={metrics['directional_recall_macro']:.2%} "
+                f"F1={metrics['directional_f1_macro']:.2%}"
+            )
             print(f"  Tradeable:     {tradeable:,}/{len(results):,} ({tradeable/max(len(results),1):.1%})")
         return results
 
@@ -467,10 +552,12 @@ def main():
 
         if results and 'correct' in results[0]:
             df_r = pd.DataFrame(results)
+            metrics = _directional_metrics_from_rows(results)
             summary = {
                 'total': int(len(df_r)),
                 'tradeable': int(df_r['tradeable'].sum()),
-                'accuracy': round(float(df_r['correct'].mean()), 4),
+                **metrics,
+                'event_gate_rate': round(float(df_r['event_gate_passed'].mean()), 4) if 'event_gate_passed' in df_r.columns else 0.0,
                 'long': int((df_r['bias'] == 'LONG').sum()),
                 'short': int((df_r['bias'] == 'SHORT').sum()),
                 'neutral': int((df_r['bias'] == 'NEUTRAL').sum()),

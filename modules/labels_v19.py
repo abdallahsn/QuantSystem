@@ -99,9 +99,11 @@ def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
 def build_causal_event_labels(
     df: pd.DataFrame,
     horizon: int = 50,
+    event_roll_window: int = 50,
+    direction_threshold_ticks: float = 5.0,
     tp_mult: float = 1.5,
     sl_mult: float = 1.0,
-    neutral_mult: float = 0.35,
+    neutral_mult: float = 0.45,
     tick_size: float = 1e-4,
 ) -> pd.DataFrame:
     """
@@ -143,14 +145,26 @@ def build_causal_event_labels(
         if "micro_price" in out.columns:
             out["micro_price"] = pd.to_numeric(out["micro_price"], errors="coerce").fillna(out["close"]).astype(np.float32)
 
-    roll_window = max(12, min(64, max(6, int(horizon // 2) if horizon > 0 else 20)))
+    roll_window = max(int(event_roll_window), 1)
     out = engineer_features(out, roll_window=roll_window)
 
     vol_mult = float(np.clip(1.0 + neutral_mult, 1.15, 1.80))
     obi_thr = float(np.clip(neutral_mult, 0.15, 0.40))
     wall_thr = float(np.clip(0.80 + neutral_mult * 0.5, 0.90, 1.20))
-    event_mask = build_event_filter(out, vol_mult=vol_mult, obi_thr=obi_thr, wall_str_thr=wall_thr)
-    labeled = label_with_forward_scan(out, out, max_bars_forward=horizon, tick_size=tick_size)
+    event_mask = build_event_filter(
+        out,
+        vol_mult=vol_mult,
+        obi_thr=obi_thr,
+        wall_str_thr=wall_thr,
+        roll_window=roll_window,
+    )
+    labeled = label_with_forward_scan(
+        out,
+        out,
+        max_bars_forward=horizon,
+        tick_size=tick_size,
+        direction_threshold_ticks=direction_threshold_ticks,
+    )
 
     quiet_rows = ~event_mask.fillna(False)
     if quiet_rows.any():

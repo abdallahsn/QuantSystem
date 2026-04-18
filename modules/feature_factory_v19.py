@@ -11,6 +11,9 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+EXPECTED_SCHEMA_VERSION = 'v19-event-binary'
+EXPECTED_META_FEATURES = 6
+
 
 DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')
 DEFAULT_PASSTHROUGH_COLS = [
@@ -164,6 +167,19 @@ class V19FeatureFactory:
         self.timestamp_cols = tuple(self.schema.get('timestamp_cols', list(DEFAULT_TIMESTAMP_COLS)))
         self.input_dim = int(self.schema.get('input_dim', len(self.stat_features) + len(self.meta_features)))
         self.seq_len = int(self.schema.get('seq_len', 50))
+        self._validate_schema()
+
+    def _validate_schema(self) -> None:
+        version = str(self.schema.get('version', '')).strip()
+        if version != EXPECTED_SCHEMA_VERSION:
+            raise ValueError(
+                f'Unsupported feature schema version: {version or "<missing>"}. '
+                f'Expected {EXPECTED_SCHEMA_VERSION}.'
+            )
+        if len(self.meta_features) != EXPECTED_META_FEATURES:
+            raise ValueError(
+                f'Unsupported meta feature surface: expected {EXPECTED_META_FEATURES} dims, got {len(self.meta_features)}'
+            )
 
     def prepare_frame(self, df: pd.DataFrame, already_scaled: bool = False, include_meta: bool = True) -> pd.DataFrame:
         return prepare_feature_frame(

@@ -34,6 +34,9 @@ def main():
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
     p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'])
+    p.add_argument('--training_mode', default=str(defaults.get('mode', 'event_binary')))
+    p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
+    p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
 
@@ -50,6 +53,9 @@ def main():
         train_frac=args.train_frac,
         min_seq_coverage=args.min_seq_coverage,
         catboost_device=args.catboost_device,
+        training_mode=args.training_mode,
+        quality_weight_strong=args.quality_weight_strong,
+        quality_weight_weak=args.quality_weight_weak,
         phase='catboost',
         config_snapshot=cfg,
     )

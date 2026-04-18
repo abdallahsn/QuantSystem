@@ -489,7 +489,8 @@ def build_lob_tensor_dataset(
         output_path: str | None = None,
         timestamps_path: str | None = None,
         snapshot_stride: int | None = None,
-        max_tensors: int | None = None) -> dict:
+        max_tensors: int | None = None,
+        emit_positions=None) -> dict:
     """
     يبني مصفوفة من الـ 3D Tensors بشكل streaming وآمن للذاكرة.
 
@@ -504,13 +505,29 @@ def build_lob_tensor_dataset(
     df_mbo = _prepare_sorted_frame(df_mbo, ts_col=ts_col)
     df_mbp = _prepare_sorted_frame(df_mbp, ts_col=ts_col)
 
-    plan = _build_snapshot_sampling_plan(
-        len(df_mbp),
-        time_steps=time_steps,
-        snapshot_stride=snapshot_stride,
-        max_tensors=max_tensors,
-    )
-    planned_tensors = int(plan['planned_tensors'])
+    emit_positions_arr = None
+    if emit_positions is not None:
+        emit_positions_arr = np.asarray(emit_positions, dtype=np.int64).reshape(-1)
+        if emit_positions_arr.size:
+            min_ready_pos = max(int(time_steps) - 1, 0)
+            emit_positions_arr = emit_positions_arr[
+                (emit_positions_arr >= min_ready_pos) & (emit_positions_arr < len(df_mbp))
+            ]
+            emit_positions_arr = np.unique(emit_positions_arr)
+        planned_tensors = int(len(emit_positions_arr))
+        plan = {
+            'stride': 1,
+            'first_emit_pos': int(emit_positions_arr[0]) if planned_tensors else 0,
+            'planned_tensors': planned_tensors,
+        }
+    else:
+        plan = _build_snapshot_sampling_plan(
+            len(df_mbp),
+            time_steps=time_steps,
+            snapshot_stride=snapshot_stride,
+            max_tensors=max_tensors,
+        )
+        planned_tensors = int(plan['planned_tensors'])
 
     metadata = {
         'n_mbo_rows': int(len(df_mbo)),
@@ -521,6 +538,7 @@ def build_lob_tensor_dataset(
         'estimated_tensor_bytes': estimate_lob_tensor_bytes(planned_tensors, time_steps=time_steps),
         'output_path': output_path,
         'timestamps_path': timestamps_path,
+        'emit_positions_requested': 0 if emit_positions_arr is None else int(len(emit_positions_arr)),
     }
 
     empty_tensors = np.zeros((0, time_steps, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32)
@@ -564,6 +582,7 @@ def build_lob_tensor_dataset(
     mbp_pos = -1
     next_emit_pos = int(plan['first_emit_pos'])
     write_pos = 0
+    emit_lookup = set(int(pos) for pos in emit_positions_arr.tolist()) if emit_positions_arr is not None else None
 
     while i_mbo < len(df_mbo) or i_mbp < len(df_mbp):
         use_mbo = (
@@ -591,13 +610,20 @@ def build_lob_tensor_dataset(
         builder.update_mbp_levels(bid0, ask0, bid_sizes, ask_sizes)
 
         mbp_pos += 1
-        if mbp_pos == next_emit_pos:
+        should_emit = False
+        if emit_lookup is not None:
+            should_emit = mbp_pos in emit_lookup
+        elif mbp_pos == next_emit_pos:
+            should_emit = True
+
+        if should_emit:
             tensor = builder.get_tensor()
             if tensor is not None and write_pos < planned_tensors:
                 tensor_store[write_pos] = tensor
                 ts_store[write_pos] = mbp_ts[i_mbp].astype('datetime64[ns]').astype(np.int64)
                 write_pos += 1
-            next_emit_pos += int(plan['stride'])
+            if emit_lookup is None:
+                next_emit_pos += int(plan['stride'])
 
         i_mbp += 1
 

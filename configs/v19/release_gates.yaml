@@ -1,7 +1,7 @@
 {
   "metrics": {
-    "mean_accuracy": { "min": 0.38 },
-    "mean_trade_accuracy": { "min": 0.38 },
+    "mean_directional_precision": { "min": 0.38 },
+    "mean_directional_f1": { "min": 0.38 },
     "mean_win_rate": { "min": 0.45 },
     "total_trades": { "min": 10 },
     "mean_trade_sharpe": { "min": 0.0 },

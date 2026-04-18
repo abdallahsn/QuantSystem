@@ -16,6 +16,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -120,6 +121,30 @@ def _trade_sharpe(pnls: list[float]) -> float:
     if std <= 1e-12:
         return 0.0
     return float(arr.mean() / std * math.sqrt(len(arr)))
+
+
+def _directional_metrics(results_df: pd.DataFrame) -> dict:
+    if results_df.empty or 'true_bias' not in results_df.columns:
+        return {
+            'directional_precision_macro': 0.0,
+            'directional_recall_macro': 0.0,
+            'directional_f1_macro': 0.0,
+        }
+
+    y_true = pd.to_numeric(results_df.get('true_bias', 2), errors='coerce').fillna(2).astype(int).values
+    y_pred = pd.to_numeric(results_df.get('bias_idx', 2), errors='coerce').fillna(2).astype(int).values
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        average='macro',
+        zero_division=0,
+    )
+    return {
+        'directional_precision_macro': round(float(precision), 4),
+        'directional_recall_macro': round(float(recall), 4),
+        'directional_f1_macro': round(float(f1), 4),
+    }
 
 
 def run_causal_backtest(
@@ -237,11 +262,9 @@ def run_causal_backtest(
         'predictions': int(len(results_df)),
         'trades': int(len(trades_df)),
         'tradeable_signals': int(results_df['tradeable'].sum()) if 'tradeable' in results_df.columns else 0,
-        'accuracy': round(float(results_df['correct'].mean()), 4)
-            if 'correct' in results_df.columns and len(results_df) else 0.0,
-        'trade_accuracy': round(float(results_df.loc[results_df['executed'] == True, 'correct'].mean()), 4)
-            if 'correct' in results_df.columns and 'executed' in results_df.columns
-            and (results_df['executed'] == True).any() else 0.0,
+        **_directional_metrics(results_df),
+        'event_gate_rate': round(float(results_df['event_gate_passed'].mean()), 4)
+            if 'event_gate_passed' in results_df.columns and len(results_df) else 0.0,
         'win_rate': round(float((trades_df['pnl'] > 0).mean()), 4) if len(trades_df) else 0.0,
         'total_pnl_dollars': round(float(trades_df['pnl'].sum()), 2) if len(trades_df) else 0.0,
         'avg_trade_pnl_dollars': round(float(trades_df['pnl'].mean()), 2) if len(trades_df) else 0.0,
@@ -270,7 +293,7 @@ def run_causal_backtest(
                 trades=trades,
                 equity=equity_curve,
                 n_test_bars=len(results_df),
-                model_acc=summary.get('accuracy', 0.0),
+                model_acc=summary.get('directional_f1_macro', 0.0),
                 n_features=0,
                 n_dataset=len(replay_df),
             )

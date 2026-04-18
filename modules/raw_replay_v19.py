@@ -58,6 +58,10 @@ def build_replay_dataset(
     chunksize: int = 0,
     n_workers: int | None = None,
     target_bars: int = 500,
+    label_horizon: int = 50,
+    event_roll_window: int = 50,
+    direction_threshold_ticks: float = 5.0,
+    lob_event_sample: int = 100000,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
 ) -> dict:
@@ -81,6 +85,10 @@ def build_replay_dataset(
         label_mode=label_mode,
         n_workers=n_workers,
         target_bars=target_bars,
+        label_horizon=label_horizon,
+        event_roll_window=event_roll_window,
+        direction_threshold_ticks=direction_threshold_ticks,
+        lob_event_sample=lob_event_sample,
         external_scaler_path=external_scaler_path,
         fit_aux_models=fit_aux_models,
     )

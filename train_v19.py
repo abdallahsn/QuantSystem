@@ -23,12 +23,14 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from prepare_training_data import (
     BINARY_FEATURES,
     CATBOOST_ADVISOR_FEATURES,
+    RAW_STAT_FEATURE_COLS,
     RAW_STAT_PREFIX,
     TEMPORAL_DROP_COLS,
 )
@@ -58,8 +60,10 @@ except ImportError:
 
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
-N_CB_PROBS = 3
+N_CB_PROBS = 2
 SEQ_LEN = 50
+SCHEMA_VERSION = 'v19-event-binary'
+TRAIN_MODE_EVENT_BINARY = 'event_binary'
 PHASE_FULL = 'full'
 PHASE_CATBOOST = 'catboost'
 PHASE_VISUAL = 'visual'
@@ -71,16 +75,17 @@ STAGE_TO_PHASE = {
     3: PHASE_TRAIN,
 }
 META_FEATURE_NAMES = [
-    'cb_prob_long', 'cb_prob_short', 'cb_prob_neutral',
+    'cb_prob_long', 'cb_prob_short',
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 TRAINING_PASSTHROUGH_COLS = [
-    col for col in DEFAULT_PASSTHROUGH_COLS
+    col for col in (list(DEFAULT_PASSTHROUGH_COLS) + RAW_STAT_FEATURE_COLS)
     if col in {
         'ts_event',
         'label_end_ts',
         'price',
+        'size',
         'bias_label',
         'conf_label',
         'signal_quality',
@@ -91,6 +96,7 @@ TRAINING_PASSTHROUGH_COLS = [
         'liq_score',
         'forward_return',
         'label_horizon_steps',
+        *RAW_STAT_FEATURE_COLS,
     }
 ]
 
@@ -227,6 +233,53 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
     return df
 
 
+def build_event_training_view(
+    df: pd.DataFrame,
+    mode: str = TRAIN_MODE_EVENT_BINARY,
+    quality_weight_strong: float = 2.0,
+    quality_weight_weak: float = 1.0,
+) -> tuple[pd.DataFrame, dict]:
+    if mode != TRAIN_MODE_EVENT_BINARY:
+        raise ValueError(f'Unsupported training mode: {mode}')
+
+    out = df.copy()
+    if 'ts_event' in out.columns:
+        out = out.sort_values('ts_event').reset_index(drop=True)
+    out['event_flag'] = pd.to_numeric(out.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    out['bias_label'] = pd.to_numeric(out.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
+    out['signal_quality'] = pd.to_numeric(out.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
+
+    event_mask = (out['event_flag'] == 1) & (out['bias_label'].isin([0, 1]))
+    event_df = out.loc[event_mask].copy().reset_index(drop=True)
+    if event_df.empty:
+        raise RuntimeError('❌ لا توجد directional event rows صالحة للتدريب بعد تطبيق event view')
+
+    event_df['quality_sample_weight'] = np.where(
+        event_df['signal_quality'].values.astype(np.int8) == 2,
+        float(quality_weight_strong),
+        float(quality_weight_weak),
+    ).astype(np.float32)
+    event_df['conf_target'] = (event_df['signal_quality'].values.astype(np.int8) == 2).astype(np.float32)
+    event_df['event_seq_idx'] = np.arange(len(event_df), dtype=np.int32)
+
+    info = {
+        'mode': mode,
+        'rows_full': int(len(out)),
+        'rows_event_directional': int(len(event_df)),
+        'event_rate_full': float(event_mask.mean()),
+        'quality_weight_strong': float(quality_weight_strong),
+        'quality_weight_weak': float(quality_weight_weak),
+        'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
+        'quality_counts': {str(k): int(v) for k, v in event_df['signal_quality'].value_counts().to_dict().items()},
+    }
+    print(
+        "  ✅ Event Training View: "
+        f"{info['rows_event_directional']:,}/{info['rows_full']:,} rows "
+        f"({info['event_rate_full']:.1%}) | bias={info['bias_counts']} | quality={info['quality_counts']}"
+    )
+    return event_df, info
+
+
 def _raw_feature_name(col: str) -> str:
     return f'{RAW_STAT_PREFIX}{col}'
 
@@ -281,10 +334,9 @@ def _build_scaled_stat_matrix(df: pd.DataFrame, cols: list[str], scaler_params: 
     return scaled[cols].values.astype(np.float32)
 
 
-def _class_weights(y: np.ndarray) -> dict[int, float]:
-    counts = np.bincount(y.astype(np.int32), minlength=3)
-    total = int(len(y))
-    return {k: total / (3 * max(c, 1)) for k, c in enumerate(counts)}
+def _quality_sample_weights(df: pd.DataFrame, strong_weight: float = 2.0, weak_weight: float = 1.0) -> np.ndarray:
+    quality = pd.to_numeric(df.get('signal_quality', 1), errors='coerce').fillna(1).astype(np.int32).values
+    return np.where(quality == 2, float(strong_weight), float(weak_weight)).astype(np.float32)
 
 
 def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
@@ -440,6 +492,8 @@ def stage1_oof_meta(
     t1: pd.Series | None = None,
     inference_scaler_params: dict | None = None,
     catboost_device: str = 'auto',
+    quality_weight_strong: float = 2.0,
+    quality_weight_weak: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + Regime Meta-Features")
@@ -447,7 +501,7 @@ def stage1_oof_meta(
 
     n = len(df)
     raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
-    y = df['bias_label'].fillna(2).astype(np.int32).values
+    y = df['bias_label'].fillna(1).astype(np.int32).values
     if splits is None:
         splits, t0, t1 = build_time_splits(
             df,
@@ -489,15 +543,18 @@ def stage1_oof_meta(
         X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
         X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
 
-        cw = _class_weights(y[fit_idx])
-        sw = np.array([cw[label] for label in y[fit_idx]], dtype=np.float32)
+        sw = _quality_sample_weights(
+            df.iloc[fit_idx],
+            strong_weight=quality_weight_strong,
+            weak_weight=quality_weight_weak,
+        )
         model = CatBoostClassifier(
             iterations=400,
             depth=6,
             learning_rate=0.05,
             l2_leaf_reg=3.0,
-            loss_function='MultiClass',
-            eval_metric='Accuracy',
+            loss_function='Logloss',
+            eval_metric='Logloss',
             early_stopping_rounds=50 if inner_val is not None else None,
             use_best_model=inner_val is not None,
             verbose=0,
@@ -517,8 +574,19 @@ def stage1_oof_meta(
             N_CB_PROBS,
             classes=present_classes,
         )
-        acc = float(np.mean(np.argmax(preds, axis=1) == y[test_idx]))
-        return preds, {'accuracy': acc}
+        pred_labels = np.argmax(preds, axis=1)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y[test_idx],
+            pred_labels,
+            labels=[0, 1],
+            average='macro',
+            zero_division=0,
+        )
+        return preds, {
+            'directional_precision': float(precision),
+            'directional_recall': float(recall),
+            'directional_f1': float(f1),
+        }
 
     oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
         n, N_CB_PROBS, splits, _cb_predict
@@ -553,15 +621,18 @@ def stage1_oof_meta(
 
     final_scaler = inference_scaler_params or _fit_scaler_params_from_frame(raw_stat)
     X_final = _apply_scaler_to_stat_frame(raw_stat, final_scaler).values.astype(np.float32)
-    final_cw = _class_weights(y)
-    final_sw = np.array([final_cw[label] for label in y], dtype=np.float32)
+    final_sw = _quality_sample_weights(
+        df,
+        strong_weight=quality_weight_strong,
+        weak_weight=quality_weight_weak,
+    )
     final_model = CatBoostClassifier(
         iterations=500,
         depth=6,
         learning_rate=0.05,
         l2_leaf_reg=3.0,
-        loss_function='MultiClass',
-        eval_metric='Accuracy',
+        loss_function='Logloss',
+        eval_metric='Logloss',
         early_stopping_rounds=50,
         use_best_model=False,
         verbose=50,
@@ -804,8 +875,13 @@ def build_safe_sequences(
     split_idx = split_ctx['split_idx']
     split_time = split_ctx['split_time']
 
-    y_bias = df['bias_label'].fillna(2).astype(np.int32).values
-    y_conf = df.get('conf_label', pd.Series(np.zeros(n))).fillna(0).astype(np.float32).values
+    y_bias = df['bias_label'].fillna(1).astype(np.int32).values
+    if 'conf_target' in df.columns:
+        y_conf = pd.to_numeric(df['conf_target'], errors='coerce').fillna(0).astype(np.float32).values
+    elif 'signal_quality' in df.columns:
+        y_conf = (pd.to_numeric(df['signal_quality'], errors='coerce').fillna(0).astype(np.int32).values == 2).astype(np.float32)
+    else:
+        y_conf = df.get('conf_label', pd.Series(np.zeros(n))).fillna(0).astype(np.float32).values
 
     train_row_ok = split_ctx['train_row_ok']
     val_row_ok = split_ctx['val_row_ok']
@@ -908,14 +984,12 @@ def stage3_meta_learner_v19(
         confidence_threshold=0.65,
     )
 
-    class_weights = _class_weights(yb_tr)
     history = meta.fit_train_val(
         X_tr, yb_tr, yc_tr,
         X_val, yb_val, yc_val,
         epochs=epochs,
         batch=batch,
         output_dir=output_dir,
-        class_weights=class_weights,
     )
 
     if history is not None:
@@ -923,7 +997,7 @@ def stage3_meta_learner_v19(
         with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
             json.dump({'history': hist_dict, 'split': split_stats}, f, indent=2)
         schema = {
-            'version': 'v19-alpha',
+            'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
             'stat_features': CATBOOST_ADVISOR_FEATURES,
             'meta_features': META_FEATURE_NAMES,
@@ -944,13 +1018,20 @@ def stage3_meta_learner_v19(
                 'meta_features_oof': 'meta_features_oof_v19.npy',
                 'meta_features_live': 'meta_features_live_v19.npy',
             },
+            'event_gate': {
+                'roll_window': 50,
+                'vol_mult': 1.45,
+                'obi_thr': 0.40,
+                'wall_str_thr': 1.025,
+                'shift_z_thr': 0.75,
+            },
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
         print("  ✅ MetaLearner V19 history + schema محفوظان")
 
 
-def _load_required_stage1_artifacts(output_dir: str) -> tuple[np.ndarray, np.ndarray]:
+def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
     coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
     required_files = [
@@ -971,6 +1052,10 @@ def _load_required_stage1_artifacts(output_dir: str) -> tuple[np.ndarray, np.nda
 
     meta_features = np.load(meta_path)
     coverage = np.load(coverage_path).astype(bool)
+    if n_rows is not None and (len(meta_features) != int(n_rows) or len(coverage) != int(n_rows)):
+        raise ValueError(
+            f'❌ Stage1 cached artifacts shape mismatch: meta={len(meta_features)}, coverage={len(coverage)}, expected={int(n_rows)}'
+        )
     return meta_features, coverage
 
 
@@ -1009,6 +1094,9 @@ def run_training_pipeline(
     stage: int = 0,
     phase: str | None = None,
     catboost_device: str = 'auto',
+    training_mode: str | None = None,
+    quality_weight_strong: float | None = None,
+    quality_weight_weak: float | None = None,
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
@@ -1021,13 +1109,30 @@ def run_training_pipeline(
     print(f'   Phase: {_phase_banner(resolved_phase)}')
     print('=' * 65)
 
-    df = load_training_csv(csv_path)
+    train_cfg = (config_snapshot or {}).get('training', {})
+    training_mode = training_mode or str(train_cfg.get('mode', TRAIN_MODE_EVENT_BINARY))
+    quality_weight_strong = float(
+        quality_weight_strong if quality_weight_strong is not None else train_cfg.get('quality_weight_strong', 2.0)
+    )
+    quality_weight_weak = float(
+        quality_weight_weak if quality_weight_weak is not None else train_cfg.get('quality_weight_weak', 1.0)
+    )
+
+    df_full = load_training_csv(csv_path)
+    event_df, event_view_info = build_event_training_view(
+        df_full,
+        mode=training_mode,
+        quality_weight_strong=quality_weight_strong,
+        quality_weight_weak=quality_weight_weak,
+    )
+    with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
+        json.dump(event_view_info, f, indent=2)
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
 
     inference_scaler_params, scaler_info = build_inference_scaler_params(
-        df,
+        event_df,
         CATBOOST_ADVISOR_FEATURES,
         train_frac=train_frac,
     )
@@ -1047,7 +1152,7 @@ def run_training_pipeline(
             lob_ts_path = guess_ts
 
     splits, split_t0, split_t1 = build_time_splits(
-        df,
+        event_df,
         n_folds=n_folds,
         test_size=test_size,
         embargo_pct=embargo_pct,
@@ -1063,7 +1168,7 @@ def run_training_pipeline(
         resolved_phase == PHASE_VISUAL and not (os.path.exists(meta_path) and os.path.exists(coverage_path))
     ):
         meta_features, coverage = stage1_oof_meta(
-            df,
+            event_df,
             output_dir,
             splits=splits,
             n_folds=n_folds,
@@ -1074,15 +1179,19 @@ def run_training_pipeline(
             t1=split_t1,
             inference_scaler_params=inference_scaler_params,
             catboost_device=catboost_device,
+            quality_weight_strong=quality_weight_strong,
+            quality_weight_weak=quality_weight_weak,
         )
     else:
-        meta_features, coverage = _load_required_stage1_artifacts(output_dir)
+        meta_features, coverage = _load_required_stage1_artifacts(output_dir, n_rows=len(event_df))
         print(f'✅ CatBoost artifacts loaded from cache: {meta_features.shape}')
 
     if resolved_phase == PHASE_CATBOOST:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
         summary = {
-            'rows': int(len(df)),
+            'rows_full': int(len(df_full)),
+            'rows_event': int(len(event_df)),
+            'training_mode': training_mode,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': None,
@@ -1105,6 +1214,9 @@ def run_training_pipeline(
                 'stage': stage,
                 'phase': resolved_phase,
                 'catboost_device': catboost_device,
+                'mode': training_mode,
+                'quality_weight_strong': quality_weight_strong,
+                'quality_weight_weak': quality_weight_weak,
             },
             inputs={
                 'csv': csv_path,
@@ -1127,20 +1239,22 @@ def run_training_pipeline(
     lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
     if resolved_phase in (PHASE_FULL, PHASE_VISUAL):
         visual_embeddings, visual_coverage = stage2_oof_visual_embeddings(
-            df,
+            event_df,
             output_dir,
             splits=splits,
             lob_tensors=lob_tensors,
             lob_timestamps=lob_timestamps,
         )
     else:
-        visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(df))
+        visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(event_df))
         print(f'✅ Visual embeddings ready: {visual_embeddings.shape} | source={visual_source}')
 
     if resolved_phase == PHASE_VISUAL:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
         summary = {
-            'rows': int(len(df)),
+            'rows_full': int(len(df_full)),
+            'rows_event': int(len(event_df)),
+            'training_mode': training_mode,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': list(visual_embeddings.shape),
@@ -1163,6 +1277,9 @@ def run_training_pipeline(
                 'stage': stage,
                 'phase': resolved_phase,
                 'catboost_device': catboost_device,
+                'mode': training_mode,
+                'quality_weight_strong': quality_weight_strong,
+                'quality_weight_weak': quality_weight_weak,
             },
             inputs={
                 'csv': csv_path,
@@ -1191,7 +1308,7 @@ def run_training_pipeline(
                 "ثبّت TensorFlow أولًا أو شغّل المرحلة الثالثة على Linux/WSL2."
             ) from e
         stage3_meta_learner_v19(
-            df,
+            event_df,
             meta_features,
             visual_embeddings,
             coverage_mask=coverage,
@@ -1205,7 +1322,9 @@ def run_training_pipeline(
 
     elapsed = (datetime.datetime.now() - started_at).total_seconds()
     summary = {
-        'rows': int(len(df)),
+        'rows_full': int(len(df_full)),
+        'rows_event': int(len(event_df)),
+        'training_mode': training_mode,
         'meta_shape': list(meta_features.shape),
         'meta_coverage_ratio': float(np.mean(coverage)),
         'visual_shape': list(visual_embeddings.shape),
@@ -1230,6 +1349,9 @@ def run_training_pipeline(
             'stage': stage,
             'phase': resolved_phase,
             'catboost_device': catboost_device,
+            'mode': training_mode,
+            'quality_weight_strong': quality_weight_strong,
+            'quality_weight_weak': quality_weight_weak,
         },
         inputs={
             'csv': csv_path,
@@ -1270,6 +1392,9 @@ def main():
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
+    p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
+    p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
+    p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -1290,6 +1415,9 @@ def main():
         stage=args.stage,
         phase=args.phase,
         catboost_device=args.catboost_device,
+        training_mode=args.training_mode,
+        quality_weight_strong=args.quality_weight_strong,
+        quality_weight_weak=args.quality_weight_weak,
         config_snapshot=cfg,
     )
 
