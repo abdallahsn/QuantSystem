@@ -60,6 +60,7 @@ from modules.dynamic_labels import (
 
 try:
     from modules.dynamic_labels import TREND_DOWN, TREND_NEUTRAL, TREND_UP, kalman_trend
+    TREND_HELPERS_AVAILABLE = True
 except ImportError:
     # Trend helpers are optional for backwards-compatibility with older
     # dynamic_labels.py versions. The runtime path already has a safe fallback.
@@ -67,6 +68,7 @@ except ImportError:
     TREND_DOWN = -1
     TREND_NEUTRAL = 0
     kalman_trend = None
+    TREND_HELPERS_AVAILABLE = False
 
 # ── public aliases (backwards-compat) ─────────────────────────────────────────
 BIAS_LONG    = DIR_LONG
@@ -585,10 +587,14 @@ def build_causal_event_labels(
     #      - Improves precision at the cost of recall (acceptable trade-off)
     #      - Lets model learn: "signal + trend alignment = conviction"
     #
+    trend_runtime_available = bool(TREND_HELPERS_AVAILABLE and callable(kalman_trend))
     try:
+        if not trend_runtime_available:
+            raise RuntimeError("kalman_trend unavailable in modules.dynamic_labels")
         trend_lbl, trend_strength, kalman_price = kalman_trend(prices_arr)
     except Exception:
         # kalman_trend not yet implemented → graceful fallback
+        trend_runtime_available = False
         trend_lbl      = np.full(n, TREND_NEUTRAL, dtype=np.int8)
         trend_strength = np.zeros(n, dtype=np.float32)
         kalman_price   = prices_arr.astype(np.float32)
@@ -597,7 +603,8 @@ def build_causal_event_labels(
     labeled["trend_strength"] = trend_strength.astype(np.float32)
     labeled["kalman_price"]   = kalman_price.astype(np.float32)
 
-    if trend_filter:
+    trend_filter_applied = bool(trend_filter and trend_runtime_available)
+    if trend_filter_applied:
         bias_filtered = _apply_trend_filter(
             labeled["bias_label"].values.astype(np.int8),
             trend_lbl,
@@ -660,6 +667,8 @@ def build_causal_event_labels(
     n_events  = int(labeled["event_flag"].sum())
     n_up      = int((labeled["trend_label"] == TREND_UP).sum())
     n_down    = int((labeled["trend_label"] == TREND_DOWN).sum())
+    n_trend_neutral = int((labeled["trend_label"] == TREND_NEUTRAL).sum())
+    n_directional = int(n_long + n_short)
 
     h_med = int(np.median(adaptive_horizons))
     h_min = int(adaptive_horizons.min())
@@ -680,14 +689,28 @@ def build_causal_event_labels(
         f"| feat_win={feat_window}  ev_win={ev_window}"
     )
     print(
-        f"[v22] Trend  → UP={n_up:,} ({n_up/total:.1%})  "
+        f"[v22] Trend  → status={'APPLIED' if trend_filter_applied else ('UNAVAILABLE' if trend_filter else 'OFF')}  "
+        f"UP={n_up:,} ({n_up/total:.1%})  "
         f"DOWN={n_down:,} ({n_down/total:.1%})  "
-        f"filter={'ON' if trend_filter else 'OFF'}"
+        f"NEUTRAL={n_trend_neutral:,} ({n_trend_neutral/total:.1%})"
     )
     print(
         f"[v22] Horizon→ adaptive={'ON' if adaptive_horizon else 'OFF'}  "
         f"med={h_med}  min={h_min}  max={h_max}  base={horizon}"
     )
+
+    if n_directional / total < 0.05:
+        print(
+            f"[v22] Warn   → directional labels are sparse: "
+            f"{n_directional:,}/{total:,} ({n_directional/total:.1%})"
+        )
+    if n_events / total > 0.90:
+        print(
+            f"[v22] Warn   → event filter is permissive: "
+            f"{n_events:,}/{total:,} ({n_events/total:.1%})"
+        )
+    if trend_filter and not trend_runtime_available:
+        print("[v22] Warn   → kalman_trend unavailable in dynamic_labels.py; trend filter skipped")
 
     if n_none > 0:
         warnings.warn(

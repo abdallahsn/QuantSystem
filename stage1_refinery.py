@@ -25,7 +25,7 @@ def main():
     p.add_argument('--event_roll_window', type=int, default=int(defaults.get('event_roll_window', 30)))
     p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 5.0)))
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
-    p.add_argument('--feature_roll_window', type=int,default=int(defaults.get('feature_roll_window', 150))) 
+    p.add_argument('--feature_roll_window', type=int,default=int(defaults.get('feature_roll_window', 150)))
 
     args = p.parse_args()
 
