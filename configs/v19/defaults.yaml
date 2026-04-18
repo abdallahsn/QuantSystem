@@ -19,9 +19,13 @@
     "chunksize": 0,
     "n_workers": null,
     "target_bars": 500,
-    "label_horizon": 50,
+    "label_horizon": 150,
     "event_roll_window": 50,
-    "direction_threshold_ticks": 5.0,
+    "direction_threshold_ticks": 1.0,
+    "tp_mult": 1.2,
+    "sl_mult": 1.0,
+    "kalman_slope_threshold": 0.05,
+    "trend_strength_min": 0.05,
     "lob_event_sample": 100000
   },
   "backtest": {

@@ -210,6 +210,7 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
         "pct_short": n_short / max(total, 1) * 100,
         "long_hit_rate": correct_long / max(total_long, 1) * 100,
         "short_hit_rate": correct_short / max(total_short, 1) * 100,
+        "note": "5m CatBoost predictions, not Step 4 raw causal labels",
         "regime_dist": bars["regime_label"].value_counts().to_dict() if "regime_label" in bars.columns else {},
     }
 
@@ -487,7 +488,8 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
     )
 
     stats_text = (
-        f"<b>5m CatBoost Statistics</b><br>"
+        f"<b>5m CatBoost Prediction Statistics</b><br>"
+        f"{stats.get('note', '5m CatBoost predictions')}<br>"
         f"LONG: {stats['n_long']:,} ({stats['pct_long']:.1f}%) | Fwd Hit Rate: {stats['long_hit_rate']:.0f}%<br>"
         f"SHORT: {stats['n_short']:,} ({stats['pct_short']:.1f}%) | Fwd Hit Rate: {stats['short_hit_rate']:.0f}%"
     )

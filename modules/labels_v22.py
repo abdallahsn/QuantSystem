@@ -322,7 +322,9 @@ def _forward_scan_per_row(
 def _apply_trend_filter(
     bias_arr: np.ndarray,
     trend_lbl: np.ndarray,
+    trend_strength: Optional[np.ndarray] = None,
     strict: bool = False,
+    trend_strength_min: float = 0.05,
 ) -> np.ndarray:
     """
     FIX-11: Suppress counter-trend labels using Kalman trend direction.
@@ -344,20 +346,62 @@ def _apply_trend_filter(
     ----------
     bias_arr  : int8 array (DIR_LONG / DIR_SHORT / DIR_NEUTRAL)
     trend_lbl : int8 array (TREND_UP / TREND_DOWN / TREND_NEUTRAL)
+    trend_strength : normalized trend strength in [0, 1], optional.
     strict    : bool — see above
+    trend_strength_min : minimum trend strength required to keep a
+                         directional label after counter-trend suppression.
 
     Returns
     -------
     filtered bias_arr (new array, original untouched)
     """
-    filtered = bias_arr.copy()
+    filtered = np.asarray(bias_arr, dtype=np.int8).copy()
+    trend_lbl = np.asarray(trend_lbl, dtype=np.int8)
 
     # Counter-trend suppression
     mask_bad_long  = (filtered == DIR_LONG)  & (trend_lbl == TREND_DOWN)
     mask_bad_short = (filtered == DIR_SHORT) & (trend_lbl == TREND_UP)
     filtered[mask_bad_long  | mask_bad_short] = DIR_NEUTRAL
 
+    if trend_strength is not None:
+        strength_arr = np.asarray(trend_strength, dtype=np.float32)
+        directional_mask = filtered != DIR_NEUTRAL
+        weak_trend_mask = strength_arr < max(float(trend_strength_min), 0.0)
+        filtered[directional_mask & weak_trend_mask] = DIR_NEUTRAL
+
+    if strict:
+        filtered[(filtered != DIR_NEUTRAL) & (trend_lbl == TREND_NEUTRAL)] = DIR_NEUTRAL
+
     return filtered
+
+
+def _bias_slice_counts(values: np.ndarray) -> tuple[int, int, int, int]:
+    arr = np.asarray(values, dtype=np.int8)
+    total = int(arr.size)
+    n_long = int((arr == BIAS_LONG).sum())
+    n_short = int((arr == BIAS_SHORT).sum())
+    n_neutral = int((arr == BIAS_NEUTRAL).sum())
+    return total, n_long, n_short, n_neutral
+
+
+def _format_bias_line(
+    tag: str,
+    total: int,
+    n_long: int,
+    n_short: int,
+    n_neutral: int | None = None,
+) -> str:
+    display_total = int(total)
+    total = max(display_total, 1)
+    text = (
+        f"[v22] {tag:<7}→ LONG={n_long:,} ({n_long/total:.1%})  "
+        f"SHORT={n_short:,} ({n_short/total:.1%})"
+    )
+    if n_neutral is not None:
+        text += f"  NEUTRAL={n_neutral:,} ({n_neutral/total:.1%})"
+    else:
+        text += f"  | rows={display_total:,}"
+    return text
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -383,9 +427,9 @@ def build_causal_event_labels(
     kalman_slope_threshold: float = 0.05,
     # رُفع من 1e-5 (≈ صفر بعد التطبيع) → 0.05 = 5% من أقوى ميل مرصود
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
-    trend_strength_min: float = 0.20,
+    trend_strength_min: float = 0.05,
     # الحد الأدنى لقوة الترند لتفعيل الحذف في trend filter
-    # 0.20 = نحذف فقط إذا كان الترند متوسط القوة أو أكثر
+    # 0.05 = إعداد هجومي: نقبل directional labels أكثر طالما ليست counter-trend
 ) -> pd.DataFrame:
     """
     Build causal labels using unified order-book features + price-action forward scan.
@@ -670,15 +714,41 @@ def build_causal_event_labels(
     n_down    = int((labeled["trend_label"] == TREND_DOWN).sum())
     n_trend_neutral = int((labeled["trend_label"] == TREND_NEUTRAL).sum())
     n_directional = int(n_long + n_short)
+    event_slice = labeled[labeled["event_flag"].astype(np.int8) == 1]
+    directional_event_slice = event_slice[event_slice["bias_label"].astype(np.int8) != BIAS_NEUTRAL]
+
+    evt_total, evt_long, evt_short, evt_neutral = _bias_slice_counts(
+        event_slice["bias_label"].values.astype(np.int8)
+        if len(event_slice)
+        else np.array([], dtype=np.int8)
+    )
+    evt_dir_total, evt_dir_long, evt_dir_short, _ = _bias_slice_counts(
+        directional_event_slice["bias_label"].values.astype(np.int8)
+        if len(directional_event_slice)
+        else np.array([], dtype=np.int8)
+    )
 
     h_med = int(np.median(adaptive_horizons))
     h_min = int(adaptive_horizons.min())
     h_max = int(adaptive_horizons.max())
 
     print(
-        f"[v22] Bias   → LONG={n_long:,} ({n_long/total:.1%})  "
-        f"SHORT={n_short:,} ({n_short/total:.1%})  "
-        f"NEUTRAL={n_neutral:,} ({n_neutral/total:.1%})"
+        "[v22] Note   → Step 4 shows raw row-level causal labels, "
+        "not 5m CatBoost prediction mix"
+    )
+    print(
+        f"[v22] Config → thr_ticks={direction_threshold_ticks:.2f}  "
+        f"tp_mult={tp_mult:.2f}  sl_mult={sl_mult:.2f}  "
+        f"kalman_thr={kalman_slope_threshold:.2f}  trend_min={trend_strength_min:.2f}"
+    )
+    print(
+        _format_bias_line("BiasAll", total, n_long, n_short, n_neutral)
+    )
+    print(
+        _format_bias_line("BiasEvt", evt_total, evt_long, evt_short, evt_neutral)
+    )
+    print(
+        _format_bias_line("BiasDir", evt_dir_total, evt_dir_long, evt_dir_short)
     )
     print(
         f"[v22] Qual   → STRONG={n_strong:,} ({n_strong/total:.1%})  "

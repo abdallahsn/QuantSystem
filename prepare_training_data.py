@@ -1085,12 +1085,16 @@ def _normalize_and_save(
     target    = df_train.get('bias_label', pd.Series(np.zeros(len(df_train))))
 
     try:
-        protected_in_data = [f for f in PROTECTED_FEATURES if f in feat_cols_available] + EMBEDDING_COLS
-        filtered = spearman_redundancy_filter(df_train[feat_cols_available], threshold=0.85, target=target, protected=set(protected_in_data))
-        if len(feat_cols_available) - len(filtered) > 0: print(f"  Spearman: حذف {len(feat_cols_available) - len(filtered)} feature متكررة")
+        if fit_aux_models:
+            protected_in_data = [f for f in PROTECTED_FEATURES if f in feat_cols_available] + EMBEDDING_COLS
+            filtered = spearman_redundancy_filter(df_train[feat_cols_available], threshold=0.85, target=target, protected=set(protected_in_data))
+            if len(feat_cols_available) - len(filtered) > 0: print(f"  Spearman: حذف {len(feat_cols_available) - len(filtered)} feature متكررة")
 
-        selected = mrmr_selection(df_train[filtered], target, n_features=min(40, len(filtered)), protected=set(protected_in_data))
-        print(f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature (على {len(df_train):,} train rows)")
+            selected = mrmr_selection(df_train[filtered], target, n_features=min(40, len(filtered)), protected=set(protected_in_data))
+            print(f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature (على {len(df_train):,} train rows)")
+        else:
+            selected = feat_cols_available
+            print("  ✅ mRMR skipped intentionally (fit_aux_models=False)")
 
         with open(os.path.join(output_dir, 'selected_features.txt'), 'w') as f: f.write('\n'.join(selected))
 
@@ -1215,14 +1219,14 @@ def run_refinery(
     target_bars=500,
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
-    direction_threshold_ticks: float = 2.0,  # FIX: 5.0 → 2.0
+    direction_threshold_ticks: float = 1.0,  # إعداد هجومي: 2.0 → 1.0
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
-    tp_mult: float = 1.5,
+    tp_mult: float = 1.2,
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
-    trend_strength_min: float = 0.20,
+    trend_strength_min: float = 0.05,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -1480,8 +1484,32 @@ if __name__=='__main__':
     p.add_argument('--n_workers',   type=int, default=None)
     p.add_argument('--target_bars', type=int, default=500,
                    help='عدد الـ Volume Bars لكل session (500=swing, 200=scalp, 1000=position)')
+    p.add_argument('--label_horizon', type=int, default=150,
+                   help='Base forward horizon for causal labels (default: 150)')
+    p.add_argument('--event_roll_window', type=int, default=50,
+                   help='Rolling window for event filter (default: 50)')
+    p.add_argument('--direction_threshold_ticks', type=float, default=1.0,
+                   help='Directional threshold floor in ticks (default: 1.0)')
+    p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
+                   help='Max event-rich emit positions for LOB tensors')
+    p.add_argument('--tp_mult', type=float, default=1.2,
+                   help='TP multiplier applied to dynamic threshold (default: 1.2)')
+    p.add_argument('--sl_mult', type=float, default=1.0,
+                   help='SL multiplier applied to dynamic threshold (default: 1.0)')
+    p.add_argument('--kalman_slope_threshold', type=float, default=0.05,
+                   help='Kalman slope threshold for trend direction (default: 0.05)')
+    p.add_argument('--trend_strength_min', type=float, default=0.05,
+                   help='Minimum trend strength required to keep directional labels (default: 0.05)')
     a  = p.parse_args()
     cs = None if a.chunksize == 0 else a.chunksize
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
                  chunksize=cs, label_mode=a.label_mode,
-                 n_workers=a.n_workers, target_bars=a.target_bars)
+                 n_workers=a.n_workers, target_bars=a.target_bars,
+                 label_horizon=a.label_horizon,
+                 event_roll_window=a.event_roll_window,
+                 direction_threshold_ticks=a.direction_threshold_ticks,
+                 lob_event_sample=a.lob_event_sample,
+                 tp_mult=a.tp_mult,
+                 sl_mult=a.sl_mult,
+                 kalman_slope_threshold=a.kalman_slope_threshold,
+                 trend_strength_min=a.trend_strength_min)

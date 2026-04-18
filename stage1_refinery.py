@@ -18,7 +18,7 @@ def main():
     p.add_argument('--symbol', default='')
     p.add_argument('--output', default='outputs_v19')
     p.add_argument('--chunksize', type=int, default=int(defaults.get('chunksize', 300_000)))
-    p.add_argument('--label_mode', choices=['v19'], default=defaults.get('label_mode', 'v19'))
+    p.add_argument('--label_mode', choices=['v19', 'v22'], default=defaults.get('label_mode', 'v19'))
     p.add_argument('--n_workers', type=int, default=None)
     p.add_argument('--target_bars', type=int, default=int(defaults.get('target_bars', 500)))
 
@@ -31,22 +31,22 @@ def main():
 
     # FIX: خُفّض من 5.0 → 2.0 tick
     # 5 tick floor كان يرفع TP/SL بشكل مبالغ فيه على بيانات منخفضة التذبذب
-    p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 2.0)))
+    p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 1.0)))
 
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
     p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
 
     # معاملات جديدة للمصفاة
-    p.add_argument('--tp_mult', type=float, default=float(defaults.get('tp_mult', 1.5)),
-                   help='TP = tp_mult × ATR (default: 1.5)')
+    p.add_argument('--tp_mult', type=float, default=float(defaults.get('tp_mult', 1.2)),
+                   help='TP = tp_mult × ATR (default: 1.2)')
     p.add_argument('--sl_mult', type=float, default=float(defaults.get('sl_mult', 1.0)),
                    help='SL = sl_mult × ATR (default: 1.0)')
     p.add_argument('--kalman_slope_threshold', type=float,
                    default=float(defaults.get('kalman_slope_threshold', 0.05)),
                    help='حد قوة الميل في Kalman (default: 0.05, القديم: 1e-5)')
     p.add_argument('--trend_strength_min', type=float,
-                   default=float(defaults.get('trend_strength_min', 0.20)),
-                   help='الحد الأدنى لقوة الترند لتفعيل فلتر الحذف (default: 0.20)')
+                   default=float(defaults.get('trend_strength_min', 0.05)),
+                   help='الحد الأدنى لقوة الترند لتفعيل فلتر الحذف (default: 0.05)')
 
     args = p.parse_args()
 
