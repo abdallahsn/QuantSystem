@@ -1213,12 +1213,16 @@ def run_refinery(
     label_mode='v19',
     n_workers=None,
     target_bars=500,
-    label_horizon: int = 50,
+    label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
-    direction_threshold_ticks: float = 5.0,
+    direction_threshold_ticks: float = 2.0,  # FIX: 5.0 → 2.0
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
+    tp_mult: float = 1.5,
+    sl_mult: float = 1.0,
+    kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
+    trend_strength_min: float = 0.20,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -1303,10 +1307,12 @@ def run_refinery(
             horizon=label_horizon,
             event_roll_window=event_roll_window,
             direction_threshold_ticks=direction_threshold_ticks,
-            tp_mult=1.5,
-            sl_mult=1.0,
+            tp_mult=tp_mult,
+            sl_mult=sl_mult,
             neutral_mult=0.45,
             tick_size=_tick,
+            kalman_slope_threshold=kalman_slope_threshold,
+            trend_strength_min=trend_strength_min,
         )
     else:
         print("\n⚙️  Step 4 — Fallback Session Labeling...")

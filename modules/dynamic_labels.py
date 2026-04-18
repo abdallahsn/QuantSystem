@@ -876,7 +876,10 @@ def kalman_trend(
     prices: np.ndarray,
     process_var: float = 1e-4,
     obs_var: float = 1e-2,
-    slope_threshold: float = 1e-5,
+    slope_threshold: float = 0.05,  # FIX: رُفع من 1e-5 → 0.05
+    # القيمة السابقة 1e-5 ≈ 0 بعد التطبيع، أدّت إلى تصنيف 97%+ كـ UP/DOWN
+    # والفلتر كان يمحي معظم إشارات LONG/SHORT الاتجاهية لاحقاً.
+    # 0.05 = نسبة 5% من أقوى ميل مرصود → فقط الترندات الواضحة تُعتبر UP/DOWN.
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Lightweight 2-state Kalman filter for trend direction estimation.

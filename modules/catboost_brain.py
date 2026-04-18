@@ -54,7 +54,14 @@ class CatBoostQuantBrain:
                  learning_rate: float = 0.05,
                  l2_leaf_reg: float = 3.0,
                  confidence_threshold: float = 0.60,
-                 embeddings_dim: int = 8): # أضفنا حجم الـ embeddings هنا
+                 embeddings_dim: int = 8,
+                 # ── FIX: Rolling Context Window ──────────────────────────
+                 use_rolling_context: bool = True,
+                 rolling_window: int = 12,
+                 # 12 شمعة × 5 دقائق = 60 دقيقة من السياق الزمني
+                 # CatBoost يرى الآن mean/std آخر 12 شمعة لكل feature
+                 # بدلاً من لقطة واحدة فقط → يعرف أين هو في الترند
+                 ):
 
         # ندمج أسماء الميزات الأصلية مع أسماء الـ Embeddings
         self.base_feature_cols = feature_cols
@@ -67,6 +74,12 @@ class CatBoostQuantBrain:
         self.learning_rate        = learning_rate
         self.l2_leaf_reg          = l2_leaf_reg
         self.confidence_threshold = confidence_threshold
+
+        # Rolling context
+        self.use_rolling_context = use_rolling_context
+        self.rolling_window      = rolling_window
+        self._ctx_feature_cols   = list(self.feature_cols)  # يُحدَّث بعد fit
+        self._predict_buffer     = deque(maxlen=rolling_window)  # بافر للـ predict اللحظي
 
         self.model       = None
         self._fitted     = False
@@ -83,6 +96,58 @@ class CatBoostQuantBrain:
             except Exception as e:
                 print(f"[CatBoost] ⚠️ مكسور ({e}) — بنبني جديد")
                 self.model = None
+
+    # ── Rolling Context ────────────────────────────────────────────────────────
+
+    def _build_rolling_features(self, X: np.ndarray, cols: list) -> tuple:
+        """
+        FIX-Context: يُضيف rolling mean + std آخر rolling_window صف لكل feature.
+
+        المشكلة:
+          CatBoost كان يرى لقطة واحدة (تيك واحد) بلا ذاكرة زمنية.
+          النتيجة: يُغيّر رأيه مع كل شمعة لأنه لا يعرف إذا كنا في ترند.
+
+        الحل:
+          لكل صف i نُضيف:
+            - mean(X[i-w+1 : i+1]) → الاتجاه العام في النافذة
+            - std(X[i-w+1 : i+1])  → مستوى التذبذب في النافذة
+
+          هذا يُعطي CatBoost "ذاكرة" بسيطة دون الحاجة لـ LSTM/Transformer.
+
+        Returns: (X_ctx, ctx_cols)
+        """
+        if not self.use_rolling_context or len(X) == 0:
+            return X, cols
+
+        w = self.rolling_window
+        df_X = pd.DataFrame(X, columns=cols)
+
+        roll_mean = df_X.rolling(w, min_periods=1).mean()
+        roll_std  = df_X.rolling(w, min_periods=1).std().fillna(0.0)
+
+        roll_mean.columns = [f'{c}__rm{w}' for c in cols]
+        roll_std.columns  = [f'{c}__rs{w}' for c in cols]
+
+        X_ctx    = np.hstack([X, roll_mean.values, roll_std.values])
+        ctx_cols = cols + list(roll_mean.columns) + list(roll_std.columns)
+        return X_ctx.astype(np.float32), ctx_cols
+
+    def _rolling_from_buffer(self, x_combined: np.ndarray) -> np.ndarray:
+        """
+        يحسب rolling context من بافر الـ predict اللحظي.
+        يُستخدم في predict() عند التداول الحي — بافر يحفظ آخر rolling_window صف.
+        """
+        if not self.use_rolling_context:
+            return x_combined
+
+        self._predict_buffer.append(x_combined.copy())
+        buf = np.array(self._predict_buffer)  # (k, features), k <= rolling_window
+
+        ctx_mean = buf.mean(axis=0)
+        ctx_std  = buf.std(axis=0) if len(buf) > 1 else np.zeros_like(ctx_mean)
+        return np.concatenate([x_combined, ctx_mean, ctx_std]).astype(np.float32)
+
+    # ── Training ────────────────────────────────────────────────────────────────
 
     def fit(self, X: np.ndarray, y_bias: np.ndarray, embeddings: np.ndarray = None,
             output_dir: str = 'outputs') -> dict:
@@ -112,6 +177,12 @@ class CatBoostQuantBrain:
              print("  ⚠️ لم يتم تمرير Embeddings لـ CatBoost، تم استخدام قيم صفرية مؤقتاً.")
 
 
+        # ── FIX: تطبيق Rolling Context (mean/std آخر rolling_window شمعة) ──
+        # يُعطي CatBoost ذاكرة زمنية لـ 60 دقيقة بدلاً من لقطة واحدة
+        current_base_cols = self.feature_cols
+        X_combined, ctx_cols = self._build_rolling_features(X_combined, current_base_cols)
+        self._ctx_feature_cols = ctx_cols  # نحفظها للـ predict
+
         # 🔴 تصحيح الجراحة: فلترة القيم السالبة لمنع Crash الـ bincount
         valid_mask = (y_bias >= 0) & (y_bias <= 2)
         X_clean = X_combined[valid_mask]
@@ -136,14 +207,14 @@ class CatBoostQuantBrain:
         print(f"  Weights: LONG={cw[0]:.2f} SHORT={cw[1]:.2f} NEUTRAL={cw[2]:.2f}")
 
         # التحقق من تطابق عدد الميزات
-        if X_tr.shape[1] != len(self.feature_cols):
-             print(f"  ⚠️ خطأ في الأبعاد: X_tr={X_tr.shape[1]}, feature_cols={len(self.feature_cols)}")
+        if X_tr.shape[1] != len(self._ctx_feature_cols):
+             print(f"  ⚠️ خطأ في الأبعاد: X_tr={X_tr.shape[1]}, ctx_feature_cols={len(self._ctx_feature_cols)}")
              return {}
 
         train_pool = Pool(X_tr, y_tr, sample_weight=sample_w,
-                          feature_names=self.feature_cols)
+                          feature_names=self._ctx_feature_cols)
         val_pool   = Pool(X_val, y_val,
-                          feature_names=self.feature_cols)
+                          feature_names=self._ctx_feature_cols)
 
         from modules.gpu_config import GPU_AVAILABLE
         self.model = CatBoostClassifier(
@@ -247,13 +318,13 @@ class CatBoostQuantBrain:
 
                 bars = ax.barh(range(len(names_r)), vals_r,
                                color=color, alpha=0.8)
-                
+
                 ax.set_yticks(range(len(names_r)))
                 ax.set_yticklabels(names_r, color='white', fontsize=9)
                 ax.set_xlabel('Mean |SHAP|', color='gray')
                 ax.set_title(f'{cls_name}', color=color, fontweight='bold')
                 ax.tick_params(colors='gray')
-                
+
                 for spine in ax.spines.values():
                     spine.set_edgecolor('#333')
 
@@ -304,11 +375,17 @@ class CatBoostQuantBrain:
              zeros_emb = np.zeros(self.embeddings_dim)
              x_combined = np.concatenate((x, zeros_emb))
 
-        x2d   = x_combined.reshape(1, -1)
-        
+        # ── FIX: Rolling Context (ذاكرة زمنية) ──
+        # نضيف لـ x_combined mean/std من بافر آخر rolling_window صف
+        # CatBoost يرى الآن السياق الزمني لآخر 12 شمعة (60 دقيقة)
+        x_ctx = self._rolling_from_buffer(x_combined)
+
+        x2d   = x_ctx.reshape(1, -1)
+
         # التحقق من عدد الميزات قبل التنبؤ
-        if x2d.shape[1] != len(self.feature_cols):
-             print(f"  ⚠️ خطأ في الأبعاد للتنبؤ: المدخلات={x2d.shape[1]}, المطلوب={len(self.feature_cols)}")
+        expected_cols = len(self._ctx_feature_cols)
+        if x2d.shape[1] != expected_cols:
+             print(f"  ⚠️ خطأ في الأبعاد للتنبؤ: المدخلات={x2d.shape[1]}, المطلوب={expected_cols}")
              return {'bias': 'NEUTRAL', 'bias_idx': 2, 'confidence': 0.0, 'tradeable': False}
 
         probs = self.model.predict_proba(x2d)[0]

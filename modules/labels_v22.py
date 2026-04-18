@@ -379,6 +379,13 @@ def build_causal_event_labels(
     # ── FIX-11 ───────────────────────────────────────────────────────────
     trend_filter: bool = True,
     trend_filter_strict: bool = False,
+    # ── FIX-Kalman ───────────────────────────────────────────────────────
+    kalman_slope_threshold: float = 0.05,
+    # رُفع من 1e-5 (≈ صفر بعد التطبيع) → 0.05 = 5% من أقوى ميل مرصود
+    # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
+    trend_strength_min: float = 0.20,
+    # الحد الأدنى لقوة الترند لتفعيل الحذف في trend filter
+    # 0.20 = نحذف فقط إذا كان الترند متوسط القوة أو أكثر
 ) -> pd.DataFrame:
     """
     Build causal labels using unified order-book features + price-action forward scan.
@@ -583,7 +590,7 @@ def build_causal_event_labels(
     try:
         if not trend_runtime_available:
             raise RuntimeError("kalman_trend unavailable in modules.dynamic_labels")
-        trend_lbl, trend_strength, kalman_price = kalman_trend(prices_arr)
+        trend_lbl, trend_strength, kalman_price = kalman_trend(prices_arr, slope_threshold=kalman_slope_threshold)
     except Exception:
         # kalman_trend not yet implemented → graceful fallback
         trend_runtime_available = False
@@ -600,7 +607,9 @@ def build_causal_event_labels(
         bias_filtered = _apply_trend_filter(
             labeled["bias_label"].values.astype(np.int8),
             trend_lbl,
+            trend_strength=trend_strength,
             strict=trend_filter_strict,
+            trend_strength_min=trend_strength_min,
         )
         labeled["bias_label"] = bias_filtered.astype(np.int8)
         # Re-sync long_label / short_label after trend filter
