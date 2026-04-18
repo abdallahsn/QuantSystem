@@ -63,8 +63,11 @@ LOB_EVENT_SAMPLE_DEFAULT = 100_000
 try:
     from modules.labels_v19 import build_causal_event_labels
     V19_LABELS_AVAILABLE = True
-except ImportError:
+    V19_LABELS_IMPORT_ERROR = None
+except ImportError as exc:
     V19_LABELS_AVAILABLE = False
+    V19_LABELS_IMPORT_ERROR = exc
+    build_causal_event_labels = None
 
 try:
     from tqdm import tqdm
@@ -1298,6 +1301,8 @@ def run_refinery(
         )
     else:
         print("\n⚙️  Step 4 — Fallback Session Labeling...")
+        if V19_LABELS_IMPORT_ERROR is not None:
+            print(f"  ⚠️ V19 labels import failed: {V19_LABELS_IMPORT_ERROR}")
         df_labeled = _label_sessions(df_merged)
 
     # ── V19 Step 3e: LOB Tensor Dataset (event-rich emit positions) ─────

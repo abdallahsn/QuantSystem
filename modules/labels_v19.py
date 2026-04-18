@@ -52,15 +52,21 @@ from modules.dynamic_labels import (
     QUALITY_STRONG,
     QUALITY_WEAK,
     REGIME_RANGING,
-    TREND_DOWN,
-    TREND_UP,
-    TREND_NEUTRAL,
     append_dynamic_orderbook_features,
     build_event_filter,
     engineer_features,
     label_with_forward_scan,
-    kalman_trend,           # returns (trend_label, trend_strength, kalman_price)
 )
+
+try:
+    from modules.dynamic_labels import TREND_DOWN, TREND_NEUTRAL, TREND_UP, kalman_trend
+except ImportError:
+    # Trend helpers are optional for backwards-compatibility with older
+    # dynamic_labels.py versions. The runtime path already has a safe fallback.
+    TREND_UP = 1
+    TREND_DOWN = -1
+    TREND_NEUTRAL = 0
+    kalman_trend = None
 
 # ── public aliases (backwards-compat) ─────────────────────────────────────────
 BIAS_LONG    = DIR_LONG
