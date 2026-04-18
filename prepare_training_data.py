@@ -61,13 +61,21 @@ DEEPLOB_MAX_GB_DEFAULT = 0.30
 LOB_EVENT_SAMPLE_DEFAULT = 100_000
 
 try:
-    from modules.labels_v19 import build_causal_event_labels
+    from modules.labels_v22 import build_causal_event_labels
     V19_LABELS_AVAILABLE = True
     V19_LABELS_IMPORT_ERROR = None
-except ImportError as exc:
-    V19_LABELS_AVAILABLE = False
-    V19_LABELS_IMPORT_ERROR = exc
-    build_causal_event_labels = None
+    V19_LABELS_SOURCE = 'modules.labels_v22'
+except ImportError:
+    try:
+        from modules.labels_v19 import build_causal_event_labels
+        V19_LABELS_AVAILABLE = True
+        V19_LABELS_IMPORT_ERROR = None
+        V19_LABELS_SOURCE = 'modules.labels_v19'
+    except ImportError as exc:
+        V19_LABELS_AVAILABLE = False
+        V19_LABELS_IMPORT_ERROR = exc
+        V19_LABELS_SOURCE = None
+        build_causal_event_labels = None
 
 try:
     from tqdm import tqdm
@@ -1287,8 +1295,9 @@ def run_refinery(
     print("\n⚙️  Step 3d — Daily/Weekly Levels...")
     df_merged = compute_daily_weekly_levels(df_merged)
 
-    if label_mode == 'v19' and V19_LABELS_AVAILABLE:
-        print("\n⚙️  Step 4 — V19 Causal Event Labels...")
+    if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
+        label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
+        print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
         df_labeled = build_causal_event_labels(
             df_merged,
             horizon=label_horizon,
@@ -1461,7 +1470,7 @@ if __name__=='__main__':
     p.add_argument('--symbol',     default='')
     p.add_argument('--output',     default='outputs')
     p.add_argument('--chunksize',  type=int, default=300_000)
-    p.add_argument('--label_mode', choices=['v19'], default='v19')
+    p.add_argument('--label_mode', choices=['v19', 'v22'], default='v19')
     p.add_argument('--n_workers',   type=int, default=None)
     p.add_argument('--target_bars', type=int, default=500,
                    help='عدد الـ Volume Bars لكل session (500=swing, 200=scalp, 1000=position)')

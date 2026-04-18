@@ -34,6 +34,9 @@ QUALITY_NONE = 0
 
 REGIME_TRENDING = 1
 REGIME_RANGING = 0
+TREND_UP = 1
+TREND_DOWN = -1
+TREND_NEUTRAL = 0
 EVENT_SHIFT_COLS = ("obi", "cvd", "micro_price", "liquidity_density")
 
 
@@ -214,6 +217,8 @@ class OrderWallScanner:
         valid_dists = [d for d in (dist_bid, dist_ask) if d > 0]
         distance_to_wall = min(valid_dists) if valid_dists else 0.0
         gap_size = max(bid_gap_size, ask_gap_size)
+        dist_to_bid_wall = (mid - bid_wall_px) if bid_wall_px is not None else None
+        dist_to_ask_wall = (ask_wall_px - mid) if ask_wall_px is not None else None
 
         top_bid_idx = min(4, len(bid_px) - 1)
         top_ask_idx = min(4, len(ask_px) - 1)
@@ -222,8 +227,9 @@ class OrderWallScanner:
             + (float(bid_px[0]) - float(bid_px[top_bid_idx])) / tick,
             1.0,
         )
-        near_sz = float(sum(bid_sz[:5]) + sum(ask_sz[:5]))
-        liquidity_density = near_sz / price_range_pips
+        bid_density = float(sum(bid_sz[:5])) / price_range_pips
+        ask_density = float(sum(ask_sz[:5])) / price_range_pips
+        liquidity_density = bid_density + ask_density
 
         fv = MarketFeatureVector(
             obi=round(float(obi), 6),
@@ -252,9 +258,16 @@ class OrderWallScanner:
             "ask_gap_px": ask_gap_px,
             "bid_gap_size": round(float(bid_gap_size), 2),
             "ask_gap_size": round(float(ask_gap_size), 2),
+            "dist_to_bid_wall": round(float(dist_to_bid_wall), 6) if dist_to_bid_wall is not None else None,
+            "dist_to_ask_wall": round(float(dist_to_ask_wall), 6) if dist_to_ask_wall is not None else None,
             "distance_to_wall": round(float(distance_to_wall), 2),
             "gap_size": round(float(gap_size), 2),
+            "bid_liquidity_density": round(float(bid_density), 4),
+            "ask_liquidity_density": round(float(ask_density), 4),
             "liquidity_density": round(float(liquidity_density), 4),
+            "bid_wall_size_raw": float(next((sz for px, sz in zip(bid_px, bid_sz) if bid_wall_px is not None and px == bid_wall_px), 0.0)),
+            "ask_wall_size_raw": float(next((sz for px, sz in zip(ask_px, ask_sz) if ask_wall_px is not None and px == ask_wall_px), 0.0)),
+            "mean_sz": round(float(mean_sz), 4),
             "feature_vector": fv,
         }
 
@@ -274,11 +287,85 @@ class OrderWallScanner:
             "ask_gap_px": None,
             "bid_gap_size": 0.0,
             "ask_gap_size": 0.0,
+            "dist_to_bid_wall": None,
+            "dist_to_ask_wall": None,
             "distance_to_wall": 0.0,
             "gap_size": 0.0,
+            "bid_liquidity_density": 0.0,
+            "ask_liquidity_density": 0.0,
             "liquidity_density": 0.0,
+            "bid_wall_size_raw": 0.0,
+            "ask_wall_size_raw": 0.0,
+            "mean_sz": 0.0,
             "feature_vector": MarketFeatureVector(),
         }
+
+
+def compute_dynamic_levels(
+    scan_result: dict,
+    current_price: float,
+    tick_size: float = 0.0001,
+    min_tp_pips: float = 15.0,
+    max_sl_pips: float = 20.0,
+) -> dict:
+    """
+    Compute execution-oriented TP/SL levels from the current order-book scan.
+
+    This keeps the project-compatible API expected by the live signal tracker
+    without changing the label enums used by training.
+    """
+
+    mid = float(current_price or scan_result.get("mid_price", 0.0) or 0.0)
+    pip = max(float(tick_size or 0.0), 1e-9)
+
+    ask_density = float(scan_result.get("ask_liquidity_density", 1.0) or 1.0)
+    bid_density = float(scan_result.get("bid_liquidity_density", 1.0) or 1.0)
+
+    if scan_result.get("ask_gap_px") and float(scan_result["ask_gap_px"]) > mid:
+        raw_long_tp = float(scan_result["ask_gap_px"]) - mid
+        long_tp = raw_long_tp * max(0.5, 1.0 - ask_density * 0.01)
+    else:
+        long_tp = pip * min_tp_pips
+
+    if scan_result.get("bid_wall_px") and float(scan_result["bid_wall_px"]) < mid:
+        raw_long_sl = mid - float(scan_result["bid_wall_px"])
+        long_sl = raw_long_sl * max(0.3, 1.0 - float(scan_result.get("bid_wall_strength", 0.0) or 0.0) * 0.1)
+    else:
+        long_sl = pip * (min_tp_pips * 0.5)
+
+    if scan_result.get("bid_gap_px") and float(scan_result["bid_gap_px"]) < mid:
+        raw_short_tp = mid - float(scan_result["bid_gap_px"])
+        short_tp = raw_short_tp * max(0.5, 1.0 - bid_density * 0.01)
+    else:
+        short_tp = pip * min_tp_pips
+
+    if scan_result.get("ask_wall_px") and float(scan_result["ask_wall_px"]) > mid:
+        raw_short_sl = float(scan_result["ask_wall_px"]) - mid
+        short_sl = raw_short_sl * max(0.3, 1.0 - float(scan_result.get("ask_wall_strength", 0.0) or 0.0) * 0.1)
+    else:
+        short_sl = pip * (min_tp_pips * 0.5)
+
+    long_sl = float(np.clip(long_sl, pip * 5, pip * max_sl_pips))
+    short_sl = float(np.clip(short_sl, pip * 5, pip * max_sl_pips))
+    long_tp = max(float(long_tp), pip * min_tp_pips * 0.5)
+    short_tp = max(float(short_tp), pip * min_tp_pips * 0.5)
+
+    long_rr = round(long_tp / max(long_sl, 1e-9), 3)
+    short_rr = round(short_tp / max(short_sl, 1e-9), 3)
+
+    return {
+        "long_tp": round(long_tp, 6),
+        "long_sl": round(long_sl, 6),
+        "short_tp": round(short_tp, 6),
+        "short_sl": round(short_sl, 6),
+        "long_rr": long_rr,
+        "short_rr": short_rr,
+        "tp_distance": round(max(long_tp, short_tp), 6),
+        "sl_distance": round(max(long_sl, short_sl), 6),
+        "expected_rr": round((long_rr + short_rr) / 2.0, 3),
+        "long_wall_size": float(scan_result.get("bid_wall_size_raw", 1.0) or 1.0),
+        "short_wall_size": float(scan_result.get("ask_wall_size_raw", 1.0) or 1.0),
+    }
 
 
 def engineer_features(df: pd.DataFrame, roll_window: int = 20) -> pd.DataFrame:
@@ -529,6 +616,8 @@ def append_dynamic_orderbook_features(
                 "ask_gap_px": scan_result.get("ask_gap_px"),
                 "bid_gap_size": scan_result.get("bid_gap_size", 0.0),
                 "ask_gap_size": scan_result.get("ask_gap_size", 0.0),
+                "dist_to_bid_wall": scan_result.get("dist_to_bid_wall"),
+                "dist_to_ask_wall": scan_result.get("dist_to_ask_wall"),
                 "bid_wall_str": scan_result.get("bid_wall_str", 0.0),
                 "ask_wall_str": scan_result.get("ask_wall_str", 0.0),
                 "obi": float(fv.obi),
@@ -536,6 +625,11 @@ def append_dynamic_orderbook_features(
                 "volume": float(fv.volume),
                 "bid_wall_strength": float(fv.bid_wall_strength),
                 "ask_wall_strength": float(fv.ask_wall_strength),
+                "bid_liquidity_density": scan_result.get("bid_liquidity_density", 0.0),
+                "ask_liquidity_density": scan_result.get("ask_liquidity_density", 0.0),
+                "bid_wall_size_raw": scan_result.get("bid_wall_size_raw", 0.0),
+                "ask_wall_size_raw": scan_result.get("ask_wall_size_raw", 0.0),
+                "mean_sz": scan_result.get("mean_sz", 0.0),
                 "distance_to_wall": float(fv.distance_to_wall),
                 "gap_size": float(fv.gap_size),
                 "liquidity_density": float(fv.liquidity_density),
@@ -776,3 +870,63 @@ def build_training_dataset(
     print(f"   Features ({len(feature_cols)}): {feature_cols[:6]} ...")
 
     return X, y, feature_cols
+
+
+def kalman_trend(
+    prices: np.ndarray,
+    process_var: float = 1e-4,
+    obs_var: float = 1e-2,
+    slope_threshold: float = 1e-5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Lightweight 2-state Kalman filter for trend direction estimation.
+
+    Returns:
+      trend_label    : TREND_UP / TREND_DOWN / TREND_NEUTRAL
+      trend_strength : normalized absolute slope in [0, 1]
+      kalman_price   : filtered price estimate
+    """
+
+    arr = np.asarray(prices, dtype=np.float64)
+    if arr.size == 0:
+        return (
+            np.array([], dtype=np.int8),
+            np.array([], dtype=np.float32),
+            np.array([], dtype=np.float32),
+        )
+
+    x = np.array([arr[0], 0.0], dtype=np.float64)
+    p_cov = np.eye(2, dtype=np.float64)
+
+    f_mat = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+    h_mat = np.array([[1.0, 0.0]], dtype=np.float64)
+    q_mat = np.eye(2, dtype=np.float64) * float(process_var)
+    r_mat = np.array([[float(obs_var)]], dtype=np.float64)
+
+    kalman_price = np.zeros(arr.size, dtype=np.float64)
+    slopes = np.zeros(arr.size, dtype=np.float64)
+
+    for i, obs in enumerate(arr):
+        x = f_mat @ x
+        p_cov = f_mat @ p_cov @ f_mat.T + q_mat
+
+        innovation = obs - float((h_mat @ x)[0])
+        innovation_cov = (h_mat @ p_cov @ h_mat.T) + r_mat
+        gain = (p_cov @ h_mat.T) / innovation_cov[0, 0]
+        x = x + gain.flatten() * innovation
+        p_cov = (np.eye(2, dtype=np.float64) - gain.reshape(2, 1) @ h_mat) @ p_cov
+
+        kalman_price[i] = x[0]
+        slopes[i] = x[1]
+
+    max_abs_slope = float(np.abs(slopes).max()) + 1e-10
+    norm_slope = slopes / max_abs_slope
+
+    trend_label = np.where(
+        norm_slope > float(slope_threshold),
+        TREND_UP,
+        np.where(norm_slope < -float(slope_threshold), TREND_DOWN, TREND_NEUTRAL),
+    ).astype(np.int8)
+
+    trend_strength = np.abs(norm_slope).astype(np.float32)
+    return trend_label, trend_strength, kalman_price.astype(np.float32)
