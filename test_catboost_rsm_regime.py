@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from modules.catboost_5m_report import _build_price_hover_trace
 from modules.range_state_machine import apply_range_filter_to_dataframe, RangeStateMachine
 
 
@@ -98,3 +99,80 @@ def test_generate_report_prefers_regime_label(monkeypatch, tmp_path):
 
     assert captured["regime_col"] == "regime_label"
     assert summary["direction_counts"] == {"SHORT": 1}
+
+
+def test_trending_mode_allows_high_confidence_edge_entry_early():
+    rsm = RangeStateMachine(
+        min_confirmations=3,
+        confirmation_window=6,
+        min_candles_between=0,
+        cvd_window=2,
+        obi_window=2,
+        hawkes_window=4,
+        trend_early_entry_confidence=0.78,
+        trend_early_entry_range_pos=0.85,
+        trend_early_entry_min_reversal=1.0,
+    )
+
+    warmup = [
+        {"price": 1.2200, "raw_signal": "NEUTRAL", "confidence": 0.0, "hawkes": 0.01},
+        {"price": 1.2204, "raw_signal": "NEUTRAL", "confidence": 0.0, "hawkes": 0.01},
+        {"price": 1.2208, "raw_signal": "NEUTRAL", "confidence": 0.0, "hawkes": 0.01},
+        {"price": 1.2212, "raw_signal": "NEUTRAL", "confidence": 0.0, "hawkes": 0.01},
+    ]
+    for row in warmup:
+        rsm.process(
+            regime="Trending",
+            cvd=0.0,
+            obi=0.0,
+            absorption=0.0,
+            **row,
+        )
+
+    decision = rsm.process(
+        price=1.2230,
+        raw_signal="SHORT",
+        confidence=0.82,
+        cvd=-0.05,
+        obi=-0.08,
+        hawkes=0.20,
+        absorption=0.0,
+        regime="Trending",
+    )
+
+    assert decision["action"] == "ENTER"
+    assert decision["direction"] == "SHORT"
+    assert decision["reason"] == "trend_confirmed_1confs_early"
+
+
+def test_price_hover_trace_exposes_raw_signal_when_rsm_masks_it():
+    bars = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(["2025-01-15 07:55:00"]),
+            "open": [1.2224],
+            "high": [1.2234],
+            "low": [1.2219],
+            "close": [1.2233],
+            "event_count": [12],
+            "volume": [42.0],
+            "cb_direction": ["NEUTRAL"],
+            "cb_direction_raw": ["SHORT"],
+            "cb_confidence": [0.79217],
+            "cb_prob_long": [0.20783],
+            "cb_prob_short": [0.79217],
+            "cvd_delta": [-0.116959],
+            "obi": [-0.15711],
+            "absorption_intensity": [0.515036],
+            "kyle_lambda": [0.680569],
+            "hawkes_intensity": [0.035122],
+            "regime_label": ["Trending"],
+            "rsm_action": ["HOLD"],
+            "rsm_reason": ["trend_accumulating_1/2"],
+        }
+    )
+
+    trace = _build_price_hover_trace(bars)
+
+    assert trace.customdata[0][6] == "NEUTRAL"
+    assert trace.customdata[0][16] == "SHORT"
+    assert trace.customdata[0][18] == "trend_accumulating_1/2"

@@ -723,7 +723,11 @@ def generate_catboost_5m_report(
     # بدلاً من كل إشارة خام من CatBoost
     if RSM_AVAILABLE and not bars.empty:
         try:
-            regime_col = 'regime_name' if 'regime_name' in bars.columns else 'regime'
+            regime_col = (
+                'regime_label' if 'regime_label' in bars.columns else
+                'regime_name' if 'regime_name' in bars.columns else
+                'regime'
+            )
             bars = apply_range_filter_to_dataframe(
                 bars,
                 signal_col  = 'cb_direction',

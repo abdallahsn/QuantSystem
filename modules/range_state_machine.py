@@ -442,7 +442,12 @@ def apply_range_filter_to_dataframe(
         except: return d
 
     for _, row in df.iterrows():
-        regime = str(row.get(regime_col, 'Ranging'))
+        regime = str(
+            row.get(
+                regime_col,
+                row.get("regime_label", row.get("regime", "Ranging")),
+            )
+        )
         if regime.lstrip('-').isdigit():
             regime = {'0':'Trending','1':'Ranging','2':'Volatile','3':'Low_Liquidity'}.get(regime,'Ranging')
 
