@@ -9,6 +9,16 @@ from __future__ import annotations
 
 import json
 import os
+
+try:
+    from modules.range_state_machine import apply_range_filter_to_dataframe
+    RSM_AVAILABLE = True
+except ImportError:
+    try:
+        from range_state_machine import apply_range_filter_to_dataframe
+        RSM_AVAILABLE = True
+    except ImportError:
+        RSM_AVAILABLE = False
 from pathlib import Path
 from typing import Any
 
@@ -694,6 +704,33 @@ def generate_catboost_5m_report(
     bars = _resample_catboost_bars(pred_df, freq=freq)
     if len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
+
+    # ── تطبيق RangeStateMachine على الـ visualization ─────────────────
+    # يُظهر فقط الإشارات المؤكدة (N تأكيدات من الحافة الصحيحة)
+    # بدلاً من كل إشارة خام من CatBoost
+    if RSM_AVAILABLE and not bars.empty:
+        try:
+            regime_col = 'regime_name' if 'regime_name' in bars.columns else 'regime'
+            bars = apply_range_filter_to_dataframe(
+                bars,
+                signal_col  = 'cb_direction',
+                conf_col    = 'cb_confidence',
+                price_col   = 'close',
+                regime_col  = regime_col,
+                tick_size   = 0.0001,
+                min_confirmations   = 3,
+                confirmation_window = 6,
+                min_candles_between = 4,
+            )
+            # استبدل cb_direction بالإشارة المفلترة للـ stats والرسم
+            bars['cb_direction_raw'] = bars['cb_direction'].copy()
+            bars['cb_direction']     = bars['rsm_direction']
+            bars['cb_direction_idx'] = bars['cb_direction'].map(
+                {'LONG': 0, 'SHORT': 1, 'NEUTRAL': 2}
+            ).fillna(2).astype(int)
+            print(f"  ✅ RSM applied: {(bars['rsm_action']=='ENTER').sum()} confirmed signals")
+        except Exception as _rsm_err:
+            print(f"  ⚠️ RSM skipped: {_rsm_err}")
 
     t_min = bars["ts_event"].min() if not bars.empty else pd.Timestamp.min
     t_max = bars["signal_time"].max() if not bars.empty and "signal_time" in bars.columns else pd.Timestamp.max
