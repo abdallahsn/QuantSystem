@@ -1,5 +1,5 @@
 """
-deep_validation.py — 5 Scientific Tests for V16Pro-3
+deep_validation.py — 5 Scientific Tests for QuantSystem V19
 """
 import sys, os, time, tempfile, warnings
 import numpy as np
@@ -14,17 +14,18 @@ np.random.seed(42)
 
 from prepare_training_data import (
     _process_mbo, _process_mbp10, _merge,
-    _add_rolling_context, _label_sessions,
+    _add_rolling_context,
     _normalize_and_save, MODEL_FEATURE_COLS
 )
 from modules.fractional_diff   import apply_fractional_diff
 from modules.context_features  import compute_daily_weekly_levels
+from modules.labels_v22        import build_causal_event_labels
 from modules.regime_classifier import RegimeClassifier, REGIME_NAMES
 from modules.purging_embargo   import walk_forward_expanding, compute_pbo
 
 # ── داتا محاكاة (Simulation Data) ─────────────────────────────────
 print('='*65)
-print('V16Pro-3 — DEEP VALIDATION SUITE')
+print('QuantSystem V19 — DEEP VALIDATION SUITE')
 print('='*65)
 print('\nBuild data...')
 
@@ -67,7 +68,17 @@ merged = _merge(mbo_p, mbp_p)
 merged = _add_rolling_context(merged)
 merged, _ = apply_fractional_diff(merged, 0.4)
 merged = compute_daily_weekly_levels(merged)
-labeled = _label_sessions(merged)
+labeled = build_causal_event_labels(
+    merged,
+    horizon=150,
+    event_roll_window=50,
+    direction_threshold_ticks=1.0,
+    tp_mult=1.2,
+    sl_mult=1.0,
+    tick_size=0.0001,
+    kalman_slope_threshold=0.05,
+    trend_strength_min=0.05,
+)
 
 with tempfile.TemporaryDirectory() as tmp:
     _, path, _ = _normalize_and_save(labeled, tmp, rolling_window=50)

@@ -106,10 +106,11 @@ class V19PredictionEngine:
         gate_cfg = self.factory.schema.get('event_gate', {}) or {}
         self.event_gate = EventGate(
             roll_window=int(gate_cfg.get('roll_window', 50)),
-            vol_mult=float(gate_cfg.get('vol_mult', 1.45)),
-            obi_thr=float(gate_cfg.get('obi_thr', 0.40)),
-            wall_str_thr=float(gate_cfg.get('wall_str_thr', 1.025)),
+            vol_mult=float(gate_cfg.get('vol_mult', 1.10)),
+            obi_thr=float(gate_cfg.get('obi_thr', 0.08)),
+            wall_str_thr=float(gate_cfg.get('wall_str_thr', 0.70)),
             shift_z_thr=float(gate_cfg.get('shift_z_thr', 0.75)),
+            score_threshold=float(gate_cfg.get('score_threshold', 0.0)),
         )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))
@@ -178,6 +179,7 @@ class V19PredictionEngine:
         )
 
         self._seq_buffer = deque(maxlen=self.seq_len)
+        self._regime_buffer = deque(maxlen=max(self.seq_len * 4, 128))
         self.event_writer = event_writer
         schema_version = str(self.factory.schema.get('version', 'v19'))
         self.pred_logger = PredictionLogger(event_writer, run_mode=run_mode, manifest_path=self.manifest_path, model_version='v19', schema_version=schema_version, symbol=symbol)
@@ -187,6 +189,7 @@ class V19PredictionEngine:
 
     def reset_state(self):
         self._seq_buffer.clear()
+        self._regime_buffer.clear()
         self.event_gate.reset()
         self.loss_guard.reset_daily()
 
@@ -239,6 +242,12 @@ class V19PredictionEngine:
         except Exception:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
 
+    def _update_regime_context(self, stat_df: pd.DataFrame) -> None:
+        if stat_df is None or len(stat_df) == 0:
+            return
+        for _, row in stat_df.iterrows():
+            self._regime_buffer.append(row.to_dict())
+
     def _get_regime_one_hot(self, stat_df: pd.DataFrame) -> np.ndarray:
         n = len(stat_df)
         out = np.zeros((n, N_CLUSTERS), dtype=np.float32)
@@ -246,7 +255,11 @@ class V19PredictionEngine:
             out[:, 0] = 1.0
             return out
         try:
-            labels = self.regime_clf.predict(stat_df)
+            if n == 1 and len(self._regime_buffer):
+                recent_df = pd.DataFrame(list(self._regime_buffer))
+                labels = self.regime_clf.predict(recent_df)[-1:]
+            else:
+                labels = self.regime_clf.predict(stat_df)
             for i, lbl in enumerate(labels):
                 lbl = int(lbl)
                 if 0 <= lbl < N_CLUSTERS:
@@ -359,6 +372,7 @@ class V19PredictionEngine:
             already_scaled=already_scaled,
             include_meta=True,
         )
+        self._update_regime_context(stat_df)
         health = evaluate_system_health(
             models_dir=self.models_dir,
             engine_status=self.get_runtime_status(),

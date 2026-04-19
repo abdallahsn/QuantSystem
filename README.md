@@ -116,13 +116,13 @@ QuantSystem V19/
 - `pandas`
 - `tensorflow`
 - `scikit-learn`
+- `catboost`
 - `matplotlib`
 - `openpyxl`
 - `tqdm`
 
 ### Common Optional Dependencies
 بعض أجزاء المشروع تستخدم أو تستفيد من:
-- `catboost`
 - `jupyterlab`
 - `ipykernel`
 - `pyarrow`
@@ -132,7 +132,7 @@ QuantSystem V19/
 
 ```bash
 pip install -r requirements.txt
-pip install catboost jupyterlab ipykernel pyarrow hmmlearn
+pip install jupyterlab ipykernel pyarrow hmmlearn
 ```
 
 

@@ -229,6 +229,8 @@ def run_walkforward(
             round_trip_cost_pips=float(bt_cfg.get('round_trip_cost_pips', 1.0)),
             max_size=int(bt_cfg.get('max_size', 5)),
             starting_equity=float(bt_cfg.get('starting_equity', 100000.0)),
+            single_position_only=bool(bt_cfg.get('single_position_only', True)),
+            cooldown_rows=int(bt_cfg.get('cooldown_rows', 0)),
         )
 
         fold_report = {

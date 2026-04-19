@@ -79,6 +79,10 @@ META_FEATURE_NAMES = [
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
+EVENT_GATE_VOL_MULT = 1.10
+EVENT_GATE_OBI_THR = 0.08
+EVENT_GATE_WALL_THR = 0.70
+EVENT_GATE_SHIFT_Z_THR = 0.75
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
@@ -287,6 +291,20 @@ def build_event_training_view(
     if event_df.empty:
         raise RuntimeError('❌ لا توجد directional event rows صالحة للتدريب بعد تطبيق event view')
 
+    event_score_series = out['event_score'] if 'event_score' in out.columns else pd.Series(0.0, index=out.index)
+    event_scores = pd.to_numeric(event_score_series, errors='coerce').fillna(0.0).astype(np.float32)
+    selected_event_rows = pd.to_numeric(out.get(event_col, 0), errors='coerce').fillna(0).astype(np.int8) == 1
+    event_gate_config = {
+        'roll_window': 50,
+        'vol_mult': EVENT_GATE_VOL_MULT,
+        'obi_thr': EVENT_GATE_OBI_THR,
+        'wall_str_thr': EVENT_GATE_WALL_THR,
+        'shift_z_thr': EVENT_GATE_SHIFT_Z_THR,
+        'score_threshold': float(event_scores.loc[selected_event_rows].min()) if bool(selected_event_rows.any()) else 0.0,
+        'event_col': event_col,
+        'observed_gate_rate': float(selected_event_rows.mean()),
+    }
+
     event_df['quality_sample_weight'] = np.where(
         event_df['signal_quality'].values.astype(np.int8) == 2,
         float(quality_weight_strong),
@@ -306,6 +324,7 @@ def build_event_training_view(
         'quality_weight_weak': float(quality_weight_weak),
         'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
         'quality_counts': {str(k): int(v) for k, v in event_df['signal_quality'].value_counts().to_dict().items()},
+        'event_gate_config': event_gate_config,
     }
     print(
         "  ✅ Event Training View: "
@@ -1130,6 +1149,7 @@ def stage3_meta_learner_v19(
     train_frac: float = 0.80,
     split_time=None,
     min_seq_coverage: float = 0.80,
+    event_gate_config: dict | None = None,
 ) -> None:
     print("\n" + "═" * 65)
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
@@ -1186,6 +1206,16 @@ def stage3_meta_learner_v19(
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
         with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
             json.dump({'history': hist_dict, 'split': split_stats}, f, indent=2)
+        event_gate_schema = {
+            'roll_window': int((event_gate_config or {}).get('roll_window', 50)),
+            'vol_mult': float((event_gate_config or {}).get('vol_mult', EVENT_GATE_VOL_MULT)),
+            'obi_thr': float((event_gate_config or {}).get('obi_thr', EVENT_GATE_OBI_THR)),
+            'wall_str_thr': float((event_gate_config or {}).get('wall_str_thr', EVENT_GATE_WALL_THR)),
+            'shift_z_thr': float((event_gate_config or {}).get('shift_z_thr', EVENT_GATE_SHIFT_Z_THR)),
+            'score_threshold': float((event_gate_config or {}).get('score_threshold', 0.0)),
+            'event_col': str((event_gate_config or {}).get('event_col', 'train_event_flag')),
+            'observed_gate_rate': float((event_gate_config or {}).get('observed_gate_rate', 0.0)),
+        }
         schema = {
             'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
@@ -1209,13 +1239,7 @@ def stage3_meta_learner_v19(
                 'meta_features_oof': 'meta_features_oof_v19.npy',
                 'meta_features_live': 'meta_features_live_v19.npy',
             },
-            'event_gate': {
-                'roll_window': 50,
-                'vol_mult': 1.45,
-                'obi_thr': 0.40,
-                'wall_str_thr': 1.025,
-                'shift_z_thr': 0.75,
-            },
+            'event_gate': event_gate_schema,
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
@@ -1316,6 +1340,9 @@ def run_training_pipeline(
         quality_weight_strong=quality_weight_strong,
         quality_weight_weak=quality_weight_weak,
     )
+    ref_cfg = (config_snapshot or {}).get('refinery', {})
+    if 'event_gate_config' in event_view_info:
+        event_view_info['event_gate_config']['roll_window'] = int(ref_cfg.get('event_roll_window', 50))
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
@@ -1520,6 +1547,7 @@ def run_training_pipeline(
             train_frac=train_frac,
             split_time=refinery_split_time,
             min_seq_coverage=min_seq_coverage,
+            event_gate_config=event_view_info.get('event_gate_config'),
         )
 
     elapsed = (datetime.datetime.now() - started_at).total_seconds()

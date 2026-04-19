@@ -33,7 +33,9 @@
     "tick_value": 10.0,
     "round_trip_cost_pips": 1.0,
     "max_size": 5,
-    "starting_equity": 100000.0
+    "starting_equity": 100000.0,
+    "single_position_only": true,
+    "cooldown_rows": 0
   },
   "walkforward": {
     "n_splits": 3,

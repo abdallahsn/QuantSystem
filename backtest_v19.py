@@ -291,6 +291,8 @@ def run_causal_backtest(
     sl_mult: float = 1.0,
     max_horizon_steps: int | None = None,
     allow_oracle_forward_return: bool = False,
+    single_position_only: bool = True,
+    cooldown_rows: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
@@ -320,9 +322,29 @@ def run_causal_backtest(
     replayed_trades = 0
     oracle_trades = 0
     skipped_trade_replays = 0
+    active_trade = None
+    cooldown_until = -1
 
     for i, (_, row) in enumerate(replay_df.iterrows()):
         ts = row.get('ts_event', None)
+        if active_trade is not None and i >= int(active_trade['exit_idx']):
+            equity += float(active_trade['pnl'])
+            engine.loss_guard.update_equity(equity)
+            engine.loss_guard.record_trade(float(active_trade['pnl']), ts=ts)
+            equity_curve.append(float(equity))
+            closed_trade = {
+                **active_trade,
+                'exit_ts': '' if pd.isna(ts) else str(ts),
+                'equity_after': round(float(equity), 2),
+            }
+            trades.append(closed_trade)
+            if active_trade.get('pnl_source') == 'path_replay':
+                replayed_trades += 1
+            else:
+                oracle_trades += 1
+            active_trade = None
+            cooldown_until = i + max(int(cooldown_rows), 0)
+
         visual = visual_embeddings[i] if visual_embeddings.size else None
         pred = engine.predict_step(
             row.to_dict(),
@@ -351,6 +373,15 @@ def run_causal_backtest(
         tradeable = bool(pred.get('tradeable', False))
         direction = pred.get('bias', 'NEUTRAL')
         pred['executed'] = False
+
+        if active_trade is not None and bool(single_position_only):
+            pred['trade_skip_reason'] = 'single_position_only'
+            results.append(pred)
+            continue
+        if i < cooldown_until:
+            pred['trade_skip_reason'] = 'cooldown_active'
+            results.append(pred)
+            continue
 
         if tradeable and direction in ('LONG', 'SHORT'):
             size = int(pred.get('position_size') or confidence_bet_size(
@@ -396,15 +427,6 @@ def run_causal_backtest(
             net_pnl_pips = raw_pnl_pips - round_trip_cost_pips
             net_pnl_dollars = net_pnl_pips * tick_value * size
 
-            equity += net_pnl_dollars
-            engine.loss_guard.update_equity(equity)
-            engine.loss_guard.record_trade(net_pnl_dollars, ts=ts)
-            equity_curve.append(float(equity))
-            if pnl_source == 'path_replay':
-                replayed_trades += 1
-            else:
-                oracle_trades += 1
-
             result = 'WIN' if net_pnl_pips > 0 else ('LOSE' if net_pnl_pips < 0 else 'FLAT')
             exit_idx = int(trade_path['exit_idx'])
             exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
@@ -432,14 +454,29 @@ def run_causal_backtest(
                 'cluster': pred.get('cluster', 0),
                 'cluster_name': pred.get('cluster_name', 'Unknown'),
             }
-            trades.append(trade)
             pred['executed'] = True
             pred['position_size'] = size
-            pred['net_pnl_pips'] = round(net_pnl_pips, 4)
-            pred['net_pnl_dollars'] = round(net_pnl_dollars, 2)
-            pred['equity_after'] = round(equity, 2)
+            pred['pending_exit_idx'] = exit_idx
+            pred['pending_exit_ts'] = '' if pd.isna(exit_ts) else str(exit_ts)
             pred['exit_reason'] = str(trade_path['exit_reason'])
             pred['pnl_source'] = pnl_source
+
+            if bool(single_position_only):
+                active_trade = trade
+            else:
+                equity += net_pnl_dollars
+                engine.loss_guard.update_equity(equity)
+                engine.loss_guard.record_trade(net_pnl_dollars, ts=ts)
+                equity_curve.append(float(equity))
+                trade['equity_after'] = round(float(equity), 2)
+                trades.append(trade)
+                if pnl_source == 'path_replay':
+                    replayed_trades += 1
+                else:
+                    oracle_trades += 1
+                pred['net_pnl_pips'] = round(net_pnl_pips, 4)
+                pred['net_pnl_dollars'] = round(net_pnl_dollars, 2)
+                pred['equity_after'] = round(equity, 2)
 
         results.append(pred)
 
@@ -474,6 +511,8 @@ def run_causal_backtest(
         'oracle_forward_return_trades': int(oracle_trades),
         'oracle_forward_return_used': bool(oracle_trades > 0),
         'skipped_trade_replays': int(skipped_trade_replays),
+        'single_position_only': bool(single_position_only),
+        'cooldown_rows': int(max(cooldown_rows, 0)),
         'visual_coverage': round(float((np.linalg.norm(visual_embeddings, axis=1) > 0).mean()), 4)
             if visual_embeddings.size else 0.0,
     }
@@ -524,6 +563,10 @@ def main():
                    help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
     p.add_argument('--allow_oracle_forward_return', action='store_true',
                    help='dangerous: fall back to stored forward_return when no causal replay window is available')
+    p.add_argument('--disable_single_position_only', action='store_true',
+                   help='allow overlapping trades; default keeps one active position at a time')
+    p.add_argument('--cooldown_rows', type=int, default=0,
+                   help='rows to wait after closing a trade before opening a new one')
     args = p.parse_args()
 
     df = _load_csv(args.csv)
@@ -558,6 +601,8 @@ def main():
         sl_mult=args.sl_mult,
         max_horizon_steps=(args.max_horizon_steps if args.max_horizon_steps > 0 else None),
         allow_oracle_forward_return=args.allow_oracle_forward_return,
+        single_position_only=(not args.disable_single_position_only),
+        cooldown_rows=args.cooldown_rows,
     )
 
     print("\n✅ V19 causal backtest complete")
