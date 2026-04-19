@@ -15,10 +15,17 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("QUANTSYSTEM_SKIP_HEAVY_ML", "1")
 os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 
+import numpy as np
 import pandas as pd
 
 from modules.catboost_5m_report import _build_dashboard, _compute_signal_stats
-from modules.labels_v22 import DIR_LONG, DIR_SHORT, build_causal_event_labels
+from modules.labels_v22 import (
+    DIR_LONG,
+    DIR_NEUTRAL,
+    DIR_SHORT,
+    _forward_scan_per_row,
+    build_causal_event_labels,
+)
 from prepare_training_data import (
     run_refinery,
 )
@@ -85,6 +92,60 @@ class V22LabelsRegressionTests(unittest.TestCase):
         self.assertIn("train_event_flag", out.columns)
         self.assertIn("event_score", out.columns)
         self.assertEqual(len(out), len(df))
+
+    def test_build_causal_event_labels_caps_tp_at_liquidity_wall(self):
+        df = pd.DataFrame(
+            {
+                "ts_event": pd.date_range("2026-01-01", periods=4, freq="s", tz="UTC"),
+                "price": [100.00, 100.12, 100.50, 100.32],
+                "size": [1, 1, 1, 1],
+                "cvd": [0, 0, 0, 0],
+                "micro_price": [100.00, 100.12, 100.50, 100.32],
+                "bid_wall_strength": [0.0, 0.0, 0.0, 0.0],
+                "ask_wall_strength": [0.9, 0.0, 0.0, 0.0],
+                "distance_to_wall": [5.0, 0.0, 0.0, 0.0],
+                "gap_size": [0.0, 0.0, 0.0, 0.0],
+                "liquidity_density": [1.0, 1.0, 1.0, 1.0],
+                "bid_wall_px": [np.nan, np.nan, np.nan, np.nan],
+                "ask_wall_px": [100.50, np.nan, np.nan, np.nan],
+            }
+        )
+
+        out = build_causal_event_labels(
+            df,
+            horizon=3,
+            direction_threshold_ticks=40.0,
+            tp_mult=2.0,
+            sl_mult=1.0,
+            tick_size=0.01,
+            adaptive_horizon=False,
+            trend_filter=False,
+        )
+
+        self.assertEqual(int(out.loc[0, "bias_label"]), DIR_LONG)
+        self.assertEqual(int(out.loc[0, "signal_quality"]), 2)
+
+    def test_forward_scan_ignores_weak_liquidity_wall_and_falls_back_to_atr(self):
+        prices = np.array([100.00, 99.86, 99.70, 99.82], dtype=np.float64)
+        dynamic_threshold = np.full(prices.shape[0], 0.40, dtype=np.float64)
+        adaptive_horizons = np.full(prices.shape[0], 3, dtype=np.int32)
+
+        bias_arr, quality_arr, end_idx_arr = _forward_scan_per_row(
+            prices=prices,
+            dynamic_threshold=dynamic_threshold,
+            adaptive_horizons=adaptive_horizons,
+            tick_size=0.01,
+            tp_mult=2.0,
+            sl_mult=1.0,
+            bid_wall_px=np.array([99.70, np.nan, np.nan, np.nan], dtype=np.float64),
+            ask_wall_px=np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64),
+            bid_wall_strength=np.array([0.30, np.nan, np.nan, np.nan], dtype=np.float64),
+            ask_wall_strength=np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64),
+        )
+
+        self.assertEqual(int(bias_arr[0]), DIR_NEUTRAL)
+        self.assertEqual(int(quality_arr[0]), 1)
+        self.assertEqual(int(end_idx_arr[0]), 0)
 
     def test_sample_step4_prints_bias_layers_and_aggressive_is_more_directional(self):
         legacy, legacy_stdout = _run_sample_refinery(

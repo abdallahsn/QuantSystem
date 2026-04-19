@@ -353,6 +353,59 @@ def _compute_adaptive_horizons(
     return horizons
 
 
+# ── Liquidity-aware TP cap ────────────────────────────────────────────────────
+
+def _find_liquidity_tp_distance(
+    current_price: float,
+    direction: int,
+    tick_size: float,
+    bid_wall_px: float = np.nan,
+    ask_wall_px: float = np.nan,
+    bid_wall_strength: float = np.nan,
+    ask_wall_strength: float = np.nan,
+    min_wall_strength: float = 2.5,
+    wall_exit_buffer_ticks: float = 1.0,
+    min_tp_ticks: float = 2.0,
+) -> Optional[float]:
+    """
+    Return a causal TP distance derived from the nearest structural wall.
+
+    Scanner strengths may arrive either normalized to [0, 1] or as raw
+    size/mean-size ratios. We accept both scales by using a 0.5 floor for
+    normalized strengths and a higher default floor for ratio-style values.
+    """
+    tick = max(float(tick_size or 0.0), 1e-9)
+    buffer_px = max(float(wall_exit_buffer_ticks), 0.0) * tick
+    min_tp_px = max(float(min_tp_ticks), 0.0) * tick
+
+    if direction == DIR_LONG:
+        wall_px = float(ask_wall_px) if np.isfinite(ask_wall_px) else np.nan
+        strength = float(ask_wall_strength) if np.isfinite(ask_wall_strength) else np.nan
+        if not np.isfinite(wall_px) or wall_px <= current_price:
+            return None
+        target_price = wall_px - buffer_px
+        distance = target_price - current_price
+    elif direction == DIR_SHORT:
+        wall_px = float(bid_wall_px) if np.isfinite(bid_wall_px) else np.nan
+        strength = float(bid_wall_strength) if np.isfinite(bid_wall_strength) else np.nan
+        if not np.isfinite(wall_px) or wall_px >= current_price:
+            return None
+        target_price = wall_px + buffer_px
+        distance = current_price - target_price
+    else:
+        return None
+
+    if np.isfinite(strength) and strength > 0.0:
+        strength_floor = min(float(min_wall_strength), 0.5) if strength <= 1.0 else float(min_wall_strength)
+        if strength < strength_floor:
+            return None
+
+    if not np.isfinite(distance) or distance < min_tp_px:
+        return None
+
+    return float(distance)
+
+
 # ── FIX-10: Per-row forward scan ──────────────────────────────────────────────
 
 def _forward_scan_per_row(
@@ -362,6 +415,13 @@ def _forward_scan_per_row(
     tick_size: float,
     tp_mult: float = 1.5,
     sl_mult: float = 1.0,
+    bid_wall_px: Optional[np.ndarray] = None,
+    ask_wall_px: Optional[np.ndarray] = None,
+    bid_wall_strength: Optional[np.ndarray] = None,
+    ask_wall_strength: Optional[np.ndarray] = None,
+    min_wall_strength: float = 2.5,
+    wall_exit_buffer_ticks: float = 1.0,
+    min_wall_tp_ticks: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     FIX-10: Vectorised per-row forward scan with row-specific threshold AND horizon.
@@ -404,6 +464,39 @@ def _forward_scan_per_row(
         sl  = thr * sl_mult
         h   = int(adaptive_horizons[i])
         end = min(i + h, n - 1)
+        tp_long = tp
+        tp_short = tp
+
+        liquidity_tp_long = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_LONG,
+            tick_size=tick_size,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=min_wall_tp_ticks,
+        )
+        if liquidity_tp_long is not None:
+            # Wall acts as a TP cap: don't force price through the first barrier.
+            tp_long = min(tp_long, liquidity_tp_long)
+
+        liquidity_tp_short = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_SHORT,
+            tick_size=tick_size,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=min_wall_tp_ticks,
+        )
+        if liquidity_tp_short is not None:
+            tp_short = min(tp_short, liquidity_tp_short)
 
         tp_long_hit  = False
         sl_long_hit  = False
@@ -414,7 +507,7 @@ def _forward_scan_per_row(
 
         for j in range(i + 1, end + 1):
             move = prices[j] - p0
-            if not tp_long_hit and move >= tp:
+            if not tp_long_hit and move >= tp_long:
                 tp_long_hit = True
                 first_long_hit_idx = j
                 break                          # LONG TP → best case, stop here
@@ -425,7 +518,7 @@ def _forward_scan_per_row(
 
         for j in range(i + 1, end + 1):
             move = prices[j] - p0
-            if not tp_short_hit and move <= -tp:
+            if not tp_short_hit and move <= -tp_short:
                 tp_short_hit = True
                 first_short_hit_idx = j
                 break
@@ -723,6 +816,12 @@ def build_causal_event_labels(
         # FIX-5 fallback: static ×1.5 (v21 behaviour)
         adaptive_horizons = np.full(n, int(horizon * 1.5), dtype=np.int32)
 
+    nan_series = pd.Series(np.full(n, np.nan), index=out.index, dtype=np.float64)
+    bid_wall_px_arr = pd.to_numeric(out.get("bid_wall_px", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    ask_wall_px_arr = pd.to_numeric(out.get("ask_wall_px", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    bid_wall_strength_arr = pd.to_numeric(out.get("bid_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    ask_wall_strength_arr = pd.to_numeric(out.get("ask_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
     # ── 6. FIX-10: per-row forward scan ──────────────────────────────────────
     #
     #  v21: label_with_forward_scan(scalar_threshold)
@@ -738,6 +837,10 @@ def build_causal_event_labels(
         tick_size  = tick_size,
         tp_mult    = tp_mult,
         sl_mult    = sl_mult,
+        bid_wall_px = bid_wall_px_arr,
+        ask_wall_px = ask_wall_px_arr,
+        bid_wall_strength = bid_wall_strength_arr,
+        ask_wall_strength = ask_wall_strength_arr,
     )
 
     # Merge into labeled DataFrame (keeping all columns from engineer_features)
