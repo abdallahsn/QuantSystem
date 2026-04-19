@@ -730,7 +730,7 @@ def generate_catboost_5m_report(
                 tick_size   = 0.0001,
                 min_confirmations   = 3,
                 confirmation_window = 6,
-                min_candles_between = 4,
+                min_candles_between = 1,
             )
             # استبدل cb_direction بالإشارة المفلترة للـ stats والرسم
             bars['cb_direction_raw'] = bars['cb_direction'].copy()
