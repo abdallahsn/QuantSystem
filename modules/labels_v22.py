@@ -47,6 +47,7 @@ from modules.dynamic_labels import (
     DIR_LONG,
     DIR_NEUTRAL,
     DIR_SHORT,
+    EVENT_SHIFT_COLS,
     LABEL_CANCEL,
     QUALITY_NONE,
     QUALITY_STRONG,
@@ -159,6 +160,9 @@ def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
     out["long_label"]           = empty_int8
     out["short_label"]          = empty_int8
     out["event_flag"]           = empty_int8
+    out["train_event_flag"]     = empty_int8
+    out["event_score"]          = empty_float32
+    out["event_trigger_count"]  = empty_int8
     out["is_event"]             = empty_int8
     out["trend_label"]          = empty_int8
     out["trend_strength"]       = empty_float32
@@ -178,6 +182,114 @@ def _compute_micro_atr(prices: np.ndarray, window: int = 20) -> np.ndarray:
         atr[i] = np.std(returns[lo : i + 1]) if i >= 1 else abs(returns[i])
     atr = np.where(atr < 1e-10, np.nanmedian(atr) or 1e-5, atr)
     return atr
+
+
+def _rolling_zscore_np(values: np.ndarray, window: int) -> np.ndarray:
+    """Causal rolling z-score used by the stronger training-event gate."""
+    series = pd.Series(np.asarray(values, dtype=np.float64))
+    roll_window = max(int(window), 1)
+    roll_mean = series.rolling(roll_window, min_periods=1).mean()
+    roll_std = series.rolling(roll_window, min_periods=1).std().replace(0.0, 1e-9)
+    return ((series - roll_mean) / roll_std).fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+
+
+def _build_training_event_gate(
+    df: pd.DataFrame,
+    base_event_mask: pd.Series | np.ndarray,
+    roll_window: int,
+    vol_mult: float,
+    obi_thr: float,
+    wall_thr: float,
+    shift_z_thr: float = 0.75,
+    target_rate: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Build a stricter causal gate for dataset selection.
+
+    `event_flag` remains a broad activity/anomaly marker. `train_event_flag`
+    is narrower and keeps roughly the strongest quarter of rows using only
+    current-time information.
+    """
+    n = len(df)
+    if n == 0:
+        empty_int8 = np.array([], dtype=np.int8)
+        empty_float32 = np.array([], dtype=np.float32)
+        return empty_int8, empty_float32, empty_int8, 0.0
+
+    if "volume" in df.columns:
+        volume = _safe_series(df, "volume", n).astype(np.float64)
+    elif "size" in df.columns:
+        volume = _safe_series(df, "size", n).astype(np.float64)
+    else:
+        volume = np.zeros(n, dtype=np.float64)
+
+    roll_vol = (
+        pd.Series(volume)
+        .rolling(max(int(roll_window), 1), min_periods=1)
+        .mean()
+        .to_numpy(dtype=np.float64, copy=False)
+    )
+    vol_ratio = volume / np.maximum(roll_vol, 1e-9)
+    obi_abs = np.abs(_safe_series(df, "obi", n).astype(np.float64))
+    wall_strength = np.maximum(
+        _safe_series(df, "bid_wall_strength", n).astype(np.float64),
+        _safe_series(df, "ask_wall_strength", n).astype(np.float64),
+    )
+
+    shift_peak = np.zeros(n, dtype=np.float64)
+    for col in EVENT_SHIFT_COLS:
+        z_col = f"{col}_zscore"
+        if z_col in df.columns:
+            zscore = np.abs(_safe_series(df, z_col, n).astype(np.float64))
+        elif col in df.columns:
+            zscore = np.abs(_rolling_zscore_np(_safe_series(df, col, n), window=roll_window))
+        else:
+            continue
+        shift_peak = np.maximum(shift_peak, zscore)
+
+    cond_vol = vol_ratio > max(float(vol_mult), 1e-6)
+    cond_obi = obi_abs > max(float(obi_thr), 1e-6)
+    cond_wall = wall_strength > max(float(wall_thr), 1e-6)
+    cond_shift = shift_peak > max(float(shift_z_thr), 1e-6)
+    trigger_count = (
+        cond_vol.astype(np.int8)
+        + cond_obi.astype(np.int8)
+        + cond_wall.astype(np.int8)
+        + cond_shift.astype(np.int8)
+    ).astype(np.int8)
+
+    vol_excess = np.clip((vol_ratio / max(float(vol_mult), 1e-6)) - 1.0, 0.0, None)
+    obi_excess = np.clip((obi_abs / max(float(obi_thr), 1e-6)) - 1.0, 0.0, None)
+    wall_excess = np.clip((wall_strength / max(float(wall_thr), 1e-6)) - 1.0, 0.0, None)
+    shift_excess = np.clip((shift_peak / max(float(shift_z_thr), 1e-6)) - 1.0, 0.0, None)
+    score = (
+        0.30 * vol_excess
+        + 0.30 * obi_excess
+        + 0.20 * wall_excess
+        + 0.20 * shift_excess
+        + 0.50 * np.clip(trigger_count.astype(np.float32) - 1.0, 0.0, None)
+    ).astype(np.float32)
+
+    base_mask = np.asarray(base_event_mask, dtype=bool)
+    candidate = np.zeros(n, dtype=bool)
+    threshold = 0.0
+    if base_mask.any():
+        base_rate = float(base_mask.mean())
+        desired_rate = min(max(float(target_rate), 0.05), base_rate)
+        keep_inside_base = min(max(desired_rate / max(base_rate, 1e-9), 0.0), 1.0)
+        if keep_inside_base >= 0.999:
+            candidate = base_mask.copy()
+            threshold = float(np.nanmin(score[base_mask]))
+        else:
+            q = min(max(1.0 - keep_inside_base, 0.0), 1.0)
+            threshold = float(np.nanquantile(score[base_mask], q))
+            candidate = base_mask & (score >= threshold)
+        if not candidate.any():
+            fallback = base_mask & (trigger_count >= 2)
+            candidate = fallback if fallback.any() else base_mask.copy()
+            threshold = float(np.nanmin(score[candidate])) if candidate.any() else threshold
+
+    return candidate.astype(np.int8), score, trigger_count, threshold
 
 
 # ── FIX-9: Adaptive per-row horizon ──────────────────────────────────────────
@@ -330,8 +442,10 @@ def _apply_trend_filter(
     FIX-11: Suppress counter-trend labels using Kalman trend direction.
 
     Rules:
-      - LONG  label where Kalman trend == TREND_DOWN  → NEUTRAL
-      - SHORT label where Kalman trend == TREND_UP    → NEUTRAL
+      - LONG  label where Kalman trend == TREND_DOWN and the opposite trend is
+        sufficiently strong → NEUTRAL
+      - SHORT label where Kalman trend == TREND_UP and the opposite trend is
+        sufficiently strong → NEUTRAL
       - NEUTRAL labels: unchanged (unless strict=True, then also filtered)
 
     This is a post-labeling mask, not a feature — it fires before the model
@@ -348,8 +462,9 @@ def _apply_trend_filter(
     trend_lbl : int8 array (TREND_UP / TREND_DOWN / TREND_NEUTRAL)
     trend_strength : normalized trend strength in [0, 1], optional.
     strict    : bool — see above
-    trend_strength_min : minimum trend strength required to keep a
-                         directional label after counter-trend suppression.
+    trend_strength_min : minimum opposite-trend strength required to veto a
+                         directional label. Weak / neutral trends no longer
+                         erase directional labels by themselves.
 
     Returns
     -------
@@ -358,16 +473,15 @@ def _apply_trend_filter(
     filtered = np.asarray(bias_arr, dtype=np.int8).copy()
     trend_lbl = np.asarray(trend_lbl, dtype=np.int8)
 
-    # Counter-trend suppression
-    mask_bad_long  = (filtered == DIR_LONG)  & (trend_lbl == TREND_DOWN)
-    mask_bad_short = (filtered == DIR_SHORT) & (trend_lbl == TREND_UP)
-    filtered[mask_bad_long  | mask_bad_short] = DIR_NEUTRAL
-
     if trend_strength is not None:
         strength_arr = np.asarray(trend_strength, dtype=np.float32)
-        directional_mask = filtered != DIR_NEUTRAL
-        weak_trend_mask = strength_arr < max(float(trend_strength_min), 0.0)
-        filtered[directional_mask & weak_trend_mask] = DIR_NEUTRAL
+        strong_counter_mask = strength_arr >= max(float(trend_strength_min), 0.0)
+    else:
+        strong_counter_mask = np.ones_like(filtered, dtype=bool)
+
+    mask_bad_long  = (filtered == DIR_LONG)  & (trend_lbl == TREND_DOWN)
+    mask_bad_short = (filtered == DIR_SHORT) & (trend_lbl == TREND_UP)
+    filtered[(mask_bad_long | mask_bad_short) & strong_counter_mask] = DIR_NEUTRAL
 
     if strict:
         filtered[(filtered != DIR_NEUTRAL) & (trend_lbl == TREND_NEUTRAL)] = DIR_NEUTRAL
@@ -428,8 +542,8 @@ def build_causal_event_labels(
     # رُفع من 1e-5 (≈ صفر بعد التطبيع) → 0.05 = 5% من أقوى ميل مرصود
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
     trend_strength_min: float = 0.05,
-    # الحد الأدنى لقوة الترند لتفعيل الحذف في trend filter
-    # 0.05 = إعداد هجومي: نقبل directional labels أكثر طالما ليست counter-trend
+    # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
+    # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
 ) -> pd.DataFrame:
     """
     Build causal labels using unified order-book features + price-action forward scan.
@@ -465,6 +579,8 @@ def build_causal_event_labels(
     horizon_max_mult      : Ceiling multiplier for adaptive horizon.
     trend_filter          : Enable FIX-11 Kalman trend gate (default True).
     trend_filter_strict   : If True, also filter NEUTRAL rows by trend.
+    trend_strength_min    : Minimum opposite-trend strength required to veto a
+                            directional label.
     """
 
     out = df.copy()
@@ -530,7 +646,7 @@ def build_causal_event_labels(
 
     out = engineer_features(out, roll_window=feat_window)
 
-    # ── 3. FIX-1: relaxed event filter ───────────────────────────────────────
+    # ── 3. FIX-1: broad event filter + stronger training gate ───────────────
     vol_mult = 1.10
     obi_thr  = 0.08
     wall_thr = 0.70
@@ -541,6 +657,14 @@ def build_causal_event_labels(
         obi_thr=obi_thr,
         wall_str_thr=wall_thr,
         roll_window=ev_window,
+    )
+    train_event_flag, event_score, event_trigger_count, event_score_threshold = _build_training_event_gate(
+        out,
+        base_event_mask=event_mask,
+        roll_window=ev_window,
+        vol_mult=vol_mult,
+        obi_thr=obi_thr,
+        wall_thr=wall_thr,
     )
 
     # ── 4. ATR: compute once, used by FIX-9 and FIX-10 ───────────────────────
@@ -694,8 +818,11 @@ def build_causal_event_labels(
     labeled["label_horizon_steps"] = (end_idx - np.arange(n)).astype(np.int32)
     labeled["effective_horizon"]   = adaptive_horizons.astype(np.int32)   # FIX-9: expose per-row
 
-    # FIX-6: event_flag as ML feature
+    # FIX-6: broad event flag as context feature + stricter train-event gate
     labeled["event_flag"] = event_mask.fillna(False).astype(np.int8)
+    labeled["train_event_flag"] = train_event_flag.astype(np.int8)
+    labeled["event_score"] = event_score.astype(np.float32)
+    labeled["event_trigger_count"] = event_trigger_count.astype(np.int8)
     labeled["is_event"]   = labeled["event_flag"]
 
     # ── 11. diagnostics ───────────────────────────────────────────────────────
@@ -710,12 +837,15 @@ def build_causal_event_labels(
     n_weak    = qual_counts.get(QUALITY_WEAK,   0)
     n_none    = qual_counts.get(QUALITY_NONE,   0)
     n_events  = int(labeled["event_flag"].sum())
+    n_train_events = int(labeled["train_event_flag"].sum())
     n_up      = int((labeled["trend_label"] == TREND_UP).sum())
     n_down    = int((labeled["trend_label"] == TREND_DOWN).sum())
     n_trend_neutral = int((labeled["trend_label"] == TREND_NEUTRAL).sum())
     n_directional = int(n_long + n_short)
     event_slice = labeled[labeled["event_flag"].astype(np.int8) == 1]
+    train_event_slice = labeled[labeled["train_event_flag"].astype(np.int8) == 1]
     directional_event_slice = event_slice[event_slice["bias_label"].astype(np.int8) != BIAS_NEUTRAL]
+    directional_train_slice = train_event_slice[train_event_slice["bias_label"].astype(np.int8) != BIAS_NEUTRAL]
 
     evt_total, evt_long, evt_short, evt_neutral = _bias_slice_counts(
         event_slice["bias_label"].values.astype(np.int8)
@@ -725,6 +855,16 @@ def build_causal_event_labels(
     evt_dir_total, evt_dir_long, evt_dir_short, _ = _bias_slice_counts(
         directional_event_slice["bias_label"].values.astype(np.int8)
         if len(directional_event_slice)
+        else np.array([], dtype=np.int8)
+    )
+    train_total, train_long, train_short, train_neutral = _bias_slice_counts(
+        train_event_slice["bias_label"].values.astype(np.int8)
+        if len(train_event_slice)
+        else np.array([], dtype=np.int8)
+    )
+    train_dir_total, train_dir_long, train_dir_short, _ = _bias_slice_counts(
+        directional_train_slice["bias_label"].values.astype(np.int8)
+        if len(directional_train_slice)
         else np.array([], dtype=np.int8)
     )
 
@@ -751,13 +891,25 @@ def build_causal_event_labels(
         _format_bias_line("BiasDir", evt_dir_total, evt_dir_long, evt_dir_short)
     )
     print(
+        _format_bias_line("BiasTrn", train_total, train_long, train_short, train_neutral)
+    )
+    print(
+        _format_bias_line("BiasSel", train_dir_total, train_dir_long, train_dir_short)
+    )
+    print(
         f"[v22] Qual   → STRONG={n_strong:,} ({n_strong/total:.1%})  "
         f"WEAK={n_weak:,} ({n_weak/total:.1%})  "
         f"NONE={n_none:,} (target=0)"
     )
     print(
-        f"[v22] Events → {n_events:,}/{total:,} ({n_events/total:.1%})  "
+        f"[v22] Events → raw={n_events:,}/{total:,} ({n_events/total:.1%})  "
+        f"train={n_train_events:,}/{total:,} ({n_train_events/total:.1%})  "
         f"| feat_win={feat_window}  ev_win={ev_window}"
+    )
+    print(
+        f"[v22] Gate   → score_thr={event_score_threshold:.3f}  "
+        f"avg_score={float(np.nanmean(event_score)):.3f}  "
+        f"max_triggers={int(event_trigger_count.max()) if len(event_trigger_count) else 0}"
     )
     print(
         f"[v22] Trend  → status={'APPLIED' if trend_filter_applied else ('UNAVAILABLE' if trend_filter else 'OFF')}  "
@@ -779,6 +931,11 @@ def build_causal_event_labels(
         print(
             f"[v22] Warn   → event filter is permissive: "
             f"{n_events:,}/{total:,} ({n_events/total:.1%})"
+        )
+    if 0 < n_train_events / total < 0.05:
+        print(
+            f"[v22] Warn   → training-event gate is too sparse: "
+            f"{n_train_events:,}/{total:,} ({n_train_events/total:.1%})"
         )
     if trend_filter and not trend_runtime_available:
         print("[v22] Warn   → kalman_trend unavailable in dynamic_labels.py; trend filter skipped")

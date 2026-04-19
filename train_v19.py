@@ -92,6 +92,9 @@ TRAINING_PASSTHROUGH_COLS = [
         'regime_label',
         'regime_cluster',
         'event_flag',
+        'train_event_flag',
+        'event_score',
+        'event_trigger_count',
         'is_expansion',
         'liq_score',
         'forward_return',
@@ -246,10 +249,12 @@ def build_event_training_view(
     if 'ts_event' in out.columns:
         out = out.sort_values('ts_event').reset_index(drop=True)
     out['event_flag'] = pd.to_numeric(out.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    out['train_event_flag'] = pd.to_numeric(out.get('train_event_flag', out['event_flag']), errors='coerce').fillna(0).astype(np.int8)
     out['bias_label'] = pd.to_numeric(out.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
     out['signal_quality'] = pd.to_numeric(out.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
 
-    event_mask = (out['event_flag'] == 1) & (out['bias_label'].isin([0, 1]))
+    event_col = 'train_event_flag' if 'train_event_flag' in out.columns else 'event_flag'
+    event_mask = (out[event_col] == 1) & (out['bias_label'].isin([0, 1]))
     event_df = out.loc[event_mask].copy().reset_index(drop=True)
     if event_df.empty:
         raise RuntimeError('❌ لا توجد directional event rows صالحة للتدريب بعد تطبيق event view')
@@ -264,9 +269,11 @@ def build_event_training_view(
 
     info = {
         'mode': mode,
+        'event_col': event_col,
         'rows_full': int(len(out)),
         'rows_event_directional': int(len(event_df)),
         'event_rate_full': float(event_mask.mean()),
+        'raw_event_rate_full': float(out['event_flag'].mean()),
         'quality_weight_strong': float(quality_weight_strong),
         'quality_weight_weak': float(quality_weight_weak),
         'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
@@ -275,7 +282,9 @@ def build_event_training_view(
     print(
         "  ✅ Event Training View: "
         f"{info['rows_event_directional']:,}/{info['rows_full']:,} rows "
-        f"({info['event_rate_full']:.1%}) | bias={info['bias_counts']} | quality={info['quality_counts']}"
+        f"({info['event_rate_full']:.1%}) via {event_col} "
+        f"| raw_event={info['raw_event_rate_full']:.1%} "
+        f"| bias={info['bias_counts']} | quality={info['quality_counts']}"
     )
     return event_df, info
 

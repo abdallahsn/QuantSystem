@@ -28,6 +28,9 @@ DEFAULT_PASSTHROUGH_COLS = [
     'regime_label',
     'regime_cluster',
     'event_flag',
+    'train_event_flag',
+    'event_score',
+    'event_trigger_count',
     'is_expansion',
     'liq_score',
     'forward_return',
@@ -40,6 +43,8 @@ DEFAULT_INT_COLS = {
     'regime_label',
     'regime_cluster',
     'event_flag',
+    'train_event_flag',
+    'event_trigger_count',
     'is_expansion',
 }
 

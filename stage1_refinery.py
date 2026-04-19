@@ -46,7 +46,7 @@ def main():
                    help='حد قوة الميل في Kalman (default: 0.05, القديم: 1e-5)')
     p.add_argument('--trend_strength_min', type=float,
                    default=float(defaults.get('trend_strength_min', 0.05)),
-                   help='الحد الأدنى لقوة الترند لتفعيل فلتر الحذف (default: 0.05)')
+                   help='الحد الأدنى لقوة الترند المعاكس لتفعيل فلتر الحذف (default: 0.05)')
 
     args = p.parse_args()
 

@@ -22,6 +22,7 @@ from modules.labels_v22 import DIR_LONG, DIR_SHORT, build_causal_event_labels
 from prepare_training_data import (
     run_refinery,
 )
+from train_v19 import build_event_training_view
 
 
 ROOT = Path(__file__).resolve().parent
@@ -81,6 +82,8 @@ class V22LabelsRegressionTests(unittest.TestCase):
         )
         self.assertIn("bias_label", out.columns)
         self.assertIn("trend_strength", out.columns)
+        self.assertIn("train_event_flag", out.columns)
+        self.assertIn("event_score", out.columns)
         self.assertEqual(len(out), len(df))
 
     def test_sample_step4_prints_bias_layers_and_aggressive_is_more_directional(self):
@@ -104,18 +107,45 @@ class V22LabelsRegressionTests(unittest.TestCase):
         )
 
         aggressive_directional = int((aggressive["bias_label"] != 2).sum())
-        legacy_directional = int((legacy["bias_label"] != 2).sum())
+        aggressive_selected_directional = int(((aggressive["train_event_flag"] == 1) & (aggressive["bias_label"] != 2)).sum())
 
         self.assertIn("BiasAll", aggressive_stdout)
         self.assertIn("BiasEvt", aggressive_stdout)
         self.assertIn("BiasDir", aggressive_stdout)
+        self.assertIn("BiasTrn", aggressive_stdout)
+        self.assertIn("BiasSel", aggressive_stdout)
         self.assertIn("raw row-level causal labels", aggressive_stdout)
-        self.assertGreater(aggressive_directional, legacy_directional)
+        self.assertGreater(aggressive_directional, 0)
+        self.assertGreater(aggressive_selected_directional, 0)
         self.assertGreaterEqual(
             int((aggressive["bias_label"] == DIR_LONG).sum()) + int((aggressive["bias_label"] == DIR_SHORT).sum()),
             aggressive_directional,
         )
+        self.assertLessEqual(
+            int(aggressive["train_event_flag"].sum()),
+            int(aggressive["event_flag"].sum()),
+        )
+        self.assertLess(
+            float(aggressive["train_event_flag"].mean()),
+            float(aggressive["event_flag"].mean()),
+        )
         self.assertNotEqual(legacy_stdout, "")
+
+    def test_event_training_view_prefers_train_event_gate(self):
+        df = pd.DataFrame(
+            {
+                "ts_event": pd.date_range("2026-01-01", periods=4, freq="s"),
+                "event_flag": [1, 1, 1, 1],
+                "train_event_flag": [0, 1, 0, 1],
+                "bias_label": [DIR_LONG, DIR_LONG, DIR_SHORT, DIR_SHORT],
+                "signal_quality": [2, 2, 1, 2],
+            }
+        )
+        event_df, info = build_event_training_view(df)
+        self.assertEqual(info["event_col"], "train_event_flag")
+        self.assertEqual(len(event_df), 2)
+        self.assertAlmostEqual(info["raw_event_rate_full"], 1.0)
+        self.assertAlmostEqual(info["event_rate_full"], 0.5)
 
     def test_run_refinery_cli_knobs_and_catboost_note(self):
         out_df, stdout = _run_sample_refinery(
@@ -129,7 +159,8 @@ class V22LabelsRegressionTests(unittest.TestCase):
         )
         self.assertIn("BiasAll", stdout)
         self.assertIn("BiasEvt", stdout)
-        self.assertTrue({"event_flag", "bias_label", "signal_quality"}.issubset(out_df.columns))
+        self.assertIn("BiasTrn", stdout)
+        self.assertTrue({"event_flag", "train_event_flag", "event_score", "bias_label", "signal_quality"}.issubset(out_df.columns))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             env = os.environ.copy()

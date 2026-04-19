@@ -822,7 +822,8 @@ def _select_event_rich_lob_emit_positions(
     ):
         return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
 
-    label_cols = ['ts_event', 'event_flag', 'bias_label', 'signal_quality']
+    event_col = 'train_event_flag' if 'train_event_flag' in df_labeled.columns else 'event_flag'
+    label_cols = ['ts_event', 'event_flag', 'train_event_flag', 'bias_label', 'signal_quality']
     candidates = df_labeled.loc[:, [c for c in label_cols if c in df_labeled.columns]].copy()
     if len(candidates) == 0 or 'ts_event' not in candidates.columns:
         return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
@@ -830,10 +831,11 @@ def _select_event_rich_lob_emit_positions(
     candidates['ts_event'] = pd.to_datetime(candidates['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
     candidates = candidates.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
     candidates['event_flag'] = pd.to_numeric(candidates.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    candidates['train_event_flag'] = pd.to_numeric(candidates.get('train_event_flag', candidates['event_flag']), errors='coerce').fillna(0).astype(np.int8)
     candidates['bias_label'] = pd.to_numeric(candidates.get('bias_label', DIR_NEUTRAL), errors='coerce').fillna(DIR_NEUTRAL).astype(np.int8)
     candidates['signal_quality'] = pd.to_numeric(candidates.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
     candidates = candidates[
-        (candidates['event_flag'] == 1) &
+        (candidates[event_col] == 1) &
         (candidates['bias_label'] != DIR_NEUTRAL)
     ].reset_index(drop=True)
     if len(candidates) == 0:
@@ -869,6 +871,7 @@ def _select_event_rich_lob_emit_positions(
     emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
     meta = {
         'directional_events_available': int(len(candidates)),
+        'event_col': event_col,
         'strong_available': int(len(strong)),
         'weak_available': int(len(weak)),
         'selected_events': int(len(selected)),
@@ -1131,7 +1134,7 @@ def _normalize_and_save(
     # SESSION_LEAK_COLS تُحفظ كـ metadata للتحليل لكن لا تدخل FEATURE_COLS
     session_meta = [c for c in SESSION_LEAK_COLS if c in df.columns]
     meta_cols = ['price', 'size', 'bias_label', 'setup_label', 'conf_label', 'signal_quality',
-                 'is_expansion', 'event_flag',
+                 'is_expansion', 'event_flag', 'train_event_flag', 'event_score', 'event_trigger_count',
                  'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
@@ -1499,7 +1502,7 @@ if __name__=='__main__':
     p.add_argument('--kalman_slope_threshold', type=float, default=0.05,
                    help='Kalman slope threshold for trend direction (default: 0.05)')
     p.add_argument('--trend_strength_min', type=float, default=0.05,
-                   help='Minimum trend strength required to keep directional labels (default: 0.05)')
+                   help='Minimum opposite-trend strength required to veto directional labels (default: 0.05)')
     a  = p.parse_args()
     cs = None if a.chunksize == 0 else a.chunksize
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
