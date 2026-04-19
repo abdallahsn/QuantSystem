@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from modules.catboost_5m_report import _build_price_hover_trace
-from modules.range_state_machine import apply_range_filter_to_dataframe, RangeStateMachine
+from modules.range_state_machine import SignalState, apply_range_filter_to_dataframe, RangeStateMachine
 
 
 def test_apply_range_filter_falls_back_to_regime_label(monkeypatch):
@@ -176,3 +176,54 @@ def test_price_hover_trace_exposes_raw_signal_when_rsm_masks_it():
     assert trace.customdata[0][6] == "NEUTRAL"
     assert trace.customdata[0][16] == "SHORT"
     assert trace.customdata[0][18] == "trend_accumulating_1/2"
+
+
+def test_locked_state_times_out_and_reprocesses_current_bar():
+    rsm = RangeStateMachine(
+        min_confirmations=3,
+        confirmation_window=6,
+        min_candles_between=0,
+        cvd_window=2,
+        obi_window=2,
+        hawkes_window=4,
+        max_lock_bars=3,
+        trend_early_entry_confidence=0.75,
+        trend_early_entry_range_pos=0.80,
+        trend_early_entry_min_reversal=1.0,
+    )
+
+    for row in [
+        {"price": 1.2208, "hawkes": 0.01},
+        {"price": 1.2206, "hawkes": 0.01},
+        {"price": 1.2204, "hawkes": 0.01},
+        {"price": 1.2202, "hawkes": 0.01},
+    ]:
+        rsm.process(
+            price=row["price"],
+            raw_signal="NEUTRAL",
+            confidence=0.0,
+            cvd=0.0,
+            obi=0.0,
+            hawkes=row["hawkes"],
+            absorption=0.0,
+            regime="Trending",
+        )
+
+    rsm.signal_state = SignalState.LOCKED
+    rsm._last_trade_direction = "SHORT"
+    rsm._last_trade_price = 1.2208
+    rsm._last_trade_candle = rsm.candle_idx - 3
+
+    decision = rsm.process(
+        price=1.2190,
+        raw_signal="LONG",
+        confidence=0.84,
+        cvd=0.0,
+        obi=0.0,
+        hawkes=0.20,
+        absorption=0.0,
+        regime="Trending",
+    )
+
+    assert decision["action"] == "ENTER"
+    assert decision["direction"] == "LONG"

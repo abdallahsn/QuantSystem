@@ -213,6 +213,7 @@ class RangeStateMachine:
                  hawkes_mult=1.4, reversal_min_signals=2,
                  boundary_mult=1.5, breakout_mult=2.5,
                  tick_size=0.0001, range_window=20,
+                 max_lock_bars=8,
                  trend_early_entry_confidence=0.78,
                  trend_early_entry_range_pos=0.85,
                  trend_early_entry_min_reversal=1.0):
@@ -221,6 +222,7 @@ class RangeStateMachine:
         self.confirmation_window = confirmation_window
         self.min_confidence      = min_confidence
         self.min_candles_between = min_candles_between
+        self.max_lock_bars       = max(int(max_lock_bars), 1)
         self.tick_size           = tick_size
         self.trend_early_entry_confidence = trend_early_entry_confidence
         self.trend_early_entry_range_pos  = trend_early_entry_range_pos
@@ -288,7 +290,13 @@ class RangeStateMachine:
             if self.reversal_engine.is_reversal(reversal):
                 return {'action': 'CLOSE', 'direction': None,
                         'reason': f'microstructure_reversal_{reversal["reversal_score"]:.1f}'}
-            return self._hold('position_locked')
+            held_bars = self.candle_idx - self._last_trade_candle
+            if held_bars >= self.max_lock_bars:
+                # Don't keep the state machine frozen for hours; release and
+                # let the current bar compete for a fresh entry immediately.
+                self.unlock()
+            else:
+                return self._hold('position_locked')
 
         if self.candle_idx - self._last_trade_candle < self.min_candles_between:
             self._signal_buffer.append('NEUTRAL')
