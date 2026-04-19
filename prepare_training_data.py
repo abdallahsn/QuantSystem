@@ -1211,6 +1211,24 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
     
     return df
 
+
+def _require_causal_label_runtime(label_mode: str) -> None:
+    requested = str(label_mode or '').strip().lower()
+    if requested not in {'v19', 'v22'}:
+        return
+    if V19_LABELS_AVAILABLE:
+        return
+    if os.environ.get('QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS', '').strip() == '1':
+        print("  ⚠️ Fallback session labeling override enabled via QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1")
+        return
+
+    detail = f" Import error: {V19_LABELS_IMPORT_ERROR}" if V19_LABELS_IMPORT_ERROR is not None else ''
+    raise RuntimeError(
+        "❌ Causal v19/v22 labels are unavailable, and the unsafe session-label fallback is disabled by default."
+        " Fix the label runtime or set QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1 to override."
+        f"{detail}"
+    )
+
 def run_refinery(
     mbo_path,
     mbp_path,
@@ -1306,6 +1324,8 @@ def run_refinery(
     print("\n⚙️  Step 3d — Daily/Weekly Levels...")
     df_merged = compute_daily_weekly_levels(df_merged)
 
+    _require_causal_label_runtime(label_mode)
+
     if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
         label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
         print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
@@ -1322,7 +1342,7 @@ def run_refinery(
             trend_strength_min=trend_strength_min,
         )
     else:
-        print("\n⚙️  Step 4 — Fallback Session Labeling...")
+        print("\n⚙️  Step 4 — Fallback Session Labeling (override enabled)...")
         if V19_LABELS_IMPORT_ERROR is not None:
             print(f"  ⚠️ V19 labels import failed: {V19_LABELS_IMPORT_ERROR}")
         df_labeled = _label_sessions(df_merged)

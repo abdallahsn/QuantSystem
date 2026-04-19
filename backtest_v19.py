@@ -3,7 +3,8 @@ backtest_v19.py - Causal replay backtester for QuantSystem V19
 ================================================================
 This backtester replays rows one-by-one through V19PredictionEngine using the
 same step-by-step path as live inference. It evaluates predictions against the
-causal V19 labels and computes trading metrics using forward_return.
+causal V19 labels and computes trading metrics by replaying the future price
+path instead of settling directly on the stored oracle forward_return label.
 """
 
 from __future__ import annotations
@@ -37,6 +38,117 @@ def _safe_float(x, default=0.0):
         return float(x)
     except Exception:
         return float(default)
+
+
+def _safe_int(x, default=0):
+    try:
+        if pd.isna(x):
+            return int(default)
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _series_or_default(df: pd.DataFrame, col: str, default, dtype=None) -> pd.Series:
+    if col in df.columns:
+        series = df[col]
+    else:
+        series = pd.Series([default] * len(df), index=df.index)
+    if dtype is not None:
+        series = pd.to_numeric(series, errors='coerce').fillna(default).astype(dtype)
+    return series
+
+
+def _simulate_trade_path(
+    entry_idx: int,
+    direction: str,
+    prices: np.ndarray,
+    horizons: np.ndarray,
+    micro_atr: np.ndarray,
+    tick_size: float,
+    direction_threshold_ticks: float = 1.0,
+    tp_mult: float = 1.2,
+    sl_mult: float = 1.0,
+    max_horizon_steps: int | None = None,
+) -> dict | None:
+    if direction not in ('LONG', 'SHORT'):
+        return None
+    if entry_idx < 0 or entry_idx >= len(prices):
+        return None
+
+    entry_price = float(prices[entry_idx])
+    if not np.isfinite(entry_price) or entry_price <= 0:
+        return None
+
+    horizon_steps = int(horizons[entry_idx]) if entry_idx < len(horizons) else 0
+    if max_horizon_steps is not None and int(max_horizon_steps) > 0:
+        horizon_steps = min(horizon_steps, int(max_horizon_steps)) if horizon_steps > 0 else int(max_horizon_steps)
+    if horizon_steps <= 0:
+        return None
+
+    exit_cap_idx = min(entry_idx + horizon_steps, len(prices) - 1)
+    if exit_cap_idx <= entry_idx:
+        return None
+
+    atr_now = float(micro_atr[entry_idx]) if entry_idx < len(micro_atr) else 0.0
+    base_threshold = max(float(direction_threshold_ticks) * float(tick_size), 0.5 * max(atr_now, 0.0), float(tick_size))
+    tp_distance = max(float(tp_mult) * base_threshold, float(tick_size))
+    sl_distance = max(float(sl_mult) * base_threshold, float(tick_size))
+
+    if direction == 'LONG':
+        tp_level = entry_price + tp_distance
+        sl_level = entry_price - sl_distance
+    else:
+        tp_level = entry_price - tp_distance
+        sl_level = entry_price + sl_distance
+
+    future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    if future_prices.size == 0:
+        return None
+
+    exit_idx = exit_cap_idx
+    exit_reason = 'horizon'
+    for offset, future_price in enumerate(future_prices, start=1):
+        if direction == 'LONG':
+            if future_price >= tp_level:
+                exit_idx = entry_idx + offset
+                exit_reason = 'tp'
+                break
+            if future_price <= sl_level:
+                exit_idx = entry_idx + offset
+                exit_reason = 'sl'
+                break
+        else:
+            if future_price <= tp_level:
+                exit_idx = entry_idx + offset
+                exit_reason = 'tp'
+                break
+            if future_price >= sl_level:
+                exit_idx = entry_idx + offset
+                exit_reason = 'sl'
+                break
+
+    exit_price = float(prices[exit_idx])
+    if direction == 'LONG':
+        price_return = exit_price - entry_price
+        path_moves = future_prices - entry_price
+    else:
+        price_return = entry_price - exit_price
+        path_moves = entry_price - future_prices
+
+    favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
+    adverse_move = float(np.min(path_moves)) if path_moves.size else 0.0
+
+    return {
+        'exit_idx': int(exit_idx),
+        'exit_price': float(exit_price),
+        'exit_reason': exit_reason,
+        'hold_steps': int(exit_idx - entry_idx),
+        'price_return': float(price_return),
+        'raw_pnl_pips': float(price_return / max(float(tick_size), 1e-8)),
+        'mfe_pips': float(favourable_move / max(float(tick_size), 1e-8)),
+        'mae_pips': float(adverse_move / max(float(tick_size), 1e-8)),
+    }
 
 
 def _load_csv(path: str) -> pd.DataFrame:
@@ -174,6 +286,11 @@ def run_causal_backtest(
     round_trip_cost_pips: float,
     max_size: int,
     starting_equity: float,
+    direction_threshold_ticks: float = 1.0,
+    tp_mult: float = 1.2,
+    sl_mult: float = 1.0,
+    max_horizon_steps: int | None = None,
+    allow_oracle_forward_return: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
@@ -181,6 +298,17 @@ def run_causal_backtest(
     source_has_labels = 'bias_label' in df.columns
     source_has_fwd = 'forward_return' in df.columns
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
+    price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
+    horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
+    if 'raw__micro_atr' in replay_df.columns:
+        micro_atr_arr = _series_or_default(replay_df, 'raw__micro_atr', 0.0, dtype=np.float64).values
+    else:
+        micro_atr_arr = _series_or_default(replay_df, 'micro_atr', 0.0, dtype=np.float64).values
+    ts_arr = pd.to_datetime(
+        replay_df.get('ts_event', pd.Series([pd.NaT] * len(replay_df), index=replay_df.index)),
+        utc=True,
+        errors='coerce',
+    ).dt.tz_localize(None)
 
     results = []
     trades = []
@@ -188,8 +316,10 @@ def run_causal_backtest(
     equity = float(starting_equity)
 
     has_labels = source_has_labels
-    has_fwd = source_has_fwd
     blocked_count = 0
+    replayed_trades = 0
+    oracle_trades = 0
+    skipped_trade_replays = 0
 
     for i, (_, row) in enumerate(replay_df.iterrows()):
         ts = row.get('ts_event', None)
@@ -222,14 +352,47 @@ def run_causal_backtest(
         direction = pred.get('bias', 'NEUTRAL')
         pred['executed'] = False
 
-        if tradeable and direction in ('LONG', 'SHORT') and has_fwd:
+        if tradeable and direction in ('LONG', 'SHORT'):
             size = int(pred.get('position_size') or confidence_bet_size(
                 float(pred.get('confidence', 0.0)),
                 base_size=1,
                 max_size=max_size,
             ))
-            forward_return = _safe_float(row.get('forward_return', 0.0))
-            raw_pnl_pips = (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size)
+            trade_path = _simulate_trade_path(
+                entry_idx=i,
+                direction=direction,
+                prices=price_arr,
+                horizons=horizon_arr,
+                micro_atr=micro_atr_arr,
+                tick_size=tick_size,
+                direction_threshold_ticks=direction_threshold_ticks,
+                tp_mult=tp_mult,
+                sl_mult=sl_mult,
+                max_horizon_steps=max_horizon_steps,
+            )
+
+            pnl_source = 'path_replay'
+            if trade_path is None and allow_oracle_forward_return and source_has_fwd:
+                forward_return = _safe_float(row.get('forward_return', 0.0))
+                trade_path = {
+                    'exit_idx': min(i + max(_safe_int(row.get('label_horizon_steps', 1), 1), 1), len(replay_df) - 1),
+                    'exit_price': _safe_float(row.get('price', 0.0)) + (forward_return if direction == 'LONG' else -forward_return),
+                    'exit_reason': 'oracle_forward_return',
+                    'hold_steps': max(_safe_int(row.get('label_horizon_steps', 1), 1), 1),
+                    'price_return': forward_return if direction == 'LONG' else -forward_return,
+                    'raw_pnl_pips': (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size),
+                    'mfe_pips': 0.0,
+                    'mae_pips': 0.0,
+                }
+                pnl_source = 'oracle_forward_return'
+
+            if trade_path is None:
+                skipped_trade_replays += 1
+                pred['trade_skip_reason'] = 'missing_exit_path'
+                results.append(pred)
+                continue
+
+            raw_pnl_pips = float(trade_path['raw_pnl_pips'])
             net_pnl_pips = raw_pnl_pips - round_trip_cost_pips
             net_pnl_dollars = net_pnl_pips * tick_value * size
 
@@ -237,8 +400,14 @@ def run_causal_backtest(
             engine.loss_guard.update_equity(equity)
             engine.loss_guard.record_trade(net_pnl_dollars, ts=ts)
             equity_curve.append(float(equity))
+            if pnl_source == 'path_replay':
+                replayed_trades += 1
+            else:
+                oracle_trades += 1
 
             result = 'WIN' if net_pnl_pips > 0 else ('LOSE' if net_pnl_pips < 0 else 'FLAT')
+            exit_idx = int(trade_path['exit_idx'])
+            exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
             trade = {
                 'idx': i,
                 'ts_event': pred['ts_event'],
@@ -246,11 +415,18 @@ def run_causal_backtest(
                 'confidence': round(_safe_float(pred.get('confidence', 0.0)), 4),
                 'size': size,
                 'ep': _safe_float(row.get('price', 0.0)),
-                'xp': _safe_float(row.get('price', 0.0)) + forward_return,
-                'dur_min': _safe_float(row.get('label_horizon_steps', 0.0)),
+                'xp': round(float(trade_path['exit_price']), 6),
+                'exit_idx': exit_idx,
+                'exit_ts': '' if pd.isna(exit_ts) else str(exit_ts),
+                'exit_reason': str(trade_path['exit_reason']),
+                'dur_steps': int(trade_path['hold_steps']),
+                'dur_min': int(trade_path['hold_steps']),
                 'pips': round(net_pnl_pips, 4),
                 'raw_pnl_pips': round(raw_pnl_pips, 4),
                 'cost_pips': round(round_trip_cost_pips, 4),
+                'mfe_pips': round(float(trade_path.get('mfe_pips', 0.0)), 4),
+                'mae_pips': round(float(trade_path.get('mae_pips', 0.0)), 4),
+                'pnl_source': pnl_source,
                 'pnl': round(net_pnl_dollars, 2),
                 'result': result,
                 'cluster': pred.get('cluster', 0),
@@ -262,6 +438,8 @@ def run_causal_backtest(
             pred['net_pnl_pips'] = round(net_pnl_pips, 4)
             pred['net_pnl_dollars'] = round(net_pnl_dollars, 2)
             pred['equity_after'] = round(equity, 2)
+            pred['exit_reason'] = str(trade_path['exit_reason'])
+            pred['pnl_source'] = pnl_source
 
         results.append(pred)
 
@@ -291,6 +469,11 @@ def run_causal_backtest(
         'max_drawdown_pct': round(float(mdd_pct), 4),
         'ending_equity': round(float(equity), 2),
         'blocked_predictions': int(blocked_count),
+        'pnl_engine': 'path_replay',
+        'replayed_trades': int(replayed_trades),
+        'oracle_forward_return_trades': int(oracle_trades),
+        'oracle_forward_return_used': bool(oracle_trades > 0),
+        'skipped_trade_replays': int(skipped_trade_replays),
         'visual_coverage': round(float((np.linalg.norm(visual_embeddings, axis=1) > 0).mean()), 4)
             if visual_embeddings.size else 0.0,
     }
@@ -334,6 +517,13 @@ def main():
     p.add_argument('--round_trip_cost_pips', type=float, default=1.0)
     p.add_argument('--max_size', type=int, default=5)
     p.add_argument('--starting_equity', type=float, default=100000.0)
+    p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
+    p.add_argument('--tp_mult', type=float, default=1.2)
+    p.add_argument('--sl_mult', type=float, default=1.0)
+    p.add_argument('--max_horizon_steps', type=int, default=0,
+                   help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
+    p.add_argument('--allow_oracle_forward_return', action='store_true',
+                   help='dangerous: fall back to stored forward_return when no causal replay window is available')
     args = p.parse_args()
 
     df = _load_csv(args.csv)
@@ -363,6 +553,11 @@ def main():
         round_trip_cost_pips=args.round_trip_cost_pips,
         max_size=args.max_size,
         starting_equity=args.starting_equity,
+        direction_threshold_ticks=args.direction_threshold_ticks,
+        tp_mult=args.tp_mult,
+        sl_mult=args.sl_mult,
+        max_horizon_steps=(args.max_horizon_steps if args.max_horizon_steps > 0 else None),
+        allow_oracle_forward_return=args.allow_oracle_forward_return,
     )
 
     print("\n✅ V19 causal backtest complete")

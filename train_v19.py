@@ -417,16 +417,91 @@ def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.
     return s
 
 
+def _normalize_split_time(split_time) -> pd.Timestamp | None:
+    if split_time is None:
+        return None
+    ts = pd.to_datetime(split_time, utc=True, errors='coerce')
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts).tz_localize(None)
+
+
+def _load_refinery_split_meta(csv_path: str) -> dict:
+    src_dir = os.path.dirname(os.path.abspath(csv_path))
+    path = os.path.join(src_dir, 'refinery_split.json')
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path) as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"  ⚠️ Failed to read refinery_split.json: {e}")
+        return {}
+
+    split_time = _normalize_split_time(meta.get('split_time'))
+    if split_time is None:
+        return {}
+
+    return {
+        **meta,
+        'path': path,
+        'split_time': split_time,
+    }
+
+
 def _sequence_split_context(
     df: pd.DataFrame,
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
+    split_time=None,
 ) -> dict:
     n = len(df)
+    if n == 0:
+        return {
+            'split_idx': 0,
+            'split_time': pd.NaT,
+            'label_end': pd.Series(dtype='datetime64[ns]'),
+            'train_row_ok': np.array([], dtype=bool),
+            'val_row_ok': np.array([], dtype=bool),
+            'split_source': 'empty',
+        }
+
+    ts = _time_series(df, 'ts_event')
+    label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
+    explicit_split_time = _normalize_split_time(split_time)
+
+    if explicit_split_time is not None:
+        split_time = explicit_split_time
+        split_idx = int(np.searchsorted(
+            ts.to_numpy(dtype='datetime64[ns]'),
+            split_time.to_datetime64(),
+            side='left',
+        ))
+        train_row_ok = (
+            (ts.to_numpy(dtype='datetime64[ns]') < split_time.to_datetime64())
+            & (label_end.to_numpy(dtype='datetime64[ns]') < split_time.to_datetime64())
+        )
+        val_row_ok = ts.to_numpy(dtype='datetime64[ns]') >= split_time.to_datetime64()
+
+        if np.any(train_row_ok) and np.any(val_row_ok):
+            return {
+                'split_idx': int(split_idx),
+                'split_time': split_time,
+                'label_end': label_end,
+                'train_row_ok': train_row_ok,
+                'val_row_ok': val_row_ok,
+                'split_source': 'explicit_time',
+            }
+
+        print(
+            "  ⚠️ Explicit split_time did not yield both train and validation rows; "
+            "falling back to event-view split."
+        )
+
     split_idx = max(seq_len * 2, int(n * train_frac))
     split_idx = min(max(split_idx, seq_len), n)
-    split_time = _time_series(df, 'ts_event').iloc[min(split_idx, n - 1)]
-    label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
+    split_time = ts.iloc[min(split_idx, n - 1)]
     train_row_ok = (np.arange(n) < split_idx) & (label_end < split_time)
     val_row_ok = np.arange(n) >= split_idx
     return {
@@ -435,6 +510,7 @@ def _sequence_split_context(
         'label_end': label_end,
         'train_row_ok': train_row_ok,
         'val_row_ok': val_row_ok,
+        'split_source': 'event_view_fraction',
     }
 
 
@@ -442,8 +518,14 @@ def build_inference_scaler_params(
     df: pd.DataFrame,
     cols: list[str],
     train_frac: float = 0.80,
+    split_time=None,
 ) -> tuple[dict, dict]:
-    split_ctx = _sequence_split_context(df, seq_len=SEQ_LEN, train_frac=train_frac)
+    split_ctx = _sequence_split_context(
+        df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=split_time,
+    )
     raw_frame = _raw_stat_frame(df, cols)
     train_mask = split_ctx['train_row_ok']
     if not np.any(train_mask):
@@ -456,6 +538,7 @@ def build_inference_scaler_params(
         'split_idx': int(split_ctx['split_idx']),
         'split_time': str(split_ctx['split_time']),
         'scaler_train_rows': int(len(train_frame)),
+        'split_source': str(split_ctx.get('split_source', 'unknown')),
     }
     return scaler_params, info
 
@@ -470,7 +553,7 @@ def _save_scaler_params(output_dir: str, scaler_params: dict) -> str:
 def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
     copied = {}
     src_dir = os.path.dirname(os.path.abspath(csv_path))
-    for name in ('selected_features.txt', 'refinery_report.txt', 'lob_tensor_timestamps.npy'):
+    for name in ('selected_features.txt', 'refinery_report.txt', 'lob_tensor_timestamps.npy', 'refinery_split.json'):
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
         if os.path.exists(src):
@@ -479,6 +562,15 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
                 continue
             shutil.copy2(src, dst)
             copied[name] = dst
+
+    src_refinery_scaler = os.path.join(src_dir, 'scaler_params.json')
+    dst_refinery_scaler = os.path.join(output_dir, 'refinery_scaler_params.json')
+    if os.path.exists(src_refinery_scaler):
+        if os.path.abspath(src_refinery_scaler) == os.path.abspath(dst_refinery_scaler):
+            copied['refinery_scaler_params.json'] = dst_refinery_scaler
+        else:
+            shutil.copy2(src_refinery_scaler, dst_refinery_scaler)
+            copied['refinery_scaler_params.json'] = dst_refinery_scaler
     return copied
 
 
@@ -934,12 +1026,18 @@ def build_safe_sequences(
     coverage_mask: np.ndarray,
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
+    split_time=None,
     min_seq_coverage: float = 0.80,
     n_stat_feat: int = len(CATBOOST_ADVISOR_FEATURES),
     sequence_aux_mode: str = SEQUENCE_AUX_LAST_STEP_ONLY,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     n = len(df)
-    split_ctx = _sequence_split_context(df, seq_len=seq_len, train_frac=train_frac)
+    split_ctx = _sequence_split_context(
+        df,
+        seq_len=seq_len,
+        train_frac=train_frac,
+        split_time=split_time,
+    )
     split_idx = split_ctx['split_idx']
     split_time = split_ctx['split_time']
 
@@ -1015,6 +1113,7 @@ def build_safe_sequences(
         'val_sequences': int(len(X_val)),
         'min_seq_coverage': float(min_seq_coverage),
         'sequence_aux_mode': str(sequence_aux_mode),
+        'split_source': str(split_ctx.get('split_source', 'unknown')),
     }
     return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
 
@@ -1029,6 +1128,7 @@ def stage3_meta_learner_v19(
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
+    split_time=None,
     min_seq_coverage: float = 0.80,
 ) -> None:
     print("\n" + "═" * 65)
@@ -1049,6 +1149,7 @@ def stage3_meta_learner_v19(
         coverage_mask=coverage_mask,
         seq_len=SEQ_LEN,
         train_frac=train_frac,
+        split_time=split_time,
         min_seq_coverage=min_seq_coverage,
         n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
         sequence_aux_mode=sequence_aux_mode,
@@ -1221,15 +1322,25 @@ def run_training_pipeline(
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
 
+    refinery_split_meta = _load_refinery_split_meta(csv_path)
+    refinery_split_time = refinery_split_meta.get('split_time')
+    if refinery_split_time is not None:
+        print(
+            "  ✅ Reusing refinery wall-clock split: "
+            f"{refinery_split_time} ({refinery_split_meta.get('path', 'refinery_split.json')})"
+        )
+
     inference_scaler_params, scaler_info = build_inference_scaler_params(
         event_df,
         CATBOOST_ADVISOR_FEATURES,
         train_frac=train_frac,
+        split_time=refinery_split_time,
     )
     scaler_path = _save_scaler_params(output_dir, inference_scaler_params)
     print(
         f"  ✅ Model scaler saved: {scaler_path} | "
-        f"rows={scaler_info['scaler_train_rows']:,} | split={scaler_info['split_time']}"
+        f"rows={scaler_info['scaler_train_rows']:,} | split={scaler_info['split_time']} "
+        f"| source={scaler_info['split_source']}"
     )
 
     if not lob_path:
@@ -1407,6 +1518,7 @@ def run_training_pipeline(
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,
+            split_time=refinery_split_time,
             min_seq_coverage=min_seq_coverage,
         )
 
