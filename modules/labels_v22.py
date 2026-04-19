@@ -180,8 +180,27 @@ def _compute_micro_atr(prices: np.ndarray, window: int = 20) -> np.ndarray:
     for i in range(len(prices)):
         lo = max(0, i - window + 1)
         atr[i] = np.std(returns[lo : i + 1]) if i >= 1 else abs(returns[i])
-    atr = np.where(atr < 1e-10, np.nanmedian(atr) or 1e-5, atr)
+    atr_hist = np.where(atr > 1e-10, atr, np.nan)
+    causal_med = _causal_expanding_median(
+        atr_hist,
+        min_periods=max(5, min(int(window), 20)),
+        fallback=1e-5,
+    )
+    atr = np.where(atr < 1e-10, causal_med, atr)
     return atr
+
+
+def _causal_expanding_median(
+    values: np.ndarray,
+    min_periods: int = 20,
+    fallback: float = 1e-5,
+) -> np.ndarray:
+    """Causal expanding median with no future-row contamination."""
+    series = pd.Series(np.asarray(values, dtype=np.float64)).replace([np.inf, -np.inf], np.nan)
+    primary = series.expanding(min_periods=max(int(min_periods), 1)).median()
+    bootstrap = series.expanding(min_periods=1).median()
+    med = primary.where(primary.notna(), bootstrap).ffill().fillna(float(fallback))
+    return med.to_numpy(dtype=np.float64, copy=False)
 
 
 def _rolling_zscore_np(values: np.ndarray, window: int) -> np.ndarray:
@@ -310,8 +329,9 @@ def _compute_adaptive_horizons(
         → don't wait forever for a move that isn't coming
 
     Formula:
-        h_i = base × clip(ATR_median / ATR_i, min_mult, max_mult)
+        h_i = base × clip(ATR_median_t / ATR_i, min_mult, max_mult)
 
+    ATR_median_t is causal/expanding, so row i never sees future volatility.
     This is the inverse of ATR: slow = short horizon, fast = long horizon.
     Result is rounded to the nearest integer and bounded.
 
@@ -319,12 +339,15 @@ def _compute_adaptive_horizons(
     -------
     np.ndarray of int32, shape (n,)
     """
-    atr_med = np.nanmedian(atr)
-    if atr_med < 1e-10:
+    atr = np.asarray(atr, dtype=np.float64)
+    atr_hist = np.where(atr > 1e-10, atr, np.nan)
+    if np.isnan(atr_hist).all():
         # degenerate case: flat price, return base horizon everywhere
         return np.full(len(atr), base_horizon, dtype=np.int32)
 
-    ratio    = np.clip(atr_med / np.where(atr < 1e-10, atr_med, atr),
+    atr_med = _causal_expanding_median(atr_hist, min_periods=20, fallback=float(base_horizon))
+    safe_atr = np.where(atr < 1e-10, atr_med, atr)
+    ratio    = np.clip(atr_med / np.where(safe_atr < 1e-10, atr_med, safe_atr),
                        min_mult, max_mult)
     horizons = np.round(base_horizon * ratio).astype(np.int32)
     return horizons

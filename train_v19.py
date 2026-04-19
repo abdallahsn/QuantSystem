@@ -79,6 +79,23 @@ META_FEATURE_NAMES = [
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
+SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
+FORBIDDEN_MODEL_INPUT_COLS = {
+    'forward_return',
+    'label_end_ts',
+    'ts_event',
+    'bias_label',
+    'conf_label',
+    'signal_quality',
+    'regime_label',
+    'regime_cluster',
+    'event_flag',
+    'train_event_flag',
+    'event_score',
+    'event_trigger_count',
+    'is_expansion',
+    'label_horizon_steps',
+}
 TRAINING_PASSTHROUGH_COLS = [
     col for col in (list(DEFAULT_PASSTHROUGH_COLS) + RAW_STAT_FEATURE_COLS)
     if col in {
@@ -102,6 +119,17 @@ TRAINING_PASSTHROUGH_COLS = [
         *RAW_STAT_FEATURE_COLS,
     }
 ]
+
+
+def _assert_no_forbidden_model_inputs(cols: list[str]) -> None:
+    requested = {str(col) for col in cols}
+    requested_raw = {col[len(RAW_STAT_PREFIX):] for col in requested if col.startswith(RAW_STAT_PREFIX)}
+    leaked = sorted((requested | requested_raw) & FORBIDDEN_MODEL_INPUT_COLS)
+    if leaked:
+        raise ValueError(
+            "❌ Forbidden leakage-prone columns requested for model inputs: "
+            f"{leaked}"
+        )
 
 
 def _resolve_phase(stage: int = 0, phase: str | None = None) -> str:
@@ -294,6 +322,9 @@ def _raw_feature_name(col: str) -> str:
 
 
 def _raw_stat_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    # Hard guard: passthrough/meta columns such as forward_return may exist in
+    # the CSV for analysis/backtesting, but they must never enter model inputs.
+    _assert_no_forbidden_model_inputs(list(cols))
     data = {}
     for col in cols:
         raw_col = _raw_feature_name(col)
@@ -341,6 +372,22 @@ def _build_scaled_stat_matrix(df: pd.DataFrame, cols: list[str], scaler_params: 
     raw_frame = _raw_stat_frame(df, cols)
     scaled = _apply_scaler_to_stat_frame(raw_frame, scaler_params)
     return scaled[cols].values.astype(np.float32)
+
+
+def _project_sequence_aux_context(
+    window: np.ndarray,
+    n_stat_feat: int,
+    sequence_aux_mode: str = SEQUENCE_AUX_LAST_STEP_ONLY,
+) -> np.ndarray:
+    arr = np.asarray(window, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f'Expected 2D sequence window, got {arr.shape}')
+    if sequence_aux_mode != SEQUENCE_AUX_LAST_STEP_ONLY or arr.shape[1] <= int(n_stat_feat):
+        return arr.astype(np.float32, copy=True)
+
+    out = arr.astype(np.float32, copy=True)
+    out[:-1, int(n_stat_feat):] = 0.0
+    return out
 
 
 def _quality_sample_weights(df: pd.DataFrame, strong_weight: float = 2.0, weak_weight: float = 1.0) -> np.ndarray:
@@ -507,6 +554,11 @@ def stage1_oof_meta(
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + Regime Meta-Features")
     print("═" * 65)
+    if not inference_scaler_params:
+        raise RuntimeError(
+            '❌ inference_scaler_params is required for stage1_oof_meta. '
+            'Refusing to fall back to a full-data scaler.'
+        )
 
     n = len(df)
     raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
@@ -628,7 +680,12 @@ def stage1_oof_meta(
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
         json.dump(fold_metrics, f, indent=2)
 
-    final_scaler = inference_scaler_params or _fit_scaler_params_from_frame(raw_stat)
+    if not inference_scaler_params:
+        raise RuntimeError(
+            '❌ inference_scaler_params is required for the final CatBoost fit. '
+            'Refusing to fall back to a full-data scaler.'
+        )
+    final_scaler = inference_scaler_params
     X_final = _apply_scaler_to_stat_frame(raw_stat, final_scaler).values.astype(np.float32)
     final_sw = _quality_sample_weights(
         df,
@@ -878,6 +935,8 @@ def build_safe_sequences(
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
     min_seq_coverage: float = 0.80,
+    n_stat_feat: int = len(CATBOOST_ADVISOR_FEATURES),
+    sequence_aux_mode: str = SEQUENCE_AUX_LAST_STEP_ONLY,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     n = len(df)
     split_ctx = _sequence_split_context(df, seq_len=seq_len, train_frac=train_frac)
@@ -904,6 +963,8 @@ def build_safe_sequences(
             return False
         if not bool(cov[-1]):
             return False
+        if sequence_aux_mode == SEQUENCE_AUX_LAST_STEP_ONLY:
+            return True
         return float(np.mean(cov)) >= float(min_seq_coverage)
 
     for end_idx in range(seq_len - 1, split_idx):
@@ -912,7 +973,13 @@ def build_safe_sequences(
             continue
         if not _coverage_ok(coverage_mask[start_idx:end_idx + 1]):
             continue
-        X_tr.append(X_rows[start_idx:end_idx + 1])
+        X_tr.append(
+            _project_sequence_aux_context(
+                X_rows[start_idx:end_idx + 1],
+                n_stat_feat=n_stat_feat,
+                sequence_aux_mode=sequence_aux_mode,
+            )
+        )
         yb_tr.append(y_bias[end_idx])
         yc_tr.append(y_conf[end_idx])
 
@@ -924,7 +991,13 @@ def build_safe_sequences(
             continue
         if not _coverage_ok(coverage_mask[start_idx:end_idx + 1]):
             continue
-        X_val.append(X_rows[start_idx:end_idx + 1])
+        X_val.append(
+            _project_sequence_aux_context(
+                X_rows[start_idx:end_idx + 1],
+                n_stat_feat=n_stat_feat,
+                sequence_aux_mode=sequence_aux_mode,
+            )
+        )
         yb_val.append(y_bias[end_idx])
         yc_val.append(y_conf[end_idx])
 
@@ -941,6 +1014,7 @@ def build_safe_sequences(
         'train_sequences': int(len(X_tr)),
         'val_sequences': int(len(X_val)),
         'min_seq_coverage': float(min_seq_coverage),
+        'sequence_aux_mode': str(sequence_aux_mode),
     }
     return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
 
@@ -962,6 +1036,10 @@ def stage3_meta_learner_v19(
     print("═" * 65)
     MetaLearnerLSTM = _load_meta_learner_class()
 
+    # OOF CatBoost probabilities / visual embeddings are intentionally exposed
+    # only on the last step of each sequence. Historical timesteps stay pure
+    # market-structure features to avoid fold-boundary artifacts in the LSTM.
+    sequence_aux_mode = SEQUENCE_AUX_LAST_STEP_ONLY
     X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
 
@@ -972,6 +1050,8 @@ def stage3_meta_learner_v19(
         seq_len=SEQ_LEN,
         train_frac=train_frac,
         min_seq_coverage=min_seq_coverage,
+        n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
+        sequence_aux_mode=sequence_aux_mode,
     )
     if len(X_tr) == 0 or len(X_val) == 0:
         raise RuntimeError(
@@ -1011,6 +1091,7 @@ def stage3_meta_learner_v19(
             'stat_features': CATBOOST_ADVISOR_FEATURES,
             'meta_features': META_FEATURE_NAMES,
             'visual_features': VISUAL_FEATURE_NAMES,
+            'sequence_aux_mode': sequence_aux_mode,
             'passthrough_cols': TRAINING_PASSTHROUGH_COLS,
             'timestamp_cols': ['ts_event', 'label_end_ts'],
             'input_dim': int(X_rows.shape[1]),

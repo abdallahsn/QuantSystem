@@ -23,8 +23,14 @@ def embargo_observations(train_idx: np.ndarray, test_idx: np.ndarray, embargo_pc
     if len(test_idx) == 0 or len(train_idx) == 0:
         return train_idx
 
+    # In expanding splits train rows usually lie entirely before the test block, in
+    # which case a post-test embargo is structurally inapplicable and should stay a
+    # transparent no-op rather than pretending to purge anything.
+    if np.max(train_idx) <= np.max(test_idx):
+        return train_idx
+
     test_end = test_idx.max()
-    n = len(train_idx) + len(test_idx)
+    n = int(max(np.max(train_idx), np.max(test_idx)) + 1)
     embargo_n = max(1, int(n * embargo_pct))
 
     embargo_start = test_end + 1

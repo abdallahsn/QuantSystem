@@ -102,6 +102,7 @@ class V19PredictionEngine:
         self.meta_features = self.factory.meta_features
         self.visual_features = self.factory.visual_features
         self.input_dim = self.factory.input_dim
+        self.sequence_aux_mode = str(self.factory.schema.get('sequence_aux_mode', 'full_window')).strip() or 'full_window'
         gate_cfg = self.factory.schema.get('event_gate', {}) or {}
         self.event_gate = EventGate(
             roll_window=int(gate_cfg.get('roll_window', 50)),
@@ -112,7 +113,11 @@ class V19PredictionEngine:
         )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))
-        self.visual_emb_path = os.path.join(models_dir, artifacts.get('visual_embeddings', 'visual_embeddings_v19.npy'))
+        if run_mode == 'backtest':
+            visual_artifact = artifacts.get('visual_embeddings_oof', artifacts.get('visual_embeddings', 'visual_embeddings_v19.npy'))
+        else:
+            visual_artifact = artifacts.get('visual_embeddings_live', artifacts.get('visual_embeddings', 'visual_embeddings_v19.npy'))
+        self.visual_emb_path = os.path.join(models_dir, visual_artifact)
 
         self.cb_advisor = None
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
@@ -316,6 +321,17 @@ class V19PredictionEngine:
         result['source'] = 'MetaLearner_V19'
         return result
 
+    def _project_sequence_for_meta(self, seq: np.ndarray) -> np.ndarray:
+        arr = np.asarray(seq, dtype=np.float32)
+        if self.sequence_aux_mode != 'last_step_only' or arr.ndim != 2:
+            return arr
+        n_stat = len(self.stat_features)
+        if arr.shape[1] <= n_stat:
+            return arr
+        out = arr.copy()
+        out[:-1, n_stat:] = 0.0
+        return out
+
     def predict_step(self,
                      stat_features: dict,
                      visual_embedding: np.ndarray | None = None,
@@ -410,6 +426,7 @@ class V19PredictionEngine:
             return result
 
         seq = np.array(list(self._seq_buffer), dtype=np.float32)
+        seq = self._project_sequence_for_meta(seq)
         result = self._meta_decision(seq)
         if self.run_mode == 'rollout' and not runtime_mode.get('allow_rollout', False):
             result['tradeable'] = False

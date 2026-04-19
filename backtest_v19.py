@@ -82,10 +82,25 @@ def _load_meta_features(
     df: pd.DataFrame,
     explicit_path: str | None,
     expected_dim: int,
+    allow_in_sample_live_override: bool = False,
 ) -> np.ndarray | None:
     n = len(df)
     if not explicit_path or not os.path.exists(explicit_path):
         return None
+
+    basename = os.path.basename(str(explicit_path)).lower()
+    if (
+        not allow_in_sample_live_override
+        and 'live' in basename
+        and ('bias_label' in df.columns or 'forward_return' in df.columns)
+    ):
+        # The final/live meta stack is fitted on all rows. Reusing it on a
+        # labeled backtest slice would leak in-sample predictions back into the
+        # evaluation unless the user explicitly overrides this guard.
+        raise ValueError(
+            '❌ Refusing to use live/final-fit meta features on a labeled backtest dataset. '
+            'Use meta_features_oof_v19.npy or omit --meta_npy.'
+        )
 
     meta = np.load(explicit_path)
     meta = np.asarray(meta, dtype=np.float32)
@@ -160,7 +175,7 @@ def run_causal_backtest(
     max_size: int,
     starting_equity: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    engine = V19PredictionEngine(models_dir)
+    engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
     engine.loss_guard.update_equity(starting_equity)
     source_has_labels = 'bias_label' in df.columns
@@ -310,6 +325,8 @@ def main():
     p.add_argument('--output', default='outputs_v19', help='backtest output directory')
     p.add_argument('--visual_npy', default=None, help='optional row-aligned visual embeddings file')
     p.add_argument('--meta_npy', default=None, help='optional row-aligned stage-1 meta features file')
+    p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
+                   help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
     p.add_argument('--input_scaled', action='store_true',
                    help='set when CSV is already scaled like training_features_ready.csv')
     p.add_argument('--tick_size', type=float, default=0.0001)
@@ -331,6 +348,7 @@ def main():
         df,
         explicit_path=args.meta_npy,
         expected_dim=len(engine.meta_features),
+        allow_in_sample_live_override=args.allow_in_sample_live_meta_override,
     )
 
     _, _, summary = run_causal_backtest(

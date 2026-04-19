@@ -47,6 +47,22 @@ DEFAULT_INT_COLS = {
     'event_trigger_count',
     'is_expansion',
 }
+FORBIDDEN_STAT_FEATURES = {
+    'forward_return',
+    'label_end_ts',
+    'ts_event',
+    'bias_label',
+    'conf_label',
+    'signal_quality',
+    'regime_label',
+    'regime_cluster',
+    'event_flag',
+    'train_event_flag',
+    'event_score',
+    'event_trigger_count',
+    'is_expansion',
+    'label_horizon_steps',
+}
 
 
 def _load_json(path: str, required: bool = True):
@@ -184,6 +200,11 @@ class V19FeatureFactory:
         if len(self.meta_features) != EXPECTED_META_FEATURES:
             raise ValueError(
                 f'Unsupported meta feature surface: expected {EXPECTED_META_FEATURES} dims, got {len(self.meta_features)}'
+            )
+        leaked = sorted(set(self.stat_features) & FORBIDDEN_STAT_FEATURES)
+        if leaked:
+            raise ValueError(
+                f'Stat feature schema contains forbidden leakage-prone columns: {leaked}'
             )
 
     def prepare_frame(self, df: pd.DataFrame, already_scaled: bool = False, include_meta: bool = True) -> pd.DataFrame:
