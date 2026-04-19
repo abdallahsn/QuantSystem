@@ -419,8 +419,16 @@ def apply_range_filter_to_dataframe(
         try: return float(row.get(col, d) or d)
         except: return d
 
+    def _resolve_regime(row):
+        for candidate in (regime_col, 'regime_label', 'regime_name', 'regime'):
+            if candidate in row:
+                value = row.get(candidate, 'Ranging')
+                if value is not None and str(value).strip():
+                    return str(value)
+        return 'Ranging'
+
     for _, row in df.iterrows():
-        regime = str(row.get(regime_col, 'Ranging'))
+        regime = _resolve_regime(row)
         if regime.lstrip('-').isdigit():
             regime = {'0':'Trending','1':'Ranging','2':'Volatile','3':'Low_Liquidity'}.get(regime,'Ranging')
 

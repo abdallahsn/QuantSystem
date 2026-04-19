@@ -710,7 +710,17 @@ def generate_catboost_5m_report(
     # بدلاً من كل إشارة خام من CatBoost
     if RSM_AVAILABLE and not bars.empty:
         try:
-            regime_col = 'regime_name' if 'regime_name' in bars.columns else 'regime'
+            # Resampled CatBoost bars carry the market regime in `regime_label`
+            # (mapped to human-readable names). Falling back to a missing column
+            # forces the RSM into RANGING mode and suppresses valid trend entries.
+            regime_col = next(
+                (
+                    candidate
+                    for candidate in ("regime_label", "regime_name", "regime")
+                    if candidate in bars.columns
+                ),
+                "regime_label",
+            )
             bars = apply_range_filter_to_dataframe(
                 bars,
                 signal_col  = 'cb_direction',
