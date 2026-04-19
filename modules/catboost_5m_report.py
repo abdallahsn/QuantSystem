@@ -38,7 +38,7 @@ try:
 except ImportError:
     CB_AVAILABLE = False
 
-BIAS_LABELS = {0: "LONG", 1: "SHORT", 2: "NEUTRAL"}
+BIAS_LABELS = {0: "LONG", 1: "SHORT"}
 DIRECTION_PROB_COLS = ["cb_prob_long", "cb_prob_short"]
 REGIME_LABELS = {
     0: "Trending",
@@ -685,30 +685,6 @@ def _build_turns_table(bars: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def _suppress_long_signals(bars: pd.DataFrame) -> pd.DataFrame:
-    if bars.empty or "cb_direction" not in bars.columns:
-        return bars
-
-    out = bars.copy()
-    long_mask = out["cb_direction"].fillna("NEUTRAL").astype(str).eq("LONG")
-    if not bool(long_mask.any()):
-        return out
-
-    out.loc[long_mask, "cb_direction"] = "NEUTRAL"
-    out.loc[long_mask, "cb_direction_idx"] = 2
-
-    if "rsm_direction" in out.columns:
-        out.loc[long_mask, "rsm_direction"] = "NEUTRAL"
-    if "rsm_action" in out.columns:
-        enter_long_mask = long_mask & out["rsm_action"].fillna("").astype(str).eq("ENTER")
-        out.loc[enter_long_mask, "rsm_action"] = "HOLD"
-    if "rsm_reason" in out.columns:
-        out.loc[long_mask, "rsm_reason"] = "long_disabled"
-
-    out["cb_change_flag"] = (out["cb_direction"] != out["cb_direction"].shift(1)).astype(int)
-    return out
-
-
 def generate_catboost_5m_report(
     csv_path: str,
     models_dir: str,
@@ -719,7 +695,6 @@ def generate_catboost_5m_report(
     mbp_path: str = "",
     max_bars: int = 400,
     future_bars: int = 4,
-    allow_long_signals: bool = False,
 ) -> dict[str, Any]:
     output_dir = output_dir or models_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -763,14 +738,9 @@ def generate_catboost_5m_report(
             bars['cb_direction_idx'] = bars['cb_direction'].map(
                 {'LONG': 0, 'SHORT': 1, 'NEUTRAL': 2}
             ).fillna(2).astype(int)
-            if not allow_long_signals:
-                bars = _suppress_long_signals(bars)
             print(f"  ✅ RSM applied: {(bars['rsm_action']=='ENTER').sum()} confirmed signals")
         except Exception as _rsm_err:
             print(f"  ⚠️ RSM skipped: {_rsm_err}")
-
-    if not allow_long_signals:
-        bars = _suppress_long_signals(bars)
 
     t_min = bars["ts_event"].min() if not bars.empty else pd.Timestamp.min
     t_max = bars["signal_time"].max() if not bars.empty and "signal_time" in bars.columns else pd.Timestamp.max
