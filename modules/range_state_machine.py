@@ -212,13 +212,19 @@ class RangeStateMachine:
                  cvd_window=8, obi_window=5, hawkes_window=10,
                  hawkes_mult=1.4, reversal_min_signals=2,
                  boundary_mult=1.5, breakout_mult=2.5,
-                 tick_size=0.0001, range_window=20):
+                 tick_size=0.0001, range_window=20,
+                 trend_early_entry_confidence=0.78,
+                 trend_early_entry_range_pos=0.85,
+                 trend_early_entry_min_reversal=1.0):
 
         self.min_confirmations   = min_confirmations
         self.confirmation_window = confirmation_window
         self.min_confidence      = min_confidence
         self.min_candles_between = min_candles_between
         self.tick_size           = tick_size
+        self.trend_early_entry_confidence = trend_early_entry_confidence
+        self.trend_early_entry_range_pos  = trend_early_entry_range_pos
+        self.trend_early_entry_min_reversal = trend_early_entry_min_reversal
 
         self.reversal_engine = MicrostructureReversalEngine(
             cvd_window=cvd_window, obi_window=obi_window,
@@ -349,10 +355,26 @@ class RangeStateMachine:
             self.signal_state = SignalState.ACCUMULATING
 
         needed = max(2, self.min_confirmations - 1)
+        if self._is_strong_trend_edge_signal(raw_signal, confidence, reversal, boundary):
+            needed = 1
         confs  = self._count_confirmations()
         if confs >= needed:
-            return self._confirm_entry(raw_signal, price, f'trend_confirmed_{confs}confs')
+            suffix = '_early' if needed == 1 else ''
+            return self._confirm_entry(raw_signal, price, f'trend_confirmed_{confs}confs{suffix}')
         return self._hold(f'trend_accumulating_{confs}/{needed}')
+
+    def _is_strong_trend_edge_signal(self, raw_signal, confidence, reversal, boundary):
+        if raw_signal not in ('LONG', 'SHORT'):
+            return False
+        if confidence < self.trend_early_entry_confidence:
+            return False
+        if reversal.get('reversal_score', 0.0) < self.trend_early_entry_min_reversal:
+            return False
+        range_pos = float(boundary.get('range_pos', 0.5))
+        edge_pos = float(self.trend_early_entry_range_pos)
+        if raw_signal == 'SHORT':
+            return range_pos >= edge_pos
+        return range_pos <= (1.0 - edge_pos)
 
     def _count_confirmations(self):
         if not self._signal_buffer or self._accumulating_direction is None:

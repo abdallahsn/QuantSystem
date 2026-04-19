@@ -227,6 +227,9 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
 
 def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
     hover_y = ((bars["high"] + bars["low"]) / 2.0).fillna(bars["close"]).astype(float)
+    raw_signal = bars.get("cb_direction_raw", bars["cb_direction"]).fillna("UNKNOWN").astype(str)
+    rsm_reason = bars.get("rsm_reason", pd.Series([""] * len(bars), index=bars.index)).fillna("").astype(str)
+    rsm_action = bars.get("rsm_action", pd.Series([""] * len(bars), index=bars.index)).fillna("").astype(str)
     customdata = np.column_stack(
         [
             bars["open"].astype(float).values,
@@ -245,6 +248,9 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             bars["kyle_lambda"].fillna(0.0).astype(float).values,
             bars["hawkes_intensity"].fillna(0.0).astype(float).values,
             bars["regime_label"].fillna("Ranging").astype(str).values,
+            raw_signal.values,
+            rsm_action.values,
+            rsm_reason.values,
         ]
     )
     return go.Scatter(
@@ -272,7 +278,10 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             "Absorption=%{customdata[12]:.3f}<br>"
             "Kyle λ=%{customdata[13]:.3f}<br>"
             "Hawkes=%{customdata[14]:.3f}<br>"
-            "Regime=%{customdata[15]}<extra></extra>"
+            "Regime=%{customdata[15]}<br>"
+            "RawSignal=%{customdata[16]}<br>"
+            "RSM Action=%{customdata[17]}<br>"
+            "RSM Reason=%{customdata[18]}<extra></extra>"
         ),
     )
 
@@ -353,6 +362,8 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                         bars.loc[mask, "cb_prob_long"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_short"].fillna(0.0).values,
                         bars.loc[mask, "regime_label"].fillna("Ranging").astype(str).values,
+                        bars.loc[mask].get("cb_direction_raw", bars.loc[mask, "cb_direction"]).fillna("UNKNOWN").astype(str).values,
+                        bars.loc[mask].get("rsm_reason", pd.Series([""] * int(mask.sum()), index=bars.loc[mask].index)).fillna("").astype(str).values,
                     ],
                     axis=1,
                 ),
@@ -365,7 +376,9 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                     "Confidence=%{customdata[4]:.3f}<br>"
                     "P(LONG)=%{customdata[5]:.3f}<br>"
                     "P(SHORT)=%{customdata[6]:.3f}<br>"
-                    "Regime=%{customdata[7]}<extra></extra>"
+                    "Regime=%{customdata[7]}<br>"
+                    "RawSignal=%{customdata[8]}<br>"
+                    "RSM Reason=%{customdata[9]}<extra></extra>"
                 ),
             ),
             row=1,
