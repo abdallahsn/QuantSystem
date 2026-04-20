@@ -45,12 +45,15 @@ from modules.gpu_config import detect_gpu
 from modules.manifest_v19 import write_manifest
 from modules.oof_stacking import (
     align_probability_columns,
-    fill_uncovered_one_hot,
     fill_uncovered_probabilities,
     run_sequential_oof,
 )
 from modules.purging_embargo import embargo_observations, purge_overlapping, walk_forward_expanding
-from modules.regime_classifier import RegimeClassifier
+from modules.regime_classifier import (
+    RegimeClassifier,
+    REGIME_META_SCORE_COLS,
+    REGIME_ONE_HOT_COLS,
+)
 
 try:
     from catboost import CatBoostClassifier, Pool
@@ -62,7 +65,7 @@ BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 2
 SEQ_LEN = 50
-SCHEMA_VERSION = 'v19-event-binary'
+SCHEMA_VERSION = 'v19-event-binary-soft-regime-meta'
 TRAIN_MODE_EVENT_BINARY = 'event_binary'
 PHASE_FULL = 'full'
 PHASE_CATBOOST = 'catboost'
@@ -74,9 +77,10 @@ STAGE_TO_PHASE = {
     2: PHASE_VISUAL,
     3: PHASE_TRAIN,
 }
+REGIME_META_FEATURE_NAMES = [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS]
 META_FEATURE_NAMES = [
     'cb_prob_long', 'cb_prob_short',
-    'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
+    *REGIME_META_FEATURE_NAMES,
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 EVENT_GATE_VOL_MULT = 1.10
@@ -169,6 +173,36 @@ def _load_meta_learner_class():
     from modules.meta_learner import MetaLearnerLSTM
 
     return MetaLearnerLSTM
+
+
+def _directional_metric_dict(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        average='macro',
+        zero_division=0,
+    )
+    return {
+        'directional_precision_macro': float(precision),
+        'directional_recall_macro': float(recall),
+        'directional_f1_macro': float(f1),
+    }
+
+
+def _fill_uncovered_regime_meta(
+    regime_meta: np.ndarray,
+    covered: np.ndarray,
+    default_class: int = 0,
+) -> np.ndarray:
+    out = np.asarray(regime_meta, dtype=np.float32).copy()
+    if out.ndim != 2:
+        raise ValueError(f'Expected 2D regime meta surface, got {out.shape}')
+    out[~covered] = 0.0
+    if out.shape[1] > 0:
+        default_class = int(np.clip(default_class, 0, min(N_CLUSTERS, out.shape[1]) - 1))
+        out[~covered, default_class] = 1.0
+    return out
 
 
 def _load_deeplob_runtime():
@@ -768,24 +802,30 @@ def stage1_oof_meta(
     def _regime_predict(train_idx, test_idx, fold_no):
         clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         clf.fit(df.iloc[train_idx].copy(), output_dir=regime_tmp_dir)
-        labels = clf.predict(df.iloc[test_idx].copy())
-        out = np.zeros((len(test_idx), N_CLUSTERS), dtype=np.float32)
-        for i, label in enumerate(labels):
-            if 0 <= int(label) < N_CLUSTERS:
-                out[i, int(label)] = 1.0
-            else:
-                out[i, 0] = 1.0
-        return out, {'cluster_counts': np.bincount(labels.astype(np.int32), minlength=N_CLUSTERS).tolist()}
+        regime_meta = clf.predict_regime_meta(df.iloc[test_idx].copy())
+        out = regime_meta.loc[:, REGIME_META_FEATURE_NAMES].values.astype(np.float32)
+        labels = np.argmax(out[:, :N_CLUSTERS], axis=1).astype(np.int32) if len(out) else np.zeros(0, dtype=np.int32)
+        score_means = {}
+        if len(out):
+            for idx, col in enumerate(REGIME_META_SCORE_COLS, start=N_CLUSTERS):
+                score_means[col] = float(np.mean(out[:, idx]))
+        return out, {
+            'cluster_counts': np.bincount(labels, minlength=N_CLUSTERS).tolist(),
+            'score_means': score_means,
+        }
 
     regime_raw, regime_covered, regime_reports = run_sequential_oof(
-        n, N_CLUSTERS, splits, _regime_predict
+        n, len(REGIME_META_FEATURE_NAMES), splits, _regime_predict
     )
-    regime_oh = fill_uncovered_one_hot(regime_raw, regime_covered, default_class=0)
+    regime_meta = _fill_uncovered_regime_meta(regime_raw, regime_covered, default_class=0)
     coverage = prob_covered & regime_covered
 
     fold_metrics = {
         'catboost_folds': prob_reports,
         'regime_folds': regime_reports,
+        'meta_feature_names': META_FEATURE_NAMES,
+        'regime_meta_feature_names': REGIME_META_FEATURE_NAMES,
+        'meta_feature_dim': int(len(META_FEATURE_NAMES)),
         'coverage_ratio': float(coverage.mean()),
     }
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
@@ -830,19 +870,13 @@ def stage1_oof_meta(
         N_CB_PROBS,
         classes=final_cb_classes,
     )
-    live_regime_labels = final_regime.predict(df.copy())
-    live_regime_oh = np.zeros((n, N_CLUSTERS), dtype=np.float32)
-    for i, label in enumerate(live_regime_labels):
-        if 0 <= int(label) < N_CLUSTERS:
-            live_regime_oh[i, int(label)] = 1.0
-        else:
-            live_regime_oh[i, 0] = 1.0
+    live_regime_meta = final_regime.predict_regime_meta(df.copy()).loc[:, REGIME_META_FEATURE_NAMES].values.astype(np.float32)
     np.save(
         os.path.join(output_dir, 'meta_features_live_v19.npy'),
-        np.concatenate([live_probs, live_regime_oh], axis=1).astype(np.float32),
+        np.concatenate([live_probs, live_regime_meta], axis=1).astype(np.float32),
     )
 
-    meta = np.concatenate([oof_probs, regime_oh], axis=1).astype(np.float32)
+    meta = np.concatenate([oof_probs, regime_meta], axis=1).astype(np.float32)
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
     print(f"  ✅ OOF Meta Features: {meta.shape}")
@@ -1203,9 +1237,33 @@ def stage3_meta_learner_v19(
     )
 
     if history is not None:
+        cb_offset = len(CATBOOST_ADVISOR_FEATURES)
+        baseline_probs = X_val[:, -1, cb_offset:cb_offset + N_CB_PROBS]
+        baseline_pred = np.argmax(baseline_probs, axis=1).astype(np.int32)
+        baseline_metrics = _directional_metric_dict(yb_val, baseline_pred)
+        meta_outputs = meta.model.predict(X_val, verbose=0) if getattr(meta, 'model', None) is not None else None
+        meta_pred = np.argmax(meta_outputs['bias_out'], axis=1).astype(np.int32) if meta_outputs is not None else baseline_pred
+        meta_metrics = _directional_metric_dict(yb_val, meta_pred)
+        metric_delta = {
+            key: float(meta_metrics[key] - baseline_metrics[key])
+            for key in meta_metrics
+        }
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
         with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
-            json.dump({'history': hist_dict, 'split': split_stats}, f, indent=2)
+            json.dump(
+                {
+                    'history': hist_dict,
+                    'split': split_stats,
+                    'meta_feature_names': META_FEATURE_NAMES,
+                    'validation_metrics': {
+                        'catboost_last_step_baseline': baseline_metrics,
+                        'meta_learner': meta_metrics,
+                        'delta_vs_baseline': metric_delta,
+                    },
+                },
+                f,
+                indent=2,
+            )
         event_gate_schema = {
             'roll_window': int((event_gate_config or {}).get('roll_window', 50)),
             'vol_mult': float((event_gate_config or {}).get('vol_mult', EVENT_GATE_VOL_MULT)),
@@ -1267,9 +1325,16 @@ def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) 
 
     meta_features = np.load(meta_path)
     coverage = np.load(coverage_path).astype(bool)
+    expected_dim = len(META_FEATURE_NAMES)
     if n_rows is not None and (len(meta_features) != int(n_rows) or len(coverage) != int(n_rows)):
         raise ValueError(
             f'❌ Stage1 cached artifacts shape mismatch: meta={len(meta_features)}, coverage={len(coverage)}, expected={int(n_rows)}'
+        )
+    if meta_features.ndim != 2 or meta_features.shape[1] != expected_dim:
+        raise ValueError(
+            '❌ Stage1 cached meta feature surface is incompatible with this runtime. '
+            f'Expected {(len(meta_features), expected_dim) if meta_features.ndim == 2 else f"(*, {expected_dim})"}, '
+            f'got {meta_features.shape}. Re-run phase catboost with the new soft-regime-meta schema.'
         )
     return meta_features, coverage
 

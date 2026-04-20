@@ -5,7 +5,7 @@ V19 inference uses the exact feature schema and scaler artifacts produced by
 the training pipeline, then reconstructs the same step vector used in training:
 
   [25 scaled statistical features] + [2 CatBoost probs] +
-  [4 regime one-hot] + [8 visual embeddings if available]
+  [4 regime one-hot + 3 regime scores] + [8 visual embeddings if available]
 """
 
 from __future__ import annotations
@@ -248,24 +248,23 @@ class V19PredictionEngine:
         for _, row in stat_df.iterrows():
             self._regime_buffer.append(row.to_dict())
 
-    def _get_regime_one_hot(self, stat_df: pd.DataFrame) -> np.ndarray:
+    def _get_regime_meta_block(self, stat_df: pd.DataFrame) -> np.ndarray:
         n = len(stat_df)
-        out = np.zeros((n, N_CLUSTERS), dtype=np.float32)
+        expected_dim = max(len(self.meta_features) - N_CB_PROBS, 0)
+        out = np.zeros((n, expected_dim), dtype=np.float32)
+        if expected_dim == 0:
+            return out
         if not self.regime_clf._fitted:
             out[:, 0] = 1.0
             return out
         try:
             if n == 1 and len(self._regime_buffer):
                 recent_df = pd.DataFrame(list(self._regime_buffer))
-                labels = self.regime_clf.predict(recent_df)[-1:]
+                meta_df = self.regime_clf.predict_regime_meta(recent_df).iloc[-1:]
             else:
-                labels = self.regime_clf.predict(stat_df)
-            for i, lbl in enumerate(labels):
-                lbl = int(lbl)
-                if 0 <= lbl < N_CLUSTERS:
-                    out[i, lbl] = 1.0
-                else:
-                    out[i, 0] = 1.0
+                meta_df = self.regime_clf.predict_regime_meta(stat_df)
+            meta_cols = list(self.meta_features[N_CB_PROBS:])
+            out = meta_df.reindex(columns=meta_cols, fill_value=0.0).values.astype(np.float32)
         except Exception:
             out[:, 0] = 1.0
         return out
@@ -301,19 +300,19 @@ class V19PredictionEngine:
             if meta_override.ndim == 1:
                 meta_override = meta_override.reshape(1, -1)
             expected_dim = len(self.meta_features)
-            if meta_override.shape[1] < expected_dim:
-                pad = np.zeros((meta_override.shape[0], expected_dim - meta_override.shape[1]), dtype=np.float32)
-                meta_override = np.concatenate([meta_override, pad], axis=1)
-            meta_override = meta_override[:, :expected_dim]
+            if meta_override.shape[1] != expected_dim:
+                raise ValueError(
+                    f'❌ meta override columns ({meta_override.shape[1]}) do not match schema ({expected_dim})'
+                )
             cb_probs = meta_override[:, :N_CB_PROBS]
-            regime_oh = meta_override[:, N_CB_PROBS:N_CB_PROBS + N_CLUSTERS]
+            regime_meta = meta_override[:, N_CB_PROBS:expected_dim]
         else:
             cb_probs = self._get_cb_probs(X_stat)
-            regime_oh = self._get_regime_one_hot(stat_df)
+            regime_meta = self._get_regime_meta_block(stat_df)
         if visual_emb is None:
             visual_emb = np.zeros((len(stat_df), len(self.visual_features)), dtype=np.float32)
-        X_step = np.concatenate([X_stat, cb_probs, regime_oh, visual_emb], axis=1).astype(np.float32)
-        return X_step, cb_probs, regime_oh
+        X_step = np.concatenate([X_stat, cb_probs, regime_meta, visual_emb], axis=1).astype(np.float32)
+        return X_step, cb_probs, regime_meta
 
     def _meta_decision(self, seq: np.ndarray) -> dict:
         if self.meta is None:
@@ -420,7 +419,7 @@ class V19PredictionEngine:
             visual_emb = self.factory.prepare_visual_embeddings(visual_embedding, n_rows=len(stat_df))
         else:
             visual_emb = self._get_visual_embeddings(len(stat_df), lob_tensor=lob_tensor)
-        step_rows, cb_probs, regime_oh = self._build_step_vectors(
+        step_rows, cb_probs, regime_meta = self._build_step_vectors(
             stat_df,
             visual_emb=visual_emb,
             meta_override=meta_override,
@@ -450,7 +449,7 @@ class V19PredictionEngine:
             result['tradeable'] = False
             result['reason'] = runtime_mode.get('reason', 'Paper blocked')
             self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode)
-        cluster = int(np.argmax(regime_oh[0]))
+        cluster = int(np.argmax(regime_meta[0, :N_CLUSTERS])) if regime_meta.shape[1] >= N_CLUSTERS else 0
         bias_probs = np.asarray(result.get('bias_probs', cb_probs[0]), dtype=np.float32).reshape(-1)
         direction_probs = {
             'LONG': round(float(bias_probs[0]) if len(bias_probs) > 0 else 0.0, 4),
@@ -465,6 +464,12 @@ class V19PredictionEngine:
             result['visual_norm'] = round(float(np.linalg.norm(visual_emb[0])), 4)
         result['cluster'] = cluster
         result['cluster_name'] = REGIME_NAMES.get(cluster, f'Cluster_{cluster}')
+        score_offset = N_CLUSTERS
+        result['regime_scores'] = {
+            'volatile': round(float(regime_meta[0, score_offset + 0]), 4) if regime_meta.shape[1] > score_offset + 0 else 0.0,
+            'trend': round(float(regime_meta[0, score_offset + 1]), 4) if regime_meta.shape[1] > score_offset + 1 else 0.0,
+            'low_liq': round(float(regime_meta[0, score_offset + 2]), 4) if regime_meta.shape[1] > score_offset + 2 else 0.0,
+        }
         result['sequence_ready'] = True
         result['feature_hash'] = feature_hash
         result['event_gate_passed'] = True
@@ -514,6 +519,11 @@ class V19PredictionEngine:
             if len(meta_features) != len(canonical_df):
                 raise ValueError(
                     f'❌ meta features rows ({len(meta_features)}) do not match CSV rows ({len(canonical_df)})'
+                )
+            if meta_features.ndim != 2 or meta_features.shape[1] != len(self.meta_features):
+                raise ValueError(
+                    f'❌ meta features columns ({meta_features.shape[1] if meta_features.ndim == 2 else meta_features.shape}) '
+                    f'do not match schema ({len(self.meta_features)})'
                 )
 
         y_bias = canonical_df['bias_label'].values.astype(np.int32) if source_has_labels else None

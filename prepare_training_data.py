@@ -41,7 +41,7 @@ from modules.dynamic_labels         import (DIR_NEUTRAL,
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
-from modules.regime_classifier       import RegimeClassifier
+from modules.regime_classifier       import RegimeClassifier, REGIME_META_SCORE_COLS
 from modules.slippage_model          import SlippageModel
 from modules.session_features        import add_session_features, SESSION_FEATURE_COLS, SessionVWAPEngine # 🔴 إضافة VWAP
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
@@ -191,7 +191,8 @@ RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_F
 META_FEATURE_COLS = [
     'cb_prob_long', 'cb_prob_short',                       # 2 احتمالات CatBoost
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',   # 4 One-Hot Cluster
-]  # N = 6
+    *list(REGIME_META_SCORE_COLS),                        # 3 Soft regime scores
+]  # N = 9
 
 # V19 Visual Features — مخرجات CNN
 VISUAL_EMB_COLS = [f'vis_emb_{i}' for i in range(8)]  # N = 8

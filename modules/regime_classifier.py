@@ -25,6 +25,23 @@ REGIME_NAMES = {
     3: 'Low_Liquidity',
 }
 
+REGIME_ONE_HOT_COLS = (
+    'cluster_0',
+    'cluster_1',
+    'cluster_2',
+    'cluster_3',
+)
+REGIME_SCORE_COLS = (
+    'volatile_score',
+    'trend_score',
+    'low_liq_score',
+)
+REGIME_META_SCORE_COLS = (
+    'regime_volatile_score',
+    'regime_trend_score',
+    'regime_low_liq_score',
+)
+
 REGIME_TRADEABLE = {
     0: True,   
     1: False,  
@@ -169,11 +186,12 @@ class RegimeClassifier:
         X = _build_regime_features(df)
         requested_model = (self.model_type or 'auto').strip().lower()
         use_rules = requested_model in ('auto', 'rules')
+        if not X.empty:
+            self._fit_rules(X)
 
         if use_rules:
             self.model = None
             self.scaler = None
-            self._fit_rules(X)
             labels = self._predict_rules(X)
             self._labels = labels
             self._cluster_names = [REGIME_NAMES[i] for i in range(self.n_regimes)]
@@ -303,6 +321,21 @@ class RegimeClassifier:
         labels[(trending & ~volatile & ~low_liq).values] = 0
         return labels
 
+    def _predict_labels_from_features(self, X: pd.DataFrame) -> np.ndarray:
+        if len(X) == 0:
+            return np.zeros(0, dtype=np.int8)
+        if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
+            return self._predict_rules(X)
+        X_scaled = self.scaler.transform(X)
+        clusters = self.model.predict(X_scaled)
+        return np.array([self._regime_map.get(int(c), 1) for c in clusters], dtype=np.int8)
+
+    def _predict_scores_from_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        if len(X) == 0:
+            return pd.DataFrame(index=X.index, columns=list(REGIME_SCORE_COLS), dtype=np.float64)
+        scores = _build_rule_scores(X, self.rule_stats or {})
+        return scores.loc[:, list(REGIME_SCORE_COLS)].astype(np.float64)
+
     def _print_distribution(self, labels: np.ndarray):
         for regime_id in range(self.n_regimes):
             count = int(np.sum(labels == regime_id))
@@ -368,12 +401,44 @@ class RegimeClassifier:
             return np.zeros(len(df), dtype=np.int8)
 
         X = _build_regime_features(df)
-        if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
-            return self._predict_rules(X)
-        X_scaled = self.scaler.transform(X)
-        clusters = self.model.predict(X_scaled)
-        
-        return np.array([self._regime_map.get(int(c), 1) for c in clusters], dtype=np.int8)
+        return self._predict_labels_from_features(X)
+
+    def predict_scores(self, df: pd.DataFrame) -> pd.DataFrame:
+        X = _build_regime_features(df)
+        if not self._fitted:
+            return pd.DataFrame(0.0, index=df.index, columns=list(REGIME_SCORE_COLS), dtype=np.float64)
+        return self._predict_scores_from_features(X)
+
+    def predict_regime_meta(self, df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) == 0:
+            cols = list(REGIME_ONE_HOT_COLS) + list(REGIME_META_SCORE_COLS)
+            return pd.DataFrame(index=df.index, columns=cols, dtype=np.float32)
+
+        X = _build_regime_features(df)
+        scores = self._predict_scores_from_features(X) if self._fitted else pd.DataFrame(
+            0.0,
+            index=df.index,
+            columns=list(REGIME_SCORE_COLS),
+            dtype=np.float64,
+        )
+        labels = self._predict_labels_from_features(X) if self._fitted else np.zeros(len(df), dtype=np.int8)
+
+        out = pd.DataFrame(
+            0.0,
+            index=df.index,
+            columns=list(REGIME_ONE_HOT_COLS) + list(REGIME_META_SCORE_COLS),
+            dtype=np.float32,
+        )
+        if len(out):
+            row_idx = np.arange(len(out), dtype=np.int64)
+            safe_labels = np.clip(labels.astype(np.int64), 0, len(REGIME_ONE_HOT_COLS) - 1)
+            one_hot = out.loc[:, list(REGIME_ONE_HOT_COLS)].values
+            one_hot[row_idx, safe_labels] = 1.0
+            out.loc[:, list(REGIME_ONE_HOT_COLS)] = one_hot
+        out.loc[:, list(REGIME_META_SCORE_COLS)] = scores.rename(
+            columns=dict(zip(REGIME_SCORE_COLS, REGIME_META_SCORE_COLS))
+        ).loc[:, list(REGIME_META_SCORE_COLS)].astype(np.float32)
+        return out
 
     def predict_current(self, recent_bars: pd.DataFrame) -> dict:
         if not self._fitted or len(recent_bars) == 0:

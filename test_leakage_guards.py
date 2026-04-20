@@ -16,9 +16,10 @@ os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 from backtest_v19 import _load_meta_features, _simulate_trade_path
 from prepare_training_data import _require_causal_label_runtime
 from modules.dynamic_labels import EventGate
+from modules.feature_factory_v19 import V19FeatureFactory
 from modules.labels_v22 import _compute_adaptive_horizons
-from modules.regime_classifier import RegimeClassifier
-from train_v19 import _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
+from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
+from train_v19 import _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
 
 
 class LeakageGuardTests(unittest.TestCase):
@@ -51,7 +52,7 @@ class LeakageGuardTests(unittest.TestCase):
                 "forward_return": [0.1, -0.1, 0.0],
             }
         )
-        meta = np.zeros((len(df), 6), dtype=np.float32)
+        meta = np.zeros((len(df), 9), dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "meta_features_live_v19.npy")
             np.save(path, meta)
@@ -59,7 +60,7 @@ class LeakageGuardTests(unittest.TestCase):
                 _load_meta_features(
                     df,
                     explicit_path=path,
-                    expected_dim=6,
+                    expected_dim=9,
                     allow_in_sample_live_override=False,
                 )
 
@@ -163,6 +164,82 @@ class LeakageGuardTests(unittest.TestCase):
             prefix_last = np.array([clf.predict(df.iloc[:i + 1])[-1] for i in range(130, n)], dtype=np.int8)
 
         np.testing.assert_array_equal(full[130:], prefix_last)
+
+    def test_regime_scores_are_causal_across_prefixes(self):
+        rng = np.random.default_rng(11)
+        n = 180
+        df = pd.DataFrame(
+            {
+                'price': 100 + np.cumsum(rng.normal(0.0, 0.15, n)),
+                'size': rng.integers(1, 10, n),
+                'cvd': np.cumsum(rng.normal(0.0, 0.8, n)),
+                'obi': rng.uniform(-1.0, 1.0, n),
+                'inter_event_time': rng.exponential(0.4, n),
+                'micro_atr': np.abs(rng.normal(0.2, 0.04, n)),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clf = RegimeClassifier(n_regimes=4)
+            clf.fit(df.iloc[:130], output_dir=tmpdir)
+            full_scores = clf.predict_scores(df)
+            prefix_last = np.vstack(
+                [clf.predict_scores(df.iloc[:i + 1]).iloc[-1].values for i in range(130, n)]
+            ).astype(np.float64)
+
+        np.testing.assert_allclose(full_scores.iloc[130:].values, prefix_last, atol=1e-8)
+        self.assertTrue(((full_scores.values >= 0.0) & (full_scores.values <= 1.0)).all())
+
+    def test_regime_meta_surface_has_expected_order(self):
+        rng = np.random.default_rng(13)
+        n = 64
+        df = pd.DataFrame(
+            {
+                'price': 100 + np.cumsum(rng.normal(0.0, 0.1, n)),
+                'size': rng.integers(1, 6, n),
+                'cvd': np.cumsum(rng.normal(0.0, 0.6, n)),
+                'obi': rng.uniform(-1.0, 1.0, n),
+                'inter_event_time': rng.exponential(0.5, n),
+                'micro_atr': np.abs(rng.normal(0.2, 0.03, n)),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clf = RegimeClassifier(n_regimes=4)
+            clf.fit(df, output_dir=tmpdir)
+            meta = clf.predict_regime_meta(df)
+
+        expected_cols = [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS]
+        self.assertEqual(list(meta.columns), expected_cols)
+        self.assertEqual(meta.shape, (n, len(expected_cols)))
+        np.testing.assert_allclose(meta.loc[:, list(REGIME_ONE_HOT_COLS)].sum(axis=1).values, 1.0)
+        self.assertTrue(((meta.loc[:, list(REGIME_META_SCORE_COLS)].values >= 0.0) & (meta.loc[:, list(REGIME_META_SCORE_COLS)].values <= 1.0)).all())
+
+    def test_stage1_cached_meta_surface_rejects_old_dimension(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            np.save(os.path.join(tmpdir, 'meta_features_oof_v19.npy'), np.zeros((5, 6), dtype=np.float32))
+            np.save(os.path.join(tmpdir, 'meta_coverage_v19.npy'), np.ones(5, dtype=np.uint8))
+            for name in ('catboost_advisor_v19.cbm', 'catboost_classes_v19.json', 'regime_classifier.pkl'):
+                with open(os.path.join(tmpdir, name), 'wb') as f:
+                    f.write(b'0')
+            with self.assertRaises(ValueError):
+                _load_required_stage1_artifacts(tmpdir, n_rows=5)
+
+    def test_feature_factory_rejects_old_schema_surface(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            schema = {
+                'version': 'v19-event-binary',
+                'seq_len': 50,
+                'stat_features': ['cvd'],
+                'meta_features': ['cb_prob_long', 'cb_prob_short', 'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3'],
+                'visual_features': [],
+                'input_dim': 7,
+            }
+            with open(os.path.join(tmpdir, 'feature_schema_v19.json'), 'w') as f:
+                import json
+                json.dump(schema, f)
+            with self.assertRaises(ValueError):
+                V19FeatureFactory(tmpdir)
 
     def test_event_gate_respects_training_score_threshold(self):
         gate = EventGate(

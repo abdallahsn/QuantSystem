@@ -222,11 +222,11 @@ def _load_meta_features(
         raise ValueError(
             f'❌ meta features rows ({len(meta)}) do not match CSV rows ({n}) for explicit file {explicit_path}'
         )
-    if meta.shape[1] < expected_dim:
+    if meta.shape[1] != expected_dim:
         raise ValueError(
-            f'❌ meta features columns ({meta.shape[1]}) أقل من المطلوب ({expected_dim})'
+            f'❌ meta features columns ({meta.shape[1]}) لا تطابق schema المطلوب ({expected_dim})'
         )
-    return meta[:, :expected_dim]
+    return meta
 
 
 def _equity_metrics(equity_curve: list[float]) -> tuple[float, float]:

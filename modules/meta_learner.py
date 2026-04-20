@@ -8,6 +8,7 @@ meta_learner.py — LSTM Meta-Learner (V19 Core Brain)
     • الـ 25 Feature الكلاسيكية (CVD, OBI, Absorption...)
     • 2 احتمالات من CatBoost   (P_LONG, P_SHORT)
     • 4 One-Hot للـ Cluster     (Cluster 0..3)
+    • 3 Soft Regime Scores      (volatile/trend/low-liq)
 
 Architecture:
   CNN Branch:   Input(50,20,3) → DeepLOBCNN → (8,) per timestep
@@ -36,6 +37,7 @@ from sklearn.metrics import classification_report
 BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
 N_CB_PROBS   = 2   # P_LONG, P_SHORT
+N_REGIME_SCORES = 3
 
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
@@ -70,8 +72,9 @@ class MetaLearnerLSTM:
       - الفيتشرز الإحصائية (n_stat)
       - احتمالات CatBoost (2)
       - One-Hot Cluster (4)
+      - Soft Regime Scores (3)
       - Visual Embeddings من CNN (8)
-      المجموع: n_stat + 2 + 4 + 8 feature per timestep
+      المجموع: n_stat + 2 + 4 + 3 + 8 feature per timestep
     """
 
     def __init__(self,
@@ -87,7 +90,7 @@ class MetaLearnerLSTM:
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
         self.n_visual     = n_visual_emb
-        self.n_meta       = N_CB_PROBS + N_CLUSTERS          # 2 + 4 = 6
+        self.n_meta       = N_CB_PROBS + N_CLUSTERS + N_REGIME_SCORES
         self.n_total      = n_stat_feat + self.n_meta + n_visual_emb
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1
