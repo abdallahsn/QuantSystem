@@ -39,6 +39,27 @@ N_CLUSTERS   = 4
 N_CB_PROBS   = 2   # P_LONG, P_SHORT
 N_REGIME_SCORES = 3
 
+
+def _normalize_model_input_shape(model) -> tuple | None:
+    shape = getattr(model, 'input_shape', None)
+    if shape is None:
+        inputs = getattr(model, 'inputs', None)
+        if isinstance(inputs, (list, tuple)) and inputs:
+            shape = getattr(inputs[0], 'shape', None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(dim) if dim is not None else None for dim in tuple(shape))
+    except Exception:
+        return None
+
+
+def _input_shape_matches(model, seq_len: int, n_total: int) -> bool:
+    shape = _normalize_model_input_shape(model)
+    if shape is None or len(shape) < 3:
+        return False
+    return shape[-2:] == (int(seq_len), int(n_total))
+
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
     class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
@@ -106,12 +127,21 @@ class MetaLearnerLSTM:
 
         if os.path.exists(brain_file):
             try:
-                self.model   = tf.keras.models.load_model(
+                loaded_model = tf.keras.models.load_model(
                     brain_file, compile=False,
                     custom_objects={'WarmupCosineDecay': WarmupCosineDecay})
-                self._recompile()
-                self._fitted = True
-                print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
+                if not _input_shape_matches(loaded_model, self.seq_len, self.n_total):
+                    found_shape = _normalize_model_input_shape(loaded_model)
+                    print(
+                        "[MetaLearner] ⚠️ stale model input shape "
+                        f"{found_shape} != expected (None, {self.seq_len}, {self.n_total}) — rebuilding"
+                    )
+                    self.model = self._build()
+                else:
+                    self.model = loaded_model
+                    self._recompile()
+                    self._fitted = True
+                    print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
             except Exception as e:
                 print(f"[MetaLearner] ⚠️ ({e}) — بنبني جديد")
                 self.model = self._build()

@@ -18,11 +18,19 @@ from prepare_training_data import _require_causal_label_runtime
 from modules.dynamic_labels import EventGate
 from modules.feature_factory_v19 import V19FeatureFactory
 from modules.labels_v22 import _compute_adaptive_horizons
+from modules.meta_learner import _input_shape_matches
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
 from train_v19 import _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
 
 
 class LeakageGuardTests(unittest.TestCase):
+    def test_meta_learner_rejects_stale_input_shape(self):
+        class FakeModel:
+            input_shape = (None, 50, 45)
+
+        self.assertFalse(_input_shape_matches(FakeModel(), seq_len=50, n_total=48))
+        self.assertTrue(_input_shape_matches(FakeModel(), seq_len=50, n_total=45))
+
     def test_adaptive_horizons_are_causal(self):
         atr = np.full(64, 2.0, dtype=np.float64)
         future_spike = atr.copy()
