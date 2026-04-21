@@ -34,8 +34,9 @@ from modules.slippage_model import DailyLossGuard
 try:
     from modules.deeplob_cnn import DeepLOBCNN
     DEEPLOB_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     DEEPLOB_AVAILABLE = False
+    print(f"  ⚠️ DeepLOB inference غير متاح — {exc}")
 
 try:
     from catboost import CatBoostClassifier

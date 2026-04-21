@@ -25,13 +25,37 @@ import pickle
 import math
 from collections import deque
 
+
+def _configure_matplotlib_backend() -> None:
+    """
+    Keras قد يستورد matplotlib أثناء bootstrap.
+    على السيرفرات headless أو بيئات Jupyter الموروثة نثبت backend آمن.
+    """
+    backend = (os.environ.get('MPLBACKEND') or '').strip()
+    backend_l = backend.lower()
+
+    if backend_l.startswith('module://matplotlib_inline'):
+        os.environ['MPLBACKEND'] = 'Agg'
+        return
+
+    if backend:
+        return
+
+    if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+        return
+
+    os.environ['MPLBACKEND'] = 'Agg'
+
+
+_configure_matplotlib_backend()
+
 try:
     import tensorflow as tf
     from tensorflow.keras import layers, Model
     TF_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     TF_AVAILABLE = False
-    print("  ⚠️  TensorFlow غير مثبّت — DeepLOB CNN غير متاح")
+    print(f"  ⚠️  TensorFlow/DeepLOB غير متاح — {exc}")
 
 # ── ثوابت ────────────────────────────────────────────────────────
 N_TIME_STEPS   = 50    # طول النافذة الزمنية

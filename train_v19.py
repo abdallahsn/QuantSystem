@@ -210,7 +210,8 @@ def _load_deeplob_runtime():
         from modules.deeplob_cnn import DeepLOBCNN
 
         return DeepLOBCNN, True
-    except ImportError:
+    except Exception as exc:
+        print(f"  ⚠️ DeepLOB runtime غير متاح — {exc}")
         return None, False
 
 

@@ -21,7 +21,8 @@ from train_v19 import _align_lob_to_rows, _load_lob_inputs, run_training_pipelin
 try:
     from modules.deeplob_cnn import DeepLOBCNN, VISUAL_EMB_DIM
     DEEPLOB_AVAILABLE = True
-except ImportError:
+except Exception as exc:
+    print(f"  ⚠️ DeepLOB walkforward غير متاح — {exc}")
     VISUAL_EMB_DIM = 8
     DEEPLOB_AVAILABLE = False
 

@@ -1491,9 +1491,9 @@ def _load_deeplob_components() -> bool:
         N_PRICE_LEVELS = _N_PRICE_LEVELS
         N_CHANNELS = _N_CHANNELS
         DEEPLOB_AVAILABLE = True
-    except ImportError:
+    except Exception as exc:
         DEEPLOB_AVAILABLE = False
-        print("  ⚠️ DeepLOB module غير متاح")
+        print(f"  ⚠️ DeepLOB module غير متاح — {exc}")
 
     return DEEPLOB_AVAILABLE
 
