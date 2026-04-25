@@ -269,6 +269,57 @@ def _expand_directional_rows(
     return out
 
 
+def _coverage_sidecar_candidates(
+    path: str | None,
+    models_dir: str | None,
+    coverage_name: str,
+) -> list[str]:
+    seen = set()
+    candidates = []
+    for base in (
+        os.path.dirname(os.path.abspath(path)) if path else None,
+        os.path.abspath(models_dir) if models_dir else None,
+    ):
+        if not base:
+            continue
+        candidate = os.path.join(base, coverage_name)
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    return candidates
+
+
+def _expand_compact_rows_with_coverage(
+    arr: np.ndarray,
+    expected_dim: int,
+    *,
+    path: str,
+    models_dir: str | None,
+    coverage_name: str,
+    kind: str,
+    dtype=np.float32,
+) -> np.ndarray:
+    coerced = _coerce_row_aligned_array(arr, expected_dim, dtype=dtype)
+    for coverage_path in _coverage_sidecar_candidates(path, models_dir, coverage_name):
+        if not os.path.exists(coverage_path):
+            continue
+
+        coverage = np.asarray(np.load(coverage_path)).reshape(-1).astype(bool)
+        if int(coverage.sum()) != len(coerced):
+            continue
+
+        out = np.zeros((len(coverage), expected_dim), dtype=dtype)
+        out[coverage] = coerced
+        print(
+            f"  ℹ️ Expanded compact {kind} via coverage mask: "
+            f"{len(coerced):,} -> {len(coverage):,} "
+            f"({os.path.basename(path)} + {os.path.basename(coverage_path)})"
+        )
+        return out
+
+    return coerced
+
+
 def _load_visual_embeddings(
     df: pd.DataFrame,
     explicit_path: str | None,
@@ -287,9 +338,18 @@ def _load_visual_embeddings(
     vis = np.asarray(vis, dtype=np.float32)
     if vis.ndim != 2:
         raise ValueError(f'❌ visual embeddings must be 2D, got {vis.shape}')
+    vis = _expand_compact_rows_with_coverage(
+        vis,
+        expected_dim,
+        path=path,
+        models_dir=models_dir,
+        coverage_name='visual_coverage_v19.npy',
+        kind='visual embeddings',
+        dtype=np.float32,
+    )
 
     if len(vis) == n:
-        return _coerce_row_aligned_array(vis, expected_dim, dtype=np.float32)
+        return vis
 
     expanded = _expand_directional_rows(
         df,
@@ -302,19 +362,22 @@ def _load_visual_embeddings(
     if expanded is not None:
         return expanded
 
+    directional_rows = int(_directional_event_mask(df).sum())
     if explicit_path:
         raise ValueError(
             f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) '
-            f'or directional-event rows for explicit file {path}'
+            f'or directional-event rows ({directional_rows}) for explicit file {path}. '
+            'This usually means the embeddings were produced from a different '
+            'training CSV, or from a compact covered-rows artifact without a '
+            'matching visual_coverage_v19.npy sidecar.'
         )
 
     if len(vis) < n:
         out = zero.copy()
-        coerced = _coerce_row_aligned_array(vis, expected_dim, dtype=np.float32)
-        out[:len(coerced)] = coerced
+        out[:len(vis)] = vis
         return out
 
-    return _coerce_row_aligned_array(vis[:n], expected_dim, dtype=np.float32)
+    return vis[:n]
 
 
 def _load_meta_features(
@@ -719,6 +782,7 @@ def main():
         explicit_path=args.visual_npy,
         default_path=engine.visual_emb_path,
         expected_dim=len(engine.visual_features),
+        models_dir=args.models,
     )
     meta_features = _load_meta_features(
         df,
