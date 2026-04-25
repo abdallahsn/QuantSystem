@@ -213,6 +213,31 @@ def _load_csv(path: str) -> pd.DataFrame:
     return df
 
 
+def _filter_backtest_window(
+    df: pd.DataFrame,
+    start_ts: str | None = None,
+    end_ts: str | None = None,
+) -> pd.DataFrame:
+    if 'ts_event' not in df.columns or (start_ts is None and end_ts is None):
+        return df.copy()
+
+    out = df.copy()
+    ts = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    mask = pd.Series(True, index=out.index)
+
+    if start_ts is not None:
+        start = pd.to_datetime(start_ts, utc=True, errors='coerce')
+        if not pd.isna(start):
+            mask &= ts >= start.tz_localize(None)
+
+    if end_ts is not None:
+        end = pd.to_datetime(end_ts, utc=True, errors='coerce')
+        if not pd.isna(end):
+            mask &= ts < end.tz_localize(None)
+
+    return out.loc[mask].reset_index(drop=True)
+
+
 def _directional_event_mask(df: pd.DataFrame) -> np.ndarray:
     event_flag = pd.to_numeric(df.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
     train_event_flag = pd.to_numeric(df.get('train_event_flag', event_flag), errors='coerce').fillna(0).astype(np.int8)

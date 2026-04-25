@@ -43,6 +43,29 @@ def test_visual_embeddings_expand_from_directional_event_rows(tmp_path):
     assert np.allclose(out[3], [0.0, 0.0])
 
 
+def test_visual_embeddings_expand_compact_rows_via_coverage_sidecar(tmp_path):
+    df = _sample_df()
+    vis = np.array([[7.0, 8.0]], dtype=np.float32)
+    path = tmp_path / "visual_embeddings_v19.npy"
+    cov_path = tmp_path / "visual_coverage_v19.npy"
+    np.save(path, vis)
+    np.save(cov_path, np.array([1, 0], dtype=np.uint8))
+
+    out = _load_visual_embeddings(
+        df,
+        explicit_path=str(path),
+        default_path=None,
+        expected_dim=2,
+        models_dir=str(tmp_path),
+    )
+
+    assert out.shape == (len(df), 2)
+    assert np.allclose(out[0], [0.0, 0.0])
+    assert np.allclose(out[1], [7.0, 8.0])
+    assert np.allclose(out[2], [0.0, 0.0])
+    assert np.allclose(out[3], [0.0, 0.0])
+
+
 def test_meta_features_expand_from_directional_event_rows(tmp_path):
     df = _sample_df()
     meta = np.array(
