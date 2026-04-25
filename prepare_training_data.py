@@ -349,7 +349,8 @@ def _process_mbo_chunk(args):
         hawkes_val   = hawkes.update(ts_ns, action)
 
         # تحديث سياق اليوم (حتى بدون تنفيذ Trade)
-        ib_stat, r_fuel, f_exh = daily_ctx.update(ts, price)
+        daily_ctx_values = daily_ctx.update(ts, price)
+        ib_stat, r_fuel, f_exh = daily_ctx_values[:3]
 
         if action in TRADE_ACTIONS:
             is_buy = False
@@ -484,7 +485,8 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
         lsweep       = sweep.update(price)
         hawkes_val   = hawkes.update(ts_ns, action)
 
-        ib_stat, r_fuel, f_exh = daily_ctx.update(ts, price)
+        daily_ctx_values = daily_ctx.update(ts, price)
+        ib_stat, r_fuel, f_exh = daily_ctx_values[:3]
 
         if action in TRADE_ACTIONS:
             is_buy = False

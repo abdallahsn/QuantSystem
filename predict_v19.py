@@ -488,7 +488,13 @@ class V19PredictionEngine:
             ts_parsed = pd.Timestamp(ts, tz='UTC') if ts is not None else pd.Timestamp.utcnow()
             price_now = float(stat_features.get('price', stat_features.get('close', 0.0)))
             if price_now > 0:
-                ib_st, rem_fuel, fuel_ex, adr_p = self._daily_ctx.update(ts_parsed, price_now)
+                daily_ctx_values = self._daily_ctx.update(ts_parsed, price_now)
+                ib_st, rem_fuel, fuel_ex = daily_ctx_values[:3]
+                adr_p = (
+                    daily_ctx_values[3]
+                    if len(daily_ctx_values) >= 4
+                    else float(getattr(self._daily_ctx, 'adr_pips', 80.0))
+                )
                 result['remaining_fuel'] = round(rem_fuel, 6)
                 result['adr_pips']       = round(adr_p, 1)
                 result['ib_status']      = ib_st
