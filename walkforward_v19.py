@@ -21,8 +21,7 @@ from train_v19 import _align_lob_to_rows, _load_lob_inputs, run_training_pipelin
 try:
     from modules.deeplob_cnn import DeepLOBCNN, VISUAL_EMB_DIM
     DEEPLOB_AVAILABLE = True
-except Exception as exc:
-    print(f"  ⚠️ DeepLOB walkforward غير متاح — {exc}")
+except ImportError:
     VISUAL_EMB_DIM = 8
     DEEPLOB_AVAILABLE = False
 
@@ -230,8 +229,6 @@ def run_walkforward(
             round_trip_cost_pips=float(bt_cfg.get('round_trip_cost_pips', 1.0)),
             max_size=int(bt_cfg.get('max_size', 5)),
             starting_equity=float(bt_cfg.get('starting_equity', 100000.0)),
-            single_position_only=bool(bt_cfg.get('single_position_only', True)),
-            cooldown_rows=int(bt_cfg.get('cooldown_rows', 0)),
         )
 
         fold_report = {

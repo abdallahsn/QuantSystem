@@ -748,6 +748,12 @@ def _load_lob_inputs(lob_path: str | None, lob_ts_path: str | None):
         ts = pd.to_datetime(ts_raw.astype(np.int64), unit='ns', utc=True, errors='coerce').tz_localize(None)
     else:
         ts = pd.to_datetime(pd.Series(range(len(tensors))), unit='s', utc=True, errors='coerce').dt.tz_localize(None)
+    if len(ts) != len(tensors):
+        print(
+            "  ⚠️ LOB tensors/timestamps length mismatch: "
+            f"tensors={len(tensors):,}, timestamps={len(ts):,}. "
+            f"Visual stage will use the first {min(len(tensors), len(ts)):,} aligned items only."
+        )
     return tensors, pd.Series(ts)
 
 
@@ -755,15 +761,17 @@ def _align_lob_to_rows(
     df: pd.DataFrame,
     lob_timestamps: pd.Series,
     max_age: str = '5s',
+    max_tensors: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_lob = len(lob_timestamps) if max_tensors is None else min(len(lob_timestamps), int(max_tensors))
     row_ts = _time_series(df, 'ts_event')
     row_df = pd.DataFrame({
         'ts_event': row_ts,
         'row_idx': np.arange(len(df), dtype=np.int32),
     })
     lob_df = pd.DataFrame({
-        'ts_event': pd.to_datetime(lob_timestamps, utc=True, errors='coerce').dt.tz_localize(None),
-        'tensor_idx': np.arange(len(lob_timestamps), dtype=np.int32),
+        'ts_event': pd.to_datetime(pd.Series(lob_timestamps).iloc[:n_lob], utc=True, errors='coerce').dt.tz_localize(None),
+        'tensor_idx': np.arange(n_lob, dtype=np.int32),
     }).dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
 
     row_merged = pd.merge_asof(
@@ -777,8 +785,8 @@ def _align_lob_to_rows(
     row_to_tensor = row_merged['tensor_idx'].fillna(-1).astype(np.int32).values
 
     obi_series = df.get('obi', pd.Series(np.zeros(len(df)))).fillna(0).astype(np.float32)
-    tensor_targets = np.zeros(len(lob_timestamps), dtype=np.float32)
-    tensor_target_seen = np.zeros(len(lob_timestamps), dtype=bool)
+    tensor_targets = np.zeros(n_lob, dtype=np.float32)
+    tensor_target_seen = np.zeros(n_lob, dtype=bool)
     tensor_rows = pd.merge_asof(
         lob_df,
         row_df.sort_values('ts_event'),
@@ -825,13 +833,19 @@ def stage2_oof_visual_embeddings(
         np.save(os.path.join(output_dir, 'visual_coverage_v19.npy'), zero_cov.astype(np.uint8))
         return zero_emb, zero_cov
 
-    row_to_tensor, tensor_targets, tensor_target_seen = _align_lob_to_rows(df, lob_timestamps)
+    row_to_tensor, tensor_targets, tensor_target_seen = _align_lob_to_rows(
+        df,
+        lob_timestamps,
+        max_tensors=len(lob_tensors),
+    )
     row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
     row_cov = np.zeros(n_rows, dtype=bool)
 
     metrics = {
         'n_rows': int(n_rows),
-        'n_tensors': int(len(lob_tensors)),
+        'n_tensors': int(min(len(lob_tensors), len(lob_timestamps))),
+        'n_tensors_raw': int(len(lob_tensors)),
+        'n_timestamps_raw': int(len(lob_timestamps)),
         'rows_with_tensor': int(np.sum(row_to_tensor >= 0)),
         'folds': [],
     }

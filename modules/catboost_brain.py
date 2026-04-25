@@ -61,9 +61,6 @@ class CatBoostQuantBrain:
                  # 12 شمعة × 5 دقائق = 60 دقيقة من السياق الزمني
                  # CatBoost يرى الآن mean/std آخر 12 شمعة لكل feature
                  # بدلاً من لقطة واحدة فقط → يعرف أين هو في الترند
-
-
-
                  ):
 
         # ندمج أسماء الميزات الأصلية مع أسماء الـ Embeddings
@@ -396,9 +393,7 @@ class CatBoostQuantBrain:
         bias_idx   = int(np.argmax(probs))
         confidence = float(probs[bias_idx])
         bias       = BIAS_LABELS[bias_idx]
-        tradeable  = (confidence >= self.confidence_threshold
-                      and bias != 'NEUTRAL')
-
+        tradeable  = (confidence >= self.confidence_threshold and bias != 'NEUTRAL')
         return {
             'bias':        bias,
             'bias_idx':    bias_idx,

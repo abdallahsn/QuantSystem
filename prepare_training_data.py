@@ -41,7 +41,7 @@ from modules.dynamic_labels         import (DIR_NEUTRAL,
 from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
-from modules.regime_classifier       import RegimeClassifier, REGIME_META_SCORE_COLS
+from modules.regime_classifier       import RegimeClassifier
 from modules.slippage_model          import SlippageModel
 from modules.session_features        import add_session_features, SESSION_FEATURE_COLS, SessionVWAPEngine # 🔴 إضافة VWAP
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
@@ -191,8 +191,7 @@ RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_F
 META_FEATURE_COLS = [
     'cb_prob_long', 'cb_prob_short',                       # 2 احتمالات CatBoost
     'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',   # 4 One-Hot Cluster
-    *list(REGIME_META_SCORE_COLS),                        # 3 Soft regime scores
-]  # N = 9
+]  # N = 6
 
 # V19 Visual Features — مخرجات CNN
 VISUAL_EMB_COLS = [f'vis_emb_{i}' for i in range(8)]  # N = 8
@@ -1212,24 +1211,6 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
     
     return df
 
-
-def _require_causal_label_runtime(label_mode: str) -> None:
-    requested = str(label_mode or '').strip().lower()
-    if requested not in {'v19', 'v22'}:
-        return
-    if V19_LABELS_AVAILABLE:
-        return
-    if os.environ.get('QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS', '').strip() == '1':
-        print("  ⚠️ Fallback session labeling override enabled via QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1")
-        return
-
-    detail = f" Import error: {V19_LABELS_IMPORT_ERROR}" if V19_LABELS_IMPORT_ERROR is not None else ''
-    raise RuntimeError(
-        "❌ Causal v19/v22 labels are unavailable, and the unsafe session-label fallback is disabled by default."
-        " Fix the label runtime or set QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1 to override."
-        f"{detail}"
-    )
-
 def run_refinery(
     mbo_path,
     mbp_path,
@@ -1325,8 +1306,6 @@ def run_refinery(
     print("\n⚙️  Step 3d — Daily/Weekly Levels...")
     df_merged = compute_daily_weekly_levels(df_merged)
 
-    _require_causal_label_runtime(label_mode)
-
     if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
         label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
         print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
@@ -1343,7 +1322,7 @@ def run_refinery(
             trend_strength_min=trend_strength_min,
         )
     else:
-        print("\n⚙️  Step 4 — Fallback Session Labeling (override enabled)...")
+        print("\n⚙️  Step 4 — Fallback Session Labeling...")
         if V19_LABELS_IMPORT_ERROR is not None:
             print(f"  ⚠️ V19 labels import failed: {V19_LABELS_IMPORT_ERROR}")
         df_labeled = _label_sessions(df_merged)
@@ -1491,9 +1470,9 @@ def _load_deeplob_components() -> bool:
         N_PRICE_LEVELS = _N_PRICE_LEVELS
         N_CHANNELS = _N_CHANNELS
         DEEPLOB_AVAILABLE = True
-    except Exception as exc:
+    except ImportError:
         DEEPLOB_AVAILABLE = False
-        print(f"  ⚠️ DeepLOB module غير متاح — {exc}")
+        print("  ⚠️ DeepLOB module غير متاح")
 
     return DEEPLOB_AVAILABLE
 

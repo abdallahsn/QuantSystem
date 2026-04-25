@@ -481,18 +481,16 @@ class EventGate:
     def __init__(
         self,
         roll_window: int = 50,
-        vol_mult: float = 1.10,
-        obi_thr: float = 0.08,
-        wall_str_thr: float = 0.70,
+        vol_mult: float = 1.45,
+        obi_thr: float = 0.40,
+        wall_str_thr: float = 1.025,
         shift_z_thr: float = 0.75,
-        score_threshold: float = 0.0,
     ):
         self.roll_window = max(int(roll_window), 1)
         self.vol_mult = float(vol_mult)
         self.obi_thr = float(obi_thr)
         self.wall_str_thr = float(wall_str_thr)
         self.shift_z_thr = float(shift_z_thr)
-        self.score_threshold = max(float(score_threshold), 0.0)
         self._volume_hist = deque(maxlen=self.roll_window)
         self._shift_hist = {col: deque(maxlen=self.roll_window) for col in EVENT_SHIFT_COLS}
 
@@ -544,12 +542,9 @@ class EventGate:
         cond_wall = bool((bid_wall > self.wall_str_thr) or (ask_wall > self.wall_str_thr))
 
         shift_hits = []
-        shift_peak = 0.0
         for col in EVENT_SHIFT_COLS:
             current = self._pick(row, f"raw__{col}", col, default=0.0)
-            zscore = abs(self._current_zscore(col, current))
-            shift_peak = max(shift_peak, zscore)
-            if zscore > self.shift_z_thr:
+            if abs(self._current_zscore(col, current)) > self.shift_z_thr:
                 shift_hits.append(col)
         cond_shift = bool(shift_hits)
 
@@ -568,23 +563,7 @@ class EventGate:
         if cond_shift:
             reasons.append("shift")
 
-        vol_mean_safe = max(vol_mean, 1e-9)
-        trigger_count = int(cond_vol) + int(cond_obi) + int(cond_wall) + int(cond_shift)
-        vol_excess = max((volume / vol_mean_safe) / max(self.vol_mult, 1e-6) - 1.0, 0.0) if vol_mean > 0 else float(cond_vol)
-        obi_excess = max(abs(obi) / max(self.obi_thr, 1e-6) - 1.0, 0.0)
-        wall_excess = max(max(bid_wall, ask_wall) / max(self.wall_str_thr, 1e-6) - 1.0, 0.0)
-        shift_excess = max(shift_peak / max(self.shift_z_thr, 1e-6) - 1.0, 0.0)
-        score = (
-            0.30 * vol_excess
-            + 0.30 * obi_excess
-            + 0.20 * wall_excess
-            + 0.20 * shift_excess
-            + 0.50 * max(float(trigger_count) - 1.0, 0.0)
-        )
-        base_event = bool(cond_vol or cond_obi or cond_wall or cond_shift)
-        passed = bool(base_event and score >= self.score_threshold)
-        if base_event and not passed:
-            reasons.append("score")
+        passed = bool(cond_vol or cond_obi or cond_wall or cond_shift)
         return {
             "passed": passed,
             "reason": "|".join(reasons) if reasons else "quiet",
@@ -594,9 +573,6 @@ class EventGate:
                 "cond_wall": cond_wall,
                 "cond_shift": cond_shift,
                 "shift_hits": shift_hits,
-                "score": round(float(score), 6),
-                "score_threshold": round(float(self.score_threshold), 6),
-                "trigger_count": int(trigger_count),
             },
         }
 

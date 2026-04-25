@@ -25,23 +25,6 @@ REGIME_NAMES = {
     3: 'Low_Liquidity',
 }
 
-REGIME_ONE_HOT_COLS = (
-    'cluster_0',
-    'cluster_1',
-    'cluster_2',
-    'cluster_3',
-)
-REGIME_SCORE_COLS = (
-    'volatile_score',
-    'trend_score',
-    'low_liq_score',
-)
-REGIME_META_SCORE_COLS = (
-    'regime_volatile_score',
-    'regime_trend_score',
-    'regime_low_liq_score',
-)
-
 REGIME_TRADEABLE = {
     0: True,   
     1: False,  
@@ -108,46 +91,13 @@ def _pct_rank(series: pd.Series) -> pd.Series:
     return series.rank(method='average', pct=True).astype(np.float64)
 
 
-def _score_band(series: pd.Series, low: float, high: float) -> pd.Series:
-    values = pd.to_numeric(series, errors='coerce').fillna(0.0).astype(np.float64)
-    lo = float(low)
-    hi = float(high)
-    if not np.isfinite(lo):
-        lo = 0.0
-    if not np.isfinite(hi):
-        hi = lo + 1.0
-    if hi <= lo + 1e-9:
-        return (values > lo).astype(np.float64)
-    return ((values - lo) / (hi - lo)).clip(0.0, 1.0).astype(np.float64)
-
-
-def _build_rule_scores(X: pd.DataFrame, stats: dict | None = None) -> pd.DataFrame:
-    stats = stats or {}
-
-    high_vol_q = float(stats.get('high_vol_q', X['volatility'].quantile(0.75)))
-    extreme_vol_q = float(stats.get('extreme_vol_q', X['volatility'].quantile(0.90)))
-    low_activity_q = float(stats.get('low_activity_q', X['activity'].quantile(0.30)))
-    activity_med = float(stats.get('activity_med', X['activity'].median()))
-    activity_high_q = float(stats.get('activity_high_q', X['activity'].quantile(0.80)))
-    low_volume_q = float(stats.get('low_volume_q', X['volume_ratio'].quantile(0.30)))
-    volume_med = float(stats.get('volume_med', X['volume_ratio'].median()))
-    volume_high_q = float(stats.get('volume_high_q', X['volume_ratio'].quantile(0.80)))
-    cvd_q = float(stats.get('cvd_q', X['cvd_strength'].quantile(0.45)))
-    cvd_high_q = float(stats.get('cvd_high_q', X['cvd_strength'].quantile(0.80)))
-    trend_eff_q = float(stats.get('trend_eff_q', X['trend_efficiency'].quantile(0.45)))
-    trend_high_q = float(stats.get('trend_high_q', X['trend_efficiency'].quantile(0.75)))
-    imbalance_q = float(stats.get('imbalance_q', X['imbalance'].quantile(0.50)))
-    imbalance_high_q = float(stats.get('imbalance_high_q', X['imbalance'].quantile(0.80)))
-
-    vol_rank = _score_band(X['volatility'], high_vol_q, extreme_vol_q)
-    activity_rank = _score_band(X['activity'], activity_med, activity_high_q)
-    volume_rank = _score_band(X['volume_ratio'], volume_med, volume_high_q)
-    cvd_rank = _score_band(X['cvd_strength'], cvd_q, cvd_high_q)
-    trend_rank = _score_band(X['trend_efficiency'], trend_eff_q, trend_high_q)
-    imbalance_rank = _score_band(X['imbalance'], imbalance_q, imbalance_high_q)
-    low_activity_rank = 1.0 - _score_band(X['activity'], low_activity_q, activity_med)
-    low_volume_rank = 1.0 - _score_band(X['volume_ratio'], low_volume_q, volume_med)
-    low_cvd_rank = 1.0 - _score_band(X['cvd_strength'], cvd_q, cvd_high_q)
+def _build_rule_scores(X: pd.DataFrame) -> pd.DataFrame:
+    vol_rank = _pct_rank(X['volatility'])
+    activity_rank = _pct_rank(X['activity'])
+    volume_rank = _pct_rank(X['volume_ratio'])
+    cvd_rank = _pct_rank(X['cvd_strength'])
+    trend_rank = _pct_rank(X['trend_efficiency'])
+    imbalance_rank = _pct_rank(X['imbalance'])
 
     scores = pd.DataFrame(index=X.index)
     scores['volatile_score'] = (
@@ -163,9 +113,9 @@ def _build_rule_scores(X: pd.DataFrame, stats: dict | None = None) -> pd.DataFra
         + 0.10 * imbalance_rank
     )
     scores['low_liq_score'] = (
-        0.60 * low_activity_rank
-        + 0.30 * low_volume_rank
-        + 0.10 * low_cvd_rank
+        0.60 * (1.0 - activity_rank)
+        + 0.30 * (1.0 - volume_rank)
+        + 0.10 * (1.0 - cvd_rank)
     )
     return scores.fillna(0.0).astype(np.float64)
 
@@ -186,12 +136,11 @@ class RegimeClassifier:
         X = _build_regime_features(df)
         requested_model = (self.model_type or 'auto').strip().lower()
         use_rules = requested_model in ('auto', 'rules')
-        if not X.empty:
-            self._fit_rules(X)
 
         if use_rules:
             self.model = None
             self.scaler = None
+            self._fit_rules(X)
             labels = self._predict_rules(X)
             self._labels = labels
             self._cluster_names = [REGIME_NAMES[i] for i in range(self.n_regimes)]
@@ -250,6 +199,7 @@ class RegimeClassifier:
         self.model = model
 
     def _fit_rules(self, X: pd.DataFrame):
+        scores = _build_rule_scores(X)
         self.rule_stats = {
             'low_activity_q': float(X['activity'].quantile(0.30)),
             'low_volume_q': float(X['volume_ratio'].quantile(0.30)),
@@ -259,28 +209,17 @@ class RegimeClassifier:
             'cvd_q': float(X['cvd_strength'].quantile(0.45)),
             'activity_med': float(X['activity'].median()),
             'volume_med': float(X['volume_ratio'].median()),
-            'activity_high_q': float(X['activity'].quantile(0.80)),
-            'volume_high_q': float(X['volume_ratio'].quantile(0.80)),
-            'cvd_high_q': float(X['cvd_strength'].quantile(0.80)),
-            'trend_high_q': float(X['trend_efficiency'].quantile(0.75)),
-            'imbalance_q': float(X['imbalance'].quantile(0.50)),
-            'imbalance_high_q': float(X['imbalance'].quantile(0.80)),
+            'volatile_score_q': float(scores['volatile_score'].quantile(0.82)),
+            'trend_score_q': float(scores['trend_score'].quantile(0.58)),
+            'low_liq_score_q': float(scores['low_liq_score'].quantile(0.80)),
         }
-        scores = _build_rule_scores(X, self.rule_stats)
-        self.rule_stats.update(
-            {
-                'volatile_score_q': float(scores['volatile_score'].quantile(0.82)),
-                'trend_score_q': float(scores['trend_score'].quantile(0.58)),
-                'low_liq_score_q': float(scores['low_liq_score'].quantile(0.80)),
-            }
-        )
 
     def _predict_rules(self, X: pd.DataFrame) -> np.ndarray:
         if X.empty:
             return np.zeros(0, dtype=np.int8)
 
         stats = self.rule_stats or {}
-        scores = _build_rule_scores(X, stats)
+        scores = _build_rule_scores(X)
 
         low_activity_q = float(stats.get('low_activity_q', X['activity'].quantile(0.30)))
         low_volume_q = float(stats.get('low_volume_q', X['volume_ratio'].quantile(0.30)))
@@ -320,21 +259,6 @@ class RegimeClassifier:
         labels[(low_liq & ~volatile).values] = 3
         labels[(trending & ~volatile & ~low_liq).values] = 0
         return labels
-
-    def _predict_labels_from_features(self, X: pd.DataFrame) -> np.ndarray:
-        if len(X) == 0:
-            return np.zeros(0, dtype=np.int8)
-        if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
-            return self._predict_rules(X)
-        X_scaled = self.scaler.transform(X)
-        clusters = self.model.predict(X_scaled)
-        return np.array([self._regime_map.get(int(c), 1) for c in clusters], dtype=np.int8)
-
-    def _predict_scores_from_features(self, X: pd.DataFrame) -> pd.DataFrame:
-        if len(X) == 0:
-            return pd.DataFrame(index=X.index, columns=list(REGIME_SCORE_COLS), dtype=np.float64)
-        scores = _build_rule_scores(X, self.rule_stats or {})
-        return scores.loc[:, list(REGIME_SCORE_COLS)].astype(np.float64)
 
     def _print_distribution(self, labels: np.ndarray):
         for regime_id in range(self.n_regimes):
@@ -401,44 +325,12 @@ class RegimeClassifier:
             return np.zeros(len(df), dtype=np.int8)
 
         X = _build_regime_features(df)
-        return self._predict_labels_from_features(X)
-
-    def predict_scores(self, df: pd.DataFrame) -> pd.DataFrame:
-        X = _build_regime_features(df)
-        if not self._fitted:
-            return pd.DataFrame(0.0, index=df.index, columns=list(REGIME_SCORE_COLS), dtype=np.float64)
-        return self._predict_scores_from_features(X)
-
-    def predict_regime_meta(self, df: pd.DataFrame) -> pd.DataFrame:
-        if len(df) == 0:
-            cols = list(REGIME_ONE_HOT_COLS) + list(REGIME_META_SCORE_COLS)
-            return pd.DataFrame(index=df.index, columns=cols, dtype=np.float32)
-
-        X = _build_regime_features(df)
-        scores = self._predict_scores_from_features(X) if self._fitted else pd.DataFrame(
-            0.0,
-            index=df.index,
-            columns=list(REGIME_SCORE_COLS),
-            dtype=np.float64,
-        )
-        labels = self._predict_labels_from_features(X) if self._fitted else np.zeros(len(df), dtype=np.int8)
-
-        out = pd.DataFrame(
-            0.0,
-            index=df.index,
-            columns=list(REGIME_ONE_HOT_COLS) + list(REGIME_META_SCORE_COLS),
-            dtype=np.float32,
-        )
-        if len(out):
-            row_idx = np.arange(len(out), dtype=np.int64)
-            safe_labels = np.clip(labels.astype(np.int64), 0, len(REGIME_ONE_HOT_COLS) - 1)
-            one_hot = out.loc[:, list(REGIME_ONE_HOT_COLS)].values
-            one_hot[row_idx, safe_labels] = 1.0
-            out.loc[:, list(REGIME_ONE_HOT_COLS)] = one_hot
-        out.loc[:, list(REGIME_META_SCORE_COLS)] = scores.rename(
-            columns=dict(zip(REGIME_SCORE_COLS, REGIME_META_SCORE_COLS))
-        ).loc[:, list(REGIME_META_SCORE_COLS)].astype(np.float32)
-        return out
+        if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
+            return self._predict_rules(X)
+        X_scaled = self.scaler.transform(X)
+        clusters = self.model.predict(X_scaled)
+        
+        return np.array([self._regime_map.get(int(c), 1) for c in clusters], dtype=np.int8)
 
     def predict_current(self, recent_bars: pd.DataFrame) -> dict:
         if not self._fitted or len(recent_bars) == 0:

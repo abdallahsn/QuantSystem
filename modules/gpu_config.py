@@ -16,10 +16,6 @@ GPU_AVAILABLE    = False
 GPU_NAME         = 'CPU'
 GPU_MEMORY_GB    = 0.0
 
-
-def _gpu_debug_enabled() -> bool:
-    return os.environ.get('QUANTSYSTEM_DEBUG_GPU_DETECT', '').strip() == '1'
-
 def detect_gpu() -> dict:
     """
     يكتشف الـ GPU المتاح ويرجع معلوماته بأمان تام
@@ -84,9 +80,8 @@ def detect_gpu() -> dict:
             GPU_NAME       = name
             GPU_MEMORY_GB  = info['memory_gb']
             return info
-    except Exception as exc:
-        if _gpu_debug_enabled():
-            print(f'  ⚠️ TensorFlow GPU detect failed: {exc}')
+    except Exception:
+        pass
 
     # 2. PyTorch Fallback
     try:
@@ -105,9 +100,8 @@ def detect_gpu() -> dict:
             GPU_AVAILABLE  = True
             GPU_NAME       = name
             GPU_MEMORY_GB  = info['memory_gb']
-    except Exception as exc:
-        if _gpu_debug_enabled():
-            print(f'  ⚠️ PyTorch GPU detect failed: {exc}')
+    except Exception:
+        pass
 
     return info
 

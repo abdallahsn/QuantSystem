@@ -9,16 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-
-try:
-    from modules.range_state_machine import apply_range_filter_to_dataframe
-    RSM_AVAILABLE = True
-except ImportError:
-    try:
-        from range_state_machine import apply_range_filter_to_dataframe
-        RSM_AVAILABLE = True
-    except ImportError:
-        RSM_AVAILABLE = False
 from pathlib import Path
 from typing import Any
 
@@ -227,9 +217,6 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
 
 def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
     hover_y = ((bars["high"] + bars["low"]) / 2.0).fillna(bars["close"]).astype(float)
-    raw_signal = bars.get("cb_direction_raw", bars["cb_direction"]).fillna("UNKNOWN").astype(str)
-    rsm_reason = bars.get("rsm_reason", pd.Series([""] * len(bars), index=bars.index)).fillna("").astype(str)
-    rsm_action = bars.get("rsm_action", pd.Series([""] * len(bars), index=bars.index)).fillna("").astype(str)
     customdata = np.column_stack(
         [
             bars["open"].astype(float).values,
@@ -248,9 +235,6 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             bars["kyle_lambda"].fillna(0.0).astype(float).values,
             bars["hawkes_intensity"].fillna(0.0).astype(float).values,
             bars["regime_label"].fillna("Ranging").astype(str).values,
-            raw_signal.values,
-            rsm_action.values,
-            rsm_reason.values,
         ]
     )
     return go.Scatter(
@@ -278,10 +262,7 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             "Absorption=%{customdata[12]:.3f}<br>"
             "Kyle λ=%{customdata[13]:.3f}<br>"
             "Hawkes=%{customdata[14]:.3f}<br>"
-            "Regime=%{customdata[15]}<br>"
-            "RawSignal=%{customdata[16]}<br>"
-            "RSM Action=%{customdata[17]}<br>"
-            "RSM Reason=%{customdata[18]}<extra></extra>"
+            "Regime=%{customdata[15]}<extra></extra>"
         ),
     )
 
@@ -362,8 +343,6 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                         bars.loc[mask, "cb_prob_long"].fillna(0.0).values,
                         bars.loc[mask, "cb_prob_short"].fillna(0.0).values,
                         bars.loc[mask, "regime_label"].fillna("Ranging").astype(str).values,
-                        bars.loc[mask].get("cb_direction_raw", bars.loc[mask, "cb_direction"]).fillna("UNKNOWN").astype(str).values,
-                        bars.loc[mask].get("rsm_reason", pd.Series([""] * int(mask.sum()), index=bars.loc[mask].index)).fillna("").astype(str).values,
                     ],
                     axis=1,
                 ),
@@ -376,9 +355,7 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
                     "Confidence=%{customdata[4]:.3f}<br>"
                     "P(LONG)=%{customdata[5]:.3f}<br>"
                     "P(SHORT)=%{customdata[6]:.3f}<br>"
-                    "Regime=%{customdata[7]}<br>"
-                    "RawSignal=%{customdata[8]}<br>"
-                    "RSM Reason=%{customdata[9]}<extra></extra>"
+                    "Regime=%{customdata[7]}<extra></extra>"
                 ),
             ),
             row=1,
@@ -706,7 +683,7 @@ def generate_catboost_5m_report(
     report_name: str = "catboost_5m",
     mbo_path: str = "",
     mbp_path: str = "",
-    max_bars: int = 0,
+    max_bars: int = 400,
     future_bars: int = 4,
 ) -> dict[str, Any]:
     output_dir = output_dir or models_dir
@@ -715,42 +692,8 @@ def generate_catboost_5m_report(
 
     pred_df = predict_catboost_frame(csv_path, models_dir)
     bars = _resample_catboost_bars(pred_df, freq=freq)
-    bars_before_limit = int(len(bars))
-    max_bars = int(max_bars or 0)
-    if max_bars > 0 and len(bars) > max_bars:
+    if len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
-        print(f"  ℹ️ 5m report capped to last {max_bars:,} bars (from {bars_before_limit:,})")
-
-    # ── تطبيق RangeStateMachine على الـ visualization ─────────────────
-    # يُظهر فقط الإشارات المؤكدة (N تأكيدات من الحافة الصحيحة)
-    # بدلاً من كل إشارة خام من CatBoost
-    if RSM_AVAILABLE and not bars.empty:
-        try:
-            regime_col = (
-                'regime_label' if 'regime_label' in bars.columns else
-                'regime_name' if 'regime_name' in bars.columns else
-                'regime'
-            )
-            bars = apply_range_filter_to_dataframe(
-                bars,
-                signal_col  = 'cb_direction',
-                conf_col    = 'cb_confidence',
-                price_col   = 'close',
-                regime_col  = regime_col,
-                tick_size   = 0.0001,
-                min_confirmations   = 3,
-                confirmation_window = 6,
-                min_candles_between = 4,
-            )
-            # استبدل cb_direction بالإشارة المفلترة للـ stats والرسم
-            bars['cb_direction_raw'] = bars['cb_direction'].copy()
-            bars['cb_direction']     = bars['rsm_direction']
-            bars['cb_direction_idx'] = bars['cb_direction'].map(
-                {'LONG': 0, 'SHORT': 1, 'NEUTRAL': 2}
-            ).fillna(2).astype(int)
-            print(f"  ✅ RSM applied: {(bars['rsm_action']=='ENTER').sum()} confirmed signals")
-        except Exception as _rsm_err:
-            print(f"  ⚠️ RSM skipped: {_rsm_err}")
 
     t_min = bars["ts_event"].min() if not bars.empty else pd.Timestamp.min
     t_max = bars["signal_time"].max() if not bars.empty and "signal_time" in bars.columns else pd.Timestamp.max
@@ -807,8 +750,6 @@ def generate_catboost_5m_report(
     summary = {
         "rows": int(len(pred_df)),
         "bars": int(len(bars)),
-        "bars_before_limit": bars_before_limit,
-        "bars_limit_applied": int(max_bars),
         "transitions": int(len(turns)),
         "direction_counts": bars["cb_direction"].value_counts().to_dict() if not bars.empty else {},
         "files": {

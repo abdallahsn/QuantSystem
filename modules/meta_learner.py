@@ -8,7 +8,6 @@ meta_learner.py — LSTM Meta-Learner (V19 Core Brain)
     • الـ 25 Feature الكلاسيكية (CVD, OBI, Absorption...)
     • 2 احتمالات من CatBoost   (P_LONG, P_SHORT)
     • 4 One-Hot للـ Cluster     (Cluster 0..3)
-    • 3 Soft Regime Scores      (volatile/trend/low-liq)
 
 Architecture:
   CNN Branch:   Input(50,20,3) → DeepLOBCNN → (8,) per timestep
@@ -37,28 +36,6 @@ from sklearn.metrics import classification_report
 BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
 N_CB_PROBS   = 2   # P_LONG, P_SHORT
-N_REGIME_SCORES = 3
-
-
-def _normalize_model_input_shape(model) -> tuple | None:
-    shape = getattr(model, 'input_shape', None)
-    if shape is None:
-        inputs = getattr(model, 'inputs', None)
-        if isinstance(inputs, (list, tuple)) and inputs:
-            shape = getattr(inputs[0], 'shape', None)
-    if shape is None:
-        return None
-    try:
-        return tuple(int(dim) if dim is not None else None for dim in tuple(shape))
-    except Exception:
-        return None
-
-
-def _input_shape_matches(model, seq_len: int, n_total: int) -> bool:
-    shape = _normalize_model_input_shape(model)
-    if shape is None or len(shape) < 3:
-        return False
-    return shape[-2:] == (int(seq_len), int(n_total))
 
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
@@ -93,9 +70,8 @@ class MetaLearnerLSTM:
       - الفيتشرز الإحصائية (n_stat)
       - احتمالات CatBoost (2)
       - One-Hot Cluster (4)
-      - Soft Regime Scores (3)
       - Visual Embeddings من CNN (8)
-      المجموع: n_stat + 2 + 4 + 3 + 8 feature per timestep
+      المجموع: n_stat + 2 + 4 + 8 feature per timestep
     """
 
     def __init__(self,
@@ -111,7 +87,7 @@ class MetaLearnerLSTM:
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
         self.n_visual     = n_visual_emb
-        self.n_meta       = N_CB_PROBS + N_CLUSTERS + N_REGIME_SCORES
+        self.n_meta       = N_CB_PROBS + N_CLUSTERS          # 2 + 4 = 6
         self.n_total      = n_stat_feat + self.n_meta + n_visual_emb
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1
@@ -127,21 +103,12 @@ class MetaLearnerLSTM:
 
         if os.path.exists(brain_file):
             try:
-                loaded_model = tf.keras.models.load_model(
+                self.model   = tf.keras.models.load_model(
                     brain_file, compile=False,
                     custom_objects={'WarmupCosineDecay': WarmupCosineDecay})
-                if not _input_shape_matches(loaded_model, self.seq_len, self.n_total):
-                    found_shape = _normalize_model_input_shape(loaded_model)
-                    print(
-                        "[MetaLearner] ⚠️ stale model input shape "
-                        f"{found_shape} != expected (None, {self.seq_len}, {self.n_total}) — rebuilding"
-                    )
-                    self.model = self._build()
-                else:
-                    self.model = loaded_model
-                    self._recompile()
-                    self._fitted = True
-                    print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
+                self._recompile()
+                self._fitted = True
+                print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
             except Exception as e:
                 print(f"[MetaLearner] ⚠️ ({e}) — بنبني جديد")
                 self.model = self._build()

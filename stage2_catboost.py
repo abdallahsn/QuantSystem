@@ -37,12 +37,6 @@ def main():
     p.add_argument('--training_mode', default=str(defaults.get('mode', 'event_binary')))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
-    p.add_argument(
-        '--report_max_bars',
-        type=int,
-        default=int(defaults.get('report_max_bars', 0) or 0),
-        help='max 5m bars to include in the HTML/CSV report; 0 = all bars',
-    )
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
 
@@ -73,16 +67,11 @@ def main():
             output_dir=args.output,
             freq='5min',
             report_name='catboost_5m',
-            max_bars=args.report_max_bars,
         )
         print("\n📊 5m CatBoost dashboard generated")
         for key, path in summary.get('files', {}).items():
             print(f"  {key}: {path}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
-        print(
-            "  report_bars: "
-            f"{summary.get('bars', 0)} / {summary.get('bars_before_limit', summary.get('bars', 0))}"
-        )
         print(f"  transitions: {summary.get('transitions', 0)}")
     except Exception as e:
         print(f"\n⚠️ تعذر توليد Dashboard الـ 5m: {e}")
