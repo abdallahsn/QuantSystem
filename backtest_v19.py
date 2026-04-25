@@ -213,11 +213,68 @@ def _load_csv(path: str) -> pd.DataFrame:
     return df
 
 
+def _directional_event_mask(df: pd.DataFrame) -> np.ndarray:
+    event_flag = pd.to_numeric(df.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    train_event_flag = pd.to_numeric(df.get('train_event_flag', event_flag), errors='coerce').fillna(0).astype(np.int8)
+    bias_label = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
+
+    directional_mask = bias_label.isin([0, 1])
+    mask = (train_event_flag == 1) & directional_mask
+
+    if not mask.any():
+        fallback_mask = (event_flag == 1) & directional_mask
+        if fallback_mask.any():
+            mask = fallback_mask
+
+    if not mask.any() and directional_mask.any():
+        mask = directional_mask
+
+    return mask.to_numpy(dtype=bool)
+
+
+def _coerce_row_aligned_array(arr: np.ndarray, expected_dim: int, dtype=np.float32) -> np.ndarray:
+    arr = np.asarray(arr, dtype=dtype)
+    if arr.ndim != 2:
+        raise ValueError(f'❌ array must be 2D, got {arr.shape}')
+
+    if arr.shape[1] < expected_dim:
+        out = np.zeros((len(arr), expected_dim), dtype=dtype)
+        out[:, :arr.shape[1]] = arr
+        return out
+
+    return arr[:, :expected_dim]
+
+
+def _expand_directional_rows(
+    df: pd.DataFrame,
+    arr: np.ndarray,
+    expected_dim: int,
+    *,
+    kind: str,
+    path: str,
+    dtype=np.float32,
+) -> np.ndarray | None:
+    mask = _directional_event_mask(df)
+    n_rows = int(mask.sum())
+    if n_rows != len(arr):
+        return None
+
+    out = np.zeros((len(df), expected_dim), dtype=dtype)
+    coerced = _coerce_row_aligned_array(arr, expected_dim, dtype=dtype)
+    out[mask] = coerced
+    print(
+        f"  ℹ️ Expanded {kind} from directional event rows: "
+        f"{n_rows:,} -> {len(df):,} ({os.path.basename(path)})"
+    )
+    return out
+
+
 def _load_visual_embeddings(
     df: pd.DataFrame,
     explicit_path: str | None,
     default_path: str | None,
     expected_dim: int,
+    models_dir: str | None = None,
 ) -> np.ndarray:
     n = len(df)
     zero = np.zeros((n, expected_dim), dtype=np.float32)
@@ -231,17 +288,33 @@ def _load_visual_embeddings(
     if vis.ndim != 2:
         raise ValueError(f'❌ visual embeddings must be 2D, got {vis.shape}')
 
-    if explicit_path and len(vis) != n:
+    if len(vis) == n:
+        return _coerce_row_aligned_array(vis, expected_dim, dtype=np.float32)
+
+    expanded = _expand_directional_rows(
+        df,
+        vis,
+        expected_dim,
+        kind='visual embeddings',
+        path=path,
+        dtype=np.float32,
+    )
+    if expanded is not None:
+        return expanded
+
+    if explicit_path:
         raise ValueError(
-            f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) for explicit file {path}'
+            f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) '
+            f'or directional-event rows for explicit file {path}'
         )
 
     if len(vis) < n:
         out = zero.copy()
-        out[:len(vis), :min(vis.shape[1], expected_dim)] = vis[:, :expected_dim]
+        coerced = _coerce_row_aligned_array(vis, expected_dim, dtype=np.float32)
+        out[:len(coerced)] = coerced
         return out
 
-    return vis[:n, :expected_dim]
+    return _coerce_row_aligned_array(vis[:n], expected_dim, dtype=np.float32)
 
 
 def _load_meta_features(
@@ -272,10 +345,25 @@ def _load_meta_features(
     meta = np.asarray(meta, dtype=np.float32)
     if meta.ndim != 2:
         raise ValueError(f'❌ meta features must be 2D, got {meta.shape}')
-    if len(meta) != n:
-        raise ValueError(
-            f'❌ meta features rows ({len(meta)}) do not match CSV rows ({n}) for explicit file {explicit_path}'
+
+    if len(meta) == n:
+        meta = _coerce_row_aligned_array(meta, expected_dim, dtype=np.float32)
+    else:
+        expanded = _expand_directional_rows(
+            df,
+            meta,
+            expected_dim,
+            kind='meta features',
+            path=explicit_path,
+            dtype=np.float32,
         )
+        if expanded is None:
+            raise ValueError(
+                f'❌ meta features rows ({len(meta)}) do not match CSV rows ({n}) '
+                f'or directional-event rows for explicit file {explicit_path}'
+            )
+        meta = expanded
+
     if meta.shape[1] != expected_dim:
         raise ValueError(
             f'❌ meta features columns ({meta.shape[1]}) لا تطابق schema المطلوب ({expected_dim})'
