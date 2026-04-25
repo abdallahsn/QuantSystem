@@ -11,7 +11,7 @@ prepare_training_data.py — V19 Data Refinery
 """
 
 # QuantSystem V19
-import argparse, datetime, os, sys, multiprocessing, json
+import argparse, datetime, os, sys, multiprocessing, json, inspect
 import numpy as np
 import pandas as pd
 import gc
@@ -94,6 +94,36 @@ except ImportError:
         for i,x in enumerate(it):
             if (i+1)%200_000==0: print(f"  {desc}: {i+1:,}/{n:,}", flush=True)
             yield x
+
+
+def _call_build_causal_event_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """
+    Keep label-builder invocation compatible across older v19/v22 module variants.
+    Some environments may have a build_causal_event_labels implementation that
+    does not yet accept newer keyword arguments like kalman_slope_threshold.
+    """
+    if build_causal_event_labels is None:
+        raise RuntimeError("build_causal_event_labels is not available")
+
+    try:
+        sig = inspect.signature(build_causal_event_labels)
+    except (TypeError, ValueError):
+        sig = None
+
+    if sig is None:
+        return build_causal_event_labels(df, **kwargs)
+
+    params = sig.parameters
+    accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if accepts_var_kwargs:
+        return build_causal_event_labels(df, **kwargs)
+
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in params}
+    dropped = [k for k in kwargs if k not in filtered_kwargs]
+    if dropped:
+        print(f"  ℹ️ Label builder compatibility: ignoring unsupported args {dropped}")
+
+    return build_causal_event_labels(df, **filtered_kwargs)
 
 # 🔴 تحديث قائمة الميزات لتشمل حواس الماكرو الجديدة والـ Embeddings
 EMBEDDINGS_DIM = 8
@@ -324,7 +354,10 @@ def _process_mbo_chunk(args):
     sweep      = LiquiditySweepDetector(sweep_threshold=sweep_thresh)
     
     # 🔴 محركات السياق الجديدة
-    daily_ctx  = DailyContextEngine(default_adr=80.0 * cal_params.get('tick_size', 0.0001))
+    daily_ctx  = DailyContextEngine(
+        default_adr=80.0 * cal_params.get('tick_size', 0.0001),
+        tick_size=cal_params.get('tick_size', 0.0001),
+    )
     vwap_eng   = SessionVWAPEngine()
 
     cvd = 0; last_cancel_ratio = 0.0; out = []
@@ -461,7 +494,10 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
     mv         = MicroVolatilityEngine()
     
     # 🔴 محركات السياق الجديدة
-    daily_ctx  = DailyContextEngine(default_adr=80.0 * cal_params.get('tick_size', 0.0001))
+    daily_ctx  = DailyContextEngine(
+        default_adr=80.0 * cal_params.get('tick_size', 0.0001),
+        tick_size=cal_params.get('tick_size', 0.0001),
+    )
     vwap_eng   = SessionVWAPEngine()
     
     cvd        = 0; last_cancel_ratio = 0.0; out = []
@@ -1319,7 +1355,7 @@ def run_refinery(
     if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
         label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
         print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
-        df_labeled = build_causal_event_labels(
+        df_labeled = _call_build_causal_event_labels(
             df_merged,
             horizon=label_horizon,
             event_roll_window=event_roll_window,

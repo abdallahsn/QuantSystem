@@ -118,6 +118,7 @@ class V19PredictionEngine:
         self._daily_ctx = DailyContextEngine(
             default_adr=float(gate_cfg.get('default_adr_pips', 80.0)),
             adr_lookback_days=int(gate_cfg.get('adr_lookback_days', 20)),
+            tick_size=float(gate_cfg.get('tick_size', 0.0001)),
         )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))

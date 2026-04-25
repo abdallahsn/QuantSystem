@@ -171,13 +171,15 @@ class DailyContextEngine:
         default_adr: float = 80.0,
         adr_lookback_days: int = 20,
         min_adr_samples: int = 3,
+        tick_size: float | None = None,
     ):
         self.default_adr = float(default_adr)
         self.adr_lookback_days = max(int(adr_lookback_days), 1)
         self.min_adr_samples = max(int(min_adr_samples), 1)
         self._daily_ranges = deque(maxlen=self.adr_lookback_days)
         self._prev_price = None
-        self._pip_size = None
+        self._tick_size_locked = tick_size is not None and float(tick_size) > 0
+        self._pip_size = max(float(tick_size), 1e-9) if self._tick_size_locked else None
 
         # التوافق مع المسارات القديمة: training يمرر ADR بوحدة السعر،
         # بينما predict_v19 يمرر قيمة بالـ pips.
@@ -204,6 +206,9 @@ class DailyContextEngine:
         return 1.0
 
     def _update_pip_size(self, price: float) -> float:
+        if self._tick_size_locked:
+            return max(float(self._pip_size), 1e-9)
+
         price = float(price)
         if self._prev_price is not None:
             delta = abs(price - self._prev_price)
