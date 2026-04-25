@@ -3,7 +3,8 @@ backtest_v19.py - Causal replay backtester for QuantSystem V19
 ================================================================
 This backtester replays rows one-by-one through V19PredictionEngine using the
 same step-by-step path as live inference. It evaluates predictions against the
-causal V19 labels and computes trading metrics using forward_return.
+causal V19 labels and computes trading metrics by replaying the future price
+path instead of settling directly on the stored oracle forward_return label.
 """
 
 from __future__ import annotations
@@ -22,20 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.slippage_model import confidence_bet_size
 from predict_v19 import V19PredictionEngine
-from train_v19 import _align_lob_to_rows, _load_lob_inputs
 
 try:
     from modules.html_reporter import generate_backtest_report
     HTML_REPORT_AVAILABLE = True
 except ImportError:
     HTML_REPORT_AVAILABLE = False
-
-try:
-    from modules.deeplob_cnn import DeepLOBCNN
-    DEEPLOB_AVAILABLE = True
-except ImportError:
-    DeepLOBCNN = None
-    DEEPLOB_AVAILABLE = False
 
 
 def _safe_float(x, default=0.0):
@@ -47,6 +40,171 @@ def _safe_float(x, default=0.0):
         return float(default)
 
 
+def _safe_int(x, default=0):
+    try:
+        if pd.isna(x):
+            return int(default)
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _series_or_default(df: pd.DataFrame, col: str, default, dtype=None) -> pd.Series:
+    if col in df.columns:
+        series = df[col]
+    else:
+        series = pd.Series([default] * len(df), index=df.index)
+    if dtype is not None:
+        series = pd.to_numeric(series, errors='coerce').fillna(default).astype(dtype)
+    return series
+
+
+def _simulate_trade_path(
+    entry_idx: int,
+    direction: str,
+    prices: np.ndarray,
+    horizons: np.ndarray,
+    micro_atr: np.ndarray,
+    tick_size: float,
+    direction_threshold_ticks: float = 1.0,
+    tp_mult: float = 1.2,
+    sl_mult: float = 1.0,
+    max_horizon_steps: int | None = None,
+    # ── Wall data (اللايف بيستخدمها — الباك تست كان يتجاهلها) ──
+    row_data: dict | None = None,
+) -> dict | None:
+    """
+    FIX: يستخدم الآن DynamicTargetManager نفس اللايف.
+    TP/SL محسوبان من جدران السيولة الحقيقية
+    بدل ATR × multiplier الثابت.
+    """
+    if direction not in ('LONG', 'SHORT'):
+        return None
+    if entry_idx < 0 or entry_idx >= len(prices):
+        return None
+
+    entry_price = float(prices[entry_idx])
+    if not np.isfinite(entry_price) or entry_price <= 0:
+        return None
+
+    horizon_steps = int(horizons[entry_idx]) if entry_idx < len(horizons) else 0
+    if max_horizon_steps is not None and int(max_horizon_steps) > 0:
+        horizon_steps = min(horizon_steps, int(max_horizon_steps)) if horizon_steps > 0 else int(max_horizon_steps)
+    if horizon_steps <= 0:
+        return None
+
+    exit_cap_idx = min(entry_idx + horizon_steps, len(prices) - 1)
+    if exit_cap_idx <= entry_idx:
+        return None
+
+    atr_now = float(micro_atr[entry_idx]) if entry_idx < len(micro_atr) else 0.0
+    min_move = max(float(direction_threshold_ticks) * float(tick_size),
+                   0.5 * max(atr_now, 0.0), float(tick_size))
+
+    # ══════════════════════════════════════════════════════════════════
+    # FIX: استخدم DynamicTargetManager مع بيانات الجدران الحقيقية
+    # نفس المسار اللي بيسلكه اللايف
+    # ══════════════════════════════════════════════════════════════════
+    tp_level = sl_level = None
+
+    if row_data is not None:
+        try:
+            from modules.dynamic_target import DynamicTargetManager
+            dtm = DynamicTargetManager()
+
+            # بناء scan_result من الـ CSV مباشرة
+            scan_result = {
+                'bid_wall_strength':  float(row_data.get('bid_wall_strength', 0.5) or 0.5),
+                'ask_wall_strength':  float(row_data.get('ask_wall_strength', 0.5) or 0.5),
+                'dist_to_bid_wall':   float(row_data.get('dist_to_bid_wall',  min_move * 1.5) or min_move * 1.5),
+                'dist_to_ask_wall':   float(row_data.get('dist_to_ask_wall',  min_move * 1.5) or min_move * 1.5),
+                'bid_wall_size_raw':  float(row_data.get('gap_size', 1.0) or 1.0),
+                'ask_wall_size_raw':  float(row_data.get('gap_size', 1.0) or 1.0),
+            }
+
+            # بناء context
+            remaining_fuel = max(
+                float(row_data.get('micro_atr', min_move * 10) or min_move * 10) * 80,
+                min_move * 20,
+            )
+            context = {
+                'tick_size':      tick_size,
+                'remaining_fuel': remaining_fuel,
+                'adr_pips':       remaining_fuel / tick_size,
+            }
+
+            signal = {
+                'bias':      direction,
+                'price':     entry_price,
+                'cvd_delta': float(row_data.get('cvd', 0.0) or 0.0),
+            }
+
+            levels = {
+                'long_wall_size':  scan_result['bid_wall_size_raw'],
+                'short_wall_size': scan_result['ask_wall_size_raw'],
+            }
+
+            trade = dtm.open_trade(signal, levels, scan_result, context)
+            tp_level = trade.tp1
+            sl_level = trade.sl
+
+        except Exception as _e:
+            # fallback للـ ATR إذا فشل DynamicTargetManager
+            tp_level = None
+
+    # Fallback: ATR-based (إذا مفيش wall data)
+    if tp_level is None or sl_level is None:
+        tp_distance = max(float(tp_mult) * min_move, float(tick_size))
+        sl_distance = max(float(sl_mult) * min_move, float(tick_size))
+        if direction == 'LONG':
+            tp_level = entry_price + tp_distance
+            sl_level = entry_price - sl_distance
+        else:
+            tp_level = entry_price - tp_distance
+            sl_level = entry_price + sl_distance
+
+    # ── Replay المسار الزمني ───────────────────────────────────────────
+    future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    if future_prices.size == 0:
+        return None
+
+    exit_idx = exit_cap_idx
+    exit_reason = 'horizon'
+    for offset, future_price in enumerate(future_prices, start=1):
+        if direction == 'LONG':
+            if future_price >= tp_level:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
+            if future_price <= sl_level:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
+        else:
+            if future_price <= tp_level:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
+            if future_price >= sl_level:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
+
+    exit_price = float(prices[exit_idx])
+    price_return   = (exit_price - entry_price) if direction == 'LONG' else (entry_price - exit_price)
+    path_moves     = (future_prices - entry_price) if direction == 'LONG' else (entry_price - future_prices)
+    favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
+    adverse_move    = float(np.min(path_moves)) if path_moves.size else 0.0
+
+    return {
+        'exit_idx':    int(exit_idx),
+        'exit_price':  float(exit_price),
+        'exit_reason': exit_reason,
+        'hold_steps':  int(exit_idx - entry_idx),
+        'price_return': float(price_return),
+        'raw_pnl_pips': float(price_return / max(float(tick_size), 1e-8)),
+        'mfe_pips':    float(favourable_move / max(float(tick_size), 1e-8)),
+        'mae_pips':    float(adverse_move    / max(float(tick_size), 1e-8)),
+        'tp_level':    round(tp_level, 5),
+        'sl_level':    round(sl_level, 5),
+        'tp_pips':     round(abs(tp_level - entry_price) / max(tick_size, 1e-8), 1),
+        'sl_pips':     round(abs(sl_level - entry_price) / max(tick_size, 1e-8), 1),
+        'rr_ratio':    round(abs(tp_level - entry_price) / max(abs(sl_level - entry_price), tick_size), 2),
+    }
+
+
 def _load_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
     for col in ('ts_event', 'label_end_ts'):
@@ -55,154 +213,35 @@ def _load_csv(path: str) -> pd.DataFrame:
     return df
 
 
-def _filter_backtest_window(df: pd.DataFrame, start_ts: str | None = None, end_ts: str | None = None) -> pd.DataFrame:
-    out = df.copy()
-    if 'ts_event' not in out.columns or (start_ts is None and end_ts is None):
-        return out.reset_index(drop=True)
-    ts = pd.to_datetime(out.get('ts_event'), utc=True, errors='coerce').dt.tz_localize(None)
-    mask = pd.Series(True, index=out.index)
-    def _naive_timestamp(value: str) -> pd.Timestamp:
-        ts_val = pd.Timestamp(value)
-        if ts_val.tzinfo is not None:
-            return ts_val.tz_convert(None)
-        return ts_val
-    if start_ts is not None:
-        start = _naive_timestamp(start_ts)
-        mask &= ts >= start
-    if end_ts is not None:
-        end = _naive_timestamp(end_ts)
-        mask &= ts < end
-    return out.loc[mask].reset_index(drop=True)
-
-
-def _directional_event_mask(df: pd.DataFrame) -> np.ndarray:
-    n = len(df)
-    if n == 0 or 'bias_label' not in df.columns:
-        return np.zeros(n, dtype=bool)
-    event_col = 'train_event_flag' if 'train_event_flag' in df.columns else 'event_flag' if 'event_flag' in df.columns else None
-    if event_col is None:
-        return np.zeros(n, dtype=bool)
-    event_flag = pd.to_numeric(df.get(event_col, 0), errors='coerce').fillna(0).astype(np.int8).values == 1
-    bias = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8).values
-    return event_flag & np.isin(bias, [0, 1])
-
-
-def _expand_event_aligned_matrix(
-    df: pd.DataFrame,
-    arr: np.ndarray,
-    expected_dim: int,
-    artifact_name: str,
-    path: str,
-    strict: bool,
-) -> np.ndarray:
-    n = len(df)
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError(f'❌ {artifact_name} must be 2D, got {arr.shape}')
-
-    if len(arr) == n:
-        out = np.zeros((n, expected_dim), dtype=np.float32)
-        out[:, :min(arr.shape[1], expected_dim)] = arr[:, :expected_dim]
-        return out
-
-    event_mask = _directional_event_mask(df)
-    n_event = int(event_mask.sum())
-    if n_event > 0 and len(arr) == n_event:
-        out = np.zeros((n, expected_dim), dtype=np.float32)
-        out[event_mask, :min(arr.shape[1], expected_dim)] = arr[:, :expected_dim]
-        print(
-            f"  ⚠️ {artifact_name} loaded as event-aligned rows ({n_event:,}) from {path}; "
-            f"expanded to full CSV rows ({n:,})."
-        )
-        return out
-
-    msg = (
-        f'❌ {artifact_name} rows ({len(arr)}) do not match CSV rows ({n})'
-        + (f' or directional event rows ({n_event})' if n_event else '')
-        + f' for {path}'
-    )
-    if strict:
-        raise ValueError(msg)
-    print(f"  ⚠️ {msg}. Falling back to zeros.")
-    return np.zeros((n, expected_dim), dtype=np.float32)
-
-
-def _compute_visual_embeddings_from_lob(
-    df: pd.DataFrame,
-    models_dir: str,
-    lob_path: str | None,
-    lob_ts_path: str | None,
-    expected_dim: int,
-) -> np.ndarray:
-    n = len(df)
-    zero = np.zeros((n, expected_dim), dtype=np.float32)
-    if n == 0 or expected_dim <= 0 or not DEEPLOB_AVAILABLE:
-        return zero
-
-    deeplob_path = os.path.join(models_dir, 'deeplob_cnn_v19.keras')
-    if not os.path.exists(deeplob_path):
-        return zero
-
-    lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
-    if lob_tensors is None or lob_timestamps is None:
-        return zero
-
-    row_to_tensor, _, _ = _align_lob_to_rows(df, lob_timestamps, max_tensors=len(lob_tensors))
-    used_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
-    if len(used_tensor_ids) == 0:
-        return zero
-
-    cnn = DeepLOBCNN(brain_file=deeplob_path)
-    if cnn.model is None or not cnn._fitted:
-        return zero
-
-    X = np.asarray(lob_tensors[used_tensor_ids], dtype=np.float32)
-    emb = np.asarray(cnn.get_embeddings(X), dtype=np.float32)
-    if emb.ndim != 2:
-        return zero
-
-    emb_lookup = {int(tid): emb[i, :expected_dim] for i, tid in enumerate(used_tensor_ids)}
-    out = np.zeros((n, expected_dim), dtype=np.float32)
-    for row_idx, tensor_idx in enumerate(row_to_tensor):
-        if int(tensor_idx) in emb_lookup:
-            out[row_idx] = emb_lookup[int(tensor_idx)]
-    print(f"  ✅ Visual embeddings recomputed from LOB tensors: {out.shape}")
-    return out
-
-
 def _load_visual_embeddings(
     df: pd.DataFrame,
     explicit_path: str | None,
     default_path: str | None,
     expected_dim: int,
-    models_dir: str,
-    lob_path: str | None = None,
-    lob_ts_path: str | None = None,
 ) -> np.ndarray:
     n = len(df)
     zero = np.zeros((n, expected_dim), dtype=np.float32)
 
     path = explicit_path if explicit_path else default_path
-    if path and os.path.exists(path):
-        vis = np.load(path)
-        try:
-            return _expand_event_aligned_matrix(
-                df,
-                vis,
-                expected_dim=expected_dim,
-                artifact_name='visual embeddings',
-                path=path,
-                strict=bool(explicit_path),
-            )
-        except ValueError:
-            if lob_path and lob_ts_path:
-                print("  ⚠️ visual embeddings file is not row-aligned to this CSV; recomputing from LOB tensors instead.")
-                return _compute_visual_embeddings_from_lob(df, models_dir, lob_path, lob_ts_path, expected_dim)
-            raise
+    if not path or not os.path.exists(path):
+        return zero
 
-    if lob_path and lob_ts_path:
-        return _compute_visual_embeddings_from_lob(df, models_dir, lob_path, lob_ts_path, expected_dim)
-    return zero
+    vis = np.load(path)
+    vis = np.asarray(vis, dtype=np.float32)
+    if vis.ndim != 2:
+        raise ValueError(f'❌ visual embeddings must be 2D, got {vis.shape}')
+
+    if explicit_path and len(vis) != n:
+        raise ValueError(
+            f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) for explicit file {path}'
+        )
+
+    if len(vis) < n:
+        out = zero.copy()
+        out[:len(vis), :min(vis.shape[1], expected_dim)] = vis[:, :expected_dim]
+        return out
+
+    return vis[:n, :expected_dim]
 
 
 def _load_meta_features(
@@ -229,22 +268,19 @@ def _load_meta_features(
             'Use meta_features_oof_v19.npy or omit --meta_npy.'
         )
 
-    meta = np.asarray(np.load(explicit_path), dtype=np.float32)
+    meta = np.load(explicit_path)
+    meta = np.asarray(meta, dtype=np.float32)
     if meta.ndim != 2:
         raise ValueError(f'❌ meta features must be 2D, got {meta.shape}')
-    if meta.shape[1] < expected_dim:
+    if len(meta) != n:
         raise ValueError(
-            f'❌ meta features columns ({meta.shape[1]}) أقل من المطلوب ({expected_dim})'
+            f'❌ meta features rows ({len(meta)}) do not match CSV rows ({n}) for explicit file {explicit_path}'
         )
-    meta = _expand_event_aligned_matrix(
-        df,
-        meta,
-        expected_dim=expected_dim,
-        artifact_name='meta features',
-        path=explicit_path,
-        strict=True,
-    )
-    return meta[:, :expected_dim]
+    if meta.shape[1] != expected_dim:
+        raise ValueError(
+            f'❌ meta features columns ({meta.shape[1]}) لا تطابق schema المطلوب ({expected_dim})'
+        )
+    return meta
 
 
 def _equity_metrics(equity_curve: list[float]) -> tuple[float, float]:
@@ -304,6 +340,13 @@ def run_causal_backtest(
     round_trip_cost_pips: float,
     max_size: int,
     starting_equity: float,
+    direction_threshold_ticks: float = 1.0,
+    tp_mult: float = 1.2,
+    sl_mult: float = 1.0,
+    max_horizon_steps: int | None = None,
+    allow_oracle_forward_return: bool = False,
+    single_position_only: bool = True,
+    cooldown_rows: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
@@ -311,6 +354,17 @@ def run_causal_backtest(
     source_has_labels = 'bias_label' in df.columns
     source_has_fwd = 'forward_return' in df.columns
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
+    price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
+    horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
+    if 'raw__micro_atr' in replay_df.columns:
+        micro_atr_arr = _series_or_default(replay_df, 'raw__micro_atr', 0.0, dtype=np.float64).values
+    else:
+        micro_atr_arr = _series_or_default(replay_df, 'micro_atr', 0.0, dtype=np.float64).values
+    ts_arr = pd.to_datetime(
+        replay_df.get('ts_event', pd.Series([pd.NaT] * len(replay_df), index=replay_df.index)),
+        utc=True,
+        errors='coerce',
+    ).dt.tz_localize(None)
 
     results = []
     trades = []
@@ -318,11 +372,33 @@ def run_causal_backtest(
     equity = float(starting_equity)
 
     has_labels = source_has_labels
-    has_fwd = source_has_fwd
     blocked_count = 0
+    replayed_trades = 0
+    oracle_trades = 0
+    skipped_trade_replays = 0
+    active_trade = None
+    cooldown_until = -1
 
     for i, (_, row) in enumerate(replay_df.iterrows()):
         ts = row.get('ts_event', None)
+        if active_trade is not None and i >= int(active_trade['exit_idx']):
+            equity += float(active_trade['pnl'])
+            engine.loss_guard.update_equity(equity)
+            engine.loss_guard.record_trade(float(active_trade['pnl']), ts=ts)
+            equity_curve.append(float(equity))
+            closed_trade = {
+                **active_trade,
+                'exit_ts': '' if pd.isna(ts) else str(ts),
+                'equity_after': round(float(equity), 2),
+            }
+            trades.append(closed_trade)
+            if active_trade.get('pnl_source') == 'path_replay':
+                replayed_trades += 1
+            else:
+                oracle_trades += 1
+            active_trade = None
+            cooldown_until = i + max(int(cooldown_rows), 0)
+
         visual = visual_embeddings[i] if visual_embeddings.size else None
         pred = engine.predict_step(
             row.to_dict(),
@@ -352,23 +428,63 @@ def run_causal_backtest(
         direction = pred.get('bias', 'NEUTRAL')
         pred['executed'] = False
 
-        if tradeable and direction in ('LONG', 'SHORT') and has_fwd:
+        if active_trade is not None and bool(single_position_only):
+            pred['trade_skip_reason'] = 'single_position_only'
+            results.append(pred)
+            continue
+        if i < cooldown_until:
+            pred['trade_skip_reason'] = 'cooldown_active'
+            results.append(pred)
+            continue
+
+        if tradeable and direction in ('LONG', 'SHORT'):
             size = int(pred.get('position_size') or confidence_bet_size(
                 float(pred.get('confidence', 0.0)),
                 base_size=1,
                 max_size=max_size,
             ))
-            forward_return = _safe_float(row.get('forward_return', 0.0))
-            raw_pnl_pips = (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size)
+            trade_path = _simulate_trade_path(
+                entry_idx=i,
+                direction=direction,
+                prices=price_arr,
+                horizons=horizon_arr,
+                micro_atr=micro_atr_arr,
+                tick_size=tick_size,
+                direction_threshold_ticks=direction_threshold_ticks,
+                tp_mult=tp_mult,
+                sl_mult=sl_mult,
+                max_horizon_steps=max_horizon_steps,
+                row_data=row.to_dict(),  # FIX: تمرير بيانات الجدران للـ DynamicTargetManager
+            )
+
+            pnl_source = 'path_replay'
+            if trade_path is None and allow_oracle_forward_return and source_has_fwd:
+                forward_return = _safe_float(row.get('forward_return', 0.0))
+                trade_path = {
+                    'exit_idx': min(i + max(_safe_int(row.get('label_horizon_steps', 1), 1), 1), len(replay_df) - 1),
+                    'exit_price': _safe_float(row.get('price', 0.0)) + (forward_return if direction == 'LONG' else -forward_return),
+                    'exit_reason': 'oracle_forward_return',
+                    'hold_steps': max(_safe_int(row.get('label_horizon_steps', 1), 1), 1),
+                    'price_return': forward_return if direction == 'LONG' else -forward_return,
+                    'raw_pnl_pips': (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size),
+                    'mfe_pips': 0.0,
+                    'mae_pips': 0.0,
+                }
+                pnl_source = 'oracle_forward_return'
+
+            if trade_path is None:
+                skipped_trade_replays += 1
+                pred['trade_skip_reason'] = 'missing_exit_path'
+                results.append(pred)
+                continue
+
+            raw_pnl_pips = float(trade_path['raw_pnl_pips'])
             net_pnl_pips = raw_pnl_pips - round_trip_cost_pips
             net_pnl_dollars = net_pnl_pips * tick_value * size
 
-            equity += net_pnl_dollars
-            engine.loss_guard.update_equity(equity)
-            engine.loss_guard.record_trade(net_pnl_dollars, ts=ts)
-            equity_curve.append(float(equity))
-
             result = 'WIN' if net_pnl_pips > 0 else ('LOSE' if net_pnl_pips < 0 else 'FLAT')
+            exit_idx = int(trade_path['exit_idx'])
+            exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
             trade = {
                 'idx': i,
                 'ts_event': pred['ts_event'],
@@ -376,22 +492,46 @@ def run_causal_backtest(
                 'confidence': round(_safe_float(pred.get('confidence', 0.0)), 4),
                 'size': size,
                 'ep': _safe_float(row.get('price', 0.0)),
-                'xp': _safe_float(row.get('price', 0.0)) + forward_return,
-                'dur_min': _safe_float(row.get('label_horizon_steps', 0.0)),
+                'xp': round(float(trade_path['exit_price']), 6),
+                'exit_idx': exit_idx,
+                'exit_ts': '' if pd.isna(exit_ts) else str(exit_ts),
+                'exit_reason': str(trade_path['exit_reason']),
+                'dur_steps': int(trade_path['hold_steps']),
+                'dur_min': int(trade_path['hold_steps']),
                 'pips': round(net_pnl_pips, 4),
                 'raw_pnl_pips': round(raw_pnl_pips, 4),
                 'cost_pips': round(round_trip_cost_pips, 4),
+                'mfe_pips': round(float(trade_path.get('mfe_pips', 0.0)), 4),
+                'mae_pips': round(float(trade_path.get('mae_pips', 0.0)), 4),
+                'pnl_source': pnl_source,
                 'pnl': round(net_pnl_dollars, 2),
                 'result': result,
                 'cluster': pred.get('cluster', 0),
                 'cluster_name': pred.get('cluster_name', 'Unknown'),
             }
-            trades.append(trade)
             pred['executed'] = True
             pred['position_size'] = size
-            pred['net_pnl_pips'] = round(net_pnl_pips, 4)
-            pred['net_pnl_dollars'] = round(net_pnl_dollars, 2)
-            pred['equity_after'] = round(equity, 2)
+            pred['pending_exit_idx'] = exit_idx
+            pred['pending_exit_ts'] = '' if pd.isna(exit_ts) else str(exit_ts)
+            pred['exit_reason'] = str(trade_path['exit_reason'])
+            pred['pnl_source'] = pnl_source
+
+            if bool(single_position_only):
+                active_trade = trade
+            else:
+                equity += net_pnl_dollars
+                engine.loss_guard.update_equity(equity)
+                engine.loss_guard.record_trade(net_pnl_dollars, ts=ts)
+                equity_curve.append(float(equity))
+                trade['equity_after'] = round(float(equity), 2)
+                trades.append(trade)
+                if pnl_source == 'path_replay':
+                    replayed_trades += 1
+                else:
+                    oracle_trades += 1
+                pred['net_pnl_pips'] = round(net_pnl_pips, 4)
+                pred['net_pnl_dollars'] = round(net_pnl_dollars, 2)
+                pred['equity_after'] = round(equity, 2)
 
         results.append(pred)
 
@@ -421,6 +561,13 @@ def run_causal_backtest(
         'max_drawdown_pct': round(float(mdd_pct), 4),
         'ending_equity': round(float(equity), 2),
         'blocked_predictions': int(blocked_count),
+        'pnl_engine': 'path_replay',
+        'replayed_trades': int(replayed_trades),
+        'oracle_forward_return_trades': int(oracle_trades),
+        'oracle_forward_return_used': bool(oracle_trades > 0),
+        'skipped_trade_replays': int(skipped_trade_replays),
+        'single_position_only': bool(single_position_only),
+        'cooldown_rows': int(max(cooldown_rows, 0)),
         'visual_coverage': round(float((np.linalg.norm(visual_embeddings, axis=1) > 0).mean()), 4)
             if visual_embeddings.size else 0.0,
     }
@@ -455,34 +602,35 @@ def main():
     p.add_argument('--output', default='outputs_v19', help='backtest output directory')
     p.add_argument('--visual_npy', default=None, help='optional row-aligned visual embeddings file')
     p.add_argument('--meta_npy', default=None, help='optional row-aligned stage-1 meta features file')
-    p.add_argument('--lob_npy', default=None, help='optional LOB tensors file for recomputing visual embeddings on this CSV')
-    p.add_argument('--lob_ts_npy', default=None, help='optional LOB tensor timestamps file paired with --lob_npy')
     p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
                    help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
     p.add_argument('--input_scaled', action='store_true',
                    help='set when CSV is already scaled like training_features_ready.csv')
-    p.add_argument('--start_ts', default=None, help='optional inclusive start timestamp filter for the CSV')
-    p.add_argument('--end_ts', default=None, help='optional exclusive end timestamp filter for the CSV')
     p.add_argument('--tick_size', type=float, default=0.0001)
     p.add_argument('--tick_value', type=float, default=10.0)
     p.add_argument('--round_trip_cost_pips', type=float, default=1.0)
     p.add_argument('--max_size', type=int, default=5)
     p.add_argument('--starting_equity', type=float, default=100000.0)
+    p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
+    p.add_argument('--tp_mult', type=float, default=1.2)
+    p.add_argument('--sl_mult', type=float, default=1.0)
+    p.add_argument('--max_horizon_steps', type=int, default=0,
+                   help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
+    p.add_argument('--allow_oracle_forward_return', action='store_true',
+                   help='dangerous: fall back to stored forward_return when no causal replay window is available')
+    p.add_argument('--disable_single_position_only', action='store_true',
+                   help='allow overlapping trades; default keeps one active position at a time')
+    p.add_argument('--cooldown_rows', type=int, default=0,
+                   help='rows to wait after closing a trade before opening a new one')
     args = p.parse_args()
 
-    df_raw = _load_csv(args.csv)
-    df = _filter_backtest_window(df_raw, start_ts=args.start_ts, end_ts=args.end_ts)
-    if args.start_ts or args.end_ts:
-        print(f"  ✅ Backtest window rows: {len(df):,}/{len(df_raw):,}")
+    df = _load_csv(args.csv)
     engine = V19PredictionEngine(args.models)
     visual_embeddings = _load_visual_embeddings(
         df,
         explicit_path=args.visual_npy,
         default_path=engine.visual_emb_path,
         expected_dim=len(engine.visual_features),
-        models_dir=args.models,
-        lob_path=args.lob_npy,
-        lob_ts_path=args.lob_ts_npy,
     )
     meta_features = _load_meta_features(
         df,
@@ -503,6 +651,13 @@ def main():
         round_trip_cost_pips=args.round_trip_cost_pips,
         max_size=args.max_size,
         starting_equity=args.starting_equity,
+        direction_threshold_ticks=args.direction_threshold_ticks,
+        tp_mult=args.tp_mult,
+        sl_mult=args.sl_mult,
+        max_horizon_steps=(args.max_horizon_steps if args.max_horizon_steps > 0 else None),
+        allow_oracle_forward_return=args.allow_oracle_forward_return,
+        single_position_only=(not args.disable_single_position_only),
+        cooldown_rows=args.cooldown_rows,
     )
 
     print("\n✅ V19 causal backtest complete")

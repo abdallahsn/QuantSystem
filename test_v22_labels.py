@@ -147,6 +147,23 @@ class V22LabelsRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(info["raw_event_rate_full"], 1.0)
         self.assertAlmostEqual(info["event_rate_full"], 0.5)
 
+    def test_event_training_view_falls_back_to_directional_rows_when_flags_empty(self):
+        df = pd.DataFrame(
+            {
+                "ts_event": pd.date_range("2026-01-01", periods=4, freq="s"),
+                "event_flag": [0, 0, 0, 0],
+                "train_event_flag": [0, 0, 0, 0],
+                "bias_label": [DIR_LONG, DIR_LONG, DIR_SHORT, 2],
+                "signal_quality": [2, 1, 2, 0],
+            }
+        )
+        event_df, info = build_event_training_view(df)
+        self.assertEqual(info["event_col"], "bias_label")
+        self.assertEqual(info["fallback_reason"], "fallback_to_directional_rows")
+        self.assertEqual(len(event_df), 3)
+        self.assertAlmostEqual(info["raw_event_rate_full"], 0.0)
+        self.assertAlmostEqual(info["event_rate_full"], 0.75)
+
     def test_run_refinery_cli_knobs_and_catboost_note(self):
         out_df, stdout = _run_sample_refinery(
             label_horizon=150,

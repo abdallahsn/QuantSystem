@@ -289,8 +289,27 @@ def build_event_training_view(
     out['bias_label'] = pd.to_numeric(out.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
     out['signal_quality'] = pd.to_numeric(out.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
 
+    directional_mask = out['bias_label'].isin([0, 1])
     event_col = 'train_event_flag' if 'train_event_flag' in out.columns else 'event_flag'
-    event_mask = (out[event_col] == 1) & (out['bias_label'].isin([0, 1]))
+    event_mask = (out[event_col] == 1) & directional_mask
+
+    fallback_reason = None
+    if not event_mask.any() and event_col != 'event_flag':
+        fallback_mask = (out['event_flag'] == 1) & directional_mask
+        if fallback_mask.any():
+            event_col = 'event_flag'
+            event_mask = fallback_mask
+            fallback_reason = 'fallback_to_event_flag'
+
+    if not event_mask.any() and directional_mask.any():
+        event_col = 'bias_label'
+        event_mask = directional_mask
+        fallback_reason = 'fallback_to_directional_rows'
+        print(
+            "  ⚠️ Event Training View fallback: no directional rows via event flags; "
+            "using directional bias rows directly."
+        )
+
     event_df = out.loc[event_mask].copy().reset_index(drop=True)
     if event_df.empty:
         raise RuntimeError('❌ لا توجد directional event rows صالحة للتدريب بعد تطبيق event view')
@@ -310,6 +329,7 @@ def build_event_training_view(
         'rows_event_directional': int(len(event_df)),
         'event_rate_full': float(event_mask.mean()),
         'raw_event_rate_full': float(out['event_flag'].mean()),
+        'fallback_reason': fallback_reason,
         'quality_weight_strong': float(quality_weight_strong),
         'quality_weight_weak': float(quality_weight_weak),
         'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
