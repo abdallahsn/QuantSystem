@@ -166,9 +166,15 @@ class DailyContextEngine:
     """
     محرك سياق اليوم: يراقب اختراق أول ساعة (IB) والوقود اليومي المتبقي.
     """
-    def __init__(self, default_adr: float = 80.0, adr_lookback_days: int = 20):
+    def __init__(
+        self,
+        default_adr: float = 80.0,
+        adr_lookback_days: int = 20,
+        min_adr_samples: int = 3,
+    ):
         self.default_adr = float(default_adr)
         self.adr_lookback_days = max(int(adr_lookback_days), 1)
+        self.min_adr_samples = max(int(min_adr_samples), 1)
         self._daily_ranges = deque(maxlen=self.adr_lookback_days)
         self._prev_price = None
         self._pip_size = None
@@ -209,8 +215,8 @@ class DailyContextEngine:
         return max(float(self._pip_size), 1e-9)
 
     def _resolve_adr(self, pip_size: float) -> float:
-        if self._daily_ranges:
-            adr_value = float(np.mean(self._daily_ranges))
+        if len(self._daily_ranges) >= self.min_adr_samples:
+            adr_value = float(np.median(self._daily_ranges))
         elif self.default_adr > 1.0:
             adr_value = float(self.default_adr) * pip_size
         else:

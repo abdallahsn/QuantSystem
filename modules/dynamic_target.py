@@ -11,8 +11,8 @@ dynamic_target.py — V18: Regime-Aware Execution + Pipeline Integration
 """
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, List
 from enum import Enum
 
 
@@ -76,6 +76,29 @@ class DynamicTargetManager:
         self._trade:    Optional[ActiveTrade] = None
         self._cvd_hist: List[float] = []
 
+    @staticmethod
+    def _as_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clamp(value: float, lo: float, hi: float) -> float:
+        return float(min(max(value, lo), hi))
+
+    def _normalized_execution_hints(self, signal: dict) -> tuple[float, float, float]:
+        """
+        Use only calibrated execution hints, not raw latent embedding indices.
+        """
+        hints = signal.get('execution_hints', {}) or {}
+        bid_hint = self._clamp(self._as_float(hints.get('bid_wall_strength', 0.0)), 0.0, 1.5)
+        ask_hint = self._clamp(self._as_float(hints.get('ask_wall_strength', 0.0)), 0.0, 1.5)
+        absorption = self._clamp(self._as_float(hints.get('absorption', 0.0)), 0.0, 1.0)
+        return bid_hint, ask_hint, absorption
+
     # ── فتح الصفقة ────────────────────────────────────────────────────────
     def open_trade(self,
                    signal:      dict,
@@ -93,48 +116,72 @@ class DynamicTargetManager:
         scan_result : من OrderWallScanner.scan
         context     : {'remaining_fuel': float, ...}
         """
-        direction = signal.get('bias', 'LONG').upper()
-        price     = signal.get('price', 0.0)
-        cvd       = signal.get('cvd_delta', 0.0)
-        pip       = context.get('tick_size', 0.0001)
+        direction = 'SHORT' if str(signal.get('bias', 'LONG')).upper() == 'SHORT' else 'LONG'
+        price     = self._as_float(signal.get('price', 0.0))
+        cvd       = self._as_float(signal.get('cvd_delta', 0.0))
+        pip       = max(self._as_float(context.get('tick_size', 0.0001), 0.0001), 1e-9)
         min_sl    = 10.0 * pip
+        min_tp    = max(20.0 * pip, min_sl * 1.5)
+        remaining_fuel = max(self._as_float(context.get('remaining_fuel', 80.0 * pip), 80.0 * pip), min_tp)
+
+        hint_bid_str, hint_ask_str, hint_absorption = self._normalized_execution_hints(signal)
+        sl_factor = self._clamp(1.0 - hint_absorption * 0.25, 0.70, 1.15)
 
         if direction == 'LONG':
-            # SL: مسافة الحائط + تعديل بقوة الحائط
-            dist_wall    = scan_result.get('dist_to_bid_wall') or context.get('dist_to_bid_wall', 0.0)
-            wall_str     = scan_result.get('bid_wall_strength', 1.0)
+            dist_wall    = max(self._as_float(scan_result.get('dist_to_bid_wall'), context.get('dist_to_bid_wall', 0.0)), 0.0)
+            wall_str     = self._clamp(self._as_float(scan_result.get('bid_wall_strength', 0.5), 0.5), 0.0, 3.0)
             wall_size    = scan_result.get('bid_wall_size_raw', float(levels.get('long_wall_size', 1)))
-            sl_dist      = max(float(dist_wall) * max(0.5, 1.0 - wall_str * 0.1),
-                               min_sl) if dist_wall else min_sl
+            safety       = pip * (1.0 + max(0.0, 1.0 - wall_str) * 2.0)
+            if dist_wall > 0:
+                sl_dist  = max((dist_wall + safety) * sl_factor, min_sl)
+            else:
+                sl_dist  = min_sl * sl_factor
+            sl_dist      = max(sl_dist, min_sl)
             sl           = price - sl_dist
-            wall_px      = price - (float(dist_wall) if dist_wall else sl_dist)
+            wall_px      = price - (dist_wall if dist_wall else sl_dist)
             bid_wstr     = wall_str
-            ask_wstr     = scan_result.get('ask_wall_strength', 0.0)
-        else:
-            dist_wall    = scan_result.get('dist_to_ask_wall') or context.get('dist_to_ask_wall', 0.0)
-            wall_str     = scan_result.get('ask_wall_strength', 1.0)
-            wall_size    = scan_result.get('ask_wall_size_raw', float(levels.get('short_wall_size', 1)))
-            sl_dist      = max(float(dist_wall) * max(0.5, 1.0 - wall_str * 0.1),
-                               min_sl) if dist_wall else min_sl
-            sl           = price + sl_dist
-            wall_px      = price + (float(dist_wall) if dist_wall else sl_dist)
-            bid_wstr     = scan_result.get('bid_wall_strength', 0.0)
-            ask_wstr     = wall_str
+            ask_wstr     = self._clamp(self._as_float(scan_result.get('ask_wall_strength', 0.0), 0.0), 0.0, 3.0)
 
-        # 1:2 RR إجباري للـ TP1
-        tp1_dist = sl_dist * 2.0
-        remaining_fuel = context.get('remaining_fuel', 80.0 * pip)
-        tp2_dist = min(tp1_dist * 2.5, remaining_fuel * 0.5)
-        tp3_dist = min(tp1_dist * 5.0, remaining_fuel * 0.9)
+            dist_tp_wall = max(self._as_float(scan_result.get('dist_to_ask_wall'), context.get('dist_to_ask_wall', 0.0)), 0.0)
+            tp_wall_str  = self._clamp(self._as_float(scan_result.get('ask_wall_strength', 0.0), 0.0), 0.0, 3.0)
+            if dist_tp_wall > min_tp:
+                wall_buffer = pip * (1.5 + tp_wall_str * 2.0 + hint_ask_str * 1.5)
+                tp1_dist = max(dist_tp_wall - wall_buffer, min_tp)
+            else:
+                tp1_dist = max(sl_dist * 2.5, min_tp)
+        else:
+            dist_wall    = max(self._as_float(scan_result.get('dist_to_ask_wall'), context.get('dist_to_ask_wall', 0.0)), 0.0)
+            wall_str     = self._clamp(self._as_float(scan_result.get('ask_wall_strength', 0.5), 0.5), 0.0, 3.0)
+            wall_size    = scan_result.get('ask_wall_size_raw', float(levels.get('short_wall_size', 1)))
+            safety       = pip * (1.0 + max(0.0, 1.0 - wall_str) * 2.0)
+            if dist_wall > 0:
+                sl_dist  = max((dist_wall + safety) * sl_factor, min_sl)
+            else:
+                sl_dist  = min_sl * sl_factor
+            sl_dist      = max(sl_dist, min_sl)
+            sl           = price + sl_dist
+            wall_px      = price + (dist_wall if dist_wall else sl_dist)
+            bid_wstr     = self._clamp(self._as_float(scan_result.get('bid_wall_strength', 0.0), 0.0), 0.0, 3.0)
+            ask_wstr     = wall_str
+            dist_tp_wall = max(self._as_float(scan_result.get('dist_to_bid_wall'), context.get('dist_to_bid_wall', 0.0)), 0.0)
+            tp_wall_str  = self._clamp(self._as_float(scan_result.get('bid_wall_strength', 0.0), 0.0), 0.0, 3.0)
+            if dist_tp_wall > min_tp:
+                wall_buffer = pip * (1.5 + tp_wall_str * 2.0 + hint_bid_str * 1.5)
+                tp1_dist = max(dist_tp_wall - wall_buffer, min_tp)
+            else:
+                tp1_dist = max(sl_dist * 2.5, min_tp)
+
+        tp2_dist = min(tp1_dist * 2.2, remaining_fuel * 0.60)
+        tp3_dist = min(tp1_dist * 4.0, remaining_fuel * 0.90)
 
         if direction == 'LONG':
             tp1 = price + tp1_dist
-            tp2 = price + tp2_dist if tp2_dist > tp1_dist else None
-            tp3 = price + tp3_dist if tp3_dist > (tp2_dist or tp1_dist) else None
+            tp2 = price + tp2_dist if tp2_dist > tp1_dist * 1.3 else None
+            tp3 = price + tp3_dist if tp3_dist > (tp2_dist if tp2 is not None else tp1_dist) * 1.3 else None
         else:
             tp1 = price - tp1_dist
-            tp2 = price - tp2_dist if tp2_dist > tp1_dist else None
-            tp3 = price - tp3_dist if tp3_dist > (tp2_dist or tp1_dist) else None
+            tp2 = price - tp2_dist if tp2_dist > tp1_dist * 1.3 else None
+            tp3 = price - tp3_dist if tp3_dist > (tp2_dist if tp2 is not None else tp1_dist) * 1.3 else None
 
         self._trade = ActiveTrade(
             direction=direction,
@@ -156,8 +203,8 @@ class DynamicTargetManager:
         orig = self._trade.wall_size_orig
         if orig <= 0:
             return True
-        rate = current_wall_size / orig
-        self._trade.wall_consumption_rate = round(1.0 - rate, 4)
+        rate = max(self._as_float(current_wall_size, 0.0), 0.0) / orig
+        self._trade.wall_consumption_rate = round(self._clamp(1.0 - rate, 0.0, 1.0), 4)
         return rate < self.wall_thr
 
     def _cvd_consistent(self, direction: str) -> bool:
@@ -279,6 +326,8 @@ class DynamicTargetManager:
                         'context_features': ctx,
                     }
                 else:
+                    if t.remaining_size > 0:
+                        t.realized_pips += pips_tp1 * t.remaining_size
                     t.state          = TradeState.CLOSED
                     t.remaining_size = 0
                     return {
