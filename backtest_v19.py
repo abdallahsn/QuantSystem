@@ -22,12 +22,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.slippage_model import confidence_bet_size
 from predict_v19 import V19PredictionEngine
+from train_v19 import _align_lob_to_rows, _load_lob_inputs
 
 try:
     from modules.html_reporter import generate_backtest_report
     HTML_REPORT_AVAILABLE = True
 except ImportError:
     HTML_REPORT_AVAILABLE = False
+
+try:
+    from modules.deeplob_cnn import DeepLOBCNN
+    DEEPLOB_AVAILABLE = True
+except ImportError:
+    DeepLOBCNN = None
+    DEEPLOB_AVAILABLE = False
 
 
 def _safe_float(x, default=0.0):
@@ -47,35 +55,154 @@ def _load_csv(path: str) -> pd.DataFrame:
     return df
 
 
+def _filter_backtest_window(df: pd.DataFrame, start_ts: str | None = None, end_ts: str | None = None) -> pd.DataFrame:
+    out = df.copy()
+    if 'ts_event' not in out.columns or (start_ts is None and end_ts is None):
+        return out.reset_index(drop=True)
+    ts = pd.to_datetime(out.get('ts_event'), utc=True, errors='coerce').dt.tz_localize(None)
+    mask = pd.Series(True, index=out.index)
+    def _naive_timestamp(value: str) -> pd.Timestamp:
+        ts_val = pd.Timestamp(value)
+        if ts_val.tzinfo is not None:
+            return ts_val.tz_convert(None)
+        return ts_val
+    if start_ts is not None:
+        start = _naive_timestamp(start_ts)
+        mask &= ts >= start
+    if end_ts is not None:
+        end = _naive_timestamp(end_ts)
+        mask &= ts < end
+    return out.loc[mask].reset_index(drop=True)
+
+
+def _directional_event_mask(df: pd.DataFrame) -> np.ndarray:
+    n = len(df)
+    if n == 0 or 'bias_label' not in df.columns:
+        return np.zeros(n, dtype=bool)
+    event_col = 'train_event_flag' if 'train_event_flag' in df.columns else 'event_flag' if 'event_flag' in df.columns else None
+    if event_col is None:
+        return np.zeros(n, dtype=bool)
+    event_flag = pd.to_numeric(df.get(event_col, 0), errors='coerce').fillna(0).astype(np.int8).values == 1
+    bias = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8).values
+    return event_flag & np.isin(bias, [0, 1])
+
+
+def _expand_event_aligned_matrix(
+    df: pd.DataFrame,
+    arr: np.ndarray,
+    expected_dim: int,
+    artifact_name: str,
+    path: str,
+    strict: bool,
+) -> np.ndarray:
+    n = len(df)
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f'❌ {artifact_name} must be 2D, got {arr.shape}')
+
+    if len(arr) == n:
+        out = np.zeros((n, expected_dim), dtype=np.float32)
+        out[:, :min(arr.shape[1], expected_dim)] = arr[:, :expected_dim]
+        return out
+
+    event_mask = _directional_event_mask(df)
+    n_event = int(event_mask.sum())
+    if n_event > 0 and len(arr) == n_event:
+        out = np.zeros((n, expected_dim), dtype=np.float32)
+        out[event_mask, :min(arr.shape[1], expected_dim)] = arr[:, :expected_dim]
+        print(
+            f"  ⚠️ {artifact_name} loaded as event-aligned rows ({n_event:,}) from {path}; "
+            f"expanded to full CSV rows ({n:,})."
+        )
+        return out
+
+    msg = (
+        f'❌ {artifact_name} rows ({len(arr)}) do not match CSV rows ({n})'
+        + (f' or directional event rows ({n_event})' if n_event else '')
+        + f' for {path}'
+    )
+    if strict:
+        raise ValueError(msg)
+    print(f"  ⚠️ {msg}. Falling back to zeros.")
+    return np.zeros((n, expected_dim), dtype=np.float32)
+
+
+def _compute_visual_embeddings_from_lob(
+    df: pd.DataFrame,
+    models_dir: str,
+    lob_path: str | None,
+    lob_ts_path: str | None,
+    expected_dim: int,
+) -> np.ndarray:
+    n = len(df)
+    zero = np.zeros((n, expected_dim), dtype=np.float32)
+    if n == 0 or expected_dim <= 0 or not DEEPLOB_AVAILABLE:
+        return zero
+
+    deeplob_path = os.path.join(models_dir, 'deeplob_cnn_v19.keras')
+    if not os.path.exists(deeplob_path):
+        return zero
+
+    lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
+    if lob_tensors is None or lob_timestamps is None:
+        return zero
+
+    row_to_tensor, _, _ = _align_lob_to_rows(df, lob_timestamps, max_tensors=len(lob_tensors))
+    used_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
+    if len(used_tensor_ids) == 0:
+        return zero
+
+    cnn = DeepLOBCNN(brain_file=deeplob_path)
+    if cnn.model is None or not cnn._fitted:
+        return zero
+
+    X = np.asarray(lob_tensors[used_tensor_ids], dtype=np.float32)
+    emb = np.asarray(cnn.get_embeddings(X), dtype=np.float32)
+    if emb.ndim != 2:
+        return zero
+
+    emb_lookup = {int(tid): emb[i, :expected_dim] for i, tid in enumerate(used_tensor_ids)}
+    out = np.zeros((n, expected_dim), dtype=np.float32)
+    for row_idx, tensor_idx in enumerate(row_to_tensor):
+        if int(tensor_idx) in emb_lookup:
+            out[row_idx] = emb_lookup[int(tensor_idx)]
+    print(f"  ✅ Visual embeddings recomputed from LOB tensors: {out.shape}")
+    return out
+
+
 def _load_visual_embeddings(
     df: pd.DataFrame,
     explicit_path: str | None,
     default_path: str | None,
     expected_dim: int,
+    models_dir: str,
+    lob_path: str | None = None,
+    lob_ts_path: str | None = None,
 ) -> np.ndarray:
     n = len(df)
     zero = np.zeros((n, expected_dim), dtype=np.float32)
 
     path = explicit_path if explicit_path else default_path
-    if not path or not os.path.exists(path):
-        return zero
+    if path and os.path.exists(path):
+        vis = np.load(path)
+        try:
+            return _expand_event_aligned_matrix(
+                df,
+                vis,
+                expected_dim=expected_dim,
+                artifact_name='visual embeddings',
+                path=path,
+                strict=bool(explicit_path),
+            )
+        except ValueError:
+            if lob_path and lob_ts_path:
+                print("  ⚠️ visual embeddings file is not row-aligned to this CSV; recomputing from LOB tensors instead.")
+                return _compute_visual_embeddings_from_lob(df, models_dir, lob_path, lob_ts_path, expected_dim)
+            raise
 
-    vis = np.load(path)
-    vis = np.asarray(vis, dtype=np.float32)
-    if vis.ndim != 2:
-        raise ValueError(f'❌ visual embeddings must be 2D, got {vis.shape}')
-
-    if explicit_path and len(vis) != n:
-        raise ValueError(
-            f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) for explicit file {path}'
-        )
-
-    if len(vis) < n:
-        out = zero.copy()
-        out[:len(vis), :min(vis.shape[1], expected_dim)] = vis[:, :expected_dim]
-        return out
-
-    return vis[:n, :expected_dim]
+    if lob_path and lob_ts_path:
+        return _compute_visual_embeddings_from_lob(df, models_dir, lob_path, lob_ts_path, expected_dim)
+    return zero
 
 
 def _load_meta_features(
@@ -102,18 +229,21 @@ def _load_meta_features(
             'Use meta_features_oof_v19.npy or omit --meta_npy.'
         )
 
-    meta = np.load(explicit_path)
-    meta = np.asarray(meta, dtype=np.float32)
+    meta = np.asarray(np.load(explicit_path), dtype=np.float32)
     if meta.ndim != 2:
         raise ValueError(f'❌ meta features must be 2D, got {meta.shape}')
-    if len(meta) != n:
-        raise ValueError(
-            f'❌ meta features rows ({len(meta)}) do not match CSV rows ({n}) for explicit file {explicit_path}'
-        )
     if meta.shape[1] < expected_dim:
         raise ValueError(
             f'❌ meta features columns ({meta.shape[1]}) أقل من المطلوب ({expected_dim})'
         )
+    meta = _expand_event_aligned_matrix(
+        df,
+        meta,
+        expected_dim=expected_dim,
+        artifact_name='meta features',
+        path=explicit_path,
+        strict=True,
+    )
     return meta[:, :expected_dim]
 
 
@@ -325,10 +455,14 @@ def main():
     p.add_argument('--output', default='outputs_v19', help='backtest output directory')
     p.add_argument('--visual_npy', default=None, help='optional row-aligned visual embeddings file')
     p.add_argument('--meta_npy', default=None, help='optional row-aligned stage-1 meta features file')
+    p.add_argument('--lob_npy', default=None, help='optional LOB tensors file for recomputing visual embeddings on this CSV')
+    p.add_argument('--lob_ts_npy', default=None, help='optional LOB tensor timestamps file paired with --lob_npy')
     p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
                    help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
     p.add_argument('--input_scaled', action='store_true',
                    help='set when CSV is already scaled like training_features_ready.csv')
+    p.add_argument('--start_ts', default=None, help='optional inclusive start timestamp filter for the CSV')
+    p.add_argument('--end_ts', default=None, help='optional exclusive end timestamp filter for the CSV')
     p.add_argument('--tick_size', type=float, default=0.0001)
     p.add_argument('--tick_value', type=float, default=10.0)
     p.add_argument('--round_trip_cost_pips', type=float, default=1.0)
@@ -336,13 +470,16 @@ def main():
     p.add_argument('--starting_equity', type=float, default=100000.0)
     args = p.parse_args()
 
-    df = _load_csv(args.csv)
+    df = _filter_backtest_window(_load_csv(args.csv), start_ts=args.start_ts, end_ts=args.end_ts)
     engine = V19PredictionEngine(args.models)
     visual_embeddings = _load_visual_embeddings(
         df,
         explicit_path=args.visual_npy,
         default_path=engine.visual_emb_path,
         expected_dim=len(engine.visual_features),
+        models_dir=args.models,
+        lob_path=args.lob_npy,
+        lob_ts_path=args.lob_ts_npy,
     )
     meta_features = _load_meta_features(
         df,
