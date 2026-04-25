@@ -24,7 +24,15 @@ from sklearn.metrics import precision_recall_fscore_support
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
-from modules.dynamic_labels import EventGate
+from modules.dynamic_labels import (
+    DEFAULT_EVENT_OBI_THR,
+    DEFAULT_EVENT_ROLL_WINDOW,
+    DEFAULT_EVENT_SCORE_THRESHOLD,
+    DEFAULT_EVENT_SHIFT_Z_THR,
+    DEFAULT_EVENT_VOL_MULT,
+    DEFAULT_EVENT_WALL_STR_THR,
+    EventGate,
+)
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -105,11 +113,12 @@ class V19PredictionEngine:
         self.sequence_aux_mode = str(self.factory.schema.get('sequence_aux_mode', 'full_window')).strip() or 'full_window'
         gate_cfg = self.factory.schema.get('event_gate', {}) or {}
         self.event_gate = EventGate(
-            roll_window=int(gate_cfg.get('roll_window', 50)),
-            vol_mult=float(gate_cfg.get('vol_mult', 1.45)),
-            obi_thr=float(gate_cfg.get('obi_thr', 0.40)),
-            wall_str_thr=float(gate_cfg.get('wall_str_thr', 1.025)),
-            shift_z_thr=float(gate_cfg.get('shift_z_thr', 0.75)),
+            roll_window=int(gate_cfg.get('roll_window', DEFAULT_EVENT_ROLL_WINDOW)),
+            vol_mult=float(gate_cfg.get('vol_mult', DEFAULT_EVENT_VOL_MULT)),
+            obi_thr=float(gate_cfg.get('obi_thr', DEFAULT_EVENT_OBI_THR)),
+            wall_str_thr=float(gate_cfg.get('wall_str_thr', DEFAULT_EVENT_WALL_STR_THR)),
+            shift_z_thr=float(gate_cfg.get('shift_z_thr', DEFAULT_EVENT_SHIFT_Z_THR)),
+            score_threshold=float(gate_cfg.get('score_threshold', DEFAULT_EVENT_SCORE_THRESHOLD)),
         )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))

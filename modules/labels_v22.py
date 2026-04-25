@@ -44,6 +44,11 @@ import numpy as np
 import pandas as pd
 
 from modules.dynamic_labels import (
+    DEFAULT_EVENT_OBI_THR,
+    DEFAULT_EVENT_SHIFT_Z_THR,
+    DEFAULT_EVENT_TARGET_RATE,
+    DEFAULT_EVENT_VOL_MULT,
+    DEFAULT_EVENT_WALL_STR_THR,
     DIR_LONG,
     DIR_NEUTRAL,
     DIR_SHORT,
@@ -72,6 +77,9 @@ SETUP_ABSORPTION = 0
 SETUP_SPOOFING   = 1
 SETUP_OBI        = 2
 SETUP_MIXED      = 3
+
+DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
+DEFAULT_V22_TP_MULT = 1.5
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -219,8 +227,8 @@ def _build_training_event_gate(
     vol_mult: float,
     obi_thr: float,
     wall_thr: float,
-    shift_z_thr: float = 0.75,
-    target_rate: float = 0.25,
+    shift_z_thr: float = DEFAULT_EVENT_SHIFT_Z_THR,
+    target_rate: float = DEFAULT_EVENT_TARGET_RATE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Build a stricter causal gate for dataset selection.
@@ -548,8 +556,8 @@ def build_causal_event_labels(
     horizon: int = 50,
     event_roll_window: int = 30,
     feature_roll_window: int = 150,
-    direction_threshold_ticks: float = 5.0,
-    tp_mult: float = 1.5,
+    direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    tp_mult: float = DEFAULT_V22_TP_MULT,
     sl_mult: float = 1.0,
     neutral_mult: float = 0.45,
     tick_size: float = 1e-4,
@@ -670,9 +678,9 @@ def build_causal_event_labels(
     out = engineer_features(out, roll_window=feat_window)
 
     # ── 3. FIX-1: broad event filter + stronger training gate ───────────────
-    vol_mult = 1.10
-    obi_thr  = 0.08
-    wall_thr = 0.70
+    vol_mult = DEFAULT_EVENT_VOL_MULT
+    obi_thr  = DEFAULT_EVENT_OBI_THR
+    wall_thr = DEFAULT_EVENT_WALL_STR_THR
 
     event_mask = build_event_filter(
         out,

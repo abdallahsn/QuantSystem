@@ -36,6 +36,14 @@ from prepare_training_data import (
 )
 VISUAL_EMB_DIM = 8
 from modules.config_v19 import load_v19_config
+from modules.dynamic_labels import (
+    DEFAULT_EVENT_OBI_THR,
+    DEFAULT_EVENT_ROLL_WINDOW,
+    DEFAULT_EVENT_SCORE_THRESHOLD,
+    DEFAULT_EVENT_SHIFT_Z_THR,
+    DEFAULT_EVENT_VOL_MULT,
+    DEFAULT_EVENT_WALL_STR_THR,
+)
 from modules.feature_factory_v19 import (
     DEFAULT_PASSTHROUGH_COLS,
     apply_scaler_params_to_frame,
@@ -1033,6 +1041,53 @@ def build_safe_sequences(
     return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
 
 
+def _compute_bias_class_weights(y_bias: np.ndarray, max_weight: float = 2.5) -> dict[int, float]:
+    y_bias = np.asarray(y_bias, dtype=np.int32)
+    valid = y_bias[(y_bias >= 0) & (y_bias < 2)]
+    if valid.size == 0:
+        return {}
+    counts = np.bincount(valid, minlength=2)[:2]
+    nonzero = counts[counts > 0]
+    if nonzero.size < 2:
+        return {int(cls): 1.0 for cls, count in enumerate(counts) if count > 0}
+    majority = float(nonzero.max())
+    weights: dict[int, float] = {}
+    for cls, count in enumerate(counts):
+        if count <= 0:
+            continue
+        weights[int(cls)] = float(np.clip(majority / float(count), 1.0, max_weight))
+    return weights
+
+
+def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
+    event_cfg = {
+        'roll_window': DEFAULT_EVENT_ROLL_WINDOW,
+        'vol_mult': DEFAULT_EVENT_VOL_MULT,
+        'obi_thr': DEFAULT_EVENT_OBI_THR,
+        'wall_str_thr': DEFAULT_EVENT_WALL_STR_THR,
+        'shift_z_thr': DEFAULT_EVENT_SHIFT_Z_THR,
+        'score_threshold': DEFAULT_EVENT_SCORE_THRESHOLD,
+    }
+    if len(df) == 0 or 'event_score' not in df.columns:
+        return event_cfg
+
+    event_col = 'train_event_flag' if 'train_event_flag' in df.columns else 'event_flag'
+    event_mask = (
+        pd.to_numeric(df.get(event_col, 0), errors='coerce')
+        .fillna(0)
+        .astype(np.int8)
+        == 1
+    )
+    if not event_mask.any():
+        return event_cfg
+
+    event_scores = pd.to_numeric(df.get('event_score', 0.0), errors='coerce')
+    selected_scores = event_scores[event_mask].dropna()
+    if len(selected_scores):
+        event_cfg['score_threshold'] = float(max(selected_scores.min(), 0.0))
+    return event_cfg
+
+
 def stage3_meta_learner_v19(
     df: pd.DataFrame,
     meta_features: np.ndarray,
@@ -1040,6 +1095,7 @@ def stage3_meta_learner_v19(
     coverage_mask: np.ndarray,
     inference_scaler_params: dict,
     output_dir: str,
+    event_gate_cfg: dict | None = None,
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
@@ -1075,6 +1131,20 @@ def stage3_meta_learner_v19(
 
     print(f"  Train Sequences: {len(X_tr):,}")
     print(f"  Val Sequences:   {len(X_val):,}")
+    bias_counts = np.bincount(yb_tr, minlength=2)[:2]
+    bias_class_weights = _compute_bias_class_weights(yb_tr)
+    print(
+        "  Bias Seq Counts: "
+        f"LONG={int(bias_counts[0]):,} SHORT={int(bias_counts[1]):,}"
+    )
+    if bias_class_weights:
+        print(
+            "  Bias Class Weights: "
+            + " ".join(
+                f"{BIAS_LABELS.get(cls, cls)}={weight:.2f}"
+                for cls, weight in sorted(bias_class_weights.items())
+            )
+        )
 
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
@@ -1093,12 +1163,23 @@ def stage3_meta_learner_v19(
         epochs=epochs,
         batch=batch,
         output_dir=output_dir,
+        class_weights=bias_class_weights,
     )
 
     if history is not None:
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
+        event_gate_cfg = event_gate_cfg or _infer_event_gate_schema(df)
         with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
-            json.dump({'history': hist_dict, 'split': split_stats}, f, indent=2)
+            json.dump(
+                {
+                    'history': hist_dict,
+                    'split': split_stats,
+                    'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
+                    'event_gate': event_gate_cfg,
+                },
+                f,
+                indent=2,
+            )
         schema = {
             'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
@@ -1122,13 +1203,7 @@ def stage3_meta_learner_v19(
                 'meta_features_oof': 'meta_features_oof_v19.npy',
                 'meta_features_live': 'meta_features_live_v19.npy',
             },
-            'event_gate': {
-                'roll_window': 50,
-                'vol_mult': 1.45,
-                'obi_thr': 0.40,
-                'wall_str_thr': 1.025,
-                'shift_z_thr': 0.75,
-            },
+            'event_gate': event_gate_cfg,
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
@@ -1418,6 +1493,7 @@ def run_training_pipeline(
             coverage_mask=coverage,
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
+            event_gate_cfg=_infer_event_gate_schema(df_full),
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,

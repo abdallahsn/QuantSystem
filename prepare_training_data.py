@@ -61,17 +61,25 @@ DEEPLOB_MAX_GB_DEFAULT = 0.30
 LOB_EVENT_SAMPLE_DEFAULT = 100_000
 
 try:
-    from modules.labels_v22 import build_causal_event_labels
+    from modules.labels_v22 import (
+        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+        DEFAULT_V22_TP_MULT,
+        build_causal_event_labels,
+    )
     V19_LABELS_AVAILABLE = True
     V19_LABELS_IMPORT_ERROR = None
     V19_LABELS_SOURCE = 'modules.labels_v22'
 except ImportError:
     try:
         from modules.labels_v19 import build_causal_event_labels
+        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
+        DEFAULT_V22_TP_MULT = 1.5
         V19_LABELS_AVAILABLE = True
         V19_LABELS_IMPORT_ERROR = None
         V19_LABELS_SOURCE = 'modules.labels_v19'
     except ImportError as exc:
+        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
+        DEFAULT_V22_TP_MULT = 1.5
         V19_LABELS_AVAILABLE = False
         V19_LABELS_IMPORT_ERROR = exc
         V19_LABELS_SOURCE = None
@@ -1222,11 +1230,11 @@ def run_refinery(
     target_bars=500,
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
-    direction_threshold_ticks: float = 1.0,  # إعداد هجومي: 2.0 → 1.0
+    direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
-    tp_mult: float = 1.2,
+    tp_mult: float = DEFAULT_V22_TP_MULT,
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
@@ -1491,12 +1499,12 @@ if __name__=='__main__':
                    help='Base forward horizon for causal labels (default: 150)')
     p.add_argument('--event_roll_window', type=int, default=50,
                    help='Rolling window for event filter (default: 50)')
-    p.add_argument('--direction_threshold_ticks', type=float, default=1.0,
-                   help='Directional threshold floor in ticks (default: 1.0)')
+    p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+                   help=f'Directional threshold floor in ticks (default: {DEFAULT_V22_DIRECTION_THRESHOLD_TICKS:.1f})')
     p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
                    help='Max event-rich emit positions for LOB tensors')
-    p.add_argument('--tp_mult', type=float, default=1.2,
-                   help='TP multiplier applied to dynamic threshold (default: 1.2)')
+    p.add_argument('--tp_mult', type=float, default=DEFAULT_V22_TP_MULT,
+                   help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V22_TP_MULT:.1f})')
     p.add_argument('--sl_mult', type=float, default=1.0,
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
     p.add_argument('--kalman_slope_threshold', type=float, default=0.05,

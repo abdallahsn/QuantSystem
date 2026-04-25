@@ -284,12 +284,26 @@ class MetaLearnerLSTM:
             brain_path = os.path.join(output_dir, brain_path)
 
         sample_w = np.where(np.asarray(yc_tr, dtype=np.float32) > 0.5, 2.0, 1.0).astype(np.float32)
+        bias_w = sample_w.copy()
+        if class_weights:
+            for cls, weight in class_weights.items():
+                bias_w = np.where(
+                    np.asarray(yb_tr, dtype=np.int32) == int(cls),
+                    bias_w * float(weight),
+                    bias_w,
+                ).astype(np.float32)
         conf_w = sample_w.copy()
         n_tr = len(X_tr)
         n_val = len(X_val)
 
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
         print("   Quality Weights: STRONG=2.00 WEAK=1.00")
+        if class_weights:
+            weights_text = " ".join(
+                f"{int(cls)}={float(weight):.2f}"
+                for cls, weight in sorted(class_weights.items())
+            )
+            print(f"   Bias Weights: {weights_text}")
 
         cbs = [
             EarlyStopping(monitor='val_loss',
@@ -309,7 +323,7 @@ class MetaLearnerLSTM:
             epochs=epochs,
             batch_size=batch,
             sample_weight={
-                'bias_out': sample_w,
+                'bias_out': bias_w,
                 'conf_out': conf_w,
             },
             callbacks=cbs,

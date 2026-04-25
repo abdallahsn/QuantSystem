@@ -8,7 +8,11 @@ import os
 
 import pandas as pd
 
-from prepare_training_data import run_refinery
+from prepare_training_data import (
+    DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    DEFAULT_V22_TP_MULT,
+    run_refinery,
+)
 
 
 def read_market_data(path: str) -> pd.DataFrame:
@@ -60,8 +64,8 @@ def build_replay_dataset(
     target_bars: int = 500,
     label_horizon: int = 150,
     event_roll_window: int = 50,
-    direction_threshold_ticks: float = 1.0,
-    tp_mult: float = 1.2,
+    direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    tp_mult: float = DEFAULT_V22_TP_MULT,
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,
     trend_strength_min: float = 0.05,
