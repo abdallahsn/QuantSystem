@@ -470,7 +470,10 @@ def main():
     p.add_argument('--starting_equity', type=float, default=100000.0)
     args = p.parse_args()
 
-    df = _filter_backtest_window(_load_csv(args.csv), start_ts=args.start_ts, end_ts=args.end_ts)
+    df_raw = _load_csv(args.csv)
+    df = _filter_backtest_window(df_raw, start_ts=args.start_ts, end_ts=args.end_ts)
+    if args.start_ts or args.end_ts:
+        print(f"  ✅ Backtest window rows: {len(df):,}/{len(df_raw):,}")
     engine = V19PredictionEngine(args.models)
     visual_embeddings = _load_visual_embeddings(
         df,
