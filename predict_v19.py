@@ -5,7 +5,7 @@ V19 inference uses the exact feature schema and scaler artifacts produced by
 the training pipeline, then reconstructs the same step vector used in training:
 
   [25 scaled statistical features] + [2 CatBoost probs] +
-  [4 regime one-hot] + [8 visual embeddings if available]
+  [4 regime one-hot + 3 regime scores] + [8 visual embeddings if available]
 """
 
 from __future__ import annotations
@@ -24,15 +24,7 @@ from sklearn.metrics import precision_recall_fscore_support
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
-from modules.dynamic_labels import (
-    DEFAULT_EVENT_OBI_THR,
-    DEFAULT_EVENT_ROLL_WINDOW,
-    DEFAULT_EVENT_SCORE_THRESHOLD,
-    DEFAULT_EVENT_SHIFT_Z_THR,
-    DEFAULT_EVENT_VOL_MULT,
-    DEFAULT_EVENT_WALL_STR_THR,
-    EventGate,
-)
+from modules.dynamic_labels import EventGate
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -42,8 +34,9 @@ from modules.slippage_model import DailyLossGuard
 try:
     from modules.deeplob_cnn import DeepLOBCNN
     DEEPLOB_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     DEEPLOB_AVAILABLE = False
+    print(f"  ⚠️ DeepLOB inference غير متاح — {exc}")
 
 try:
     from catboost import CatBoostClassifier
@@ -113,12 +106,18 @@ class V19PredictionEngine:
         self.sequence_aux_mode = str(self.factory.schema.get('sequence_aux_mode', 'full_window')).strip() or 'full_window'
         gate_cfg = self.factory.schema.get('event_gate', {}) or {}
         self.event_gate = EventGate(
-            roll_window=int(gate_cfg.get('roll_window', DEFAULT_EVENT_ROLL_WINDOW)),
-            vol_mult=float(gate_cfg.get('vol_mult', DEFAULT_EVENT_VOL_MULT)),
-            obi_thr=float(gate_cfg.get('obi_thr', DEFAULT_EVENT_OBI_THR)),
-            wall_str_thr=float(gate_cfg.get('wall_str_thr', DEFAULT_EVENT_WALL_STR_THR)),
-            shift_z_thr=float(gate_cfg.get('shift_z_thr', DEFAULT_EVENT_SHIFT_Z_THR)),
-            score_threshold=float(gate_cfg.get('score_threshold', DEFAULT_EVENT_SCORE_THRESHOLD)),
+            roll_window=int(gate_cfg.get('roll_window', 50)),
+            vol_mult=float(gate_cfg.get('vol_mult', 1.05)),        # FIX: 1.10 → 1.05
+            obi_thr=float(gate_cfg.get('obi_thr', 0.05)),          # FIX: 0.08 → 0.05
+            wall_str_thr=float(gate_cfg.get('wall_str_thr', 0.60)), # FIX: 0.70 → 0.60
+            shift_z_thr=float(gate_cfg.get('shift_z_thr', 0.65)),  # FIX: 0.75 → 0.65
+            score_threshold=float(gate_cfg.get('score_threshold', 0.0)),
+        )
+        # FIX: DailyContextEngine بـ rolling ADR حقيقي بدل 80pip ثابت
+        from modules.context_features import DailyContextEngine
+        self._daily_ctx = DailyContextEngine(
+            default_adr=float(gate_cfg.get('default_adr_pips', 80.0)),
+            adr_lookback_days=int(gate_cfg.get('adr_lookback_days', 20)),
         )
         artifacts = self.factory.schema.get('artifacts', {})
         meta_path = os.path.join(models_dir, artifacts.get('meta_model', 'meta_learner_v19.keras'))
@@ -187,6 +186,7 @@ class V19PredictionEngine:
         )
 
         self._seq_buffer = deque(maxlen=self.seq_len)
+        self._regime_buffer = deque(maxlen=max(self.seq_len * 4, 128))
         self.event_writer = event_writer
         schema_version = str(self.factory.schema.get('version', 'v19'))
         self.pred_logger = PredictionLogger(event_writer, run_mode=run_mode, manifest_path=self.manifest_path, model_version='v19', schema_version=schema_version, symbol=symbol)
@@ -196,6 +196,7 @@ class V19PredictionEngine:
 
     def reset_state(self):
         self._seq_buffer.clear()
+        self._regime_buffer.clear()
         self.event_gate.reset()
         self.loss_guard.reset_daily()
 
@@ -248,20 +249,29 @@ class V19PredictionEngine:
         except Exception:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
 
-    def _get_regime_one_hot(self, stat_df: pd.DataFrame) -> np.ndarray:
+    def _update_regime_context(self, stat_df: pd.DataFrame) -> None:
+        if stat_df is None or len(stat_df) == 0:
+            return
+        for _, row in stat_df.iterrows():
+            self._regime_buffer.append(row.to_dict())
+
+    def _get_regime_meta_block(self, stat_df: pd.DataFrame) -> np.ndarray:
         n = len(stat_df)
-        out = np.zeros((n, N_CLUSTERS), dtype=np.float32)
+        expected_dim = max(len(self.meta_features) - N_CB_PROBS, 0)
+        out = np.zeros((n, expected_dim), dtype=np.float32)
+        if expected_dim == 0:
+            return out
         if not self.regime_clf._fitted:
             out[:, 0] = 1.0
             return out
         try:
-            labels = self.regime_clf.predict(stat_df)
-            for i, lbl in enumerate(labels):
-                lbl = int(lbl)
-                if 0 <= lbl < N_CLUSTERS:
-                    out[i, lbl] = 1.0
-                else:
-                    out[i, 0] = 1.0
+            if n == 1 and len(self._regime_buffer):
+                recent_df = pd.DataFrame(list(self._regime_buffer))
+                meta_df = self.regime_clf.predict_regime_meta(recent_df).iloc[-1:]
+            else:
+                meta_df = self.regime_clf.predict_regime_meta(stat_df)
+            meta_cols = list(self.meta_features[N_CB_PROBS:])
+            out = meta_df.reindex(columns=meta_cols, fill_value=0.0).values.astype(np.float32)
         except Exception:
             out[:, 0] = 1.0
         return out
@@ -297,19 +307,19 @@ class V19PredictionEngine:
             if meta_override.ndim == 1:
                 meta_override = meta_override.reshape(1, -1)
             expected_dim = len(self.meta_features)
-            if meta_override.shape[1] < expected_dim:
-                pad = np.zeros((meta_override.shape[0], expected_dim - meta_override.shape[1]), dtype=np.float32)
-                meta_override = np.concatenate([meta_override, pad], axis=1)
-            meta_override = meta_override[:, :expected_dim]
+            if meta_override.shape[1] != expected_dim:
+                raise ValueError(
+                    f'❌ meta override columns ({meta_override.shape[1]}) do not match schema ({expected_dim})'
+                )
             cb_probs = meta_override[:, :N_CB_PROBS]
-            regime_oh = meta_override[:, N_CB_PROBS:N_CB_PROBS + N_CLUSTERS]
+            regime_meta = meta_override[:, N_CB_PROBS:expected_dim]
         else:
             cb_probs = self._get_cb_probs(X_stat)
-            regime_oh = self._get_regime_one_hot(stat_df)
+            regime_meta = self._get_regime_meta_block(stat_df)
         if visual_emb is None:
             visual_emb = np.zeros((len(stat_df), len(self.visual_features)), dtype=np.float32)
-        X_step = np.concatenate([X_stat, cb_probs, regime_oh, visual_emb], axis=1).astype(np.float32)
-        return X_step, cb_probs, regime_oh
+        X_step = np.concatenate([X_stat, cb_probs, regime_meta, visual_emb], axis=1).astype(np.float32)
+        return X_step, cb_probs, regime_meta
 
     def _meta_decision(self, seq: np.ndarray) -> dict:
         if self.meta is None:
@@ -368,6 +378,7 @@ class V19PredictionEngine:
             already_scaled=already_scaled,
             include_meta=True,
         )
+        self._update_regime_context(stat_df)
         health = evaluate_system_health(
             models_dir=self.models_dir,
             engine_status=self.get_runtime_status(),
@@ -415,7 +426,7 @@ class V19PredictionEngine:
             visual_emb = self.factory.prepare_visual_embeddings(visual_embedding, n_rows=len(stat_df))
         else:
             visual_emb = self._get_visual_embeddings(len(stat_df), lob_tensor=lob_tensor)
-        step_rows, cb_probs, regime_oh = self._build_step_vectors(
+        step_rows, cb_probs, regime_meta = self._build_step_vectors(
             stat_df,
             visual_emb=visual_emb,
             meta_override=meta_override,
@@ -445,7 +456,7 @@ class V19PredictionEngine:
             result['tradeable'] = False
             result['reason'] = runtime_mode.get('reason', 'Paper blocked')
             self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode)
-        cluster = int(np.argmax(regime_oh[0]))
+        cluster = int(np.argmax(regime_meta[0, :N_CLUSTERS])) if regime_meta.shape[1] >= N_CLUSTERS else 0
         bias_probs = np.asarray(result.get('bias_probs', cb_probs[0]), dtype=np.float32).reshape(-1)
         direction_probs = {
             'LONG': round(float(bias_probs[0]) if len(bias_probs) > 0 else 0.0, 4),
@@ -460,11 +471,31 @@ class V19PredictionEngine:
             result['visual_norm'] = round(float(np.linalg.norm(visual_emb[0])), 4)
         result['cluster'] = cluster
         result['cluster_name'] = REGIME_NAMES.get(cluster, f'Cluster_{cluster}')
+        score_offset = N_CLUSTERS
+        result['regime_scores'] = {
+            'volatile': round(float(regime_meta[0, score_offset + 0]), 4) if regime_meta.shape[1] > score_offset + 0 else 0.0,
+            'trend': round(float(regime_meta[0, score_offset + 1]), 4) if regime_meta.shape[1] > score_offset + 1 else 0.0,
+            'low_liq': round(float(regime_meta[0, score_offset + 2]), 4) if regime_meta.shape[1] > score_offset + 2 else 0.0,
+        }
         result['sequence_ready'] = True
         result['feature_hash'] = feature_hash
         result['event_gate_passed'] = True
         result['event_gate_reason'] = gate_result.get('reason', 'event')
         result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+
+        # FIX: تمرير remaining_fuel و adr_pips الحقيقيين من DailyContextEngine
+        try:
+            ts_parsed = pd.Timestamp(ts, tz='UTC') if ts is not None else pd.Timestamp.utcnow()
+            price_now = float(stat_features.get('price', stat_features.get('close', 0.0)))
+            if price_now > 0:
+                ib_st, rem_fuel, fuel_ex, adr_p = self._daily_ctx.update(ts_parsed, price_now)
+                result['remaining_fuel'] = round(rem_fuel, 6)
+                result['adr_pips']       = round(adr_p, 1)
+                result['ib_status']      = ib_st
+                result['fuel_exhausted'] = fuel_ex
+        except Exception:
+            result['remaining_fuel'] = 0.0060
+            result['adr_pips']       = 80.0
         self.pred_logger.log_prediction(
             result,
             features=stat_features or {},
@@ -509,6 +540,11 @@ class V19PredictionEngine:
             if len(meta_features) != len(canonical_df):
                 raise ValueError(
                     f'❌ meta features rows ({len(meta_features)}) do not match CSV rows ({len(canonical_df)})'
+                )
+            if meta_features.ndim != 2 or meta_features.shape[1] != len(self.meta_features):
+                raise ValueError(
+                    f'❌ meta features columns ({meta_features.shape[1] if meta_features.ndim == 2 else meta_features.shape}) '
+                    f'do not match schema ({len(self.meta_features)})'
                 )
 
         y_bias = canonical_df['bias_label'].values.astype(np.int32) if source_has_labels else None

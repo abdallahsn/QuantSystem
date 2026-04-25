@@ -98,9 +98,28 @@ class QuantSignalTracker:
         scan_result = self.scanner.scan(order_book_row, self.tick_size)
         levels      = compute_dynamic_levels(scan_result, price, self.tick_size)
 
+        # ── FIX: سحب remaining_fuel و adr_pips الحقيقيين من signal_data ──
+        # predict_step يحسبهم من DailyContextEngine ويحطهم في النتيجة
+        # لو مش موجودين → نستخدم قيم من context أو defaults معقولة
+        real_fuel = (
+            signal_data.get('remaining_fuel') or
+            context.get('remaining_fuel') or
+            0.0060   # 60pip fallback
+        )
+        real_adr  = (
+            signal_data.get('adr_pips') or
+            context.get('adr_pips') or
+            80.0
+        )
+
         # ── فتح الصفقة عبر DynamicTargetManager ─────────────────────────
         mgr = DynamicTargetManager()
-        ctx = {**context, 'tick_size': self.tick_size}
+        ctx = {
+            **context,
+            'tick_size':      self.tick_size,
+            'remaining_fuel': float(real_fuel),
+            'adr_pips':       float(real_adr),
+        }
         trade = mgr.open_trade(signal_data, levels, scan_result, ctx, 4)
 
         trade_record = {
@@ -302,7 +321,11 @@ if __name__ == '__main__':
         'cvd_delta': 150.0, 'confidence': 0.72,
         'tradeable': True,
     }
-    context = {'remaining_fuel': 0.0080, 'tick_size': 0.0001}
+    context = {
+        'remaining_fuel': 0.0060,   # FIX: 60pip بدل 8pip الهاردكود القديم
+        'adr_pips':       80.0,     # FIX: يُحدَّث من DailyContextEngine في الإنتاج
+        'tick_size':      0.0001,
+    }
 
     opened = tracker.evaluate_and_open_virtual_trade(signal, fake_book, context)
     print(f"Opened: {opened}")

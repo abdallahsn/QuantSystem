@@ -8,6 +8,7 @@ meta_learner.py — LSTM Meta-Learner (V19 Core Brain)
     • الـ 25 Feature الكلاسيكية (CVD, OBI, Absorption...)
     • 2 احتمالات من CatBoost   (P_LONG, P_SHORT)
     • 4 One-Hot للـ Cluster     (Cluster 0..3)
+    • 3 Soft Regime Scores      (volatile/trend/low-liq)
 
 Architecture:
   CNN Branch:   Input(50,20,3) → DeepLOBCNN → (8,) per timestep
@@ -36,6 +37,28 @@ from sklearn.metrics import classification_report
 BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
 N_CB_PROBS   = 2   # P_LONG, P_SHORT
+N_REGIME_SCORES = 3
+
+
+def _normalize_model_input_shape(model) -> tuple | None:
+    shape = getattr(model, 'input_shape', None)
+    if shape is None:
+        inputs = getattr(model, 'inputs', None)
+        if isinstance(inputs, (list, tuple)) and inputs:
+            shape = getattr(inputs[0], 'shape', None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(dim) if dim is not None else None for dim in tuple(shape))
+    except Exception:
+        return None
+
+
+def _input_shape_matches(model, seq_len: int, n_total: int) -> bool:
+    shape = _normalize_model_input_shape(model)
+    if shape is None or len(shape) < 3:
+        return False
+    return shape[-2:] == (int(seq_len), int(n_total))
 
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
@@ -70,8 +93,9 @@ class MetaLearnerLSTM:
       - الفيتشرز الإحصائية (n_stat)
       - احتمالات CatBoost (2)
       - One-Hot Cluster (4)
+      - Soft Regime Scores (3)
       - Visual Embeddings من CNN (8)
-      المجموع: n_stat + 2 + 4 + 8 feature per timestep
+      المجموع: n_stat + 2 + 4 + 3 + 8 feature per timestep
     """
 
     def __init__(self,
@@ -87,7 +111,7 @@ class MetaLearnerLSTM:
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
         self.n_visual     = n_visual_emb
-        self.n_meta       = N_CB_PROBS + N_CLUSTERS          # 2 + 4 = 6
+        self.n_meta       = N_CB_PROBS + N_CLUSTERS + N_REGIME_SCORES
         self.n_total      = n_stat_feat + self.n_meta + n_visual_emb
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1
@@ -103,12 +127,21 @@ class MetaLearnerLSTM:
 
         if os.path.exists(brain_file):
             try:
-                self.model   = tf.keras.models.load_model(
+                loaded_model = tf.keras.models.load_model(
                     brain_file, compile=False,
                     custom_objects={'WarmupCosineDecay': WarmupCosineDecay})
-                self._recompile()
-                self._fitted = True
-                print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
+                if not _input_shape_matches(loaded_model, self.seq_len, self.n_total):
+                    found_shape = _normalize_model_input_shape(loaded_model)
+                    print(
+                        "[MetaLearner] ⚠️ stale model input shape "
+                        f"{found_shape} != expected (None, {self.seq_len}, {self.n_total}) — rebuilding"
+                    )
+                    self.model = self._build()
+                else:
+                    self.model = loaded_model
+                    self._recompile()
+                    self._fitted = True
+                    print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
             except Exception as e:
                 print(f"[MetaLearner] ⚠️ ({e}) — بنبني جديد")
                 self.model = self._build()
@@ -283,27 +316,35 @@ class MetaLearnerLSTM:
         if not os.path.isabs(brain_path) and not os.path.dirname(brain_path):
             brain_path = os.path.join(output_dir, brain_path)
 
-        sample_w = np.where(np.asarray(yc_tr, dtype=np.float32) > 0.5, 2.0, 1.0).astype(np.float32)
-        bias_w = sample_w.copy()
-        if class_weights:
-            for cls, weight in class_weights.items():
-                bias_w = np.where(
-                    np.asarray(yb_tr, dtype=np.int32) == int(cls),
-                    bias_w * float(weight),
-                    bias_w,
-                ).astype(np.float32)
-        conf_w = sample_w.copy()
-        n_tr = len(X_tr)
+        n_tr  = len(X_tr)
         n_val = len(X_val)
 
+        # ── FIX: حل مشكلة LONG imbalance ────────────────────────────────
+        # المشكلة: LONG recall=0.10 لأن الداتا 84% NEUTRAL والنموذج يتجاهل LONG
+        # الحل:    sample weights تُعطي LONG وزن أعلى بكثير من SHORT و NEUTRAL
+        yb_arr   = np.asarray(yb_tr, dtype=np.int32)
+        yc_arr   = np.asarray(yc_tr, dtype=np.float32)
+
+        # حساب تلقائي لأوزان الـ class من التوزيع الفعلي
+        n_long   = max(int((yb_arr == 0).sum()), 1)
+        n_short  = max(int((yb_arr == 1).sum()), 1)
+        n_total  = n_tr
+
+        # وزن عكسي للتوزيع: class أقل → وزن أعلى
+        w_long   = n_total / (2.0 * n_long)
+        w_short  = n_total / (2.0 * n_short)
+
+        # تطبيق الأوزان: LONG × w_long | SHORT × w_short
+        # + مضاعفة للإشارات القوية (yc > 0.5)
+        quality_boost = np.where(yc_arr > 0.5, 2.0, 1.0).astype(np.float32)
+        class_w_arr   = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
+        sample_w      = (class_w_arr * quality_boost).astype(np.float32)
+        conf_w        = quality_boost.copy()
+
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
-        print("   Quality Weights: STRONG=2.00 WEAK=1.00")
-        if class_weights:
-            weights_text = " ".join(
-                f"{int(cls)}={float(weight):.2f}"
-                for cls, weight in sorted(class_weights.items())
-            )
-            print(f"   Bias Weights: {weights_text}")
+        print(f"   Class distribution → LONG={n_long:,} ({n_long/n_tr*100:.1f}%) | SHORT={n_short:,} ({n_short/n_tr*100:.1f}%)")
+        print(f"   Class weights      → w_LONG={w_long:.2f} | w_SHORT={w_short:.2f}")
+        print(f"   Quality boost      → STRONG×2.0 | WEAK×1.0")
 
         cbs = [
             EarlyStopping(monitor='val_loss',
@@ -323,7 +364,7 @@ class MetaLearnerLSTM:
             epochs=epochs,
             batch_size=batch,
             sample_weight={
-                'bias_out': bias_w,
+                'bias_out': sample_w,
                 'conf_out': conf_w,
             },
             callbacks=cbs,
