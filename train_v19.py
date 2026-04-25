@@ -1169,6 +1169,7 @@ def stage3_meta_learner_v19(
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
         n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
+        n_meta_feat=int(meta_features.shape[1]),
         n_visual_emb=VISUAL_EMB_DIM,
         brain_file=os.path.join(output_dir, 'meta_learner_v19.keras'),
         lstm_units_1=128,

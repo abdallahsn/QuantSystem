@@ -38,6 +38,7 @@ BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
 N_CB_PROBS   = 2   # P_LONG, P_SHORT
 N_REGIME_SCORES = 3
+DEFAULT_META_FEATURES = N_CB_PROBS + N_CLUSTERS
 
 
 def _normalize_model_input_shape(model) -> tuple | None:
@@ -91,16 +92,15 @@ class MetaLearnerLSTM:
 
     يستقبل في كل خطوة زمنية:
       - الفيتشرز الإحصائية (n_stat)
-      - احتمالات CatBoost (2)
-      - One-Hot Cluster (4)
-      - Soft Regime Scores (3)
+      - Meta Features من Stage 1/Schema (n_meta)
       - Visual Embeddings من CNN (8)
-      المجموع: n_stat + 2 + 4 + 3 + 8 feature per timestep
+      المجموع: n_stat + n_meta + 8 feature per timestep
     """
 
     def __init__(self,
                  seq_len:       int   = 50,
                  n_stat_feat:   int   = 25,    # statistical features for V19
+                 n_meta_feat:   int   = DEFAULT_META_FEATURES,
                  n_visual_emb:  int   = 8,     # من DeepLOB CNN
                  brain_file:    str   = 'outputs/meta_learner.keras',
                  lstm_units_1:  int   = 128,
@@ -110,8 +110,8 @@ class MetaLearnerLSTM:
 
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
+        self.n_meta       = max(int(n_meta_feat), 0)
         self.n_visual     = n_visual_emb
-        self.n_meta       = N_CB_PROBS + N_CLUSTERS + N_REGIME_SCORES
         self.n_total      = n_stat_feat + self.n_meta + n_visual_emb
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1

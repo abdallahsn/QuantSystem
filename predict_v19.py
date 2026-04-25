@@ -168,6 +168,7 @@ class V19PredictionEngine:
             self.meta = MetaLearnerLSTM(
                 seq_len=self.seq_len,
                 n_stat_feat=len(self.stat_features),
+                n_meta_feat=len(self.meta_features),
                 n_visual_emb=len(self.visual_features),
                 brain_file=meta_path,
             )
