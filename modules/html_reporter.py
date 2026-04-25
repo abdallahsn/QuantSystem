@@ -1,4 +1,5 @@
 import os, json, math
+import html as html_lib
 import numpy as np
 import pandas as pd
 
@@ -394,3 +395,381 @@ def generate_backtest_report(
 
 # ... _base_styles() و _training_html_template() كما هما في كودك الأصلي ...
 # ملاحظة: للاستخدام المباشر، تأكد من إبقاء دوال الـ HTML الطويلة (_base_styles و _training_html_template) من الكود الأصلي الخاص بك كما هي دون تعديل.
+
+
+def _base_styles() -> str:
+    return """
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: #131a2b;
+        --panel-2: #1a2338;
+        --text: #edf2ff;
+        --muted: #98a3bd;
+        --line: #28324a;
+        --good: #37d67a;
+        --bad: #ff6b6b;
+        --warn: #ffb84d;
+        --accent: #4db5ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px;
+        background: linear-gradient(180deg, #09101d 0%, #0f1728 100%);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .hero {
+        background: linear-gradient(135deg, rgba(77,181,255,0.18), rgba(55,214,122,0.10));
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 18px;
+        padding: 24px;
+        margin-bottom: 18px;
+      }
+      h1, h2, h3 {
+        margin: 0 0 10px 0;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin: 18px 0;
+      }
+      .card {
+        background: rgba(19,26,43,0.92);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 16px;
+      }
+      .metric-label {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .metric-value {
+        font-size: 28px;
+        font-weight: 700;
+      }
+      .good { color: var(--good); }
+      .bad { color: var(--bad); }
+      .warn { color: var(--warn); }
+      .accent { color: var(--accent); }
+      .section {
+        background: rgba(19,26,43,0.92);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      .two-col {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 16px;
+      }
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      .table th,
+      .table td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 8px;
+        text-align: left;
+        font-size: 13px;
+      }
+      .table th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .kpi-strip {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 10px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        color: var(--text);
+        font-size: 12px;
+      }
+      .muted { color: var(--muted); }
+      .raw-html .t-row,
+      .raw-html .feat-bar,
+      .raw-html .sbar,
+      .raw-html .class-card {
+        margin-bottom: 10px;
+      }
+      .raw-html .t-row {
+        display: grid;
+        grid-template-columns: 48px repeat(9, minmax(0, 1fr));
+        gap: 10px;
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        padding: 10px 0;
+        font-size: 13px;
+      }
+      .raw-html .feat-track,
+      .raw-html .sbar-track {
+        width: 100%;
+        height: 10px;
+        background: rgba(255,255,255,0.08);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .raw-html .feat-fill,
+      .raw-html .sbar-fill {
+        height: 100%;
+        border-radius: 999px;
+      }
+      .raw-html .feat-head,
+      .raw-html .sbar-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 6px;
+        font-size: 13px;
+      }
+      .footer {
+        margin-top: 18px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      @media (max-width: 900px) {
+        body { padding: 14px; }
+        .two-col { grid-template-columns: 1fr; }
+        .raw-html .t-row {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+    """
+
+
+def _training_html_template(
+    *,
+    train_acc,
+    val_acc,
+    n_samples,
+    n_train,
+    n_val,
+    n_features,
+    gap,
+    pbo,
+    avg_wf,
+    avg_sh,
+    feat_bars_html,
+    class_html,
+    wf_rows_html,
+    chart_data,
+) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>V19 Training Report</title>
+    {_base_styles()}
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="hero">
+        <h1>V19 Training Report</h1>
+        <p>Summary of training, validation, feature importance, and walk-forward diagnostics.</p>
+      </div>
+
+      <div class="grid">
+        <div class="card"><div class="metric-label">Train Accuracy</div><div class="metric-value accent">{_safe_float(train_acc) * 100:.2f}%</div></div>
+        <div class="card"><div class="metric-label">Validation Accuracy</div><div class="metric-value {'good' if _safe_float(val_acc) >= 0.6 else 'warn' if _safe_float(val_acc) >= 0.5 else 'bad'}">{_safe_float(val_acc) * 100:.2f}%</div></div>
+        <div class="card"><div class="metric-label">Generalization Gap</div><div class="metric-value {'bad' if _safe_float(gap) > 0.05 else 'good'}">{_safe_float(gap) * 100:.2f}%</div></div>
+        <div class="card"><div class="metric-label">Walk-Forward Mean</div><div class="metric-value">{_safe_float(avg_wf) * 100:.2f}%</div></div>
+        <div class="card"><div class="metric-label">Walk-Forward Sharpe</div><div class="metric-value">{_safe_float(avg_sh):.3f}</div></div>
+        <div class="card"><div class="metric-label">PBO</div><div class="metric-value">{_safe_float(pbo):.3f}</div></div>
+      </div>
+
+      <div class="kpi-strip">
+        <div class="pill">Samples: {_safe_int(n_samples):,}</div>
+        <div class="pill">Train: {_safe_int(n_train):,}</div>
+        <div class="pill">Validation: {_safe_int(n_val):,}</div>
+        <div class="pill">Features: {_safe_int(n_features):,}</div>
+      </div>
+
+      <div class="two-col" style="margin-top:16px;">
+        <div class="section raw-html">
+          <h2>Feature Importance</h2>
+          {feat_bars_html}
+        </div>
+        <div class="section raw-html">
+          <h2>Class Metrics</h2>
+          {class_html}
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Walk-Forward Folds</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Fold</th>
+              <th>Train Start</th>
+              <th>Train End</th>
+              <th>Test Start</th>
+              <th>Test End</th>
+              <th>Train Size</th>
+              <th>Test Size</th>
+              <th>Accuracy</th>
+              <th>Sharpe</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>{wf_rows_html}</tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h2>Raw Chart Payload</h2>
+        <p>This JSON block is kept for downstream visualization/debugging.</p>
+        <pre>{html_lib.escape(chart_data)}</pre>
+      </div>
+
+      <div class="footer">Generated by QuantSystem V19.</div>
+    </div>
+  </body>
+</html>"""
+
+
+def _backtest_html_template(
+    *,
+    T,
+    wins,
+    loses,
+    tos,
+    wr,
+    aw,
+    al,
+    rr,
+    pnl,
+    mdd,
+    sh,
+    equity_start,
+    equity_end,
+    tp_avg,
+    sl_avg,
+    dur_avg,
+    max_win,
+    max_los,
+    dominant,
+    verdict,
+    verdict_sub,
+    style_html,
+    trade_rows_html,
+    regime_rows,
+    chart_data,
+    n_test_bars,
+    max_tpsl,
+) -> str:
+    pnl_class = 'good' if _safe_float(pnl) >= 0 else 'bad'
+    sharpe_class = 'good' if _safe_float(sh) > 0 else 'bad'
+    rr_class = 'good' if _safe_float(rr) >= 1 else 'warn'
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>V19 Backtest Report</title>
+    {_base_styles()}
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="hero">
+        <h1>V19 Backtest Report</h1>
+        <p>{html_lib.escape(str(verdict))}</p>
+        <p style="margin-top:8px;">{html_lib.escape(str(verdict_sub))}</p>
+      </div>
+
+      <div class="grid">
+        <div class="card"><div class="metric-label">Trades</div><div class="metric-value">{_safe_int(T):,}</div></div>
+        <div class="card"><div class="metric-label">Win Rate</div><div class="metric-value {'good' if _safe_float(wr) >= 0.5 else 'bad'}">{_safe_float(wr) * 100:.2f}%</div></div>
+        <div class="card"><div class="metric-label">Total PnL</div><div class="metric-value {pnl_class}">${_safe_float(pnl):,.2f}</div></div>
+        <div class="card"><div class="metric-label">Max Drawdown</div><div class="metric-value {'bad' if _safe_float(mdd) > 0 else 'good'}">${_safe_float(mdd):,.2f}</div></div>
+        <div class="card"><div class="metric-label">Sharpe</div><div class="metric-value {sharpe_class}">{_safe_float(sh):.3f}</div></div>
+        <div class="card"><div class="metric-label">R/R</div><div class="metric-value {rr_class}">{_safe_float(rr):.2f}</div></div>
+      </div>
+
+      <div class="kpi-strip">
+        <div class="pill">Wins: {_safe_int(wins)}</div>
+        <div class="pill">Losses: {_safe_int(loses)}</div>
+        <div class="pill">Timeouts: {_safe_int(tos)}</div>
+        <div class="pill">Test Bars: {_safe_int(n_test_bars):,}</div>
+        <div class="pill">Equity Start: ${_safe_float(equity_start):,.2f}</div>
+        <div class="pill">Equity End: ${_safe_float(equity_end):,.2f}</div>
+      </div>
+
+      <div class="two-col" style="margin-top:16px;">
+        <div class="section">
+          <h2>Trade Profile</h2>
+          <table class="table">
+            <tbody>
+              <tr><th>Average Win (pips)</th><td class="good">{_safe_float(aw):+.2f}</td></tr>
+              <tr><th>Average Loss (pips)</th><td class="bad">{_safe_float(al):+.2f}</td></tr>
+              <tr><th>Average TP</th><td>{_safe_float(tp_avg):.2f}</td></tr>
+              <tr><th>Average SL</th><td>{_safe_float(sl_avg):.2f}</td></tr>
+              <tr><th>Average Duration (min)</th><td>{_safe_float(dur_avg):.2f}</td></tr>
+              <tr><th>Max Win (pips)</th><td class="good">{_safe_float(max_win):+.2f}</td></tr>
+              <tr><th>Max Loss (pips)</th><td class="bad">{_safe_float(max_los):+.2f}</td></tr>
+              <tr><th>Dominant Style</th><td>{html_lib.escape(str(dominant))}</td></tr>
+              <tr><th>TP/SL Scale Anchor</th><td>{_safe_float(max_tpsl):.2f}</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section raw-html">
+          <h2>Style Mix</h2>
+          {style_html}
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Regime Breakdown</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Regime</th>
+              <th>Trades</th>
+              <th>Win Rate</th>
+              <th>Avg Pips</th>
+              <th>Avg Duration</th>
+              <th>Total PnL</th>
+            </tr>
+          </thead>
+          <tbody>{regime_rows}</tbody>
+        </table>
+      </div>
+
+      <div class="section raw-html">
+        <h2>Recent Trades</h2>
+        {trade_rows_html}
+      </div>
+
+      <div class="section">
+        <h2>Raw Chart Payload</h2>
+        <p>This JSON block is kept for downstream visualization/debugging.</p>
+        <pre>{html_lib.escape(chart_data)}</pre>
+      </div>
+
+      <div class="footer">Generated by QuantSystem V19.</div>
+    </div>
+  </body>
+</html>"""

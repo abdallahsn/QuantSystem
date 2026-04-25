@@ -706,7 +706,7 @@ def generate_catboost_5m_report(
     report_name: str = "catboost_5m",
     mbo_path: str = "",
     mbp_path: str = "",
-    max_bars: int = 400,
+    max_bars: int = 0,
     future_bars: int = 4,
 ) -> dict[str, Any]:
     output_dir = output_dir or models_dir
@@ -715,8 +715,11 @@ def generate_catboost_5m_report(
 
     pred_df = predict_catboost_frame(csv_path, models_dir)
     bars = _resample_catboost_bars(pred_df, freq=freq)
-    if len(bars) > max_bars:
+    bars_before_limit = int(len(bars))
+    max_bars = int(max_bars or 0)
+    if max_bars > 0 and len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
+        print(f"  ℹ️ 5m report capped to last {max_bars:,} bars (from {bars_before_limit:,})")
 
     # ── تطبيق RangeStateMachine على الـ visualization ─────────────────
     # يُظهر فقط الإشارات المؤكدة (N تأكيدات من الحافة الصحيحة)
@@ -804,6 +807,8 @@ def generate_catboost_5m_report(
     summary = {
         "rows": int(len(pred_df)),
         "bars": int(len(bars)),
+        "bars_before_limit": bars_before_limit,
+        "bars_limit_applied": int(max_bars),
         "transitions": int(len(turns)),
         "direction_counts": bars["cb_direction"].value_counts().to_dict() if not bars.empty else {},
         "files": {
