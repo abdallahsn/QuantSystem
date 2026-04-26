@@ -56,25 +56,76 @@ def build_walkforward_windows(
     return windows
 
 
-def compute_eval_visual_embeddings(test_csv: str, test_lob: str, test_lob_ts: str, models_dir: str) -> np.ndarray:
+def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
+    denominator = float(denominator)
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / denominator
+
+
+def compute_eval_visual_embeddings(
+    test_csv: str,
+    test_lob: str,
+    test_lob_ts: str,
+    models_dir: str,
+    *,
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
     df = _load_csv(test_csv)
+    diagnostics = {
+        'source': 'zeros',
+        'reason': 'init',
+        'rows_total': int(len(df)),
+        'lob_tensors_available': 0,
+        'lob_timestamps_available': 0,
+        'rows_with_tensor': 0,
+        'rows_with_tensor_ratio': 0.0,
+        'used_tensor_count': 0,
+        'rows_with_visual': 0,
+        'visual_coverage_ratio': 0.0,
+    }
+    zero = np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+
+    def _return(out: np.ndarray, *, source: str, reason: str, extra: dict | None = None):
+        diagnostics.update({
+            'source': source,
+            'reason': reason,
+        })
+        if extra:
+            diagnostics.update(extra)
+        if out.size:
+            rows_with_visual = int((np.linalg.norm(out, axis=1) > 0).sum())
+            diagnostics['rows_with_visual'] = rows_with_visual
+            diagnostics['visual_coverage_ratio'] = round(_safe_ratio(rows_with_visual, len(out)), 4)
+        if return_diagnostics:
+            return out, diagnostics
+        return out
+
     if not DEEPLOB_AVAILABLE:
-        return np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+        return _return(zero, source='zeros', reason='deeplob_unavailable')
 
     deeplob_path = os.path.join(models_dir, 'deeplob_cnn_v19.keras')
     if not os.path.exists(deeplob_path):
-        return np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+        return _return(zero, source='zeros', reason='missing_deeplob_model')
 
     lob_tensors, lob_timestamps = _load_lob_inputs(test_lob, test_lob_ts)
     if lob_tensors is None or lob_timestamps is None:
-        return np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+        return _return(zero, source='zeros', reason='missing_lob_inputs')
+
+    diagnostics['lob_tensors_available'] = int(len(lob_tensors))
+    diagnostics['lob_timestamps_available'] = int(len(lob_timestamps))
 
     row_to_tensor, _, _ = _align_lob_to_rows(df, lob_timestamps)
+    rows_with_tensor = int((row_to_tensor >= 0).sum())
+    diagnostics['rows_with_tensor'] = rows_with_tensor
+    diagnostics['rows_with_tensor_ratio'] = round(_safe_ratio(rows_with_tensor, len(df)), 4)
+
     cnn = DeepLOBCNN(brain_file=deeplob_path)
     if cnn.model is None or not cnn._fitted:
-        return np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+        return _return(zero, source='zeros', reason='cnn_not_fitted')
 
     used_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
+    diagnostics['used_tensor_count'] = int(len(used_tensor_ids))
     emb_lookup = {}
     if len(used_tensor_ids):
         X = np.asarray(lob_tensors[used_tensor_ids], dtype=np.float32)
@@ -82,11 +133,11 @@ def compute_eval_visual_embeddings(test_csv: str, test_lob: str, test_lob_ts: st
         for i, tid in enumerate(used_tensor_ids):
             emb_lookup[int(tid)] = emb[i]
 
-    out = np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
+    out = zero.copy()
     for row_idx, tensor_idx in enumerate(row_to_tensor):
         if int(tensor_idx) in emb_lookup:
             out[row_idx] = emb_lookup[int(tensor_idx)][:VISUAL_EMB_DIM]
-    return out
+    return _return(out, source='cnn_eval', reason='ok')
 
 
 def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:

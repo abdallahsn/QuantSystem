@@ -1061,6 +1061,66 @@ def build_safe_sequences(
     return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
 
 
+def _resolve_meta_learner_profile(
+    train_sequences: int,
+    visual_seq_coverage: float,
+) -> dict:
+    train_sequences = int(max(train_sequences, 0))
+    visual_seq_coverage = float(min(max(visual_seq_coverage, 0.0), 1.0))
+
+    if train_sequences < 2500:
+        profile = {
+            'name': 'compact',
+            'lstm_units_1': 48,
+            'lstm_units_2': 24,
+            'attention_heads': 2,
+            'shared_units': 64,
+            'bias_hidden_units': 32,
+            'conf_hidden_units': 16,
+            'dropout': 0.35,
+            'l2_reg': 3e-4,
+            'force_rebuild': True,
+            'visual_dropout_floor': 0.35,
+        }
+    elif train_sequences < 6000:
+        profile = {
+            'name': 'balanced',
+            'lstm_units_1': 64,
+            'lstm_units_2': 32,
+            'attention_heads': 2,
+            'shared_units': 96,
+            'bias_hidden_units': 48,
+            'conf_hidden_units': 24,
+            'dropout': 0.30,
+            'l2_reg': 2e-4,
+            'force_rebuild': True,
+            'visual_dropout_floor': 0.25,
+        }
+    else:
+        profile = {
+            'name': 'full',
+            'lstm_units_1': 96,
+            'lstm_units_2': 48,
+            'attention_heads': 4,
+            'shared_units': 128,
+            'bias_hidden_units': 64,
+            'conf_hidden_units': 32,
+            'dropout': 0.25,
+            'l2_reg': 1e-4,
+            'force_rebuild': False,
+            'visual_dropout_floor': 0.15,
+        }
+
+    visual_dropout_rate = max(
+        float(profile['visual_dropout_floor']),
+        min(0.60, 1.0 - visual_seq_coverage + 0.10),
+    )
+    profile['visual_dropout_rate'] = round(float(visual_dropout_rate), 4)
+    profile['visual_seq_coverage'] = round(visual_seq_coverage, 4)
+    profile['train_sequences'] = train_sequences
+    return profile
+
+
 def _compute_bias_class_weights(y_bias: np.ndarray, max_weight: float = 2.5) -> dict[int, float]:
     y_bias = np.asarray(y_bias, dtype=np.int32)
     valid = y_bias[(y_bias >= 0) & (y_bias < 2)]
@@ -1153,6 +1213,14 @@ def stage3_meta_learner_v19(
     print(f"  Val Sequences:   {len(X_val):,}")
     bias_counts = np.bincount(yb_tr, minlength=2)[:2]
     bias_class_weights = _compute_bias_class_weights(yb_tr)
+    train_visual_last_step = X_tr[:, -1, -VISUAL_EMB_DIM:] if len(X_tr) else np.zeros((0, VISUAL_EMB_DIM), dtype=np.float32)
+    visual_seq_coverage = float(
+        np.mean(np.linalg.norm(train_visual_last_step, axis=1) > 0)
+    ) if len(train_visual_last_step) else 0.0
+    meta_profile = _resolve_meta_learner_profile(
+        train_sequences=len(X_tr),
+        visual_seq_coverage=visual_seq_coverage,
+    )
     print(
         "  Bias Seq Counts: "
         f"LONG={int(bias_counts[0]):,} SHORT={int(bias_counts[1]):,}"
@@ -1165,6 +1233,12 @@ def stage3_meta_learner_v19(
                 for cls, weight in sorted(bias_class_weights.items())
             )
         )
+    print(
+        "  Meta Profile: "
+        f"{meta_profile['name']} | "
+        f"vis_cov={meta_profile['visual_seq_coverage']:.1%} | "
+        f"visual_dropout={meta_profile['visual_dropout_rate']:.2f}"
+    )
 
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
@@ -1172,10 +1246,17 @@ def stage3_meta_learner_v19(
         n_meta_feat=int(meta_features.shape[1]),
         n_visual_emb=VISUAL_EMB_DIM,
         brain_file=os.path.join(output_dir, 'meta_learner_v19.keras'),
-        lstm_units_1=128,
-        lstm_units_2=64,
-        dropout=0.25,
+        lstm_units_1=int(meta_profile['lstm_units_1']),
+        lstm_units_2=int(meta_profile['lstm_units_2']),
+        attention_heads=int(meta_profile['attention_heads']),
+        shared_units=int(meta_profile['shared_units']),
+        bias_hidden_units=int(meta_profile['bias_hidden_units']),
+        conf_hidden_units=int(meta_profile['conf_hidden_units']),
+        dropout=float(meta_profile['dropout']),
         confidence_threshold=0.65,
+        l2_reg=float(meta_profile['l2_reg']),
+        visual_dropout_rate=float(meta_profile['visual_dropout_rate']),
+        force_rebuild=bool(meta_profile['force_rebuild']),
     )
 
     history = meta.fit_train_val(
@@ -1196,6 +1277,7 @@ def stage3_meta_learner_v19(
                     'history': hist_dict,
                     'split': split_stats,
                     'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
+                    'meta_profile': meta_profile,
                     'event_gate': event_gate_cfg,
                 },
                 f,
@@ -1208,6 +1290,7 @@ def stage3_meta_learner_v19(
             'meta_features': META_FEATURE_NAMES,
             'visual_features': VISUAL_FEATURE_NAMES,
             'sequence_aux_mode': sequence_aux_mode,
+            'meta_learner_profile': meta_profile,
             'passthrough_cols': TRAINING_PASSTHROUGH_COLS,
             'timestamp_cols': ['ts_event', 'label_end_ts'],
             'input_dim': int(X_rows.shape[1]),

@@ -861,6 +861,7 @@ def _select_event_rich_lob_emit_positions(
     df_labeled: pd.DataFrame,
     lob_mbp_src: pd.DataFrame,
     max_events: int = LOB_EVENT_SAMPLE_DEFAULT,
+    max_positions: int | None = None,
 ) -> tuple[np.ndarray, dict]:
     if (
         df_labeled is None or len(df_labeled) == 0 or
@@ -914,14 +915,58 @@ def _select_event_rich_lob_emit_positions(
         on='ts_event',
         direction='backward',
     ).dropna(subset=['mbp_pos'])
-    emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
+    base_emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
+    collapse_ratio = float(len(base_emit_positions) / max(len(selected), 1))
+    neighbor_radius = 0
+    if len(base_emit_positions):
+        if collapse_ratio < 0.20:
+            neighbor_radius = 2
+        elif collapse_ratio < 0.50:
+            neighbor_radius = 1
+
+    emit_positions = base_emit_positions
+    expanded_emit_positions = base_emit_positions
+    extra_neighbors = np.array([], dtype=np.int32)
+    capped_extra_neighbors = False
+
+    if neighbor_radius > 0 and len(base_emit_positions):
+        offsets = np.arange(-neighbor_radius, neighbor_radius + 1, dtype=np.int32)
+        expanded_emit_positions = np.unique(
+            np.clip(
+                base_emit_positions.reshape(-1, 1) + offsets.reshape(1, -1),
+                0,
+                max(len(mbp_df) - 1, 0),
+            ).reshape(-1)
+        ).astype(np.int32)
+        extra_neighbors = expanded_emit_positions[~np.isin(expanded_emit_positions, base_emit_positions)]
+        emit_positions = expanded_emit_positions
+
+        if max_positions is not None and int(max_positions) > 0 and len(emit_positions) > int(max_positions):
+            base_budget = len(base_emit_positions)
+            extra_budget = max(int(max_positions) - base_budget, 0)
+            if extra_budget < len(extra_neighbors):
+                if extra_budget > 0:
+                    keep_idx = np.linspace(0, len(extra_neighbors) - 1, extra_budget, dtype=int)
+                    extra_neighbors = extra_neighbors[keep_idx]
+                else:
+                    extra_neighbors = np.array([], dtype=np.int32)
+                capped_extra_neighbors = True
+            emit_positions = np.sort(
+                np.unique(np.concatenate([base_emit_positions, extra_neighbors], axis=0))
+            ).astype(np.int32)
+
     meta = {
         'directional_events_available': int(len(candidates)),
         'event_col': event_col,
         'strong_available': int(len(strong)),
         'weak_available': int(len(weak)),
         'selected_events': int(len(selected)),
+        'base_emit_positions': int(len(base_emit_positions)),
         'selected_emit_positions': int(len(emit_positions)),
+        'emit_neighbor_radius': int(neighbor_radius),
+        'emit_neighbor_positions_added': int(len(emit_positions) - len(base_emit_positions)),
+        'emit_neighbor_positions_capped': bool(capped_extra_neighbors),
+        'emit_collapse_ratio': round(collapse_ratio, 4),
         'selected_strong': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_STRONG) if selected_parts else 0),
         'selected_weak': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_WEAK) if selected_parts else 0),
     }
@@ -1394,6 +1439,7 @@ def run_refinery(
                 df_labeled,
                 lob_mbp_src,
                 max_events=sample_cap,
+                max_positions=int(effective_max_tensors) if effective_max_tensors else None,
             )
             build_plan = {
                 'force': lob_limits['force'],

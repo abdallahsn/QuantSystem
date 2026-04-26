@@ -71,11 +71,21 @@ def run_raw_backtest(
     )
 
     df = _load_csv(replay_build['csv'])
-    visual_embeddings = compute_eval_visual_embeddings(
+    visual_embeddings, visual_diagnostics = compute_eval_visual_embeddings(
         test_csv=replay_build['csv'],
         test_lob=replay_build['lob'],
         test_lob_ts=replay_build['lob_ts'],
         models_dir=models_dir,
+        return_diagnostics=True,
+    )
+    with open(os.path.join(output_dir, 'eval_visual_diagnostics.json'), 'w') as f:
+        json.dump(visual_diagnostics, f, indent=2)
+    print(
+        "  ℹ️ Eval visual coverage: "
+        f"{visual_diagnostics.get('rows_with_visual', 0):,}/{visual_diagnostics.get('rows_total', 0):,} "
+        f"({visual_diagnostics.get('visual_coverage_ratio', 0.0):.1%}) | "
+        f"rows_with_tensor={visual_diagnostics.get('rows_with_tensor', 0):,} | "
+        f"used_tensors={visual_diagnostics.get('used_tensor_count', 0):,}"
     )
 
     _, _, backtest_summary = run_causal_backtest(
@@ -83,6 +93,7 @@ def run_raw_backtest(
         models_dir=models_dir,
         output_dir=output_dir,
         visual_embeddings=visual_embeddings,
+        visual_diagnostics=visual_diagnostics,
         meta_features=None,
         input_scaled=True,
         tick_size=float(tick_size if tick_size is not None else bt_cfg.get('tick_size', 0.0001)),
@@ -112,6 +123,7 @@ def run_raw_backtest(
             'end_ts': end_ts,
         },
         'dataset': replay_build,
+        'visual_diagnostics': visual_diagnostics,
         'backtest': backtest_summary,
     }
     with open(os.path.join(output_dir, 'raw_backtest_summary.json'), 'w') as f:

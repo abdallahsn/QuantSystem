@@ -27,6 +27,7 @@ try:
     import tensorflow as tf
     from tensorflow.keras import layers, Model
     from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+    from tensorflow.keras import regularizers
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
@@ -105,8 +106,15 @@ class MetaLearnerLSTM:
                  brain_file:    str   = 'outputs/meta_learner.keras',
                  lstm_units_1:  int   = 128,
                  lstm_units_2:  int   = 64,
+                 attention_heads: int = 4,
+                 shared_units: int = 128,
+                 bias_hidden_units: int = 64,
+                 conf_hidden_units: int = 32,
                  dropout:       float = 0.25,
-                 confidence_threshold: float = 0.65):
+                 confidence_threshold: float = 0.65,
+                 l2_reg: float = 1e-4,
+                 visual_dropout_rate: float = 0.0,
+                 force_rebuild: bool = False):
 
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
@@ -116,8 +124,15 @@ class MetaLearnerLSTM:
         self.brain_file   = brain_file
         self.lstm1        = lstm_units_1
         self.lstm2        = lstm_units_2
+        self.attn_heads   = max(int(attention_heads), 1)
+        self.shared_units = max(int(shared_units), 16)
+        self.bias_hidden_units = max(int(bias_hidden_units), 8)
+        self.conf_hidden_units = max(int(conf_hidden_units), 8)
         self.drop         = dropout
         self.conf_thresh  = confidence_threshold
+        self.l2_reg       = max(float(l2_reg), 0.0)
+        self.visual_dropout_rate = min(max(float(visual_dropout_rate), 0.0), 0.95)
+        self.force_rebuild = bool(force_rebuild)
 
         self.model   = None
         self._fitted = False
@@ -125,7 +140,10 @@ class MetaLearnerLSTM:
         if not TF_AVAILABLE:
             return
 
-        if os.path.exists(brain_file):
+        if self.force_rebuild:
+            print("[MetaLearner] 🧠 force rebuild requested — building fresh model")
+            self.model = self._build()
+        elif os.path.exists(brain_file):
             try:
                 loaded_model = tf.keras.models.load_model(
                     brain_file, compile=False,
@@ -155,6 +173,9 @@ class MetaLearnerLSTM:
         البناء الكامل للـ Meta-Learner:
         Input → LayerNorm → LSTM(128) → LSTM(64) → Self-Attention → Output
         """
+        kernel_reg = regularizers.l2(self.l2_reg) if self.l2_reg > 0 else None
+        recurrent_reg = regularizers.l2(self.l2_reg * 0.5) if self.l2_reg > 0 else None
+
         # Input: (batch, seq_len, n_total)
         inp = layers.Input(
             shape=(self.seq_len, self.n_total),
@@ -169,6 +190,8 @@ class MetaLearnerLSTM:
                         return_sequences=True,
                         dropout=self.drop,
                         recurrent_dropout=self.drop * 0.5,
+                        kernel_regularizer=kernel_reg,
+                        recurrent_regularizer=recurrent_reg,
                         name='lstm_1')(x)
         x = layers.LayerNormalization(epsilon=1e-6)(x)
 
@@ -176,13 +199,17 @@ class MetaLearnerLSTM:
         x = layers.LSTM(self.lstm2,
                         return_sequences=True,
                         dropout=self.drop,
+                        kernel_regularizer=kernel_reg,
+                        recurrent_regularizer=recurrent_reg,
                         name='lstm_2')(x)
 
         # ── Self-Attention ───────────────────────────────────────
         # يُركّز على أهم اللحظات في النافذة الزمنية
+        attn_heads = max(min(self.attn_heads, self.lstm2), 1)
+        key_dim = max(self.lstm2 // attn_heads, 4)
         attn_out, attn_scores = layers.MultiHeadAttention(
-            num_heads=4,
-            key_dim=self.lstm2 // 4,
+            num_heads=attn_heads,
+            key_dim=key_dim,
             dropout=self.drop * 0.5,
             name='self_attention')(x, x, return_attention_scores=True)
 
@@ -197,17 +224,30 @@ class MetaLearnerLSTM:
         # shape: (lstm2 × 2,) = (128,)
 
         # ── Shared Dense ─────────────────────────────────────────
-        shared = layers.Dense(128, activation='gelu', name='shared')(pooled)
+        shared = layers.Dense(
+            self.shared_units,
+            activation='gelu',
+            kernel_regularizer=kernel_reg,
+            name='shared',
+        )(pooled)
         shared = layers.Dropout(self.drop)(shared)
 
         # ── Output Heads ─────────────────────────────────────────
         # 1. Bias Head (LONG/SHORT)
-        b = layers.Dense(64, activation='gelu')(shared)
+        b = layers.Dense(
+            self.bias_hidden_units,
+            activation='gelu',
+            kernel_regularizer=kernel_reg,
+        )(shared)
         b = layers.Dropout(0.2)(b)
         bias_out = layers.Dense(2, activation='softmax', name='bias_out')(b)
 
         # 2. Confidence Head
-        c = layers.Dense(32, activation='gelu')(shared)
+        c = layers.Dense(
+            self.conf_hidden_units,
+            activation='gelu',
+            kernel_regularizer=kernel_reg,
+        )(shared)
         conf_out = layers.Dense(1, activation='sigmoid', name='conf_out')(c)
 
         model = Model(inp,
@@ -222,13 +262,26 @@ class MetaLearnerLSTM:
     def _recompile(self):
         lr = WarmupCosineDecay(d_model=self.lstm2, warmup_steps=500)
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
             loss={
                 'bias_out': 'sparse_categorical_crossentropy',
                 'conf_out': 'binary_crossentropy',
             },
             loss_weights={'bias_out': 1.0, 'conf_out': 0.3},
         )
+
+    def _apply_visual_dropout(self, X_meta: np.ndarray) -> tuple[np.ndarray, int]:
+        if self.n_visual <= 0 or self.visual_dropout_rate <= 0.0:
+            return np.asarray(X_meta, dtype=np.float32, copy=True), 0
+        if X_meta is None or len(X_meta) == 0:
+            return np.asarray(X_meta, dtype=np.float32, copy=True), 0
+
+        out = np.asarray(X_meta, dtype=np.float32, copy=True)
+        drop_mask = np.random.random(len(out)) < self.visual_dropout_rate
+        if not np.any(drop_mask):
+            return out, 0
+        out[drop_mask, :, -self.n_visual:] = 0.0
+        return out, int(drop_mask.sum())
 
     # ── Build Input ──────────────────────────────────────────────
     def build_meta_input(self,
@@ -333,6 +386,9 @@ class MetaLearnerLSTM:
         # وزن عكسي للتوزيع: class أقل → وزن أعلى
         w_long   = n_total / (2.0 * n_long)
         w_short  = n_total / (2.0 * n_short)
+        if class_weights:
+            w_long = float(class_weights.get(0, w_long))
+            w_short = float(class_weights.get(1, w_short))
 
         # تطبيق الأوزان: LONG × w_long | SHORT × w_short
         # + مضاعفة للإشارات القوية (yc > 0.5)
@@ -340,23 +396,33 @@ class MetaLearnerLSTM:
         class_w_arr   = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
         sample_w      = (class_w_arr * quality_boost).astype(np.float32)
         conf_w        = quality_boost.copy()
+        X_tr_fit, dropped_visual = self._apply_visual_dropout(X_tr)
 
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
         print(f"   Class distribution → LONG={n_long:,} ({n_long/n_tr*100:.1f}%) | SHORT={n_short:,} ({n_short/n_tr*100:.1f}%)")
         print(f"   Class weights      → w_LONG={w_long:.2f} | w_SHORT={w_short:.2f}")
         print(f"   Quality boost      → STRONG×2.0 | WEAK×1.0")
+        if self.visual_dropout_rate > 0:
+            print(
+                f"   Visual dropout     → rate={self.visual_dropout_rate:.2f} "
+                f"| dropped={dropped_visual:,}/{n_tr:,}"
+            )
+
+        patience = 8 if n_tr < 2500 else (12 if n_tr < 6000 else 15)
+        monitor_name = 'val_bias_out_loss'
 
         cbs = [
-            EarlyStopping(monitor='val_loss',
-                          patience=15, mode='min',
+            EarlyStopping(monitor=monitor_name,
+                          patience=patience, mode='min',
+                          min_delta=1e-4,
                           restore_best_weights=True, verbose=1),
             ModelCheckpoint(brain_path,
-                            monitor='val_loss',
+                            monitor=monitor_name,
                             save_best_only=True, mode='min', verbose=1),
         ]
 
         history = self.model.fit(
-            X_tr,
+            X_tr_fit,
             {'bias_out': yb_tr, 'conf_out': yc_tr},
             validation_data=(
                 X_val,

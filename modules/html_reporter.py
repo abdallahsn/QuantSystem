@@ -204,6 +204,8 @@ def generate_backtest_report(
     model_acc:  float   = 0,
     n_features: int     = 37,
     n_dataset:  int     = 0,
+    backtest_summary: dict | None = None,
+    visual_diagnostics: dict | None = None,
 ):
     if not trades or not equity:
         print('  ⚠️  لا صفقات أو منحنى ربح — تقرير الباك تست فارغ')
@@ -359,6 +361,14 @@ def generate_backtest_report(
         'n_test_bars': _safe_int(n_test_bars),
         'model_acc':   round(_safe_float(model_acc), 4),
     })
+
+    summary_cards_html = _render_backtest_summary_cards(
+        backtest_summary or {},
+        n_dataset=n_dataset,
+        n_test_bars=n_test_bars,
+        n_features=n_features,
+    )
+    visual_diag_html = _render_visual_diagnostics_html(visual_diagnostics or {})
     
     # حماية حساب البارات من القسمة على صفر في הـ Template
     max_tpsl = max(tp_avg, sl_avg, max_win, max_los, 1.0) # 1.0 كحد أدنى
@@ -375,7 +385,9 @@ def generate_backtest_report(
         regime_rows=regime_rows,
         chart_data=chart_data,
         n_test_bars=n_test_bars,
-        max_tpsl=max_tpsl # تمرير القيمة المحمية
+        max_tpsl=max_tpsl, # تمرير القيمة المحمية
+        summary_cards_html=summary_cards_html,
+        visual_diag_html=visual_diag_html,
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -390,7 +402,437 @@ def generate_backtest_report(
 # HTML TEMPLATES (تحديث طفيف لتمرير max_tpsl)
 # ══════════════════════════════════════════════════════════════════
 
-# [تم تقصير الكود لعدم تكرار نفس الـ CSS/JS بالكامل لأنها لم تتغير جوهرياً، فقط سنحدث _backtest_html_template لاستقبال max_tpsl]
+def _metric_card(label: str, value: str, tone: str = '') -> str:
+    tone_cls = f' {tone}' if tone else ''
+    return (
+        f'<div class="card{tone_cls}">'
+        f'<div class="label">{label}</div>'
+        f'<div class="value">{value}</div>'
+        '</div>'
+    )
 
-# ... _base_styles() و _training_html_template() كما هما في كودك الأصلي ...
-# ملاحظة: للاستخدام المباشر، تأكد من إبقاء دوال الـ HTML الطويلة (_base_styles و _training_html_template) من الكود الأصلي الخاص بك كما هي دون تعديل.
+
+def _render_backtest_summary_cards(summary: dict, *, n_dataset: int, n_test_bars: int, n_features: int) -> str:
+    cards = [
+        _metric_card('Rows', f'{_safe_int(n_dataset):,}'),
+        _metric_card('Predictions', f'{_safe_int(summary.get("predictions", n_test_bars)):,}'),
+        _metric_card('Trades', f'{_safe_int(summary.get("trades", 0)):,}'),
+        _metric_card('Win Rate', f'{_safe_float(summary.get("win_rate", 0.0)):.1%}',
+                     'good' if _safe_float(summary.get('win_rate', 0.0)) >= 0.5 else 'bad'),
+        _metric_card('Profit Factor', f'{_safe_float(summary.get("profit_factor", 0.0)):.2f}',
+                     'good' if _safe_float(summary.get('profit_factor', 0.0)) >= 1.0 else 'bad'),
+        _metric_card('Sharpe', f'{_safe_float(summary.get("trade_sharpe", 0.0)):.2f}',
+                     'good' if _safe_float(summary.get('trade_sharpe', 0.0)) >= 0 else 'bad'),
+        _metric_card('Macro F1', f'{_safe_float(summary.get("directional_f1_macro", 0.0)):.4f}',
+                     'good' if _safe_float(summary.get('directional_f1_macro', 0.0)) >= 0.38 else 'bad'),
+        _metric_card('Visual Coverage', f'{_safe_float(summary.get("visual_coverage", 0.0)):.1%}',
+                     'good' if _safe_float(summary.get('visual_coverage', 0.0)) >= 0.5 else 'bad'),
+        _metric_card('Features', f'{_safe_int(n_features):,}'),
+    ]
+    return ''.join(cards)
+
+
+def _render_visual_diagnostics_html(diag: dict) -> str:
+    if not diag:
+        return '<div class="empty-note">لا توجد diagnostics بصرية مرفقة لهذا التشغيل.</div>'
+
+    training_ref = diag.get('training_reference') or {}
+    rows_with_tensor = _safe_int(diag.get('rows_with_tensor', 0))
+    used_tensors = _safe_int(diag.get('used_tensor_count', 0))
+    notes = diag.get('diagnosis_notes') or []
+    notes_html = ''.join(f'<li>{note}</li>' for note in notes)
+
+    rows_html = ''.join([
+        f'<tr><td>Full Rows</td><td>{_safe_int(diag.get("rows_total", 0)):,}</td><td>{_safe_int(diag.get("rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("coverage_ratio", 0.0)):.1%}</td></tr>',
+        f'<tr><td>Event Rows</td><td>{_safe_int(diag.get("event_rows", 0)):,}</td><td>{_safe_int(diag.get("event_rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("event_coverage_ratio", 0.0)):.1%}</td></tr>',
+        f'<tr><td>Train-Event Rows</td><td>{_safe_int(diag.get("train_event_rows", 0)):,}</td><td>{_safe_int(diag.get("train_event_rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("train_event_coverage_ratio", 0.0)):.1%}</td></tr>',
+        f'<tr><td>Directional Train-Event Rows</td><td>{_safe_int(diag.get("directional_train_event_rows", 0)):,}</td><td>{_safe_int(diag.get("directional_train_event_rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("directional_train_event_coverage_ratio", 0.0)):.1%}</td></tr>',
+        f'<tr><td>Tradeable Rows</td><td>{_safe_int(diag.get("tradeable_rows", 0)):,}</td><td>{_safe_int(diag.get("tradeable_rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("tradeable_coverage_ratio", 0.0)):.1%}</td></tr>',
+        f'<tr><td>Executed Rows</td><td>{_safe_int(diag.get("executed_rows", 0)):,}</td><td>{_safe_int(diag.get("executed_rows_with_visual", 0)):,}</td><td>{_safe_float(diag.get("executed_coverage_ratio", 0.0)):.1%}</td></tr>',
+    ])
+
+    training_html = ''
+    if training_ref:
+        train_ref_rows = f'{_safe_int(training_ref.get("rows_total", 0)):,}'
+        train_ref_cov = f'{_safe_float(training_ref.get("coverage_ratio", 0.0)):.1%}'
+        train_ref_tensors = f'{_safe_int(training_ref.get("n_tensors", 0)):,}'
+        coverage_gap = _safe_float(diag.get('coverage_gap_vs_train', 0.0))
+        training_html = (
+            '<div class="subgrid">'
+            f'{_metric_card("Train Ref Rows", train_ref_rows)}'
+            f'{_metric_card("Train Ref Coverage", train_ref_cov)}'
+            f'{_metric_card("Train Ref Tensors", train_ref_tensors)}'
+            f'{_metric_card("Coverage Gap", f"{coverage_gap:+.1%}", "bad" if coverage_gap < 0 else "good")}'
+            '</div>'
+        )
+
+    return (
+        '<div class="diag-wrap">'
+        '<div class="subgrid">'
+        f'{_metric_card("Visual Source", str(diag.get("source", "n/a")))}'
+        f'{_metric_card("Reason", str(diag.get("reason", "n/a")))}'
+        f'{_metric_card("Rows With Tensor", f"{rows_with_tensor:,}")}'
+        f'{_metric_card("Used Tensors", f"{used_tensors:,}")}'
+        '</div>'
+        f'{training_html}'
+        '<table class="diag-table">'
+        '<thead><tr><th>Slice</th><th>Rows</th><th>Covered</th><th>Coverage</th></tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        '</table>'
+        '<div class="notes-box"><div class="notes-title">Diagnosis</div><ul>'
+        f'{notes_html}'
+        '</ul></div>'
+        '</div>'
+    )
+
+
+def _base_styles() -> str:
+    return """
+<style>
+  :root {
+    --bg: #0b1320;
+    --panel: #121c2d;
+    --panel-2: #0f1726;
+    --fg: #f4f7fb;
+    --mt: #8ea1b8;
+    --line: rgba(255,255,255,0.08);
+    --g: #2bd67b;
+    --r: #ff6b6b;
+    --a: #52c7ff;
+    --w: #ffbf4d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", Arial, sans-serif;
+    background: linear-gradient(180deg, #09111d 0%, #0b1320 100%);
+    color: var(--fg);
+  }
+  .page {
+    width: min(1180px, calc(100vw - 32px));
+    margin: 24px auto 40px;
+  }
+  .hero, .panel {
+    background: rgba(18, 28, 45, 0.96);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 20px 22px;
+    box-shadow: 0 14px 32px rgba(0,0,0,0.24);
+    margin-bottom: 18px;
+  }
+  .hero h1, .panel h2 {
+    margin: 0 0 10px;
+    font-size: 22px;
+  }
+  .hero p, .muted, .label {
+    color: var(--mt);
+  }
+  .grid, .subgrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  .card.good .value { color: var(--g); }
+  .card.bad .value { color: var(--r); }
+  .value {
+    font-size: 22px;
+    font-weight: 700;
+    margin-top: 6px;
+  }
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+  }
+  .section-title {
+    margin: 0 0 12px;
+    font-size: 16px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--mt);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    font-size: 14px;
+  }
+  th { color: var(--mt); }
+  .diag-table td:last-child, .diag-table th:last-child {
+    text-align: right;
+  }
+  .notes-box {
+    margin-top: 14px;
+    background: rgba(82, 199, 255, 0.06);
+    border: 1px solid rgba(82, 199, 255, 0.16);
+    border-radius: 14px;
+    padding: 14px 16px;
+  }
+  .notes-title {
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .notes-box ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .sbar, .feat-bar {
+    margin-bottom: 10px;
+  }
+  .sbar-head, .feat-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .sbar-track, .feat-track {
+    width: 100%;
+    background: rgba(255,255,255,0.05);
+    border-radius: 999px;
+    overflow: hidden;
+    height: 10px;
+  }
+  .sbar-fill, .feat-fill {
+    height: 100%;
+    border-radius: 999px;
+  }
+  .trade-grid {
+    display: grid;
+    gap: 8px;
+  }
+  .t-row {
+    display: grid;
+    grid-template-columns: 44px repeat(9, minmax(0, 1fr));
+    gap: 10px;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    font-size: 13px;
+  }
+  .win { color: var(--g); }
+  .lose { color: var(--r); }
+  .long { color: var(--a); font-weight: 700; }
+  .short { color: #ff9b66; font-weight: 700; }
+  .to-c { color: var(--w); }
+  .empty-note {
+    color: var(--mt);
+    padding: 14px;
+    background: var(--panel-2);
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+  }
+  details {
+    margin-top: 14px;
+  }
+  pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #08101b;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+    color: #d9e3ee;
+    font-size: 12px;
+  }
+</style>
+"""
+
+
+def _training_html_template(
+    *,
+    train_acc: float,
+    val_acc: float,
+    n_samples: int,
+    n_train: int,
+    n_val: int,
+    n_features: int,
+    gap: float,
+    pbo: float,
+    avg_wf: float,
+    avg_sh: float,
+    feat_bars_html: str,
+    class_html: str,
+    wf_rows_html: str,
+    chart_data: str,
+) -> str:
+    cards = ''.join([
+        _metric_card('Train Acc', f'{_safe_float(train_acc):.1%}', 'good'),
+        _metric_card('Val Acc', f'{_safe_float(val_acc):.1%}',
+                     'good' if _safe_float(val_acc) >= 0.5 else 'bad'),
+        _metric_card('Generalization Gap', f'{_safe_float(gap):+.1%}',
+                     'bad' if _safe_float(gap) > 0.05 else 'good'),
+        _metric_card('Samples', f'{_safe_int(n_samples):,}'),
+        _metric_card('Features', f'{_safe_int(n_features):,}'),
+        _metric_card('Avg WF Acc', f'{_safe_float(avg_wf):.1%}',
+                     'good' if _safe_float(avg_wf) >= 0.55 else 'bad'),
+        _metric_card('Avg WF Sharpe', f'{_safe_float(avg_sh):.2f}',
+                     'good' if _safe_float(avg_sh) >= 0 else 'bad'),
+        _metric_card('PBO', f'{_safe_float(pbo):.3f}',
+                     'bad' if _safe_float(pbo) > 0.2 else 'good'),
+    ])
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V19 Training Report</title>
+  {_base_styles()}
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>V19 Training Report</h1>
+      <p>عينات التدريب: {n_train:,} | عينات التحقق: {n_val:,} | إجمالي العينات: {n_samples:,}</p>
+    </section>
+    <section class="panel">
+      <div class="section-title">Overview</div>
+      <div class="kpis">{cards}</div>
+    </section>
+    <section class="panel">
+      <div class="section-title">Feature Importance</div>
+      {feat_bars_html or '<div class="empty-note">لا توجد feature importances متاحة.</div>'}
+    </section>
+    <section class="panel">
+      <div class="section-title">Class Metrics</div>
+      <div class="grid">{class_html}</div>
+    </section>
+    <section class="panel">
+      <div class="section-title">Walk-Forward Folds</div>
+      <table><tbody>{wf_rows_html}</tbody></table>
+      <details>
+        <summary>Raw Chart Data</summary>
+        <pre>{chart_data}</pre>
+      </details>
+    </section>
+  </div>
+</body>
+</html>"""
+
+
+def _backtest_html_template(
+    *,
+    T: int,
+    wins: int,
+    loses: int,
+    tos: int,
+    wr: float,
+    aw: float,
+    al: float,
+    rr: float,
+    pnl: float,
+    mdd: float,
+    sh: float,
+    equity_start: float,
+    equity_end: float,
+    tp_avg: float,
+    sl_avg: float,
+    dur_avg: float,
+    max_win: float,
+    max_los: float,
+    dominant: str,
+    verdict: str,
+    verdict_sub: str,
+    style_html: str,
+    trade_rows_html: str,
+    regime_rows: str,
+    chart_data: str,
+    n_test_bars: int,
+    max_tpsl: float,
+    summary_cards_html: str = '',
+    visual_diag_html: str = '',
+) -> str:
+    top_cards = ''.join([
+        _metric_card('Trades', f'{_safe_int(T):,}'),
+        _metric_card('Wins', f'{_safe_int(wins):,}', 'good'),
+        _metric_card('Losses', f'{_safe_int(loses):,}', 'bad'),
+        _metric_card('Timeouts', f'{_safe_int(tos):,}'),
+        _metric_card('Win Rate', f'{_safe_float(wr):.1%}', 'good' if _safe_float(wr) >= 0.5 else 'bad'),
+        _metric_card('Net PnL', f'${_safe_float(pnl):,.2f}', 'good' if _safe_float(pnl) >= 0 else 'bad'),
+        _metric_card('Max Drawdown', f'${_safe_float(mdd):,.2f}', 'bad'),
+        _metric_card('Trade Sharpe', f'{_safe_float(sh):.2f}', 'good' if _safe_float(sh) >= 0 else 'bad'),
+    ])
+    micro_cards = ''.join([
+        _metric_card('Avg Win (pips)', f'{_safe_float(aw):+.2f}', 'good'),
+        _metric_card('Avg Loss (pips)', f'{_safe_float(al):+.2f}', 'bad'),
+        _metric_card('R:R', f'{_safe_float(rr):.2f}', 'good' if _safe_float(rr) >= 1 else 'bad'),
+        _metric_card('Avg TP', f'{_safe_float(tp_avg):.1f}'),
+        _metric_card('Avg SL', f'{_safe_float(sl_avg):.1f}'),
+        _metric_card('Avg Duration', f'{_safe_float(dur_avg):.1f}m'),
+        _metric_card('Best Trade', f'{_safe_float(max_win):+.1f} pips', 'good'),
+        _metric_card('Worst Trade', f'-{_safe_float(max_los):.1f} pips', 'bad'),
+        _metric_card('Equity', f'${_safe_float(equity_start):,.0f} -> ${_safe_float(equity_end):,.0f}'),
+        _metric_card('Dominant Style', dominant),
+        _metric_card('Test Bars', f'{_safe_int(n_test_bars):,}'),
+        _metric_card('TP/SL Scale', f'{_safe_float(max_tpsl):.1f}'),
+    ])
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V19 Backtest Report</title>
+  {_base_styles()}
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>V19 Backtest Report</h1>
+      <p>{verdict}</p>
+      <p class="muted">{verdict_sub}</p>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Core Metrics</div>
+      <div class="kpis">{top_cards}</div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Run Summary</div>
+      <div class="kpis">{summary_cards_html}</div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Visual Coverage Diagnostics</div>
+      {visual_diag_html}
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Trade Shape</div>
+      <div class="kpis">{micro_cards}</div>
+      <div style="margin-top:14px">{style_html or '<div class="empty-note">لا توجد أنماط صفقات كافية.</div>'}</div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Regime Breakdown</div>
+      <table>
+        <thead>
+          <tr><th>Regime</th><th>Trades</th><th>Win Rate</th><th>Avg Pips</th><th>Avg Duration</th><th>Total PnL</th></tr>
+        </thead>
+        <tbody>{regime_rows or ''}</tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">Recent Trades</div>
+      <div class="trade-grid">{trade_rows_html or '<div class="empty-note">لا توجد صفقات لعرضها.</div>'}</div>
+      <details>
+        <summary>Raw Chart Data</summary>
+        <pre>{chart_data}</pre>
+      </details>
+    </section>
+  </div>
+</body>
+</html>"""

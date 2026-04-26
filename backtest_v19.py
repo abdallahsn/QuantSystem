@@ -504,6 +504,175 @@ def _directional_metrics(results_df: pd.DataFrame) -> dict:
     }
 
 
+def _ratio(numerator: int | float, denominator: int | float) -> float:
+    denominator = float(denominator)
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / denominator
+
+
+def _coverage_counts(mask: np.ndarray, covered_mask: np.ndarray) -> tuple[int, int, float]:
+    mask = np.asarray(mask, dtype=bool)
+    covered_mask = np.asarray(covered_mask, dtype=bool)
+    total = int(mask.sum())
+    covered = int(np.sum(mask & covered_mask))
+    return total, covered, round(_ratio(covered, total), 4)
+
+
+def _load_visual_training_reference(models_dir: str | None) -> dict | None:
+    if not models_dir:
+        return None
+    path = os.path.join(models_dir, 'visual_metrics_v19.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {
+            'path': path,
+            'rows_total': int(data.get('n_rows', 0)),
+            'rows_with_tensor': int(data.get('rows_with_tensor', 0)),
+            'coverage_ratio': round(float(data.get('coverage_ratio', 0.0)), 4),
+            'n_tensors': int(data.get('n_tensors', data.get('n_tensors_raw', 0))),
+        }
+    except Exception:
+        return None
+
+
+def _build_visual_diagnostics(
+    df: pd.DataFrame,
+    visual_embeddings: np.ndarray,
+    *,
+    models_dir: str | None = None,
+    results_df: pd.DataFrame | None = None,
+    eval_visual_diagnostics: dict | None = None,
+) -> dict:
+    n_rows = len(df)
+    if n_rows == 0:
+        base = {
+            'rows_total': 0,
+            'rows_with_visual': 0,
+            'coverage_ratio': 0.0,
+            'diagnosis_notes': ['لا توجد صفوف لتقييم التغطية البصرية.'],
+        }
+        if eval_visual_diagnostics:
+            base.update(eval_visual_diagnostics)
+        return base
+
+    if visual_embeddings is None or np.size(visual_embeddings) == 0:
+        covered_mask = np.zeros(n_rows, dtype=bool)
+    else:
+        vis = np.asarray(visual_embeddings, dtype=np.float32)
+        if vis.ndim == 1:
+            vis = vis.reshape(-1, 1)
+        covered_mask = np.linalg.norm(vis, axis=1) > 0
+
+    event_flag = pd.to_numeric(df.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    train_event_flag = pd.to_numeric(df.get('train_event_flag', event_flag), errors='coerce').fillna(0).astype(np.int8)
+    bias_label = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
+    directional_mask = bias_label.isin([0, 1]).to_numpy(dtype=bool)
+    full_mask = np.ones(n_rows, dtype=bool)
+    event_mask = (event_flag == 1).to_numpy(dtype=bool)
+    train_event_mask = (train_event_flag == 1).to_numpy(dtype=bool)
+    directional_train_event_mask = train_event_mask & directional_mask
+
+    tradeable_mask = np.zeros(n_rows, dtype=bool)
+    executed_mask = np.zeros(n_rows, dtype=bool)
+    if results_df is not None and len(results_df) == n_rows:
+        tradeable_mask = pd.to_numeric(results_df.get('tradeable', 0), errors='coerce').fillna(0).astype(bool).to_numpy()
+        executed_mask = pd.to_numeric(results_df.get('executed', 0), errors='coerce').fillna(0).astype(bool).to_numpy()
+
+    full_total, full_covered, full_ratio = _coverage_counts(full_mask, covered_mask)
+    event_total, event_covered, event_ratio = _coverage_counts(event_mask, covered_mask)
+    train_event_total, train_event_covered, train_event_ratio = _coverage_counts(train_event_mask, covered_mask)
+    directional_total, directional_covered, directional_ratio = _coverage_counts(directional_mask, covered_mask)
+    directional_train_total, directional_train_covered, directional_train_ratio = _coverage_counts(
+        directional_train_event_mask,
+        covered_mask,
+    )
+    tradeable_total, tradeable_covered, tradeable_ratio = _coverage_counts(tradeable_mask, covered_mask)
+    executed_total, executed_covered, executed_ratio = _coverage_counts(executed_mask, covered_mask)
+
+    diagnostics = {
+        'source': str((eval_visual_diagnostics or {}).get('source', 'provided')),
+        'reason': str((eval_visual_diagnostics or {}).get('reason', 'ok')),
+        'rows_total': int(full_total),
+        'rows_with_visual': int(full_covered),
+        'coverage_ratio': float(full_ratio),
+        'event_rows': int(event_total),
+        'event_rows_with_visual': int(event_covered),
+        'event_coverage_ratio': float(event_ratio),
+        'train_event_rows': int(train_event_total),
+        'train_event_rows_with_visual': int(train_event_covered),
+        'train_event_coverage_ratio': float(train_event_ratio),
+        'directional_rows': int(directional_total),
+        'directional_rows_with_visual': int(directional_covered),
+        'directional_coverage_ratio': float(directional_ratio),
+        'directional_train_event_rows': int(directional_train_total),
+        'directional_train_event_rows_with_visual': int(directional_train_covered),
+        'directional_train_event_coverage_ratio': float(directional_train_ratio),
+        'tradeable_rows': int(tradeable_total),
+        'tradeable_rows_with_visual': int(tradeable_covered),
+        'tradeable_coverage_ratio': float(tradeable_ratio),
+        'executed_rows': int(executed_total),
+        'executed_rows_with_visual': int(executed_covered),
+        'executed_coverage_ratio': float(executed_ratio),
+    }
+
+    if eval_visual_diagnostics:
+        for key in (
+            'lob_tensors_available',
+            'lob_timestamps_available',
+            'rows_with_tensor',
+            'rows_with_tensor_ratio',
+            'used_tensor_count',
+            'visual_coverage_ratio',
+        ):
+            if key in eval_visual_diagnostics:
+                diagnostics[key] = eval_visual_diagnostics[key]
+
+    training_reference = _load_visual_training_reference(models_dir)
+    if training_reference is not None:
+        diagnostics['training_reference'] = training_reference
+        diagnostics['coverage_gap_vs_train'] = round(
+            diagnostics['coverage_ratio'] - float(training_reference.get('coverage_ratio', 0.0)),
+            4,
+        )
+
+    notes: list[str] = []
+    if training_reference is not None and training_reference.get('rows_total', 0) != diagnostics['rows_total']:
+        notes.append(
+            "تغطية التدريب المرجعية محسوبة على event rows فقط "
+            f"({training_reference.get('rows_total', 0):,})، بينما ملخص الباكتيست الافتراضي هنا على كل الصفوف "
+            f"({diagnostics['rows_total']:,})."
+        )
+    if training_reference is not None and diagnostics.get('coverage_gap_vs_train', 0.0) <= -0.25:
+        notes.append(
+            "هناك فجوة كبيرة بين تغطية الـ visual branch في التدريب والتقييم "
+            f"({diagnostics['coverage_gap_vs_train']:+.1%})."
+        )
+    used_tensor_count = int(diagnostics.get('used_tensor_count', 0))
+    directional_train_rows = int(diagnostics.get('directional_train_event_rows', 0))
+    if directional_train_rows > 0 and _ratio(used_tensor_count, directional_train_rows) < 0.25:
+        notes.append(
+            "عدد الـ LOB tensors المستخدمة قليل جدًا مقارنةً بعدد directional train-event rows، "
+            "وهذا يشير عادةً إلى أن لقطات الـ MBP في التقييم sparse أو أن عدة أحداث تنهار على نفس snapshot."
+        )
+    rows_with_tensor = int(diagnostics.get('rows_with_tensor', diagnostics['rows_with_visual']))
+    if rows_with_tensor > 0 and diagnostics['rows_with_visual'] < rows_with_tensor:
+        notes.append(
+            "بعض الصفوف اصطفّت مع tensors زمنياً لكن خرجت embeddings صفرية؛ هذا يوحي بمشكلة إضافية بعد المحاذاة وليس في التوقيت فقط."
+        )
+    if diagnostics['tradeable_rows'] > 0 and diagnostics['tradeable_coverage_ratio'] < 0.25:
+        notes.append(
+            "حتى بين الصفوف tradeable، التغطية البصرية منخفضة؛ لذلك الـ MetaLearner غالبًا يتخذ قراراته على stat/meta فقط معظم الوقت."
+        )
+    if not notes:
+        notes.append("لا يظهر خلل واضح في تغطية الـ visual branch من الملخص الحالي.")
+    diagnostics['diagnosis_notes'] = notes
+    return diagnostics
+
+
 def run_causal_backtest(
     df: pd.DataFrame,
     models_dir: str,
@@ -523,6 +692,7 @@ def run_causal_backtest(
     allow_oracle_forward_return: bool = False,
     single_position_only: bool = True,
     cooldown_rows: int = 0,
+    visual_diagnostics: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
@@ -713,6 +883,13 @@ def run_causal_backtest(
 
     results_df = pd.DataFrame(results)
     trades_df = pd.DataFrame(trades)
+    visual_diag = _build_visual_diagnostics(
+        replay_df,
+        visual_embeddings,
+        models_dir=models_dir,
+        results_df=results_df,
+        eval_visual_diagnostics=visual_diagnostics,
+    )
 
     mdd_abs, mdd_pct = _equity_metrics(equity_curve)
     trade_pnls = trades_df['pnl'].tolist() if not trades_df.empty else []
@@ -744,8 +921,8 @@ def run_causal_backtest(
         'skipped_trade_replays': int(skipped_trade_replays),
         'single_position_only': bool(single_position_only),
         'cooldown_rows': int(max(cooldown_rows, 0)),
-        'visual_coverage': round(float((np.linalg.norm(visual_embeddings, axis=1) > 0).mean()), 4)
-            if visual_embeddings.size else 0.0,
+        'visual_coverage': float(visual_diag.get('coverage_ratio', 0.0)),
+        'visual_diagnostics': visual_diag,
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -753,6 +930,8 @@ def run_causal_backtest(
     trades_df.to_csv(os.path.join(output_dir, 'backtest_v19_trades.csv'), index=False)
     with open(os.path.join(output_dir, 'backtest_v19_summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
+    with open(os.path.join(output_dir, 'visual_diagnostics_v19.json'), 'w') as f:
+        json.dump(visual_diag, f, indent=2)
 
     if HTML_REPORT_AVAILABLE and len(trades_df):
         try:
@@ -764,6 +943,8 @@ def run_causal_backtest(
                 model_acc=summary.get('directional_f1_macro', 0.0),
                 n_features=0,
                 n_dataset=len(replay_df),
+                backtest_summary=summary,
+                visual_diagnostics=visual_diag,
             )
         except Exception as e:
             print(f"  ⚠️ HTML report skipped: {e}")
