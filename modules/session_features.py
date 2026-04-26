@@ -204,3 +204,48 @@ class SessionVWAPEngine:
             vwap_slope = round(self._vwap_history[-1] - self._vwap_history[-20], 6)
 
         return current_vwap, vwap_z_score, vwap_slope, self.session_cvd
+
+# ═══════════════════════════════════════════════════════════════════
+# التعديل 1 — Cyclical Session Encoding (لا leakage)
+# ═══════════════════════════════════════════════════════════════════
+CYCLICAL_SESSION_COLS = [
+    'hour_sin', 'hour_cos',
+    'minute_sin', 'minute_cos',
+    'london_active', 'ny_active', 'overlap_active',
+]
+
+def add_cyclical_session_features(df: pd.DataFrame, ts_col: str = 'ts_event') -> pd.DataFrame:
+    """
+    يحوّل الوقت لتمثيل دائري (Cyclical Encoding) بدلاً من session flags.
+
+    لماذا لا يسبب leakage؟
+      - sin/cos للساعة تعتمد فقط على الوقت الحالي (timestamp)
+      - لا تعكس أي معلومة مستقبلية
+      - london_active/ny_active تعتمد فقط على الساعة الحالية
+
+    لماذا أفضل من session flags؟
+      - 08:59 و 09:01 متشابهان في الحساب (continuity)
+      - النموذج يتعلم العلاقة بين الوقت والسلوك بشكل تدريجي
+    """
+    df = df.copy()
+
+    ts = pd.to_datetime(df.get(ts_col, pd.Series(pd.RangeIndex(len(df)))), utc=True, errors='coerce')
+    if ts.dt.tz is not None:
+        ts = ts.dt.tz_convert(None)
+    ts = ts.ffill().bfill()
+
+    hour   = ts.dt.hour.fillna(0).astype(float)
+    minute = ts.dt.minute.fillna(0).astype(float)
+
+    # Cyclical: ساعة الكرة الأرضية
+    df['hour_sin']   = np.sin(2 * np.pi * hour   / 24.0).astype(np.float32)
+    df['hour_cos']   = np.cos(2 * np.pi * hour   / 24.0).astype(np.float32)
+    df['minute_sin'] = np.sin(2 * np.pi * minute / 60.0).astype(np.float32)
+    df['minute_cos'] = np.cos(2 * np.pi * minute / 60.0).astype(np.float32)
+
+    # Binary session flags (causal — بناءً على الوقت الحالي فقط)
+    df['london_active']  = ((hour >= 7)  & (hour < 16)).astype(np.float32)
+    df['ny_active']      = ((hour >= 13) & (hour < 22)).astype(np.float32)
+    df['overlap_active'] = ((hour >= 13) & (hour < 16)).astype(np.float32)
+
+    return df

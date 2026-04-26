@@ -278,3 +278,83 @@ class DailyContextEngine:
         fuel_exhausted = 1.0 if remaining_fuel <= (adr_value * 0.1) else 0.0 # لو فاضل أقل من 10% يبقى البنزين خلص
 
         return ib_status, remaining_fuel, fuel_exhausted, self.adr_pips
+
+
+# ═══════════════════════════════════════════════════════════════════
+# التعديل 2 — GARCH Volatility Proxy
+# ═══════════════════════════════════════════════════════════════════
+
+class GARCHVolatilityProxy:
+    """
+    التعديل 2: GARCH(1,1) proxy باستخدام EWMA (RiskMetrics standard).
+
+    لماذا GARCH وليس micro_atr؟
+      - micro_atr يقيس التقلب الماضي فقط
+      - GARCH يقدّر الـ conditional volatility (التقلب المتوقع)
+      - alpha=0.94 هو المعيار في RiskMetrics لـ EWMA variance
+
+    المخرجات:
+      conditional_vol : تقلب متوقع (يُستخدم كـ feature + loss weight)
+      vol_regime      : 0=هادئ، 1=متوسط، 2=عالي (threshold-based)
+    """
+    def __init__(self, alpha: float = 0.94, window: int = 100):
+        self.alpha   = float(np.clip(alpha, 0.80, 0.99))
+        self.window  = max(int(window), 20)
+        self._ewma_var = None
+        self._returns  = deque(maxlen=window)
+        self._prev_price = None
+
+    def update(self, price: float) -> tuple[float, int]:
+        price = float(price)
+        if self._prev_price is not None:
+            ret = (price - self._prev_price) / max(abs(self._prev_price), 1e-10)
+            self._returns.append(ret)
+
+            if self._ewma_var is None:
+                self._ewma_var = ret ** 2
+            else:
+                self._ewma_var = (
+                    self.alpha * self._ewma_var
+                    + (1.0 - self.alpha) * ret ** 2
+                )
+
+        self._prev_price = price
+
+        if self._ewma_var is None or self._ewma_var <= 0:
+            return 0.0, 0
+
+        cond_vol = float(np.sqrt(self._ewma_var))
+
+        # تصنيف النظام الثلاثي بناءً على الإحصائيات التاريخية
+        if len(self._returns) >= 20:
+            arr = np.array(self._returns)
+            baseline_std = float(np.std(arr)) or 1e-10
+            ratio = cond_vol / baseline_std
+            if ratio < 0.8:
+                regime = 0   # هادئ
+            elif ratio < 1.5:
+                regime = 1   # طبيعي
+            else:
+                regime = 2   # عالي التقلب
+        else:
+            regime = 1
+
+        return round(cond_vol, 8), regime
+
+    @staticmethod
+    def compute_series(prices: pd.Series, alpha: float = 0.94) -> pd.DataFrame:
+        """
+        حساب batch للداتا الكاملة (للـ prepare_training_data.py).
+        يعيد DataFrame يحتوي conditional_vol + vol_regime.
+        """
+        engine = GARCHVolatilityProxy(alpha=alpha)
+        vols, regimes = [], []
+        for p in prices:
+            v, r = engine.update(float(p))
+            vols.append(v)
+            regimes.append(r)
+        return pd.DataFrame({
+            'garch_vol':    pd.array(vols,   dtype='float32'),
+            'garch_regime': pd.array(regimes, dtype='int8'),
+        })
+

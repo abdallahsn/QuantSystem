@@ -408,3 +408,157 @@ class RegimeClassifier:
             count = int((labels == cluster_id).sum()) if labels is not None else 0
             lines.append(f"   Cluster {cluster_id} → {regime_name}: {count} samples")
         return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# التعديل 4 — Wasserstein Regime Classifier
+# ═══════════════════════════════════════════════════════════════════
+
+class WassersteinRegimeClassifier:
+    """
+    التعديل 4: تصنيف الـ Regime باستخدام Wasserstein Distance.
+
+    لماذا Wasserstein بدلاً من GMM؟
+      - GMM يعتمد على Euclidean distance → يميل للـ Ranging (59%) لأن
+        معظم النقاط قريبة من المتوسط
+      - Wasserstein يقيس المسافة بين توزيعات العوائد كاملة
+      - يميّز Trending الخفي (moves منتظمة) من Ranging (moves عشوائية)
+        حتى لو المتوسطات متقاربة
+
+    الخوارزمية:
+      1. قسّم البيانات لـ windows متداخلة (rolling)
+      2. لكل window احسب distribution of returns
+      3. صنّف بناءً على مسافة Wasserstein من prototype distributions
+    """
+
+    REGIME_NAMES = {0: 'Trending', 1: 'Ranging', 2: 'Volatile', 3: 'Low_Liquidity'}
+
+    def __init__(
+        self,
+        window: int = 50,
+        n_regimes: int = 4,
+        percentile_trending: float = 30.0,
+        percentile_volatile: float = 70.0,
+        low_liq_threshold: float = 0.1,
+    ):
+        self.window              = max(int(window), 10)
+        self.n_regimes           = n_regimes
+        self.pct_trending        = percentile_trending
+        self.pct_volatile        = percentile_volatile
+        self.low_liq_thr         = low_liq_threshold
+        self._vol_low_thr        = None
+        self._vol_high_thr       = None
+        self._trend_thr          = None
+        self._liq_thr            = None
+        self._fitted             = False
+
+    @staticmethod
+    def _wasserstein_1d(u: np.ndarray, v: np.ndarray) -> float:
+        """Wasserstein-1 (Earth Mover's Distance) بين توزيعين 1D."""
+        try:
+            from scipy.stats import wasserstein_distance
+            return float(wasserstein_distance(u, v))
+        except ImportError:
+            # Fallback: حساب يدوي عبر CDFs مرتبة
+            u_s = np.sort(u); v_s = np.sort(v)
+            n   = max(len(u_s), len(v_s))
+            u_i = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(u_s)), u_s)
+            v_i = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(v_s)), v_s)
+            return float(np.mean(np.abs(u_i - v_i)))
+
+    def _rolling_features(self, prices: np.ndarray, volumes: np.ndarray) -> np.ndarray:
+        """
+        يحسب لكل نافذة:
+          [vol_std, trend_score, liq_score, skewness]
+        """
+        n = len(prices)
+        feats = np.zeros((n, 4), dtype=np.float32)
+
+        for i in range(n):
+            lo = max(0, i - self.window + 1)
+            w_prices = prices[lo:i + 1]
+            w_vols   = volumes[lo:i + 1]
+
+            if len(w_prices) < 3:
+                continue
+
+            returns = np.diff(w_prices)
+            if len(returns) == 0:
+                continue
+
+            # 1. Volatility (std of returns)
+            vol_std = float(np.std(returns)) if len(returns) > 1 else 0.0
+
+            # 2. Trend score (Wasserstein distance من توزيع مرتب vs عشوائي)
+            # توزيع مرتب = trending، توزيع عشوائي = ranging
+            sorted_ret  = np.sort(returns)
+            random_ref  = np.zeros_like(sorted_ret)  # توزيع الصفر = no trend
+            w_dist = self._wasserstein_1d(returns, random_ref)
+            trend_score = float(w_dist / max(vol_std, 1e-10))
+
+            # 3. Liquidity score (normalized average volume)
+            avg_vol = float(np.mean(w_vols)) if len(w_vols) > 0 else 0.0
+            all_vol_med = float(np.median(volumes)) if len(volumes) > 0 else 1.0
+            liq_score = float(avg_vol / max(all_vol_med, 1e-10))
+
+            # 4. Skewness proxy
+            if len(returns) > 2 and vol_std > 1e-10:
+                skew = float(np.mean(((returns - np.mean(returns)) / vol_std) ** 3))
+            else:
+                skew = 0.0
+
+            feats[i] = [vol_std, trend_score, liq_score, skew]
+
+        return feats
+
+    def fit(self, df: pd.DataFrame) -> 'WassersteinRegimeClassifier':
+        prices  = df['price'].fillna(method='ffill').values.astype(np.float64) \
+                  if 'price' in df.columns else \
+                  df['close'].fillna(method='ffill').values.astype(np.float64)
+        volumes = df['volume'].fillna(0).values.astype(np.float64) \
+                  if 'volume' in df.columns else np.ones(len(df))
+
+        feats = self._rolling_features(prices, volumes)
+        vol_arr   = feats[:, 0]
+        trend_arr = feats[:, 1]
+        liq_arr   = feats[:, 2]
+
+        # حساب thresholds على Train data فقط
+        self._vol_low_thr  = float(np.percentile(vol_arr[vol_arr > 0],   self.pct_trending))
+        self._vol_high_thr = float(np.percentile(vol_arr[vol_arr > 0],   self.pct_volatile))
+        self._trend_thr    = float(np.percentile(trend_arr[trend_arr > 0], 50.0))
+        self._liq_thr      = float(np.percentile(liq_arr, self.low_liq_thr * 100))
+        self._fitted       = True
+        return self
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("WassersteinRegimeClassifier: call fit() first")
+
+        prices  = df['price'].fillna(method='ffill').values.astype(np.float64) \
+                  if 'price' in df.columns else \
+                  df['close'].fillna(method='ffill').values.astype(np.float64)
+        volumes = df['volume'].fillna(0).values.astype(np.float64) \
+                  if 'volume' in df.columns else np.ones(len(df))
+
+        feats     = self._rolling_features(prices, volumes)
+        vol_arr   = feats[:, 0]
+        trend_arr = feats[:, 1]
+        liq_arr   = feats[:, 2]
+
+        labels = np.full(len(df), 1, dtype=np.int8)  # default = Ranging
+
+        # Low Liquidity
+        labels[liq_arr < self._liq_thr] = 3
+
+        # Volatile
+        labels[vol_arr > self._vol_high_thr] = 2
+
+        # Trending (يتجاوز كل ما سبق)
+        trending_mask = (trend_arr > self._trend_thr) & (vol_arr <= self._vol_high_thr)
+        labels[trending_mask] = 0
+
+        return labels
+
+    def fit_predict(self, df: pd.DataFrame) -> np.ndarray:
+        return self.fit(df).predict(df)

@@ -42,8 +42,11 @@ from modules.purging_embargo         import (spearman_redundancy_filter,
                                               mrmr_selection,
                                               walk_forward_expanding)
 from modules.regime_classifier       import RegimeClassifier
+from modules.regime_classifier       import WassersteinRegimeClassifier  # التعديل 4
 from modules.slippage_model          import SlippageModel
 from modules.session_features        import add_session_features, SESSION_FEATURE_COLS, SessionVWAPEngine # 🔴 إضافة VWAP
+from modules.session_features        import add_cyclical_session_features, CYCLICAL_SESSION_COLS          # التعديل 1
+from modules.context_features        import GARCHVolatilityProxy                                         # التعديل 2
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
 # ── V19: DeepLOB Tensor Builder ──────────────────────────────────
@@ -169,6 +172,10 @@ FEATURE_COLS = [
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'pwh', 'pwl',
     'dist_to_pdh', 'price_position',
+    # التعديل 1: Cyclical Session (لا leakage)
+    'hour_sin', 'hour_cos', 'london_active', 'ny_active', 'overlap_active',
+    # التعديل 2: GARCH Volatility
+    'garch_vol', 'garch_regime',
 ]
 
 MODEL_FEATURE_COLS = FEATURE_COLS + [
@@ -196,6 +203,10 @@ PROTECTED_FEATURES = {
     'vwap_z_score', 'vwap_slope', 'current_vwap',
     'dist_to_bid_wall', 'dist_to_ask_wall',
     'ib_status', 'remaining_fuel',
+    # التعديل 1: Cyclical Session محمية دائماً
+    'hour_sin', 'hour_cos', 'london_active', 'ny_active', 'overlap_active',
+    # التعديل 2: GARCH محمية
+    'garch_vol',
     # NOTE: session_overlap/london/ny أُزيلت من FEATURE_COLS تماماً (anti-leakage)
 }
 
@@ -861,7 +872,6 @@ def _select_event_rich_lob_emit_positions(
     df_labeled: pd.DataFrame,
     lob_mbp_src: pd.DataFrame,
     max_events: int = LOB_EVENT_SAMPLE_DEFAULT,
-    max_positions: int | None = None,
 ) -> tuple[np.ndarray, dict]:
     if (
         df_labeled is None or len(df_labeled) == 0 or
@@ -915,58 +925,14 @@ def _select_event_rich_lob_emit_positions(
         on='ts_event',
         direction='backward',
     ).dropna(subset=['mbp_pos'])
-    base_emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
-    collapse_ratio = float(len(base_emit_positions) / max(len(selected), 1))
-    neighbor_radius = 0
-    if len(base_emit_positions):
-        if collapse_ratio < 0.20:
-            neighbor_radius = 2
-        elif collapse_ratio < 0.50:
-            neighbor_radius = 1
-
-    emit_positions = base_emit_positions
-    expanded_emit_positions = base_emit_positions
-    extra_neighbors = np.array([], dtype=np.int32)
-    capped_extra_neighbors = False
-
-    if neighbor_radius > 0 and len(base_emit_positions):
-        offsets = np.arange(-neighbor_radius, neighbor_radius + 1, dtype=np.int32)
-        expanded_emit_positions = np.unique(
-            np.clip(
-                base_emit_positions.reshape(-1, 1) + offsets.reshape(1, -1),
-                0,
-                max(len(mbp_df) - 1, 0),
-            ).reshape(-1)
-        ).astype(np.int32)
-        extra_neighbors = expanded_emit_positions[~np.isin(expanded_emit_positions, base_emit_positions)]
-        emit_positions = expanded_emit_positions
-
-        if max_positions is not None and int(max_positions) > 0 and len(emit_positions) > int(max_positions):
-            base_budget = len(base_emit_positions)
-            extra_budget = max(int(max_positions) - base_budget, 0)
-            if extra_budget < len(extra_neighbors):
-                if extra_budget > 0:
-                    keep_idx = np.linspace(0, len(extra_neighbors) - 1, extra_budget, dtype=int)
-                    extra_neighbors = extra_neighbors[keep_idx]
-                else:
-                    extra_neighbors = np.array([], dtype=np.int32)
-                capped_extra_neighbors = True
-            emit_positions = np.sort(
-                np.unique(np.concatenate([base_emit_positions, extra_neighbors], axis=0))
-            ).astype(np.int32)
-
+    emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
     meta = {
         'directional_events_available': int(len(candidates)),
         'event_col': event_col,
         'strong_available': int(len(strong)),
         'weak_available': int(len(weak)),
         'selected_events': int(len(selected)),
-        'base_emit_positions': int(len(base_emit_positions)),
         'selected_emit_positions': int(len(emit_positions)),
-        'emit_neighbor_radius': int(neighbor_radius),
-        'emit_neighbor_positions_added': int(len(emit_positions) - len(base_emit_positions)),
-        'emit_neighbor_positions_capped': bool(capped_extra_neighbors),
-        'emit_collapse_ratio': round(collapse_ratio, 4),
         'selected_strong': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_STRONG) if selected_parts else 0),
         'selected_weak': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_WEAK) if selected_parts else 0),
     }
@@ -1205,9 +1171,20 @@ def _normalize_and_save(
             train_regime_df = df.iloc[train_idx].copy()
             if train_regime_df.empty:
                 train_regime_df = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
-            regime_clf = RegimeClassifier(n_regimes=4)
-            regime_clf.fit(train_regime_df, output_dir=output_dir)
-            df['regime_cluster'] = regime_clf.predict(df).astype(np.int8)
+
+            # التعديل 4: Wasserstein Regime كـ primary
+            try:
+                w_clf = WassersteinRegimeClassifier(window=50, n_regimes=4)
+                w_clf.fit(train_regime_df)
+                df['regime_cluster']    = w_clf.predict(df).astype(np.int8)
+                df['regime_wasserstein'] = df['regime_cluster'].astype(np.int8)
+                print("  ✅ Wasserstein Regime fitted")
+            except Exception as ew:
+                print(f"  ⚠️ Wasserstein fallback to rules: {ew}")
+                regime_clf = RegimeClassifier(n_regimes=4)
+                regime_clf.fit(train_regime_df, output_dir=output_dir)
+                df['regime_cluster'] = regime_clf.predict(df).astype(np.int8)
+
             if 'regime_label' not in df.columns:
                 df['regime_label'] = df['regime_cluster'].astype(np.int8)
             print(f"  ✅ Regime: fit على {len(train_regime_df):,} | predict على {len(df):,}")
@@ -1391,6 +1368,18 @@ def run_refinery(
     print("\n⚙️  Step 3b-ii — Session Zone Features (metadata only)...")
     df_merged = add_session_features(df_merged, ts_col='ts_event')
 
+    # ── التعديل 1: Cyclical Session Encoding ─────────────────────
+    print("  ✅ Cyclical Session Encoding...")
+    df_merged = add_cyclical_session_features(df_merged, ts_col='ts_event')
+
+    # ── التعديل 2: GARCH Volatility Proxy ───────────────────────
+    print("  ⏳ GARCH Volatility Proxy...")
+    price_col_g = 'price' if 'price' in df_merged.columns else 'close'
+    garch_df = GARCHVolatilityProxy.compute_series(df_merged[price_col_g])
+    df_merged['garch_vol']    = garch_df['garch_vol'].values
+    df_merged['garch_regime'] = garch_df['garch_regime'].values
+    print(f"  ✅ GARCH: vol range=[{df_merged['garch_vol'].min():.6f}, {df_merged['garch_vol'].max():.6f}]")
+
     print("\n⚙️  Step 3c — Fractional Differentiation...")
     df_merged, frac_cols = apply_fractional_diff(df_merged, d=0.4)
 
@@ -1439,7 +1428,6 @@ def run_refinery(
                 df_labeled,
                 lob_mbp_src,
                 max_events=sample_cap,
-                max_positions=int(effective_max_tensors) if effective_max_tensors else None,
             )
             build_plan = {
                 'force': lob_limits['force'],
