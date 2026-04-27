@@ -347,14 +347,27 @@ class GARCHVolatilityProxy:
         حساب batch للداتا الكاملة (للـ prepare_training_data.py).
         يعيد DataFrame يحتوي conditional_vol + vol_regime.
         """
-        engine = GARCHVolatilityProxy(alpha=alpha)
-        vols, regimes = [], []
-        for p in prices:
-            v, r = engine.update(float(p))
-            vols.append(v)
-            regimes.append(r)
-        return pd.DataFrame({
-            'garch_vol':    pd.array(vols,   dtype='float32'),
-            'garch_regime': pd.array(regimes, dtype='int8'),
-        })
+        price_s = pd.to_numeric(prices, errors='coerce').ffill().bfill().fillna(0.0).astype(np.float64)
+        if len(price_s) == 0:
+            return pd.DataFrame({
+                'garch_vol': pd.Series(dtype='float32'),
+                'garch_regime': pd.Series(dtype='int8'),
+            })
 
+        returns = price_s.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        squared = returns.pow(2)
+        ewma_var = squared.ewm(alpha=(1.0 - float(np.clip(alpha, 0.80, 0.99))), adjust=False).mean()
+        cond_vol = ewma_var.clip(lower=0.0).pow(0.5).fillna(0.0)
+
+        baseline_std = returns.rolling(100, min_periods=20).std()
+        ratio = (cond_vol / baseline_std.clip(lower=1e-10)).replace([np.inf, -np.inf], np.nan)
+        regime = np.select(
+            [ratio < 0.8, ratio < 1.5],
+            [0, 1],
+            default=2,
+        )
+        regime = np.where(baseline_std.isna().values, 1, regime).astype(np.int8)
+        return pd.DataFrame({
+            'garch_vol': cond_vol.astype('float32').values,
+            'garch_regime': regime,
+        })

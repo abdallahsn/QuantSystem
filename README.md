@@ -20,7 +20,9 @@ QuantSystem V19 هو مشروع **quantitative AI trading research system** مب
 
 1. `stage1_refinery.py`
    - يبني dataset التدريب من الخام
-   - يحفظ `training_features_ready.csv`
+   - يحفظ artifact جديدًا مبنيًا على `sharded parquet + manifest + checkpoints`
+   - يعمل افتراضيًا على streaming/shards بدل full-load
+   - يستخدم `rules` كـ default للـ regime metadata مع coarse sampling لتقليل زمن الـ stage1
 
 2. `stage2_catboost.py`
    - يدرب `CatBoost + Regime`
@@ -66,6 +68,15 @@ QuantSystem V19 هو مشروع **quantitative AI trading research system** مب
 - `Regime classifier`
 - `DeepLOB CNN`
 - `MetaLearner LSTM`
+
+### Regime Defaults In This Version
+- `stage1_refinery.py` لم يعد يستخدم `Wasserstein` كمسار افتراضي على كل الصفوف.
+- الافتراضي الآن:
+  - `regime_mode=rules`
+  - `regime_stride=50`
+  - `deterministic_stage1=true`
+- هذا يعني أن stage1 يبني `regime metadata` على surface أخف، ثم يوسعها على كامل الصفوف بدل تشغيل مصنف regime ثقيل على كل trade row.
+- إذا أردت `Wasserstein`, شغّله يدويًا فقط كـ `research mode` وليس كمسار إنتاج افتراضي.
 
 ### 4. Evaluation Layer
 - causal backtest
@@ -145,22 +156,59 @@ python3 stage1_refinery.py \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
   --output outputs_v19 \
-  --label_mode v19
+  --label_mode v19 \
+  --chunk_rows 2000000 \
+  --mbo_workers 32 \
+  --mbp_workers 32
 ```
 
+السلوك الافتراضي المهم في النسخة الحالية:
+- `stage1` صار pipeline sharded/resumable بدل `CSV` واحد في النهاية
+- `MBO` و`MBP` يُعالجان على shards مع warmup boundaries وcheckpoints
+- `regime` يعمل افتراضيًا بـ `rules` بدل `Wasserstein`
+- `regime` يُحسب على coarse sample ثم يُوسَّع على كامل الصفوف
+
+للتشغيل الكبير يفضّل ترك هذه الافتراضيات كما هي واستخدام `--resume` إذا انقطع التشغيل.
+
 النواتج المهمة:
-- `outputs_v19/training_features_ready.csv`
+- `outputs_v19/artifact_manifest.json`
+- `outputs_v19/checkpoints/*.json`
+- `outputs_v19/normalized/mbo/*.parquet`
+- `outputs_v19/normalized/mbp/*.parquet`
+- `outputs_v19/features/merged/*.parquet`
+- `outputs_v19/final/features_*.parquet`
 - `outputs_v19/scaler_params.json`
 - `outputs_v19/lob_tensors.npy`
 - `outputs_v19/lob_tensor_timestamps.npy`
 - `outputs_v19/refinery_report.txt`
 
+### 1b. Regime Research Mode
+
+إذا أردت اختبار `Wasserstein` يدويًا على dataset أصغر أو في تجربة بحثية:
+
+```bash
+python3 stage1_refinery.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19_research \
+  --label_mode v22 \
+  --regime_mode wasserstein \
+  --regime_stride 25 \
+  --regime_window 50 \
+  --regime_progress_every 25000
+```
+
+ملاحظات مهمة:
+- `Wasserstein` لم يعد default لأنه أبطأ بكثير على datasets ضخمة.
+- `regime_stride` يتحكم بعدد الصفوف المستخدمة لبناء `regime surface` قبل توسيعها على كامل dataset.
+- كلما زاد `regime_stride` أصبح stage1 أسرع، لكن surface أدقّتها الزمنية تصبح أخشن.
+
 
 ### 2. CatBoost Stage
 
 ```bash
-python3 stage2_catboost.py \
-  --csv outputs_v19/training_features_ready.csv \
+python stage2_catboost.py \
+  --data outputs_v19 \
   --output outputs_v19
 ```
 
@@ -176,7 +224,7 @@ python3 stage2_catboost.py \
 
 ```bash
 python3 stage3_train.py \
-  --csv outputs_v19/training_features_ready.csv \
+  --data outputs_v19 \
   --output outputs_v19
 ```
 
@@ -192,7 +240,7 @@ python3 stage3_train.py \
 
 ```bash
 python3 train_v19.py \
-  --csv outputs_v19/training_features_ready.csv \
+  --data outputs_v19 \
   --output outputs_v19 \
   --phase full
 ```
@@ -200,8 +248,8 @@ python3 train_v19.py \
 يمكن أيضًا تشغيل CatBoost فقط أو التدريب فقط من نفس الملف:
 
 ```bash
-python3 train_v19.py --csv outputs_v19/training_features_ready.csv --output outputs_v19 --phase catboost
-python3 train_v19.py --csv outputs_v19/training_features_ready.csv --output outputs_v19 --phase train
+python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase catboost
+python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase train
 ```
 
 
@@ -209,7 +257,7 @@ python3 train_v19.py --csv outputs_v19/training_features_ready.csv --output outp
 
 ```bash
 python3 backtest_v19.py \
-  --csv outputs_v19/training_features_ready.csv \
+  --data outputs_v19 \
   --models outputs_v19 \
   --output outputs_v19_backtest \
   --input_scaled \
@@ -236,6 +284,17 @@ python3 walkforward_v19.py \
 - `walkforward_summary.json`
 - `release_gates_report.json`
 - `manifest.json`
+
+## Stage1 Performance Notes
+
+- `stage1` لم يعد ينتظر حتى النهاية ليكتب dataset واحدًا؛ ستظهر shards وcheckpoints أثناء التشغيل.
+- أكبر عنق زجاجة تاريخيًا كان `Regime Classification` على كل الصفوف في loop Python. الآن:
+  - الإنتاج الافتراضي يستخدم `rules`
+  - `Wasserstein` بقي مسارًا بحثيًا فقط
+- إذا كنت تتعامل مع عشرات الملايين من الصفوف:
+  - ابدأ بـ `chunk_rows=2_000_000`
+  - اضبط `mbo_workers` و`mbp_workers` حسب عدد الأنوية الفعلية
+  - فعّل `--resume` في السيرفرات الرخيصة أو المعرضة للانقطاع
 
 
 ## Running On Jupyter Notebook On A Remote Server
@@ -336,7 +395,8 @@ Python (QuantSystem V19)
   --mbo /data/mbo.csv \
   --mbp /data/mbp.csv \
   --output outputs_v19 \
-  --label_mode v19
+  --label_mode v19 \
+  --chunk_rows 2000000
 ```
 
 ### 2. `02_train_v19.ipynb`
@@ -344,7 +404,7 @@ Python (QuantSystem V19)
 
 ```python
 !python3 train_v19.py \
-  --csv outputs_v19/training_features_ready.csv \
+  --data outputs_v19 \
   --output outputs_v19
 ```
 
@@ -353,7 +413,7 @@ Python (QuantSystem V19)
 
 ```python
 !python3 backtest_v19.py \
-  --csv outputs_v19/training_features_ready.csv \
+  --data outputs_v19 \
   --models outputs_v19 \
   --output outputs_v19_backtest \
   --input_scaled \
@@ -390,7 +450,7 @@ summary
 from train_v19 import run_training_pipeline
 
 summary = run_training_pipeline(
-    csv_path="outputs_v19/training_features_ready.csv",
+    csv_path="outputs_v19",
     output_dir="outputs_v19",
 )
 summary
@@ -402,7 +462,7 @@ summary
 from shadow_v19 import run_shadow
 
 summary = run_shadow(
-    csv_path="outputs_v19/training_features_ready.csv",
+    csv_path="outputs_v19",
     models_dir="outputs_v19",
     output_dir="outputs_v19_shadow",
     input_scaled=True,
@@ -416,7 +476,7 @@ summary
 from paper_v19 import run_paper
 
 summary = run_paper(
-    csv_path="outputs_v19/training_features_ready.csv",
+    csv_path="outputs_v19",
     models_dir="outputs_v19",
     output_dir="outputs_v19_paper",
     input_scaled=True,
@@ -525,7 +585,7 @@ pip install pyarrow
 1. فعّل البيئة الافتراضية
 2. افتح Jupyter Lab
 3. شغّل `01_prepare_data.ipynb`
-4. تأكد من وجود `training_features_ready.csv`
+4. تأكد من وجود `artifact_manifest.json` و`final/features_*.parquet`
 5. شغّل `02_train_v19.ipynb`
 6. راجع `manifest.json` و`feature_schema_v19.json`
 7. شغّل `03_backtest_v19.ipynb`

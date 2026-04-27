@@ -5,6 +5,11 @@ import pickle
 from collections import Counter
 
 try:
+    from scipy.stats import wasserstein_distance as SCIPY_WASSERSTEIN_DISTANCE
+except ImportError:
+    SCIPY_WASSERSTEIN_DISTANCE = None
+
+try:
     from hmmlearn import hmm
     HMM_AVAILABLE = True
 except ImportError:
@@ -438,16 +443,20 @@ class RegimeClassifier:
     def predict_regime_meta(self, df: pd.DataFrame) -> pd.DataFrame:
         labels = self.predict(df)
         scores = self.predict_scores(df)
+        one_hot = np.zeros((len(df), len(REGIME_ONE_HOT_COLS)), dtype=np.float32)
+        if len(labels):
+            safe_labels = np.asarray(labels, dtype=np.int32)
+            safe_labels = np.where(
+                (safe_labels >= 0) & (safe_labels < len(REGIME_ONE_HOT_COLS)),
+                safe_labels,
+                0,
+            )
+            one_hot[np.arange(len(safe_labels), dtype=np.int32), safe_labels] = 1.0
         out = pd.DataFrame(
-            np.zeros((len(df), len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)), dtype=np.float32),
+            np.concatenate([one_hot, np.zeros((len(df), len(REGIME_META_SCORE_COLS)), dtype=np.float32)], axis=1),
             index=df.index,
             columns=[*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
         )
-        for idx, label in enumerate(labels):
-            if 0 <= int(label) < len(REGIME_ONE_HOT_COLS):
-                out.iat[idx, int(label)] = 1.0
-            else:
-                out.iat[idx, 0] = 1.0
         for col in REGIME_META_SCORE_COLS:
             out[col] = scores.reindex(index=df.index, columns=[col], fill_value=0.0)[col].astype(np.float32)
         return out
@@ -560,85 +569,86 @@ class WassersteinRegimeClassifier:
         percentile_trending: float = 30.0,
         percentile_volatile: float = 70.0,
         low_liq_threshold: float = 0.1,
+        progress_every: int = 0,
     ):
         self.window              = max(int(window), 10)
         self.n_regimes           = n_regimes
         self.pct_trending        = percentile_trending
         self.pct_volatile        = percentile_volatile
         self.low_liq_thr         = low_liq_threshold
+        self.progress_every      = max(int(progress_every), 0)
         self._vol_low_thr        = None
         self._vol_high_thr       = None
         self._trend_thr          = None
         self._liq_thr            = None
         self._fitted             = False
+        self._feature_cache_key  = None
+        self._feature_cache      = None
 
     @staticmethod
-    def _wasserstein_1d(u: np.ndarray, v: np.ndarray) -> float:
-        """Wasserstein-1 (Earth Mover's Distance) بين توزيعين 1D."""
-        try:
-            from scipy.stats import wasserstein_distance
-            return float(wasserstein_distance(u, v))
-        except ImportError:
-            # Fallback: حساب يدوي عبر CDFs مرتبة
-            u_s = np.sort(u); v_s = np.sort(v)
-            n   = max(len(u_s), len(v_s))
-            u_i = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(u_s)), u_s)
-            v_i = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(v_s)), v_s)
-            return float(np.mean(np.abs(u_i - v_i)))
+    def _frame_cache_key(prices: np.ndarray, volumes: np.ndarray) -> tuple:
+        if len(prices) == 0:
+            return (0, 0.0, 0.0, 0.0, 0.0)
+        return (
+            int(len(prices)),
+            float(prices[0]),
+            float(prices[-1]),
+            float(volumes[0]) if len(volumes) else 0.0,
+            float(volumes[-1]) if len(volumes) else 0.0,
+        )
 
-    def _rolling_features(self, prices: np.ndarray, volumes: np.ndarray) -> np.ndarray:
+    def _rolling_features(
+        self,
+        prices: np.ndarray,
+        volumes: np.ndarray,
+        *,
+        progress_label: str = '',
+    ) -> np.ndarray:
         """
         يحسب لكل نافذة:
           [vol_std, trend_score, liq_score, skewness]
         """
-        n = len(prices)
-        feats = np.zeros((n, 4), dtype=np.float32)
+        cache_key = self._frame_cache_key(prices, volumes)
+        if self._feature_cache_key == cache_key and self._feature_cache is not None:
+            return self._feature_cache.copy()
 
-        for i in range(n):
-            lo = max(0, i - self.window + 1)
-            w_prices = prices[lo:i + 1]
-            w_vols   = volumes[lo:i + 1]
+        price_s = pd.Series(prices, dtype=np.float64)
+        vol_s = pd.Series(volumes, dtype=np.float64)
+        ret_s = price_s.diff().fillna(0.0)
 
-            if len(w_prices) < 3:
-                continue
+        # Wasserstein to a zero reference in 1D collapses here to a rolling L1 move proxy.
+        vol_std = ret_s.rolling(self.window, min_periods=3).std().fillna(0.0)
+        l1_move = ret_s.abs().rolling(self.window, min_periods=2).mean().fillna(0.0)
+        trend_score = (l1_move / vol_std.clip(lower=1e-10)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-            returns = np.diff(w_prices)
-            if len(returns) == 0:
-                continue
+        all_vol_med = float(np.median(volumes)) if len(volumes) > 0 else 1.0
+        liq_score = (
+            vol_s.rolling(self.window, min_periods=1).mean().fillna(0.0)
+            / max(all_vol_med, 1e-10)
+        )
+        skew = ret_s.rolling(self.window, min_periods=3).skew().fillna(0.0)
 
-            # 1. Volatility (std of returns)
-            vol_std = float(np.std(returns)) if len(returns) > 1 else 0.0
-
-            # 2. Trend score (Wasserstein distance من توزيع مرتب vs عشوائي)
-            # توزيع مرتب = trending، توزيع عشوائي = ranging
-            sorted_ret  = np.sort(returns)
-            random_ref  = np.zeros_like(sorted_ret)  # توزيع الصفر = no trend
-            w_dist = self._wasserstein_1d(returns, random_ref)
-            trend_score = float(w_dist / max(vol_std, 1e-10))
-
-            # 3. Liquidity score (normalized average volume)
-            avg_vol = float(np.mean(w_vols)) if len(w_vols) > 0 else 0.0
-            all_vol_med = float(np.median(volumes)) if len(volumes) > 0 else 1.0
-            liq_score = float(avg_vol / max(all_vol_med, 1e-10))
-
-            # 4. Skewness proxy
-            if len(returns) > 2 and vol_std > 1e-10:
-                skew = float(np.mean(((returns - np.mean(returns)) / vol_std) ** 3))
-            else:
-                skew = 0.0
-
-            feats[i] = [vol_std, trend_score, liq_score, skew]
-
+        feats = np.column_stack(
+            [
+                vol_std.to_numpy(dtype=np.float32),
+                trend_score.to_numpy(dtype=np.float32),
+                liq_score.to_numpy(dtype=np.float32),
+                skew.to_numpy(dtype=np.float32),
+            ]
+        )
+        self._feature_cache_key = cache_key
+        self._feature_cache = feats.copy()
         return feats
 
     def fit(self, df: pd.DataFrame) -> 'WassersteinRegimeClassifier':
-        prices  = df['price'].fillna(method='ffill').values.astype(np.float64) \
+        prices  = df['price'].ffill().bfill().values.astype(np.float64) \
                   if 'price' in df.columns else \
-                  df['close'].fillna(method='ffill').values.astype(np.float64)
+                  df['close'].ffill().bfill().values.astype(np.float64)
         volumes = df['volume'].fillna(0).values.astype(np.float64) \
-                  if 'volume' in df.columns else np.ones(len(df))
+                  if 'volume' in df.columns else \
+                  pd.to_numeric(df.get('size', pd.Series(np.ones(len(df)), index=df.index)), errors='coerce').fillna(0).values.astype(np.float64)
 
-        feats = self._rolling_features(prices, volumes)
+        feats = self._rolling_features(prices, volumes, progress_label='fit')
         vol_arr   = feats[:, 0]
         trend_arr = feats[:, 1]
         liq_arr   = feats[:, 2]
@@ -655,13 +665,14 @@ class WassersteinRegimeClassifier:
         if not self._fitted:
             raise RuntimeError("WassersteinRegimeClassifier: call fit() first")
 
-        prices  = df['price'].fillna(method='ffill').values.astype(np.float64) \
+        prices  = df['price'].ffill().bfill().values.astype(np.float64) \
                   if 'price' in df.columns else \
-                  df['close'].fillna(method='ffill').values.astype(np.float64)
+                  df['close'].ffill().bfill().values.astype(np.float64)
         volumes = df['volume'].fillna(0).values.astype(np.float64) \
-                  if 'volume' in df.columns else np.ones(len(df))
+                  if 'volume' in df.columns else \
+                  pd.to_numeric(df.get('size', pd.Series(np.ones(len(df)), index=df.index)), errors='coerce').fillna(0).values.astype(np.float64)
 
-        feats     = self._rolling_features(prices, volumes)
+        feats     = self._rolling_features(prices, volumes, progress_label='predict')
         vol_arr   = feats[:, 0]
         trend_arr = feats[:, 1]
         liq_arr   = feats[:, 2]

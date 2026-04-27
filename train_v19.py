@@ -49,6 +49,7 @@ from modules.feature_factory_v19 import (
     apply_scaler_params_to_frame,
     prepare_feature_frame,
 )
+from modules.feature_artifact_v19 import load_artifact_manifest, load_feature_artifact, resolve_artifact_root
 from modules.gpu_config import detect_gpu
 from modules.manifest_v19 import write_manifest
 from modules.oof_stacking import (
@@ -249,11 +250,8 @@ def handle_rare_classes(df, label_col="bias_label", min_samples=10, strategy="au
     return df
 
 def load_training_csv(csv_path: str) -> pd.DataFrame:
-    print(f"\n📥 قراءة: {csv_path}")
-    df = pd.read_csv(csv_path, low_memory=False)
-    for col in ('ts_event', 'label_end_ts'):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors='coerce').dt.tz_localize(None)
+    print(f"\n📥 قراءة artifact: {csv_path}")
+    df = load_feature_artifact(csv_path)
 
     if 'bias_label' not in df.columns:
         raise ValueError("❌ 'bias_label' غير موجود — شغّل prepare_training_data.py --label_mode v19 أولاً")
@@ -526,7 +524,7 @@ def _save_scaler_params(output_dir: str, scaler_params: dict) -> str:
 
 def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
     copied = {}
-    src_dir = os.path.dirname(os.path.abspath(csv_path))
+    src_dir = resolve_artifact_root(csv_path)
     for name in (
         'selected_features.txt',
         'refinery_report.txt',
@@ -534,6 +532,7 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
         'artifact_manifest.json',
         'refinery_split.json',
         'lob_build_meta.json',
+        'final_feature_shards.json',
     ):
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
@@ -547,21 +546,20 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
 
 
 def _load_source_refinery_contract(csv_path: str) -> dict:
-    src_dir = os.path.dirname(os.path.abspath(csv_path))
+    src_dir = resolve_artifact_root(csv_path)
     manifest_path = os.path.join(src_dir, 'artifact_manifest.json')
     split_path = os.path.join(src_dir, 'refinery_split.json')
     out = {
-        'source_csv': os.path.abspath(csv_path),
+        'source_csv': os.path.abspath(src_dir),
         'dataset_id': None,
         'schema_version': None,
         'label_mode': None,
         'split_time': None,
         'manifest_path': manifest_path if os.path.exists(manifest_path) else None,
     }
-    if os.path.exists(manifest_path):
+    manifest = load_artifact_manifest(csv_path) if os.path.exists(manifest_path) else {}
+    if manifest:
         try:
-            with open(manifest_path) as f:
-                manifest = json.load(f)
             extra = manifest.get('extra', {}) or {}
             out['dataset_id'] = extra.get('dataset_id')
             out['schema_version'] = extra.get('schema_version')
@@ -1378,7 +1376,7 @@ def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) 
         raise FileNotFoundError(
             '❌ CatBoost stage artifacts missing. '
             'شغّل المرحلة الثانية أولاً:\n'
-            'python train_v19.py --csv <training_features_ready.csv> --output <dir> --phase catboost\n'
+            'python train_v19.py --data <stage1_artifact_dir> --output <dir> --phase catboost\n'
             f'Missing: {missing}'
         )
 
@@ -1474,6 +1472,7 @@ def run_training_pipeline(
         event_df,
         CATBOOST_ADVISOR_FEATURES,
         train_frac=train_frac,
+        split_time=source_contract.get('split_time'),
     )
     scaler_path = _save_scaler_params(output_dir, inference_scaler_params)
     print(
@@ -1729,7 +1728,7 @@ def run_training_pipeline(
 def main():
     defaults = load_v19_config().get('training', {})
     p = argparse.ArgumentParser(description='QuantSystem V19 leakage-safe training')
-    p.add_argument('--csv', required=True, help='training_features_ready.csv from label_mode=v19')
+    p.add_argument('--data', '--csv', dest='data', required=True, help='stage1 artifact dir/manifest/parquet for label_mode=v19')
     p.add_argument('--lob', default=None, help='optional lob_tensors.npy')
     p.add_argument('--lob_ts', default=None, help='optional lob_tensor_timestamps.npy')
     p.add_argument('--output', default=defaults.get('output_dir', 'outputs_v19'), help='output directory')
@@ -1752,7 +1751,7 @@ def main():
 
     cfg = load_v19_config(args.config)
     run_training_pipeline(
-        csv_path=args.csv,
+        csv_path=args.data,
         output_dir=args.output,
         lob_path=args.lob,
         lob_ts_path=args.lob_ts,

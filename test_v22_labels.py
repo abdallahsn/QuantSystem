@@ -200,6 +200,9 @@ class V22LabelsRegressionTests(unittest.TestCase):
                     "--sl_mult", "0.90",
                     "--kalman_slope_threshold", "0.07",
                     "--trend_strength_min", "0.03",
+                    "--regime_mode", "rules",
+                    "--regime_stride", "7",
+                    "--regime_window", "21",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -213,6 +216,7 @@ class V22LabelsRegressionTests(unittest.TestCase):
             self.assertIn("sl_mult=0.90", cli_output)
             self.assertIn("kalman_thr=0.07", cli_output)
             self.assertIn("trend_min=0.03", cli_output)
+            self.assertIn("Regime: mode=rules | stride=7 | window=21", cli_output)
 
         bars = pd.DataFrame(
             {

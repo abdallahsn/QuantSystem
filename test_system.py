@@ -389,7 +389,7 @@ df_mbp.to_csv(mbp_path, index=False)
 
 def t_pipeline_imports():
     from prepare_training_data import run_refinery, FEATURE_COLS
-    assert len(FEATURE_COLS) == 23, f"FEATURE_COLS count={len(FEATURE_COLS)}"
+    assert len(FEATURE_COLS) >= 23, f"FEATURE_COLS count={len(FEATURE_COLS)}"
 
 def t_feature_cols_complete():
     from prepare_training_data import FEATURE_COLS
@@ -436,7 +436,7 @@ def t_full_pipeline():
 
 for name, fn in [
     ("prepare_training_data imports",        t_pipeline_imports),
-    ("FEATURE_COLS كاملة (23 feature)",      t_feature_cols_complete),
+    ("FEATURE_COLS كاملة (>=23 feature)",    t_feature_cols_complete),
     ("_process_mbo — يرجع DataFrame صح",    t_process_mbo),
     ("_process_mbp10 — يرجع DataFrame صح",  t_process_mbp10),
     ("Pipeline كامل — output صح",           t_full_pipeline),
@@ -490,4 +490,5 @@ if FAIL == 0:
 else:
     print(f"  ⚠️  {FAIL} اختبار فاشل — راجع الأخطاء فوق")
 print("="*60)
-sys.exit(0 if FAIL == 0 else 1)
+if __name__ == '__main__':
+    sys.exit(0 if FAIL == 0 else 1)

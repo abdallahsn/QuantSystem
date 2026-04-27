@@ -1,8 +1,11 @@
+import json
 import numpy as np
 import pandas as pd
+import pytest
 
 from backtest_v19 import (
     _build_visual_diagnostics,
+    _enforce_oos_backtest_guard,
     _filter_backtest_window,
     _load_meta_features,
     _load_visual_embeddings,
@@ -72,6 +75,22 @@ def test_visual_embeddings_expand_compact_rows_via_coverage_sidecar(tmp_path):
     assert np.allclose(out[3], [0.0, 0.0])
 
 
+def test_visual_embeddings_default_artifact_mismatch_raises(tmp_path):
+    df = _sample_df()
+    vis = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32)
+    path = tmp_path / "visual_embeddings_v19.npy"
+    np.save(path, vis)
+
+    with pytest.raises(ValueError, match="Refusing silent truncate/pad"):
+        _load_visual_embeddings(
+            df,
+            explicit_path=None,
+            default_path=str(path),
+            expected_dim=2,
+            models_dir=str(tmp_path),
+        )
+
+
 def test_meta_features_expand_from_directional_event_rows(tmp_path):
     df = _sample_df()
     meta = np.array(
@@ -96,6 +115,59 @@ def test_meta_features_expand_from_directional_event_rows(tmp_path):
     assert np.allclose(out[1], meta[0])
     assert np.allclose(out[2], meta[1])
     assert np.allclose(out[3], np.zeros(6, dtype=np.float32))
+
+
+def test_oos_guard_requires_complete_contract_for_labeled_backtest(tmp_path):
+    df = _sample_df()
+    csv_path = tmp_path / "dataset.csv"
+    df.to_csv(csv_path, index=False)
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    with pytest.raises(ValueError, match="OOS contract metadata is incomplete"):
+        _enforce_oos_backtest_guard(
+            df,
+            csv_path=str(csv_path),
+            models_dir=str(models_dir),
+        )
+
+
+def test_oos_guard_allows_same_dataset_holdout_when_contract_is_complete(tmp_path):
+    df = _sample_df().copy()
+    df["dataset_slice"] = "holdout"
+    csv_path = tmp_path / "dataset.csv"
+    df.to_csv(csv_path, index=False)
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    model_manifest = {
+        "extra": {
+            "source_contract": {
+                "source_csv": str(csv_path),
+                "dataset_id": "abc123",
+                "split_time": "2025-01-15 09:00:02",
+                "schema_version": "v19-event-binary",
+            }
+        },
+        "inputs": {"csv": str(csv_path)},
+    }
+    dataset_manifest = {
+        "extra": {
+            "dataset_id": "abc123",
+            "schema_version": "v19-event-binary",
+        }
+    }
+    (models_dir / "manifest.json").write_text(json.dumps(model_manifest))
+    (tmp_path / "artifact_manifest.json").write_text(json.dumps(dataset_manifest))
+
+    info = _enforce_oos_backtest_guard(
+        df,
+        csv_path=str(csv_path),
+        models_dir=str(models_dir),
+    )
+
+    assert info["allowed"] is True
+    assert info["reason"] in {"same_dataset_holdout_only", "same_csv_holdout_only"}
 
 
 def test_filter_backtest_window_respects_bounds():

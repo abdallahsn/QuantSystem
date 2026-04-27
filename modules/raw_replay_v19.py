@@ -8,6 +8,7 @@ import os
 
 import pandas as pd
 
+from modules.feature_artifact_v19 import read_table, write_table
 from prepare_training_data import (
     DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
     DEFAULT_V22_TP_MULT,
@@ -16,12 +17,7 @@ from prepare_training_data import (
 
 
 def read_market_data(path: str) -> pd.DataFrame:
-    ext = os.path.splitext(path)[1].lower()
-    if ext in ('.parquet', '.pq', '.snappy'):
-        return pd.read_parquet(path)
-    if ext in ('.zst', '.gz'):
-        return pd.read_csv(path, low_memory=False, compression='infer')
-    return pd.read_csv(path, low_memory=False)
+    return read_table(path)
 
 
 def normalize_ts(df: pd.DataFrame) -> pd.DataFrame:
@@ -45,11 +41,7 @@ def filter_timerange(df: pd.DataFrame, start_ts=None, end_ts=None) -> pd.DataFra
 
 def write_market_slice(df: pd.DataFrame, path: str) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if path.lower().endswith('.parquet'):
-        df.to_parquet(path, index=False)
-    else:
-        df.to_csv(path, index=False)
-    return path
+    return write_table(df, path)
 
 
 def build_replay_dataset(
@@ -70,6 +62,10 @@ def build_replay_dataset(
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,
     trend_strength_min: float = 0.05,
+    regime_mode: str = 'rules',
+    regime_stride: int = 50,
+    regime_window: int = 50,
+    regime_progress_every: int = 25_000,
     lob_event_sample: int = 100000,
     merge_tolerance_ms: int = 500,
     external_scaler_path: str | None = None,
@@ -80,11 +76,11 @@ def build_replay_dataset(
     mbo_df = filter_timerange(read_market_data(mbo_path), start_ts=start_ts, end_ts=end_ts)
     mbp_df = filter_timerange(read_market_data(mbp_path), start_ts=start_ts, end_ts=end_ts) if mbp_path else pd.DataFrame()
 
-    mbo_slice = write_market_slice(mbo_df, os.path.join(raw_dir, 'mbo_slice.csv'))
+    mbo_slice = write_market_slice(mbo_df, os.path.join(raw_dir, 'mbo_slice.parquet'))
     if len(mbp_df):
-        mbp_slice = write_market_slice(mbp_df, os.path.join(raw_dir, 'mbp_slice.csv'))
+        mbp_slice = write_market_slice(mbp_df, os.path.join(raw_dir, 'mbp_slice.parquet'))
     else:
-        mbp_slice = write_market_slice(pd.DataFrame(columns=['ts_event']), os.path.join(raw_dir, 'mbp_slice.csv'))
+        mbp_slice = write_market_slice(pd.DataFrame(columns=['ts_event']), os.path.join(raw_dir, 'mbp_slice.parquet'))
 
     run_refinery(
         mbo_path=mbo_slice,
@@ -103,6 +99,10 @@ def build_replay_dataset(
         sl_mult=sl_mult,
         kalman_slope_threshold=kalman_slope_threshold,
         trend_strength_min=trend_strength_min,
+        regime_mode=regime_mode,
+        regime_stride=regime_stride,
+        regime_window=regime_window,
+        regime_progress_every=regime_progress_every,
         lob_event_sample=lob_event_sample,
         merge_tolerance_ms=merge_tolerance_ms,
         external_scaler_path=external_scaler_path,
@@ -113,7 +113,8 @@ def build_replay_dataset(
         'output_dir': output_dir,
         'mbo_slice': mbo_slice,
         'mbp_slice': mbp_slice,
-        'csv': os.path.join(output_dir, 'training_features_ready.csv'),
+        'data': output_dir,
+        'csv': output_dir,
         'lob': os.path.join(output_dir, 'lob_tensors.npy'),
         'lob_ts': os.path.join(output_dir, 'lob_tensor_timestamps.npy'),
         'scaler': os.path.join(output_dir, 'scaler_params.json'),

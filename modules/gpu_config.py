@@ -1,5 +1,6 @@
 import os
 import multiprocessing
+import subprocess
 import numpy as np
 
 # ── Safe CPU Detection (Container-Aware) ──────────────────────────
@@ -83,25 +84,60 @@ def detect_gpu() -> dict:
     except Exception:
         pass
 
-    # 2. PyTorch Fallback
+    # 2. NVIDIA SMI Fallback (safer than importing torch on some headless/macOS setups)
     try:
-        import torch
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
-            mem  = torch.cuda.get_device_properties(0).total_memory
-            
-            info['available']       = True
-            info['name']            = name
-            info['memory_gb']       = round(mem / (1024**3), 1)
-            info['n_gpus']          = torch.cuda.device_count()
-            info['framework']       = 'torch'
-            info['catboost_device'] = 'GPU'
-            
-            GPU_AVAILABLE  = True
-            GPU_NAME       = name
-            GPU_MEMORY_GB  = info['memory_gb']
+        proc = subprocess.run(
+            [
+                'nvidia-smi',
+                '--query-gpu=name,memory.total',
+                '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            if lines:
+                first = lines[0].split(',', 1)
+                name = first[0].strip()
+                mem_mb = float(first[1].strip()) if len(first) > 1 else 0.0
+                info['available'] = True
+                info['name'] = name or 'NVIDIA GPU'
+                info['memory_gb'] = round(mem_mb / 1024.0, 1)
+                info['n_gpus'] = len(lines)
+                info['framework'] = 'nvidia-smi'
+                info['catboost_device'] = 'GPU'
+                info['tf_device'] = '/GPU:0'
+
+                GPU_AVAILABLE = True
+                GPU_NAME = info['name']
+                GPU_MEMORY_GB = info['memory_gb']
+                return info
     except Exception:
         pass
+
+    # 3. PyTorch Fallback (opt-in because some environments abort on import)
+    if os.environ.get('QUANTSYSTEM_ENABLE_TORCH_GPU_DETECT', '').strip() == '1':
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                mem  = torch.cuda.get_device_properties(0).total_memory
+
+                info['available']       = True
+                info['name']            = name
+                info['memory_gb']       = round(mem / (1024**3), 1)
+                info['n_gpus']          = torch.cuda.device_count()
+                info['framework']       = 'torch'
+                info['catboost_device'] = 'GPU'
+
+                GPU_AVAILABLE  = True
+                GPU_NAME       = name
+                GPU_MEMORY_GB  = info['memory_gb']
+        except Exception:
+            pass
 
     return info
 

@@ -50,6 +50,16 @@ from modules.context_features        import GARCHVolatilityProxy                
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
 from modules.manifest_v19            import write_manifest
+from modules.feature_artifact_v19    import (
+    FINAL_FEATURE_DIR,
+    load_feature_artifact,
+    iter_table_chunks,
+    parquet_shard_paths,
+    read_table,
+    write_checkpoint,
+    write_parquet_shards,
+    write_table,
+)
 # ── V19: DeepLOB Tensor Builder ──────────────────────────────────
 DEEPLOB_AVAILABLE = False
 LOBTensorBuilder = None
@@ -397,6 +407,361 @@ def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
     print(f"  ✅ Normalize: {n_final:,} صف | actions={n_acts}")
     return df
 
+
+def _artifact_phase_dir(output_dir: str, *parts: str) -> str:
+    path = os.path.join(output_dir, *parts)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _shard_ts_bounds(df: pd.DataFrame, ts_col: str = 'ts_event') -> tuple[str | None, str | None]:
+    if ts_col not in df.columns or len(df) == 0:
+        return None, None
+    ts = pd.to_datetime(df[ts_col], utc=True, errors='coerce').dt.tz_localize(None).dropna()
+    if ts.empty:
+        return None, None
+    return str(ts.min()), str(ts.max())
+
+
+def _shard_record(path: str, df: pd.DataFrame, shard_idx: int) -> dict:
+    ts_min, ts_max = _shard_ts_bounds(df)
+    return {
+        'shard_idx': int(shard_idx),
+        'path': os.path.abspath(path),
+        'rows': int(len(df)),
+        'ts_min': ts_min,
+        'ts_max': ts_max,
+    }
+
+
+def _read_existing_shard_record(path: str, shard_idx: int) -> dict:
+    return _shard_record(path, read_table(path), shard_idx)
+
+
+def _canonicalize_input_file(
+    path: str,
+    *,
+    kind: str,
+    output_dir: str,
+    chunk_rows: int,
+    resume: bool = False,
+) -> list[dict]:
+    phase_dir = _artifact_phase_dir(output_dir, 'normalized', kind)
+    records: list[dict] = []
+    for shard_idx, chunk in enumerate(iter_table_chunks(path, chunk_rows)):
+        shard_path = os.path.join(phase_dir, f'{kind}_{shard_idx:05d}.parquet')
+        if resume and os.path.exists(shard_path):
+            records.append(_read_existing_shard_record(shard_path, shard_idx))
+            continue
+
+        normalized = _normalize_databento_columns(chunk)
+        if 'ts_event' in normalized.columns:
+            normalized['ts_event'] = pd.to_datetime(normalized['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+            normalized = normalized.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+        write_table(normalized, shard_path, compression='snappy')
+        record = _shard_record(shard_path, normalized, shard_idx)
+        records.append(record)
+        write_checkpoint(
+            output_dir,
+            f'canonical_{kind}',
+            {'kind': kind, 'processed_shards': int(shard_idx + 1), 'last_shard': record},
+        )
+    return records
+
+
+def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
+    if not prev_path or warmup_rows <= 0 or not os.path.exists(prev_path):
+        return pd.DataFrame()
+    prev_df = read_table(prev_path)
+    return prev_df.tail(int(warmup_rows)).copy()
+
+
+def _run_shard_tasks(tasks, worker_fn, workers: int):
+    if not tasks:
+        return []
+    if workers <= 1:
+        return [worker_fn(task) for task in tasks]
+    available_methods = set(multiprocessing.get_all_start_methods())
+    preferred_method = 'fork' if sys.platform != 'win32' and 'fork' in available_methods else 'spawn'
+    ctx_mp = multiprocessing.get_context(preferred_method)
+    with ctx_mp.Pool(processes=min(int(workers), len(tasks))) as pool:
+        return pool.map(worker_fn, tasks)
+
+
+def _process_mbo_shard_task(task: dict) -> dict:
+    current_record = task['current']
+    prev_record = task.get('prev')
+    cal_params = task['cal_params']
+    warmup_rows = int(task.get('warmup_rows', 0))
+    out_path = task['out_path']
+    resume = bool(task.get('resume', False))
+    shard_idx = int(current_record['shard_idx'])
+
+    if resume and os.path.exists(out_path):
+        return _read_existing_shard_record(out_path, shard_idx)
+
+    current_df = read_table(current_record['path'])
+    current_df['__emit'] = 1
+    current_df['__chunk_id'] = shard_idx
+    warmup_df = _load_warmup_frame(prev_record['path'] if prev_record else None, warmup_rows)
+    if len(warmup_df):
+        warmup_df['__emit'] = 0
+        warmup_df['__chunk_id'] = shard_idx
+        work_df = pd.concat([warmup_df, current_df], ignore_index=True)
+    else:
+        work_df = current_df
+
+    processed = _process_mbo_chunk((work_df, cal_params))
+    processed = processed[processed.get('__emit', 1) == 1].reset_index(drop=True)
+    processed = processed.drop(columns=['__emit'], errors='ignore')
+    write_table(processed, out_path, compression='snappy')
+    return _shard_record(out_path, processed, shard_idx)
+
+
+def _process_mbp_shard_task(task: dict) -> dict:
+    current_record = task['current']
+    prev_record = task.get('prev')
+    warmup_rows = int(task.get('warmup_rows', 0))
+    tick_size = float(task.get('tick_size', 0.0001))
+    out_path = task['out_path']
+    resume = bool(task.get('resume', False))
+    shard_idx = int(current_record['shard_idx'])
+
+    if resume and os.path.exists(out_path):
+        return _read_existing_shard_record(out_path, shard_idx)
+
+    current_df = read_table(current_record['path'])
+    current_df['__emit'] = 1
+    warmup_df = _load_warmup_frame(prev_record['path'] if prev_record else None, warmup_rows)
+    if len(warmup_df):
+        warmup_df['__emit'] = 0
+        work_df = pd.concat([warmup_df, current_df], ignore_index=True)
+    else:
+        work_df = current_df
+
+    processed = _process_mbp10(work_df, tick_size=tick_size)
+    processed = processed[processed.get('__emit', 1) == 1].reset_index(drop=True)
+    processed = processed.drop(columns=['__emit'], errors='ignore')
+    write_table(processed, out_path, compression='snappy')
+    return _shard_record(out_path, processed, shard_idx)
+
+
+def _load_records_frame(records: list[dict]) -> pd.DataFrame:
+    frames = [read_table(record['path']) for record in sorted(records, key=lambda item: int(item.get('shard_idx', 0)))]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _rewrite_records_from_frame(
+    df: pd.DataFrame,
+    *,
+    records: list[dict],
+    output_dir: str,
+    phase_name: str,
+) -> list[dict]:
+    out_dir = _artifact_phase_dir(output_dir, 'features', phase_name)
+    updated: list[dict] = []
+    ordered_records = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    start = 0
+    for record in ordered_records:
+        shard_rows = int(record.get('rows', 0))
+        shard_idx = int(record.get('shard_idx', 0))
+        shard = df.iloc[start:start + shard_rows].copy()
+        start += shard_rows
+        shard_path = os.path.join(out_dir, f'{phase_name}_{shard_idx:05d}.parquet')
+        write_table(shard, shard_path, compression='snappy')
+        updated.append(_shard_record(shard_path, shard, shard_idx))
+    return updated
+
+
+def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df.copy() if df is not None else pd.DataFrame()
+
+    df = df.copy().sort_values('ts_event').reset_index(drop=True)
+    absorb = AbsorptionIntensityEngine(min_price_move=float(cal_params.get('min_price_move', 0.25)))
+    ctx = MomentumContextEngine()
+    sweep = LiquiditySweepDetector(sweep_threshold=float(cal_params.get('sweep_thresh', 0.05)))
+    fisher = FastFisherAlpha()
+    fim = FastFIMDetector()
+    kyle = KylesLambdaEngine(window=50)
+    vnet = VNETEngine()
+    tape = FastTapeSpeedTracker()
+    mv = MicroVolatilityEngine()
+    daily_ctx = DailyContextEngine(
+        default_adr=80.0 * float(cal_params.get('tick_size', 0.0001)),
+        tick_size=float(cal_params.get('tick_size', 0.0001)),
+    )
+    vwap_eng = SessionVWAPEngine()
+
+    cvd = 0.0
+    rebuilt = {key: [] for key in [
+        'cvd', 'absorption_intensity', 'micro_atr', 'volume_burst', 'inter_event_time',
+        'fisher_signal', 'anomaly', 'tape_speed', 'cvd_momentum', 'cvd_price_divergence',
+        'trend_strength', 'correction_depth', 'liquidity_sweep', 'kyle_lambda', 'vnet',
+        'ib_status', 'remaining_fuel', 'fuel_exhausted', 'current_vwap', 'vwap_z_score',
+        'vwap_slope', 'session_cvd',
+    ]}
+
+    for row in df.itertuples(index=False):
+        price = float(getattr(row, 'price', 0.0) or 0.0)
+        size = int(getattr(row, 'size', 0) or 0)
+        side = str(getattr(row, 'side', '')).strip().upper()
+        action = str(getattr(row, 'action', 'T')).strip().upper()
+        ts = pd.to_datetime(getattr(row, 'ts_event'))
+        ts_ns = int(ts.value)
+        is_buy = side in ('B', 'BID')
+        if is_buy:
+            cvd += size
+        elif side in ('A', 'ASK', 'S', 'SELL'):
+            cvd -= size
+
+        aii = absorb.update(price, cvd)
+        mu_atr, vbi, iet = mv.process_tick(action, price, size, ts_ns)
+        tape_speed = tape.update_and_get_speed(ts, action)
+        fs = fisher.update_and_get_signal(price, cvd)
+        an = fim.detect_stop_hunts(price)
+        cvd_mom, cvd_div, t_str, corr_d = ctx.update(price, cvd)
+        lsweep = sweep.update(price)
+        kyle_val = kyle.update(price, size)
+        vnet_val = vnet.update(price, size, side)
+        ib_stat, r_fuel, f_exh = daily_ctx.update(ts, price)[:3]
+        cur_vwap, v_zscore, v_slope, sess_cvd = vwap_eng.update(ts, price, float(size), is_buy)
+
+        rebuilt['cvd'].append(cvd)
+        rebuilt['absorption_intensity'].append(aii)
+        rebuilt['micro_atr'].append(mu_atr)
+        rebuilt['volume_burst'].append(vbi)
+        rebuilt['inter_event_time'].append(iet)
+        rebuilt['fisher_signal'].append(fs)
+        rebuilt['anomaly'].append(an)
+        rebuilt['tape_speed'].append(tape_speed)
+        rebuilt['cvd_momentum'].append(cvd_mom)
+        rebuilt['cvd_price_divergence'].append(cvd_div)
+        rebuilt['trend_strength'].append(t_str)
+        rebuilt['correction_depth'].append(corr_d)
+        rebuilt['liquidity_sweep'].append(lsweep)
+        rebuilt['kyle_lambda'].append(kyle_val)
+        rebuilt['vnet'].append(vnet_val)
+        rebuilt['ib_status'].append(ib_stat)
+        rebuilt['remaining_fuel'].append(r_fuel)
+        rebuilt['fuel_exhausted'].append(f_exh)
+        rebuilt['current_vwap'].append(cur_vwap)
+        rebuilt['vwap_z_score'].append(v_zscore)
+        rebuilt['vwap_slope'].append(v_slope)
+        rebuilt['session_cvd'].append(sess_cvd)
+
+    for col, values in rebuilt.items():
+        if col in {'fisher_signal', 'anomaly', 'fuel_exhausted'}:
+            df[col] = np.asarray(values, dtype=np.int8)
+        else:
+            df[col] = np.asarray(values, dtype=np.float32)
+    return df
+
+
+def _select_relevant_mbp_records(
+    records: list[dict],
+    *,
+    ts_min: pd.Timestamp,
+    ts_max: pd.Timestamp,
+    tolerance_ms: int,
+) -> list[dict]:
+    selected = []
+    lower = ts_min - pd.Timedelta(milliseconds=max(int(tolerance_ms), 1))
+    upper = ts_max
+    for record in records:
+        rec_min = pd.to_datetime(record.get('ts_min'), errors='coerce')
+        rec_max = pd.to_datetime(record.get('ts_max'), errors='coerce')
+        if pd.isna(rec_min) or pd.isna(rec_max):
+            selected.append(record)
+            continue
+        if rec_max >= lower and rec_min <= upper:
+            selected.append(record)
+    return selected
+
+
+def _merge_mbo_mbp_chunk(
+    mbo_df: pd.DataFrame,
+    mbp_df: pd.DataFrame,
+    *,
+    tolerance_ms: int = 500,
+) -> pd.DataFrame:
+    mbo_df = mbo_df.copy()
+    mbo_df = mbo_df.drop(columns=['liquidity_gaps'], errors='ignore')
+    mbo_df['ts_event'] = pd.to_datetime(mbo_df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    mbo_df = mbo_df.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    if len(mbp_df) == 0:
+        out = mbo_df.copy()
+    else:
+        mbp_df = mbp_df.copy()
+        mbp_df['ts_event'] = pd.to_datetime(mbp_df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+        mbp_df = mbp_df.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+        out = pd.merge_asof(
+            mbo_df,
+            mbp_df,
+            on='ts_event',
+            direction='backward',
+            tolerance=pd.Timedelta(milliseconds=max(int(tolerance_ms), 1)),
+        )
+    for c in [
+        'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
+        'mid_price', 'micro_price', 'spread',
+        'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
+        'distance_to_wall', 'gap_size', 'liquidity_density', 'liquidity_gaps',
+    ]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = out[c].fillna(0.0)
+    return out
+
+
+def _finalize_merged_frame(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().sort_values('ts_event').reset_index(drop=True)
+    liq = LiquidityTrapDetector()
+    df['liquidity_trap'] = [
+        liq.update(float(r.get('price', 0.0) or 0.0), float(r.get('obi', 0.0) or 0.0))
+        for _, r in df[['price', 'obi']].fillna(0.0).iterrows()
+    ]
+    for col in df.select_dtypes(include='float64').columns:
+        df[col] = df[col].astype('float32')
+    for col in df.select_dtypes(include='int64').columns:
+        df[col] = df[col].astype('int32')
+    return df
+
+
+def _sample_feature_selection_frame(
+    df_train: pd.DataFrame,
+    *,
+    label_col: str = 'bias_label',
+    max_rows: int = 200_000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    if df_train is None or len(df_train) <= max_rows:
+        return df_train.copy()
+    if label_col not in df_train.columns:
+        return df_train.sample(n=max_rows, random_state=seed).sort_index()
+    sampled = (
+        df_train.groupby(label_col, group_keys=False, dropna=False)
+        .apply(
+            lambda part: part.sample(
+                n=max(
+                    1,
+                    int(round(max_rows * (len(part) / max(len(df_train), 1)))),
+                ),
+                random_state=seed,
+                replace=len(part) < max(
+                    1,
+                    int(round(max_rows * (len(part) / max(len(df_train), 1)))),
+                ),
+            )
+        )
+        .sort_index()
+    )
+    if len(sampled) > max_rows:
+        sampled = sampled.sample(n=max_rows, random_state=seed).sort_index()
+    return sampled
+
 def _process_mbo_chunk(args):
     df_chunk, cal_params = args
 
@@ -478,6 +843,8 @@ def _process_mbo_chunk(args):
             
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
+                '__emit': int(getattr(row, '__emit', 1) or 0),
+                '__chunk_id': int(getattr(row, '__chunk_id', -1) or -1),
                 'cvd':cvd,
                 'absorption_intensity':aii, 'cancel_ratio':cancel_ratio,
                 'micro_atr':mu_atr, 'volume_burst':vbi,
@@ -624,6 +991,8 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
             
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
+                '__emit': int(getattr(row, '__emit', 1) or 0),
+                '__chunk_id': int(getattr(row, '__chunk_id', -1) or -1),
                 'cvd':cvd,
                 'absorption_intensity':aii, 'cancel_ratio':cancel_ratio,
                 'micro_atr':mu_atr, 'volume_burst':vbi,
@@ -651,71 +1020,190 @@ def _add_rolling_context(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _process_mbp10(df_mbp, tick_size: float = 0.0001):
-    ob   = OrderBookSnapshotEngine()
-    sp   = SpoofingDetector(large_mult=1.5)
-    gaps = LiquidityGapsEngine(levels=10, gap_threshold=1.0)
-    scanner = OrderWallScanner(wall_mult=3.0, gap_mult=2.0, levels=10)
-    
-    # 🔴 محرك حيطان السيولة
-    walls_eng = LiquidityWallsEngine(depth_levels=10, wall_threshold_multiplier=3.0)
-    
-    out  = []
+    if df_mbp is None or len(df_mbp) == 0:
+        return pd.DataFrame(columns=[
+            'ts_event', 'obi', 'spoofing_ratio', 'spoofing_duration', 'liquidity_gaps',
+            'dist_to_bid_wall', 'dist_to_ask_wall', 'mid_price', 'micro_price', 'spread',
+            'bid_wall_px', 'ask_wall_px', 'bid_gap_px', 'ask_gap_px', 'bid_gap_size',
+            'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength', 'distance_to_wall',
+            'gap_size', 'liquidity_density',
+        ])
 
-    for row in _prog(df_mbp.itertuples(index=False), desc='MBP10', total=len(df_mbp)):
-        action  = str(getattr(row,'action','')).strip().upper()
-        price   = float(getattr(row,'price', 0) or 0) # السعر التقريبي من الـ MBP
-        raw_t   = getattr(row,'ts_event', getattr(row,'timestamp', None))
-        try:    ts=pd.to_datetime(raw_t)
-        except: ts=pd.Timestamp.now()
-        
-        row_d   = row._asdict()
-        if price <= 0:
-            bid0 = float(row_d.get('bid_px_00', 0) or 0)
-            ask0 = float(row_d.get('ask_px_00', 0) or 0)
-            if bid0 > 0 and ask0 > 0:
-                price = (bid0 + ask0) / 2.0
-            elif bid0 > 0:
-                price = bid0
-            elif ask0 > 0:
-                price = ask0
+    out = pd.DataFrame(index=df_mbp.index.copy())
+    ts_source = (
+        df_mbp['ts_event']
+        if 'ts_event' in df_mbp.columns
+        else df_mbp['timestamp']
+        if 'timestamp' in df_mbp.columns
+        else pd.Series([pd.NaT] * len(df_mbp), index=df_mbp.index)
+    )
+    out['ts_event'] = pd.to_datetime(ts_source, errors='coerce').fillna(pd.Timestamp.now())
 
-        obi     = ob.compute_obi(row_d)
-        sr, sd  = sp.process_snapshot(row_d, action)
-        gap_val = gaps.update(row_d, tick_size=tick_size)
-        
-        # استخراج العروض والطلبات لحساب حيطان السيولة
-        bids = [[row_d.get(f'bid_px_{i:02d}',0), row_d.get(f'bid_sz_{i:02d}',0)] for i in range(10)]
-        asks = [[row_d.get(f'ask_px_{i:02d}',0), row_d.get(f'ask_sz_{i:02d}',0)] for i in range(10)]
-        
-        dist_bid_wall, dist_ask_wall = walls_eng.update(price, bids, asks)
-        
-        scan = scanner.scan(row_d, tick_size=tick_size, cvd=0.0, volume=0.0)
+    bid_px_cols = [f'bid_px_{i:02d}' for i in range(10)]
+    ask_px_cols = [f'ask_px_{i:02d}' for i in range(10)]
+    bid_sz_cols = [f'bid_sz_{i:02d}' for i in range(10)]
+    ask_sz_cols = [f'ask_sz_{i:02d}' for i in range(10)]
 
-        out.append({
-            'ts_event': ts,
-            'obi': obi,
-            'spoofing_ratio': sr,
-            'spoofing_duration': sd,
-            'liquidity_gaps': gap_val,
-            'dist_to_bid_wall': dist_bid_wall,
-            'dist_to_ask_wall': dist_ask_wall,
-            'mid_price': scan.get('mid_price', price),
-            'micro_price': scan.get('micro_price', price),
-            'spread': scan.get('spread', 0.0),
-            'bid_wall_px': scan.get('bid_wall_px'),
-            'ask_wall_px': scan.get('ask_wall_px'),
-            'bid_gap_px': scan.get('bid_gap_px'),
-            'ask_gap_px': scan.get('ask_gap_px'),
-            'bid_gap_size': scan.get('bid_gap_size', 0.0),
-            'ask_gap_size': scan.get('ask_gap_size', 0.0),
-            'bid_wall_strength': scan.get('bid_wall_strength', scan.get('bid_wall_str', 0.0)),
-            'ask_wall_strength': scan.get('ask_wall_strength', scan.get('ask_wall_str', 0.0)),
-            'distance_to_wall': scan.get('distance_to_wall', 0.0),
-            'gap_size': scan.get('gap_size', 0.0),
-            'liquidity_density': scan.get('liquidity_density', 0.0),
-        })
+    bid_px = df_mbp.reindex(columns=bid_px_cols, fill_value=0.0).astype(np.float64).to_numpy()
+    ask_px = df_mbp.reindex(columns=ask_px_cols, fill_value=0.0).astype(np.float64).to_numpy()
+    bid_sz = df_mbp.reindex(columns=bid_sz_cols, fill_value=0.0).astype(np.float64).to_numpy()
+    ask_sz = df_mbp.reindex(columns=ask_sz_cols, fill_value=0.0).astype(np.float64).to_numpy()
 
-    return pd.DataFrame(out)
+    weights = np.asarray([1.0 / (i + 1) for i in range(10)], dtype=np.float64)
+    w_bid = bid_sz @ weights
+    w_ask = ask_sz @ weights
+    total = np.maximum(w_bid + w_ask, 1e-9)
+    out['obi'] = np.clip((w_bid - w_ask) / total, -1.0, 1.0).astype(np.float32)
+
+    bid0 = bid_px[:, 0]
+    ask0 = ask_px[:, 0]
+    mid = np.where(
+        (bid0 > 0) & (ask0 > 0),
+        (bid0 + ask0) / 2.0,
+        np.where(bid0 > 0, bid0, np.where(ask0 > 0, ask0, 0.0)),
+    )
+    raw_price_source = (
+        df_mbp['price']
+        if 'price' in df_mbp.columns
+        else pd.Series(np.zeros(len(df_mbp), dtype=np.float64), index=df_mbp.index)
+    )
+    raw_price = pd.to_numeric(raw_price_source, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    price = np.where(raw_price > 0, raw_price, mid)
+    spread = np.where((bid0 > 0) & (ask0 > bid0), ask0 - bid0, 0.0)
+    micro_price = (bid0 * bid_sz[:, 0] + ask0 * ask_sz[:, 0]) / np.maximum(bid_sz[:, 0] + ask_sz[:, 0], 1e-9)
+    micro_price = np.where(np.isfinite(micro_price), micro_price, price)
+
+    out['mid_price'] = mid.astype(np.float32)
+    out['micro_price'] = micro_price.astype(np.float32)
+    out['spread'] = spread.astype(np.float32)
+
+    action = df_mbp.get('action', pd.Series('', index=df_mbp.index)).astype(str).str.strip().str.upper()
+    top_bid_vol = bid_sz[:, :3].sum(axis=1)
+    top_ask_vol = ask_sz[:, :3].sum(axis=1)
+    curr_max = np.maximum(top_bid_vol, top_ask_vol)
+    mean_size = (
+        pd.Series(np.where(curr_max > 0, curr_max, np.nan), index=df_mbp.index)
+        .rolling(200, min_periods=1)
+        .mean()
+        .fillna(1.0)
+        .clip(lower=1e-9)
+    )
+    bid_drop = np.maximum(np.r_[top_bid_vol[0], top_bid_vol[:-1]] - top_bid_vol, 0.0)
+    ask_drop = np.maximum(np.r_[top_ask_vol[0], top_ask_vol[:-1]] - top_ask_vol, 0.0)
+    drop_thr = mean_size.to_numpy(dtype=np.float64) * 1.5
+    trade_mask = action.isin(TRADE_ACTIONS).to_numpy()
+    max_drop = np.maximum(bid_drop, ask_drop)
+    is_spoof = (~trade_mask) & (max_drop > drop_thr)
+    spoof_count = pd.Series(is_spoof.astype(np.int8), index=df_mbp.index).rolling(50, min_periods=1).sum()
+    trade_count = pd.Series(trade_mask.astype(np.int8), index=df_mbp.index).rolling(50, min_periods=1).sum().clip(lower=1.0)
+    out['spoofing_ratio'] = np.minimum(spoof_count / trade_count, 1.0).astype(np.float32)
+    out['spoofing_duration'] = np.where(is_spoof, max_drop / mean_size.to_numpy(dtype=np.float64), 0.0).astype(np.float32)
+
+    tick = max(float(tick_size), 1e-8)
+    bid_diff = np.abs(np.diff(bid_px, axis=1))
+    ask_diff = np.abs(np.diff(ask_px, axis=1))
+    bid_gap_hits = (bid_diff > tick).astype(np.float64)
+    ask_gap_hits = (ask_diff > tick).astype(np.float64)
+    bid_zero_hits = (bid_sz[:, :-1] == 0).astype(np.float64) * 0.5
+    ask_zero_hits = (ask_sz[:, :-1] == 0).astype(np.float64) * 0.5
+    spread_penalty = (spread > tick * 2.0).astype(np.float64)
+    total_checks = float(bid_gap_hits.shape[1] + ask_gap_hits.shape[1] + 1)
+    raw_gap_score = (
+        bid_gap_hits.sum(axis=1)
+        + ask_gap_hits.sum(axis=1)
+        + bid_zero_hits.sum(axis=1)
+        + ask_zero_hits.sum(axis=1)
+        + spread_penalty
+    ) / max(total_checks, 1.0)
+    out['liquidity_gaps'] = (
+        pd.Series(raw_gap_score, index=df_mbp.index)
+        .rolling(50, min_periods=1)
+        .mean()
+        .astype(np.float32)
+    )
+
+    row_mean_sz = (
+        pd.DataFrame(np.concatenate([bid_sz, ask_sz], axis=1), index=df_mbp.index)
+        .replace(0.0, np.nan)
+        .mean(axis=1)
+        .fillna(0.0)
+    )
+    mean_sz_hist = row_mean_sz.rolling(200, min_periods=1).mean().fillna(row_mean_sz).clip(lower=1e-9)
+    wall_thr = mean_sz_hist.to_numpy(dtype=np.float64) * 3.0
+
+    def _first_level(mask: np.ndarray, px: np.ndarray, sz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        any_hit = mask.any(axis=1)
+        first_idx = np.argmax(mask, axis=1)
+        first_px = np.where(any_hit, px[np.arange(len(px)), first_idx], np.nan)
+        first_sz = np.where(any_hit, sz[np.arange(len(sz)), first_idx], 0.0)
+        return first_px, first_sz
+
+    bid_wall_px, bid_wall_sz = _first_level(bid_sz >= wall_thr[:, None], bid_px, bid_sz)
+    ask_wall_px, ask_wall_sz = _first_level(ask_sz >= wall_thr[:, None], ask_px, ask_sz)
+    bid_wall_strength = np.where(np.isfinite(bid_wall_px), bid_wall_sz / mean_sz_hist.to_numpy(dtype=np.float64), 0.0)
+    ask_wall_strength = np.where(np.isfinite(ask_wall_px), ask_wall_sz / mean_sz_hist.to_numpy(dtype=np.float64), 0.0)
+
+    dist_to_bid_wall = np.where(np.isfinite(bid_wall_px), mid - bid_wall_px, 0.0)
+    dist_to_ask_wall = np.where(np.isfinite(ask_wall_px), ask_wall_px - mid, 0.0)
+    dist_bid_ticks = np.where(np.isfinite(bid_wall_px), (mid - bid_wall_px) / tick, 0.0)
+    dist_ask_ticks = np.where(np.isfinite(ask_wall_px), (ask_wall_px - mid) / tick, 0.0)
+    valid_distance = np.where(
+        (dist_bid_ticks > 0) & (dist_ask_ticks > 0),
+        np.minimum(dist_bid_ticks, dist_ask_ticks),
+        np.where(dist_bid_ticks > 0, dist_bid_ticks, np.where(dist_ask_ticks > 0, dist_ask_ticks, 0.0)),
+    )
+
+    def _detect_soft_gaps(px: np.ndarray, sz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n_rows, n_levels = px.shape
+        gap_px = np.full(n_rows, np.nan, dtype=np.float64)
+        gap_strength = np.zeros(n_rows, dtype=np.float64)
+        mean_sz = mean_sz_hist.to_numpy(dtype=np.float64)
+        for level in range(max(n_levels - 1, 0)):
+            spacing_ticks = np.abs(px[:, level] - px[:, level + 1]) / tick
+            cur_sz = sz[:, level]
+            nxt_sz = sz[:, level + 1]
+            min_pair = np.minimum(cur_sz, nxt_sz)
+            avg_pair = (cur_sz + nxt_sz) / 2.0
+            scarcity = np.maximum(0.0, 1.0 - (min_pair / np.maximum(mean_sz, 1e-9)))
+            void_ratio = np.maximum(0.0, 1.0 - (avg_pair / np.maximum(mean_sz, 1e-9)))
+            effective_gap = spacing_ticks + 0.80 * scarcity + 0.60 * void_ratio
+            is_gap = (spacing_ticks >= 2.0) | ((spacing_ticks >= 1.0) & (scarcity >= 0.65) & (effective_gap >= 1.60))
+            fill_mask = np.isnan(gap_px) & is_gap
+            gap_px[fill_mask] = px[fill_mask, level + 1]
+            gap_strength[fill_mask] = effective_gap[fill_mask]
+        return gap_px, gap_strength
+
+    bid_gap_px, bid_gap_size = _detect_soft_gaps(bid_px, bid_sz)
+    ask_gap_px, ask_gap_size = _detect_soft_gaps(ask_px, ask_sz)
+    gap_size = np.maximum(bid_gap_size, ask_gap_size)
+
+    top_bid_idx = np.minimum(4, np.maximum(bid_px.shape[1] - 1, 0))
+    top_ask_idx = np.minimum(4, np.maximum(ask_px.shape[1] - 1, 0))
+    price_range_ticks = np.maximum(
+        ((ask_px[:, top_ask_idx] - ask_px[:, 0]) / tick) + ((bid_px[:, 0] - bid_px[:, top_bid_idx]) / tick),
+        1.0,
+    )
+    bid_density = bid_sz[:, :5].sum(axis=1) / price_range_ticks
+    ask_density = ask_sz[:, :5].sum(axis=1) / price_range_ticks
+    liquidity_density = bid_density + ask_density
+
+    out['dist_to_bid_wall'] = np.where(np.isfinite(bid_wall_px), dist_to_bid_wall, 0.0).astype(np.float32)
+    out['dist_to_ask_wall'] = np.where(np.isfinite(ask_wall_px), dist_to_ask_wall, 0.0).astype(np.float32)
+    out['bid_wall_px'] = np.where(np.isfinite(bid_wall_px), bid_wall_px, np.nan)
+    out['ask_wall_px'] = np.where(np.isfinite(ask_wall_px), ask_wall_px, np.nan)
+    out['bid_gap_px'] = np.where(np.isfinite(bid_gap_px), bid_gap_px, np.nan)
+    out['ask_gap_px'] = np.where(np.isfinite(ask_gap_px), ask_gap_px, np.nan)
+    out['bid_gap_size'] = np.round(bid_gap_size, 2).astype(np.float32)
+    out['ask_gap_size'] = np.round(ask_gap_size, 2).astype(np.float32)
+    out['bid_wall_strength'] = np.round(bid_wall_strength, 4).astype(np.float32)
+    out['ask_wall_strength'] = np.round(ask_wall_strength, 4).astype(np.float32)
+    out['distance_to_wall'] = np.round(valid_distance, 2).astype(np.float32)
+    out['gap_size'] = np.round(gap_size, 2).astype(np.float32)
+    out['liquidity_density'] = np.round(liquidity_density, 4).astype(np.float32)
+
+    if '__emit' in df_mbp.columns:
+        out['__emit'] = pd.to_numeric(df_mbp['__emit'], errors='coerce').fillna(1).astype(np.int8).values
+    return out
 
 def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
     print("  🔗 merge_asof MBO + MBP10...")
@@ -1114,12 +1602,148 @@ def _build_refinery_split_context(
     }
 
 
+def _resolve_regime_mode(regime_mode: str) -> str:
+    mode = str(regime_mode or 'rules').strip().lower()
+    if mode in {'off', 'none', 'skip'}:
+        return 'off'
+    if mode in {'wasserstein', 'w'}:
+        return 'wasserstein'
+    return 'rules'
+
+
+def _sample_regime_frame(
+    df: pd.DataFrame,
+    *,
+    stride: int,
+) -> tuple[pd.DataFrame, np.ndarray, int]:
+    if df is None or len(df) == 0:
+        return df.iloc[:0].copy(), np.array([], dtype=np.int64), 1
+
+    effective_stride = max(int(stride), 1)
+    if effective_stride <= 1 or len(df) <= effective_stride:
+        positions = np.arange(len(df), dtype=np.int64)
+        return df.copy(), positions, 1
+
+    positions = np.arange(0, len(df), effective_stride, dtype=np.int64)
+    if positions[-1] != len(df) - 1:
+        positions = np.append(positions, len(df) - 1)
+    sampled = df.iloc[positions].copy()
+    return sampled, positions, effective_stride
+
+
+def _expand_sampled_regime_labels(
+    n_rows: int,
+    sampled_positions: np.ndarray,
+    sampled_labels: np.ndarray,
+) -> np.ndarray:
+    out = np.zeros(max(int(n_rows), 0), dtype=np.int8)
+    if n_rows <= 0 or len(sampled_positions) == 0 or len(sampled_labels) == 0:
+        return out
+
+    positions = np.asarray(sampled_positions, dtype=np.int64)
+    labels = np.asarray(sampled_labels, dtype=np.int8)
+    if len(positions) != len(labels):
+        raise ValueError(
+            f"sampled_positions ({len(positions)}) and sampled_labels ({len(labels)}) must match"
+        )
+
+    if int(positions[0]) > 0:
+        out[:int(positions[0])] = labels[0]
+
+    for i, pos in enumerate(positions):
+        start = max(int(pos), 0)
+        stop = int(positions[i + 1]) if i + 1 < len(positions) else int(n_rows)
+        out[start:stop] = labels[i]
+
+    return out
+
+
+def _fit_regime_surface(
+    df: pd.DataFrame,
+    *,
+    train_idx: np.ndarray,
+    split_ctx: dict,
+    output_dir: str,
+    regime_mode: str = 'rules',
+    regime_stride: int = 1,
+    regime_window: int = 50,
+    regime_progress_every: int = 0,
+) -> tuple[np.ndarray, dict]:
+    mode = _resolve_regime_mode(regime_mode)
+    info = {
+        'mode': mode,
+        'requested_stride': max(int(regime_stride), 1),
+        'effective_stride': 1,
+        'train_rows': 0,
+        'full_rows': int(len(df)),
+        'train_sample_rows': 0,
+        'full_sample_rows': 0,
+        'status': 'skipped',
+    }
+    if len(df) == 0 or mode == 'off':
+        return np.zeros(len(df), dtype=np.int8), info
+
+    train_regime_df = df.iloc[train_idx].copy()
+    if train_regime_df.empty:
+        fallback_end = max(1, min(len(df), int(split_ctx.get('split_idx', len(df)))))
+        train_regime_df = df.iloc[:fallback_end].copy()
+
+    requested_stride = max(int(regime_stride), 1)
+    # Small datasets do not benefit from coarse sampling; keep full fidelity.
+    if len(df) <= max(5_000, requested_stride * 4):
+        requested_stride = 1
+
+    full_sample_df, full_positions, effective_stride = _sample_regime_frame(
+        df,
+        stride=requested_stride,
+    )
+    train_sample_df, _, _ = _sample_regime_frame(
+        train_regime_df,
+        stride=effective_stride,
+    )
+
+    info.update({
+        'effective_stride': int(effective_stride),
+        'train_rows': int(len(train_regime_df)),
+        'train_sample_rows': int(len(train_sample_df)),
+        'full_sample_rows': int(len(full_sample_df)),
+    })
+
+    print(
+        "  ℹ️ Regime surface: "
+        f"mode={mode} | stride={effective_stride} | "
+        f"train_sample={len(train_sample_df):,}/{len(train_regime_df):,} | "
+        f"full_sample={len(full_sample_df):,}/{len(df):,}"
+    )
+
+    if mode == 'wasserstein':
+        clf = WassersteinRegimeClassifier(
+            window=max(int(regime_window), 10),
+            n_regimes=4,
+            progress_every=max(int(regime_progress_every), 0),
+        )
+        clf.fit(train_sample_df)
+        sampled_labels = clf.predict(full_sample_df).astype(np.int8)
+    else:
+        clf = RegimeClassifier(n_regimes=4, model_type='rules')
+        clf.fit(train_sample_df, output_dir=output_dir)
+        sampled_labels = clf.predict(full_sample_df).astype(np.int8)
+
+    full_labels = _expand_sampled_regime_labels(len(df), full_positions, sampled_labels)
+    info['status'] = 'ok'
+    return full_labels, info
+
+
 def _normalize_and_save(
     df,
     output_dir,
     rolling_window: int = 50,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
+    regime_mode: str = 'rules',
+    regime_stride: int = 50,
+    regime_window: int = 50,
+    regime_progress_every: int = 25_000,
 ):
     print("\n📐 Normalization (RobustScaler — train-only fit)...")
     df = df.copy()
@@ -1268,16 +1892,20 @@ def _normalize_and_save(
     df_train  = df.iloc[train_idx].copy()
     if df_train.empty:
         df_train = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
-    target    = df_train.get('bias_label', pd.Series(np.zeros(len(df_train))))
+    df_train_fs = _sample_feature_selection_frame(df_train, label_col='bias_label', max_rows=200_000)
+    target    = df_train_fs.get('bias_label', pd.Series(np.zeros(len(df_train_fs))))
 
     try:
         if fit_aux_models:
             protected_in_data = [f for f in PROTECTED_FEATURES if f in feat_cols_available] + EMBEDDING_COLS
-            filtered = spearman_redundancy_filter(df_train[feat_cols_available], threshold=0.85, target=target, protected=set(protected_in_data))
+            filtered = spearman_redundancy_filter(df_train_fs[feat_cols_available], threshold=0.85, target=target, protected=set(protected_in_data))
             if len(feat_cols_available) - len(filtered) > 0: print(f"  Spearman: حذف {len(feat_cols_available) - len(filtered)} feature متكررة")
 
-            selected = mrmr_selection(df_train[filtered], target, n_features=min(40, len(filtered)), protected=set(protected_in_data))
-            print(f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature (على {len(df_train):,} train rows)")
+            selected = mrmr_selection(df_train_fs[filtered], target, n_features=min(40, len(filtered)), protected=set(protected_in_data))
+            print(
+                f"  mRMR: {len(feat_cols_available)} → {len(selected)} feature "
+                f"(على sample={len(df_train_fs):,} من train={len(df_train):,})"
+            )
         else:
             selected = feat_cols_available
             print("  ✅ mRMR skipped intentionally (fit_aux_models=False)")
@@ -1294,26 +1922,29 @@ def _normalize_and_save(
     print("\n🎯 Regime Classification (train-only fit)...")
     try:
         if fit_aux_models:
-            train_regime_df = df.iloc[train_idx].copy()
-            if train_regime_df.empty:
-                train_regime_df = df.iloc[:max(1, min(len(df), split_ctx['split_idx']))].copy()
-
-            # التعديل 4: Wasserstein Regime كـ primary
-            try:
-                w_clf = WassersteinRegimeClassifier(window=50, n_regimes=4)
-                w_clf.fit(train_regime_df)
-                df['regime_cluster']    = w_clf.predict(df).astype(np.int8)
+            selected_mode = _resolve_regime_mode(regime_mode)
+            regime_labels, regime_info = _fit_regime_surface(
+                df,
+                train_idx=train_idx,
+                split_ctx=split_ctx,
+                output_dir=output_dir,
+                regime_mode=selected_mode,
+                regime_stride=regime_stride,
+                regime_window=regime_window,
+                regime_progress_every=regime_progress_every,
+            )
+            df['regime_cluster'] = regime_labels.astype(np.int8)
+            if selected_mode == 'wasserstein':
                 df['regime_wasserstein'] = df['regime_cluster'].astype(np.int8)
-                print("  ✅ Wasserstein Regime fitted")
-            except Exception as ew:
-                print(f"  ⚠️ Wasserstein fallback to rules: {ew}")
-                regime_clf = RegimeClassifier(n_regimes=4)
-                regime_clf.fit(train_regime_df, output_dir=output_dir)
-                df['regime_cluster'] = regime_clf.predict(df).astype(np.int8)
-
             if 'regime_label' not in df.columns:
                 df['regime_label'] = df['regime_cluster'].astype(np.int8)
-            print(f"  ✅ Regime: fit على {len(train_regime_df):,} | predict على {len(df):,}")
+            print(
+                "  ✅ Regime: "
+                f"mode={selected_mode} | "
+                f"sampled_train={regime_info.get('train_sample_rows', 0):,} | "
+                f"sampled_predict={regime_info.get('full_sample_rows', 0):,} | "
+                f"expanded_rows={len(df):,}"
+            )
         else:
             df['regime_cluster'] = 0
             if 'regime_label' not in df.columns:
@@ -1335,10 +1966,23 @@ def _normalize_and_save(
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
     
-    path = os.path.join(output_dir, 'training_features_ready.csv')
-    df[out_cols].to_csv(path, index=False)
+    final_dir = _artifact_phase_dir(output_dir, FINAL_FEATURE_DIR)
+    final_shards = write_parquet_shards(
+        df[out_cols],
+        final_dir,
+        stem='features',
+        rows_per_shard=250_000,
+    )
+    path = final_dir
 
-    print(f"  ✅ CSV: {len(MODEL_FEATURE_COLS)} raw + {len(roll_cols)} rolling + meta")
+    with open(os.path.join(output_dir, 'final_feature_shards.json'), 'w') as f:
+        json.dump(final_shards, f, indent=2)
+
+    print(
+        "  ✅ Final Parquet: "
+        f"{len(final_shards)} shard(s) | "
+        f"{len(MODEL_FEATURE_COLS)} raw + {len(roll_cols)} rolling + meta"
+    )
     return df, path, roll_cols
 
 def _report(df, mbo_p, mbp_p, elapsed, output_dir):
@@ -1361,8 +2005,8 @@ def _report(df, mbo_p, mbp_p, elapsed, output_dir):
         L(f"  🌟  تم تضمين جميع الـ Embeddings بنجاح (emb_0 → emb_{EMBEDDINGS_DIM-1})")
 
     L(); L("─"*70)
-    out_csv=os.path.join(output_dir,'training_features_ready.csv')
-    L(f"🚀 python train_v19.py --csv {out_csv} --output {output_dir}")
+    out_artifact = os.path.join(output_dir, FINAL_FEATURE_DIR)
+    L(f"🚀 python train_v19.py --data {out_artifact} --output {output_dir}")
     L("="*70)
 
     rep=os.path.join(output_dir,'refinery_report.txt')
@@ -1413,6 +2057,10 @@ def run_refinery(
     chunksize=300_000,
     label_mode='v19',
     n_workers=None,
+    chunk_rows: int | None = None,
+    mbo_workers: int | None = None,
+    mbp_workers: int | None = None,
+    resume: bool = False,
     target_bars=500,
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
@@ -1425,9 +2073,14 @@ def run_refinery(
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
+    regime_mode: str = 'rules',
+    regime_stride: int = 50,
+    regime_window: int = 50,
+    regime_progress_every: int = 25_000,
     deterministic_stage1: bool = True,
     allow_unsafe_multiprocessing: bool = False,
     merge_tolerance_ms: int = 500,
+    shard_warmup_rows: int = 5_000,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -1435,74 +2088,174 @@ def run_refinery(
     print_gpu_report()
 
     print("="*70)
-    print(f"🚀 [REFINERY V19] label={label_mode.upper()} workers={n_workers or 'auto'}")
+    print(f"🚀 [REFINERY V19 SHARDED] label={label_mode.upper()} workers={n_workers or 'auto'}")
     print("="*70)
-    mode = f"Chunked ({chunksize:,}/دفعة)" if chunksize else "Full Load"
-    print(f"  ⚡ {mode}")
-    if chunksize:
-        print("  ⚠️ Chunked input reading is compatibility-mode only in this build; it still materializes the full frame before stage processing.")
+    resolved_chunk_rows = int(chunk_rows or chunksize or 0)
+    if resolved_chunk_rows <= 0:
+        resolved_chunk_rows = 2_000_000
+    requested_workers = int(n_workers if n_workers is not None else get_multiprocessing_workers())
+    mbo_workers = int(mbo_workers or requested_workers or 1)
+    mbp_workers = int(mbp_workers or requested_workers or 1)
+    effective_workers = max(mbo_workers, mbp_workers)
+    print(f"  ⚡ Sharded streaming ({resolved_chunk_rows:,}/shard)")
+    print(f"  ⚙️  Workers: MBO={mbo_workers} | MBP={mbp_workers}")
+    print(f"  ♻️ Resume: {'ON' if resume else 'OFF'} | Warmup rows={int(max(shard_warmup_rows, 0)):,}")
+    print(
+        "  🧭 Regime: "
+        f"mode={_resolve_regime_mode(regime_mode)} | "
+        f"stride={max(int(regime_stride), 1)} | "
+        f"window={max(int(regime_window), 10)}"
+    )
 
     _require_causal_label_runtime(label_mode)
 
-    def _read(path):
-        ext = os.path.splitext(path)[1].lower()
-        if ext in ('.parquet', '.pq', '.snappy'):
-            return pd.read_parquet(path)
-        elif ext in ('.zst', '.gz'):
-            if chunksize: return pd.concat(list(pd.read_csv(path, chunksize=chunksize, low_memory=False, compression='infer')), ignore_index=True)
-            return pd.read_csv(path, low_memory=False, compression='infer')
-        else:
-            if chunksize: return pd.concat(list(pd.read_csv(path, chunksize=chunksize, low_memory=False)), ignore_index=True)
-            return pd.read_csv(path, low_memory=False)
-
-    print(f"\n📥 قراءة MBO: {mbo_path}")
-    df_mbo = _read(mbo_path)
-    print(f"  {len(df_mbo):,} صف")
-    if len(df_mbo) == 0: sys.exit(1)
-
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
-    df_mbp = None
-    if mbp_exists:
-        df_mbp = _read(mbp_path)
-
-    print("\n⚙️  Step 1 — MBO (Context & Microstructure)...")
-    df_mbo = _normalize_databento_columns(df_mbo)
-    deeplob_enabled = _load_deeplob_components() and mbp_exists
-    lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
-    lob_mbo_src = _lob_source_frame(df_mbo, 'mbo') if deeplob_enabled else None
+    deeplob_enabled = False
+    lob_mbo_src = None
     lob_mbp_src = None
-    requested_workers = n_workers if n_workers is not None else get_multiprocessing_workers()
-    effective_workers = requested_workers
-    if deterministic_stage1 and not allow_unsafe_multiprocessing:
-        effective_workers = 1
-    df_mbo_p = _process_mbo(
-        df_mbo,
-        n_workers=effective_workers,
-        allow_unsafe_multiprocessing=allow_unsafe_multiprocessing and not deterministic_stage1,
+    lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
+
+    print(f"\n📥 Phase A — Canonical Ingest")
+    print(f"  MBO: {mbo_path}")
+    mbo_records = _canonicalize_input_file(
+        mbo_path,
+        kind='mbo',
+        output_dir=output_dir,
+        chunk_rows=resolved_chunk_rows,
+        resume=resume,
+    )
+    if not mbo_records:
+        raise RuntimeError("❌ No canonical MBO shards were produced")
+
+    mbp_records: list[dict] = []
+    if mbp_exists:
+        print(f"  MBP: {mbp_path}")
+        mbp_records = _canonicalize_input_file(
+            mbp_path,
+            kind='mbp',
+            output_dir=output_dir,
+            chunk_rows=resolved_chunk_rows,
+            resume=resume,
+        )
+
+    sample_mbo_source = read_table(mbo_records[0]['path'])
+    sample_mbo = sample_mbo_source.head(min(5_000, max(100, len(sample_mbo_source))))
+    cal = AutoCalibrator(n_ticks=2000).fit(sample_mbo)
+    engines = cal.build_engines(include_extended=True)
+    cal_params = {
+        'tick_size': float(cal.tick_size),
+        'min_price_move': float(cal.min_price_move),
+        'typical_size': float(cal.typical_size),
+        'volatility': float(cal.volatility),
+        'sweep_thresh': float(getattr(engines.get('sweep', object()), 'threshold', 0.05)),
+    }
+    _tick = float(cal.tick_size) if float(cal.tick_size) > 0 else 0.0001
+
+    print("\n⚙️  Phase B — MBP Vectorized Shards...")
+    mbp_feature_records: list[dict] = []
+    if mbp_records:
+        mbp_feature_dir = _artifact_phase_dir(output_dir, 'features', 'mbp')
+        mbp_tasks = []
+        for idx, record in enumerate(sorted(mbp_records, key=lambda item: int(item['shard_idx']))):
+            prev_record = mbp_records[idx - 1] if idx > 0 else None
+            mbp_tasks.append({
+                'current': record,
+                'prev': prev_record,
+                'warmup_rows': int(max(shard_warmup_rows, 0)),
+                'tick_size': _tick,
+                'out_path': os.path.join(mbp_feature_dir, f'mbp_{int(record["shard_idx"]):05d}.parquet'),
+                'resume': resume,
+            })
+        mbp_feature_records = _run_shard_tasks(mbp_tasks, _process_mbp_shard_task, mbp_workers)
+        write_checkpoint(
+            output_dir,
+            'mbp_features',
+            {'processed_shards': len(mbp_feature_records), 'rows': int(sum(r['rows'] for r in mbp_feature_records))},
+        )
+
+    print("\n⚙️  Phase C — MBO Two-Pass...")
+    mbo_pass1_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_pass1')
+    mbo_tasks = []
+    for idx, record in enumerate(sorted(mbo_records, key=lambda item: int(item['shard_idx']))):
+        prev_record = mbo_records[idx - 1] if idx > 0 else None
+        mbo_tasks.append({
+            'current': record,
+            'prev': prev_record,
+            'cal_params': cal_params,
+            'warmup_rows': int(max(shard_warmup_rows, 0)),
+            'out_path': os.path.join(mbo_pass1_dir, f'mbo_{int(record["shard_idx"]):05d}.parquet'),
+            'resume': resume,
+        })
+    mbo_pass1_records = _run_shard_tasks(mbo_tasks, _process_mbo_shard_task, mbo_workers)
+    if not mbo_pass1_records:
+        raise RuntimeError("❌ مفيش trades في MBO — تأكد أن الملف يحتوي action=T أو F")
+    write_checkpoint(
+        output_dir,
+        'mbo_pass1',
+        {'processed_shards': len(mbo_pass1_records), 'rows': int(sum(r['rows'] for r in mbo_pass1_records))},
     )
 
-    _tick = float(AutoCalibrator(200).fit(df_mbo).tick_size) if len(df_mbo) > 0 else 0.0001
-    del df_mbo
+    print("  🔁 Rebuilding global trade-driven stateful features...")
+    mbo_pass1_df = _load_records_frame(mbo_pass1_records)
+    mbo_final_df = _rebuild_trade_stateful_features(mbo_pass1_df, cal_params)
+    del mbo_pass1_df
+    mbo_final_records = _rewrite_records_from_frame(
+        mbo_final_df,
+        records=mbo_pass1_records,
+        output_dir=output_dir,
+        phase_name='mbo_final',
+    )
+    write_checkpoint(
+        output_dir,
+        'mbo_pass2',
+        {'processed_shards': len(mbo_final_records), 'rows': int(len(mbo_final_df))},
+    )
 
-    if df_mbo_p is None or len(df_mbo_p) == 0:
-        print("\n❌ مفيش trades في MBO — تأكد أن الملف يحتوي action=T أو F")
-        import sys; sys.exit(1)
-
-    if mbp_exists and df_mbp is not None and len(df_mbp) > 0:
-        print("\n⚙️  Step 2 — MBP10 (Liquidity Walls)...")
-        df_mbp = _normalize_databento_columns(df_mbp)
-        if deeplob_enabled:
-            lob_mbp_src = _lob_source_frame(df_mbp, 'mbp')
-        df_mbp_p = _process_mbp10(df_mbp, tick_size=_tick)
-        del df_mbp
-
-        print("\n⚙️  Step 3 — Merge MBO & MBP...")
-        df_merged = _merge(df_mbo_p, df_mbp_p, tolerance_ms=merge_tolerance_ms)
-        del df_mbo_p, df_mbp_p
-    else:
-        df_merged = df_mbo_p.copy()
-        del df_mbo_p
-        for c in ['obi','spoofing_ratio','spoofing_duration','liquidity_trap','liquidity_gaps','dist_to_bid_wall','dist_to_ask_wall']: df_merged[c] = 0.0
+    print("\n⚙️  Phase D — Merge MBO & MBP Shards...")
+    merged_records: list[dict] = []
+    merged_dir = _artifact_phase_dir(output_dir, 'features', 'merged')
+    mbp_cache: dict[str, pd.DataFrame] = {}
+    ordered_mbo_final = sorted(mbo_final_records, key=lambda item: int(item['shard_idx']))
+    for record in ordered_mbo_final:
+        shard_idx = int(record['shard_idx'])
+        merged_path = os.path.join(merged_dir, f'merged_{shard_idx:05d}.parquet')
+        if resume and os.path.exists(merged_path):
+            merged_records.append(_read_existing_shard_record(merged_path, shard_idx))
+            continue
+        mbo_shard = read_table(record['path'])
+        if len(mbo_shard) == 0:
+            merged = mbo_shard.copy()
+        elif mbp_feature_records:
+            ts_min = pd.to_datetime(mbo_shard['ts_event'].min())
+            ts_max = pd.to_datetime(mbo_shard['ts_event'].max())
+            relevant_records = _select_relevant_mbp_records(
+                mbp_feature_records,
+                ts_min=ts_min,
+                ts_max=ts_max,
+                tolerance_ms=merge_tolerance_ms,
+            )
+            mbp_frames = []
+            for mbp_record in relevant_records:
+                cache_key = mbp_record['path']
+                if cache_key not in mbp_cache:
+                    mbp_cache[cache_key] = read_table(cache_key)
+                mbp_frames.append(mbp_cache[cache_key])
+            mbp_slice = pd.concat(mbp_frames, ignore_index=True) if mbp_frames else pd.DataFrame()
+            merged = _merge_mbo_mbp_chunk(mbo_shard, mbp_slice, tolerance_ms=merge_tolerance_ms)
+        else:
+            merged = mbo_shard.copy()
+            for c in ['obi','spoofing_ratio','spoofing_duration','liquidity_trap','liquidity_gaps','dist_to_bid_wall','dist_to_ask_wall']:
+                merged[c] = 0.0
+        write_table(merged, merged_path, compression='snappy')
+        merged_records.append(_shard_record(merged_path, merged, shard_idx))
+    write_checkpoint(
+        output_dir,
+        'merge',
+        {'processed_shards': len(merged_records), 'rows': int(sum(r['rows'] for r in merged_records))},
+    )
+    df_merged = _finalize_merged_frame(_load_records_frame(merged_records))
+    del mbo_final_df
+    gc.collect()
 
     print("\n⚙️  Step 3b — Rolling Context Features...")
     df_merged = _add_rolling_context(df_merged)
@@ -1660,6 +2413,10 @@ def run_refinery(
         output_dir,
         external_scaler_path=external_scaler_path,
         fit_aux_models=fit_aux_models,
+        regime_mode=regime_mode,
+        regime_stride=regime_stride,
+        regime_window=regime_window,
+        regime_progress_every=regime_progress_every,
     )
     del df_labeled
 
@@ -1671,6 +2428,12 @@ def run_refinery(
                 split_meta = json.load(f)
         except Exception:
             split_meta = {}
+    final_shards = []
+    final_shards_path = os.path.join(output_dir, 'final_feature_shards.json')
+    if os.path.exists(final_shards_path):
+        with open(final_shards_path) as f:
+            final_shards = json.load(f)
+
     contract = _refinery_dataset_contract(
         df_final,
         mbo_path=mbo_path,
@@ -1684,22 +2447,50 @@ def run_refinery(
         deterministic_stage1=deterministic_stage1,
         merge_tolerance_ms=merge_tolerance_ms,
     )
+    contract.update({
+        'artifact_layout': 'stage1_v2_sharded_parquet',
+        'data_format': 'parquet',
+        'chunk_rows': int(resolved_chunk_rows),
+        'mbo_workers': int(mbo_workers),
+        'mbp_workers': int(mbp_workers),
+        'resume_enabled': bool(resume),
+        'final_feature_shards': final_shards,
+        'normalized_shards': {
+            'mbo': mbo_records,
+            'mbp': mbp_records,
+        },
+        'feature_shards': {
+            'mbp': mbp_feature_records,
+            'mbo_pass1': mbo_pass1_records,
+            'mbo_final': mbo_final_records,
+            'merged': merged_records,
+        },
+    })
     artifact_manifest_path = write_manifest(
         output_dir=output_dir,
         kind='refinery_v19',
         config={
             'label_mode': label_mode,
-            'chunksize': chunksize,
+            'chunksize': resolved_chunk_rows,
             'requested_workers': requested_workers,
             'effective_workers': effective_workers,
             'deterministic_stage1': bool(deterministic_stage1),
             'allow_unsafe_multiprocessing': bool(allow_unsafe_multiprocessing),
+            'resume': bool(resume),
+            'chunk_rows': int(resolved_chunk_rows),
+            'mbo_workers': int(mbo_workers),
+            'mbp_workers': int(mbp_workers),
+            'shard_warmup_rows': int(max(shard_warmup_rows, 0)),
             'label_horizon': int(label_horizon),
             'event_roll_window': int(event_roll_window),
             'direction_threshold_ticks': float(direction_threshold_ticks),
             'causal_threshold_mode': str(causal_threshold_mode),
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
+            'regime_mode': str(_resolve_regime_mode(regime_mode)),
+            'regime_stride': int(max(regime_stride, 1)),
+            'regime_window': int(max(regime_window, 10)),
+            'regime_progress_every': int(max(regime_progress_every, 0)),
             'merge_tolerance_ms': int(merge_tolerance_ms),
         },
         inputs={
@@ -1757,9 +2548,13 @@ if __name__=='__main__':
     p.add_argument('--mbp',        required=True)
     p.add_argument('--symbol',     default='')
     p.add_argument('--output',     default='outputs')
-    p.add_argument('--chunksize',  type=int, default=300_000)
+    p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=2_000_000)
     p.add_argument('--label_mode', choices=['v19', 'v22'], default='v19')
     p.add_argument('--n_workers',   type=int, default=None)
+    p.add_argument('--mbo_workers', type=int, default=None)
+    p.add_argument('--mbp_workers', type=int, default=None)
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--shard_warmup_rows', type=int, default=5_000)
     p.add_argument('--target_bars', type=int, default=500,
                    help='عدد الـ Volume Bars لكل session (500=swing, 200=scalp, 1000=position)')
     p.add_argument('--label_horizon', type=int, default=150,
@@ -1780,15 +2575,23 @@ if __name__=='__main__':
                    help='Kalman slope threshold for trend direction (default: 0.05)')
     p.add_argument('--trend_strength_min', type=float, default=0.05,
                    help='Minimum opposite-trend strength required to veto directional labels (default: 0.05)')
-    p.add_argument('--allow_unsafe_multiprocessing', action='store_true',
-                   help='allow legacy multi-worker MBO path رغم حدود state الحالية')
+    p.add_argument('--regime_mode', choices=['rules', 'wasserstein', 'off'], default='rules',
+                   help='regime surface mode for stage1 metadata (default: rules)')
+    p.add_argument('--regime_stride', type=int, default=50,
+                   help='sample every N rows before expanding regime back to full rows (default: 50)')
+    p.add_argument('--regime_window', type=int, default=50,
+                   help='window size for optional Wasserstein regime mode (default: 50)')
+    p.add_argument('--regime_progress_every', type=int, default=25_000,
+                   help='progress print cadence for Wasserstein rolling loops (default: 25000, 0 disables)')
     p.add_argument('--merge_tolerance_ms', type=int, default=500,
                    help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
     a  = p.parse_args()
-    cs = None if a.chunksize == 0 else a.chunksize
+    cs = None if a.chunk_rows == 0 else a.chunk_rows
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
-                 chunksize=cs, label_mode=a.label_mode,
+                 chunksize=cs, chunk_rows=cs, label_mode=a.label_mode,
                  n_workers=a.n_workers, target_bars=a.target_bars,
+                 mbo_workers=a.mbo_workers, mbp_workers=a.mbp_workers,
+                 resume=a.resume, shard_warmup_rows=a.shard_warmup_rows,
                  label_horizon=a.label_horizon,
                  event_roll_window=a.event_roll_window,
                  direction_threshold_ticks=a.direction_threshold_ticks,
@@ -1798,6 +2601,8 @@ if __name__=='__main__':
                  sl_mult=a.sl_mult,
                  kalman_slope_threshold=a.kalman_slope_threshold,
                  trend_strength_min=a.trend_strength_min,
-                 deterministic_stage1=(not a.allow_unsafe_multiprocessing),
-                 allow_unsafe_multiprocessing=a.allow_unsafe_multiprocessing,
+                 regime_mode=a.regime_mode,
+                 regime_stride=a.regime_stride,
+                 regime_window=a.regime_window,
+                 regime_progress_every=a.regime_progress_every,
                  merge_tolerance_ms=a.merge_tolerance_ms)

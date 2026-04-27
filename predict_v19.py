@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.dynamic_labels import EventGate
+from modules.feature_artifact_v19 import load_feature_artifact
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -559,11 +560,17 @@ class V19PredictionEngine:
         if visual_embeddings is None and len(self.visual_features) and os.path.exists(self.visual_emb_path):
             try:
                 vis = np.load(self.visual_emb_path)
-                if len(vis) >= len(canonical_df):
+                if len(vis) == len(canonical_df):
                     visual_embeddings = np.asarray(vis[:len(canonical_df)], dtype=np.float32)
                     print(f"  Visual Embeddings loaded: {visual_embeddings.shape}")
+                else:
+                    raise ValueError(
+                        '❌ Refusing to auto-load cached visual embeddings because their '
+                        f'row count ({len(vis)}) does not match the current CSV rows '
+                        f'({len(canonical_df)}). Pass --visual_npy for a row-aligned file.'
+                    )
             except Exception:
-                visual_embeddings = None
+                raise
         if visual_embeddings is None:
             visual_embeddings = self.factory.zero_visual_embeddings(len(canonical_df))
         if meta_features is not None:
@@ -619,20 +626,20 @@ class V19PredictionEngine:
 def main():
     p = argparse.ArgumentParser(description='QuantSystem V19 prediction engine')
     p.add_argument('--models', default='outputs_v19')
-    p.add_argument('--csv', default=None, help='optional CSV for backtest mode')
+    p.add_argument('--data', '--csv', dest='data', default=None, help='optional stage1 artifact dir/manifest/parquet for backtest mode')
     p.add_argument('--mode', choices=['backtest', 'live'], default='backtest')
     p.add_argument('--output', default='outputs_v19')
     p.add_argument('--visual_npy', default=None, help='optional precomputed visual embeddings for the same rows')
     p.add_argument('--input_scaled', action='store_true',
-                   help='set this when using training_features_ready.csv (already scaled)')
+                   help='set this when using final stage1 artifact (already scaled)')
     args = p.parse_args()
 
     engine = V19PredictionEngine(args.models)
 
     if args.mode == 'backtest':
-        if not args.csv:
-            raise ValueError('❌ --csv مطلوب في backtest mode')
-        df = pd.read_csv(args.csv, low_memory=False)
+        if not args.data:
+            raise ValueError('❌ --data مطلوب في backtest mode')
+        df = load_feature_artifact(args.data)
         visual_embeddings = None
         if args.visual_npy and os.path.exists(args.visual_npy):
             visual_embeddings = np.load(args.visual_npy)

@@ -21,6 +21,11 @@ from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from modules.feature_artifact_v19 import (
+    load_artifact_manifest,
+    load_feature_artifact,
+    resolve_artifact_root,
+)
 from modules.slippage_model import confidence_bet_size
 from predict_v19 import V19PredictionEngine
 
@@ -206,11 +211,7 @@ def _simulate_trade_path(
 
 
 def _load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    for col in ('ts_event', 'label_end_ts'):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors='coerce').dt.tz_localize(None)
-    return df
+    return load_feature_artifact(path)
 
 
 def _load_json_if_exists(path: str) -> dict | None:
@@ -226,7 +227,7 @@ def _load_json_if_exists(path: str) -> dict | None:
 
 def _load_backtest_contract(csv_path: str, models_dir: str) -> tuple[dict, dict]:
     model_manifest = _load_json_if_exists(os.path.join(models_dir, 'manifest.json')) or {}
-    dataset_manifest = _load_json_if_exists(os.path.join(os.path.dirname(os.path.abspath(csv_path)), 'artifact_manifest.json')) or {}
+    dataset_manifest = load_artifact_manifest(csv_path) or {}
     return model_manifest, dataset_manifest
 
 
@@ -253,12 +254,43 @@ def _enforce_oos_backtest_guard(
     model_manifest, dataset_manifest = _load_backtest_contract(csv_path, models_dir)
     source_contract = ((model_manifest.get('extra', {}) or {}).get('source_contract', {}) or {})
     source_csv = os.path.abspath(str(source_contract.get('source_csv') or model_manifest.get('inputs', {}).get('csv') or ''))
-    backtest_csv = os.path.abspath(csv_path)
+    backtest_csv = os.path.abspath(resolve_artifact_root(csv_path) if os.path.isdir(csv_path) else csv_path)
     source_dataset_id = str(source_contract.get('dataset_id') or '')
     backtest_dataset_id = str((dataset_manifest.get('extra', {}) or {}).get('dataset_id') or '')
+    source_split_time = str(source_contract.get('split_time') or '')
+    source_schema_version = str(source_contract.get('schema_version') or '')
+    backtest_schema_version = str((dataset_manifest.get('extra', {}) or {}).get('schema_version') or '')
 
     dataset_slice = pd.Series(df.get('dataset_slice', pd.Series([], dtype='object'))).astype(str).str.lower()
     is_pure_holdout = bool(len(dataset_slice) > 0 and dataset_slice.isin(['holdout']).all())
+
+    missing_contract_bits = []
+    if not model_manifest:
+        missing_contract_bits.append('model manifest')
+    if not dataset_manifest:
+        missing_contract_bits.append('dataset manifest')
+    if not source_csv:
+        missing_contract_bits.append('source_contract.source_csv')
+    if not source_dataset_id:
+        missing_contract_bits.append('source_contract.dataset_id')
+    if not source_split_time:
+        missing_contract_bits.append('source_contract.split_time')
+    if not source_schema_version:
+        missing_contract_bits.append('source_contract.schema_version')
+    if not backtest_dataset_id:
+        missing_contract_bits.append('dataset_manifest.extra.dataset_id')
+    if not backtest_schema_version:
+        missing_contract_bits.append('dataset_manifest.extra.schema_version')
+
+    if missing_contract_bits:
+        info['allowed'] = False
+        info['reason'] = 'missing_oos_contract'
+        raise ValueError(
+            '❌ Refusing labeled backtest because OOS contract metadata is incomplete: '
+            + ', '.join(missing_contract_bits)
+            + '. Rebuild the dataset/models with current manifests or pass '
+            '--allow_in_sample_data_override intentionally.'
+        )
 
     same_path = bool(source_csv) and source_csv == backtest_csv
     same_dataset = bool(source_dataset_id) and source_dataset_id == backtest_dataset_id
@@ -454,21 +486,14 @@ def _load_visual_embeddings(
         return expanded
 
     directional_rows = int(_directional_event_mask(df).sum())
-    if explicit_path:
-        raise ValueError(
-            f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) '
-            f'or directional-event rows ({directional_rows}) for explicit file {path}. '
-            'This usually means the embeddings were produced from a different '
-            'training CSV, or from a compact covered-rows artifact without a '
-            'matching visual_coverage_v19.npy sidecar.'
-        )
-
-    if len(vis) < n:
-        out = zero.copy()
-        out[:len(vis)] = vis
-        return out
-
-    return vis[:n]
+    source_kind = 'explicit file' if explicit_path else 'default artifact'
+    raise ValueError(
+        f'❌ visual embeddings rows ({len(vis)}) do not match CSV rows ({n}) '
+        f'or directional-event rows ({directional_rows}) for {source_kind} {path}. '
+        'Refusing silent truncate/pad because this usually means the embeddings '
+        'were produced from a different dataset or are missing their matching '
+        'visual_coverage_v19.npy sidecar.'
+    )
 
 
 def _load_meta_features(
@@ -1020,7 +1045,7 @@ def run_causal_backtest(
 
 def main():
     p = argparse.ArgumentParser(description='Causal replay backtester for QuantSystem V19')
-    p.add_argument('--csv', required=True, help='training_features_ready.csv or compatible V19 feature CSV')
+    p.add_argument('--data', '--csv', dest='data', required=True, help='stage1 artifact dir/manifest/parquet')
     p.add_argument('--models', default='outputs_v19', help='trained V19 models directory')
     p.add_argument('--output', default='outputs_v19', help='backtest output directory')
     p.add_argument('--visual_npy', default=None, help='optional row-aligned visual embeddings file')
@@ -1028,9 +1053,9 @@ def main():
     p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
                    help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
     p.add_argument('--allow_in_sample_data_override', action='store_true',
-                   help='dangerous: allow backtesting directly on the training dataset / non-holdout labeled CSV')
+                   help='dangerous: allow backtesting directly on the training dataset / non-holdout labeled artifact')
     p.add_argument('--input_scaled', action='store_true',
-                   help='set when CSV is already scaled like training_features_ready.csv')
+                   help='set when the artifact is already scaled like final stage1 features')
     p.add_argument('--tick_size', type=float, default=0.0001)
     p.add_argument('--tick_value', type=float, default=10.0)
     p.add_argument('--round_trip_cost_pips', type=float, default=1.0)
@@ -1049,10 +1074,10 @@ def main():
                    help='rows to wait after closing a trade before opening a new one')
     args = p.parse_args()
 
-    df = _load_csv(args.csv)
+    df = _load_csv(args.data)
     oos_guard = _enforce_oos_backtest_guard(
         df,
-        csv_path=args.csv,
+        csv_path=args.data,
         models_dir=args.models,
         allow_in_sample_data_override=args.allow_in_sample_data_override,
     )

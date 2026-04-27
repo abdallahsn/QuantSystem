@@ -14,7 +14,7 @@ os.environ.setdefault("QUANTSYSTEM_SKIP_HEAVY_ML", "1")
 os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 
 from backtest_v19 import _load_meta_features, _simulate_trade_path
-from prepare_training_data import _require_causal_label_runtime
+from prepare_training_data import _fit_regime_surface, _require_causal_label_runtime
 from modules.dynamic_labels import EventGate
 from modules.feature_factory_v19 import V19FeatureFactory
 from modules.labels_v22 import _compute_adaptive_horizons
@@ -222,6 +222,56 @@ class LeakageGuardTests(unittest.TestCase):
         self.assertEqual(meta.shape, (n, len(expected_cols)))
         np.testing.assert_allclose(meta.loc[:, list(REGIME_ONE_HOT_COLS)].sum(axis=1).values, 1.0)
         self.assertTrue(((meta.loc[:, list(REGIME_META_SCORE_COLS)].values >= 0.0) & (meta.loc[:, list(REGIME_META_SCORE_COLS)].values <= 1.0)).all())
+
+    def test_regime_surface_rules_expand_from_coarse_stride(self):
+        rng = np.random.default_rng(23)
+        n = 6000
+        df = pd.DataFrame(
+            {
+                'price': 100 + np.cumsum(rng.normal(0.0, 0.15, n)),
+                'size': rng.integers(1, 8, n),
+                'cvd': np.cumsum(rng.normal(0.0, 0.7, n)),
+                'obi': rng.uniform(-1.0, 1.0, n),
+                'inter_event_time': rng.exponential(0.4, n),
+                'micro_atr': np.abs(rng.normal(0.2, 0.04, n)),
+            }
+        )
+        split_ctx = {'split_idx': 4000}
+        train_idx = np.arange(4000, dtype=np.int32)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            labels, info = _fit_regime_surface(
+                df,
+                train_idx=train_idx,
+                split_ctx=split_ctx,
+                output_dir=tmpdir,
+                regime_mode='rules',
+                regime_stride=12,
+                regime_window=50,
+                regime_progress_every=0,
+            )
+
+        self.assertEqual(len(labels), len(df))
+        self.assertEqual(info['mode'], 'rules')
+        self.assertEqual(info['effective_stride'], 12)
+        self.assertLess(info['full_sample_rows'], len(df))
+        self.assertLess(info['train_sample_rows'], len(train_idx))
+        self.assertTrue(np.isin(labels, [0, 1, 2, 3]).all())
+
+    def test_regime_surface_can_be_disabled(self):
+        df = pd.DataFrame({'price': [1.0, 1.1, 1.2]})
+        labels, info = _fit_regime_surface(
+            df,
+            train_idx=np.array([0, 1], dtype=np.int32),
+            split_ctx={'split_idx': 2},
+            output_dir='.',
+            regime_mode='off',
+            regime_stride=50,
+            regime_window=50,
+            regime_progress_every=0,
+        )
+        np.testing.assert_array_equal(labels, np.zeros(len(df), dtype=np.int8))
+        self.assertEqual(info['mode'], 'off')
 
     def test_stage1_cached_meta_surface_rejects_old_dimension(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -17,9 +17,13 @@ def main():
     p.add_argument('--mbp', required=True)
     p.add_argument('--symbol', default='')
     p.add_argument('--output', default='outputs_v19')
-    p.add_argument('--chunksize', type=int, default=int(defaults.get('chunksize', 300_000)))
+    p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(defaults.get('chunk_rows', defaults.get('chunksize', 2_000_000))))
     p.add_argument('--label_mode', choices=['v19', 'v22'], default=defaults.get('label_mode', 'v19'))
-    p.add_argument('--n_workers', type=int, default=None)
+    p.add_argument('--n_workers', type=int, default=defaults.get('n_workers'))
+    p.add_argument('--mbo_workers', type=int, default=defaults.get('mbo_workers'))
+    p.add_argument('--mbp_workers', type=int, default=defaults.get('mbp_workers'))
+    p.add_argument('--resume', action='store_true', default=bool(defaults.get('resume', False)))
+    p.add_argument('--shard_warmup_rows', type=int, default=int(defaults.get('shard_warmup_rows', 5000)))
     p.add_argument('--target_bars', type=int, default=int(defaults.get('target_bars', 500)))
 
     # FIX: رُفع من 50 → 150 tick
@@ -48,7 +52,11 @@ def main():
     p.add_argument('--trend_strength_min', type=float,
                    default=float(defaults.get('trend_strength_min', 0.05)),
                    help='الحد الأدنى لقوة الترند المعاكس لتفعيل فلتر الحذف (default: 0.05)')
-    p.add_argument('--allow_unsafe_multiprocessing', action='store_true')
+    p.add_argument('--regime_mode', choices=['rules', 'wasserstein', 'off'],
+                   default=str(defaults.get('regime_mode', 'rules')))
+    p.add_argument('--regime_stride', type=int, default=int(defaults.get('regime_stride', 50)))
+    p.add_argument('--regime_window', type=int, default=int(defaults.get('regime_window', 50)))
+    p.add_argument('--regime_progress_every', type=int, default=int(defaults.get('regime_progress_every', 25000)))
     p.add_argument('--merge_tolerance_ms', type=int, default=int(defaults.get('merge_tolerance_ms', 500)))
 
     args = p.parse_args()
@@ -58,9 +66,13 @@ def main():
         mbp_path=args.mbp,
         symbol=args.symbol,
         output_dir=args.output,
-        chunksize=None if args.chunksize == 0 else args.chunksize,
+        chunksize=None if args.chunk_rows == 0 else args.chunk_rows,
+        chunk_rows=None if args.chunk_rows == 0 else args.chunk_rows,
         label_mode=args.label_mode,
         n_workers=args.n_workers,
+        mbo_workers=args.mbo_workers,
+        mbp_workers=args.mbp_workers,
+        resume=args.resume,
         target_bars=args.target_bars,
         label_horizon=args.label_horizon,
         event_roll_window=args.event_roll_window,
@@ -71,8 +83,11 @@ def main():
         sl_mult=args.sl_mult,
         kalman_slope_threshold=args.kalman_slope_threshold,
         trend_strength_min=args.trend_strength_min,
-        deterministic_stage1=(not args.allow_unsafe_multiprocessing),
-        allow_unsafe_multiprocessing=args.allow_unsafe_multiprocessing,
+        regime_mode=args.regime_mode,
+        regime_stride=args.regime_stride,
+        regime_window=args.regime_window,
+        regime_progress_every=args.regime_progress_every,
+        shard_warmup_rows=args.shard_warmup_rows,
         merge_tolerance_ms=args.merge_tolerance_ms,
     )
 

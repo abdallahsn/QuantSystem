@@ -219,6 +219,10 @@ def run_walkforward(
             sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
             kalman_slope_threshold=float(ref_cfg.get('kalman_slope_threshold', 0.05)),
             trend_strength_min=float(ref_cfg.get('trend_strength_min', 0.05)),
+            regime_mode=str(ref_cfg.get('regime_mode', 'rules')),
+            regime_stride=int(ref_cfg.get('regime_stride', 50)),
+            regime_window=int(ref_cfg.get('regime_window', 50)),
+            regime_progress_every=int(ref_cfg.get('regime_progress_every', 25000)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
             merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
         )
@@ -260,6 +264,10 @@ def run_walkforward(
             sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
             kalman_slope_threshold=float(ref_cfg.get('kalman_slope_threshold', 0.05)),
             trend_strength_min=float(ref_cfg.get('trend_strength_min', 0.05)),
+            regime_mode=str(ref_cfg.get('regime_mode', 'rules')),
+            regime_stride=int(ref_cfg.get('regime_stride', 50)),
+            regime_window=int(ref_cfg.get('regime_window', 50)),
+            regime_progress_every=int(ref_cfg.get('regime_progress_every', 25000)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
             merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
             external_scaler_path=os.path.join(model_dir, 'scaler_params.json'),
@@ -284,6 +292,9 @@ def run_walkforward(
             round_trip_cost_pips=float(bt_cfg.get('round_trip_cost_pips', 1.0)),
             max_size=int(bt_cfg.get('max_size', 5)),
             starting_equity=float(bt_cfg.get('starting_equity', 100000.0)),
+            direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 1.0)),
+            tp_mult=float(ref_cfg.get('tp_mult', 1.2)),
+            sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
         )
 
         fold_report = {
