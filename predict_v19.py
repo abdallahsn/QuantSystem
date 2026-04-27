@@ -188,12 +188,14 @@ class V19PredictionEngine:
             )
 
         if os.path.exists(meta_path):
+            meta_cfg = self.schema.get('meta_learner', {}) or {}
             self.meta = MetaLearnerLSTM(
                 seq_len=self.seq_len,
                 n_stat_feat=len(self.stat_features),
                 n_meta_feat=len(self.meta_features),
                 n_visual_emb=len(self.visual_features),
                 brain_file=meta_path,
+                bias_long_threshold=float(meta_cfg.get('bias_long_threshold', 0.50)),
             )
         else:
             self.meta = None

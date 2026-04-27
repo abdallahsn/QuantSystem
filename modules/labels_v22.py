@@ -331,6 +331,38 @@ def _build_training_event_gate(
     return candidate.astype(np.int8), score, trigger_count, threshold
 
 
+def _build_broad_event_gate(
+    df: pd.DataFrame,
+    base_event_mask: pd.Series | np.ndarray,
+    roll_window: int,
+    vol_mult: float,
+    obi_thr: float,
+    wall_thr: float,
+    shift_z_thr: float = 0.75,
+    target_rate: float = 0.70,
+    causal_threshold_mode: str = "expanding",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Build a broad-but-not-trivial causal event gate.
+
+    The legacy raw event_flag was a pure OR across several conditions and could
+    easily light up >90% of rows on volatile datasets. We keep it broader than
+    `train_event_flag`, but still causal and rate-controlled.
+    """
+    return _build_training_event_gate(
+        df,
+        base_event_mask=base_event_mask,
+        roll_window=roll_window,
+        vol_mult=vol_mult,
+        obi_thr=obi_thr,
+        wall_thr=wall_thr,
+        shift_z_thr=shift_z_thr,
+        target_rate=target_rate,
+        causal_threshold_mode=causal_threshold_mode,
+        fixed_score_threshold=None,
+    )
+
+
 # ── FIX-9: Adaptive per-row horizon ──────────────────────────────────────────
 
 def _compute_adaptive_horizons(
@@ -679,6 +711,7 @@ def build_causal_event_labels(
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
     trend_strength_min: float = 0.05,
     causal_threshold_mode: str = "expanding",
+    raw_event_target_rate: float = 0.70,
     training_event_score_threshold: float | None = None,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
     # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
@@ -720,6 +753,7 @@ def build_causal_event_labels(
     trend_strength_min    : Minimum opposite-trend strength required to veto a
                             directional label.
     causal_threshold_mode : `expanding` (default) أو `fixed` للـ training-event gate.
+    raw_event_target_rate : Target keep-rate for the broader `event_flag` mask.
     """
 
     out = df.copy()
@@ -790,16 +824,26 @@ def build_causal_event_labels(
     obi_thr  = 0.08
     wall_thr = 0.70
 
-    event_mask = build_event_filter(
+    raw_event_mask = build_event_filter(
         out,
         vol_mult=vol_mult,
         obi_thr=obi_thr,
         wall_str_thr=wall_thr,
         roll_window=ev_window,
     )
+    event_flag, _, _, raw_event_score_threshold = _build_broad_event_gate(
+        out,
+        base_event_mask=raw_event_mask,
+        roll_window=ev_window,
+        vol_mult=vol_mult,
+        obi_thr=obi_thr,
+        wall_thr=wall_thr,
+        target_rate=raw_event_target_rate,
+        causal_threshold_mode=causal_threshold_mode,
+    )
     train_event_flag, event_score, event_trigger_count, event_score_threshold = _build_training_event_gate(
         out,
-        base_event_mask=event_mask,
+        base_event_mask=event_flag.astype(bool),
         roll_window=ev_window,
         vol_mult=vol_mult,
         obi_thr=obi_thr,
@@ -970,7 +1014,7 @@ def build_causal_event_labels(
     labeled["effective_horizon"]   = adaptive_horizons.astype(np.int32)   # FIX-9: expose per-row
 
     # FIX-6: broad event flag as context feature + stricter train-event gate
-    labeled["event_flag"] = event_mask.fillna(False).astype(np.int8)
+    labeled["event_flag"] = np.asarray(event_flag, dtype=np.int8)
     labeled["train_event_flag"] = train_event_flag.astype(np.int8)
     labeled["event_score"] = event_score.astype(np.float32)
     labeled["event_trigger_count"] = event_trigger_count.astype(np.int8)
@@ -1058,8 +1102,9 @@ def build_causal_event_labels(
         f"| feat_win={feat_window}  ev_win={ev_window}"
     )
     print(
-        f"[v22] Gate   → score_thr={event_score_threshold:.3f}  "
-        f"avg_score={float(np.nanmean(event_score)):.3f}  "
+        f"[v22] Gate   → raw_score_thr={raw_event_score_threshold:.3f}  "
+        f"train_score_thr={event_score_threshold:.3f}  "
+        f"avg_train_score={float(np.nanmean(event_score)):.3f}  "
         f"max_triggers={int(event_trigger_count.max()) if len(event_trigger_count) else 0}"
     )
     print(

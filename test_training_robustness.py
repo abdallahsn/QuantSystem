@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 
 from prepare_training_data import _select_event_rich_lob_emit_positions
-from train_v19 import _resolve_default_lob_paths, _resolve_meta_learner_profile
+from modules.meta_learner import MetaLearnerLSTM
+from train_v19 import _align_lob_to_rows, _resolve_default_lob_paths, _resolve_meta_learner_profile
 from walkforward_v19 import aggregate_fold_metrics
 
 
@@ -120,3 +121,43 @@ def test_aggregate_fold_metrics_exposes_profit_factor_and_trade_pnl():
     assert out["mean_trade_pnl_dollars"] == 13.75
     assert out["total_trades"] == 38
     assert out["total_pnl_dollars"] == 525.0
+
+
+def test_align_lob_to_rows_prefers_directional_targets_over_raw_obi():
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-01 00:00:01",
+                    "2025-01-01 00:00:02",
+                    "2025-01-01 00:00:03",
+                ]
+            ),
+            "bias_label": [0, 1, 0],
+            "signal_quality": [2, 1, 2],
+            "train_event_flag": [1, 1, 0],
+            "event_flag": [1, 1, 1],
+            "obi": [-9.0, 9.0, -9.0],
+        }
+    )
+    lob_timestamps = pd.Series(df["ts_event"].copy())
+
+    row_to_tensor, tensor_targets, tensor_seen = _align_lob_to_rows(df, lob_timestamps, max_age="1s")
+
+    assert row_to_tensor.tolist() == [0, 1, 2]
+    assert tensor_seen.tolist() == [True, True, True]
+    assert np.isclose(tensor_targets[0], 1.0)
+    assert np.isclose(tensor_targets[1], -0.6)
+    assert np.isclose(tensor_targets[2], 0.5)
+
+
+def test_meta_threshold_calibration_can_shift_off_argmax_default():
+    long_probs = np.array([0.70, 0.60, 0.55, 0.52, 0.48, 0.45], dtype=np.float32)
+    y_true = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
+
+    threshold, metrics = MetaLearnerLSTM.choose_bias_long_threshold(long_probs, y_true)
+
+    assert threshold > 0.50
+    assert metrics["macro_f1"] >= 0.99
+    preds = MetaLearnerLSTM._labels_from_long_probs(long_probs, threshold)
+    assert preds.tolist() == y_true.tolist()

@@ -147,6 +147,24 @@ class V22LabelsRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(info["raw_event_rate_full"], 1.0)
         self.assertAlmostEqual(info["event_rate_full"], 0.5)
 
+    def test_refinery_raw_event_flag_is_no_longer_near_unity(self):
+        out_df, stdout = _run_sample_refinery(
+            label_horizon=150,
+            event_roll_window=50,
+            direction_threshold_ticks=1.0,
+            tp_mult=1.2,
+            sl_mult=1.0,
+            kalman_slope_threshold=0.05,
+            trend_strength_min=0.05,
+        )
+        raw_rate = float(out_df["event_flag"].mean())
+        train_rate = float(out_df["train_event_flag"].mean())
+
+        self.assertIn("raw_score_thr=", stdout)
+        self.assertIn("train_score_thr=", stdout)
+        self.assertLess(raw_rate, 0.90)
+        self.assertGreater(raw_rate, train_rate)
+
     def test_event_training_view_falls_back_to_directional_rows_when_flags_empty(self):
         df = pd.DataFrame(
             {

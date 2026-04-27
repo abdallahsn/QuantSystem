@@ -913,7 +913,23 @@ def _align_lob_to_rows(
 
     row_to_tensor = row_merged['tensor_idx'].fillna(-1).astype(np.int32).values
 
-    obi_series = df.get('obi', pd.Series(np.zeros(len(df)))).fillna(0).astype(np.float32)
+    bias_series = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int32)
+    quality_series = pd.to_numeric(df.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int32)
+    train_event_series = pd.to_numeric(
+        df.get('train_event_flag', df.get('event_flag', 0)),
+        errors='coerce',
+    ).fillna(0).astype(np.int32)
+    signed_bias_target = np.zeros(len(df), dtype=np.float32)
+    signed_bias_target[bias_series.values == 0] = 1.0
+    signed_bias_target[bias_series.values == 1] = -1.0
+    quality_scale = np.where(
+        quality_series.values >= 2,
+        1.0,
+        np.where(quality_series.values == 1, 0.6, 0.25),
+    ).astype(np.float32)
+    event_scale = np.where(train_event_series.values == 1, 1.0, 0.5).astype(np.float32)
+    directional_target = (signed_bias_target * quality_scale * event_scale).astype(np.float32)
+    obi_series = pd.to_numeric(df.get('obi', 0.0), errors='coerce').fillna(0.0).astype(np.float32)
     tensor_targets = np.zeros(n_lob, dtype=np.float32)
     tensor_target_seen = np.zeros(n_lob, dtype=bool)
     tensor_rows = pd.merge_asof(
@@ -926,7 +942,10 @@ def _align_lob_to_rows(
     for _, match in tensor_rows.dropna(subset=['row_idx']).iterrows():
         tensor_idx = int(match['tensor_idx'])
         row_idx = int(match['row_idx'])
-        tensor_targets[tensor_idx] = float(obi_series.iloc[row_idx])
+        target_value = float(directional_target[row_idx])
+        if abs(target_value) < 1e-6:
+            target_value = float(obi_series.iloc[row_idx])
+        tensor_targets[tensor_idx] = target_value
         tensor_target_seen[tensor_idx] = True
 
     return row_to_tensor, tensor_targets, tensor_target_seen
@@ -1335,6 +1354,8 @@ def stage3_meta_learner_v19(
                     'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
                     'event_gate': event_gate_cfg,
                     'profile': profile,
+                    'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
+                    'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
                 },
                 f,
                 indent=2,
@@ -1353,6 +1374,11 @@ def stage3_meta_learner_v19(
             'deeplob': {
                 'enabled': bool(len(VISUAL_FEATURE_NAMES)),
                 'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
+                'aux_target_mode': 'directional_signed_quality_weighted',
+            },
+            'meta_learner': {
+                'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
+                'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
             },
             'artifacts': {
                 'catboost_model': 'catboost_advisor_v19.cbm',

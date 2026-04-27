@@ -32,7 +32,7 @@ except ImportError:
     TF_AVAILABLE = False
     print("  ⚠️  TensorFlow غير مثبّت — MetaLearner غير متاح")
 
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, precision_recall_fscore_support
 
 BIAS_LABELS  = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS   = 4
@@ -106,7 +106,8 @@ class MetaLearnerLSTM:
                  lstm_units_1:  int   = 128,
                  lstm_units_2:  int   = 64,
                  dropout:       float = 0.25,
-                 confidence_threshold: float = 0.65):
+                 confidence_threshold: float = 0.65,
+                 bias_long_threshold: float = 0.50):
 
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
@@ -118,6 +119,10 @@ class MetaLearnerLSTM:
         self.lstm2        = lstm_units_2
         self.drop         = dropout
         self.conf_thresh  = confidence_threshold
+        self.bias_long_threshold = float(np.clip(bias_long_threshold, 0.05, 0.95))
+        self.bias_threshold_metrics = {
+            'selected_threshold': float(self.bias_long_threshold),
+        }
 
         self.model   = None
         self._fitted = False
@@ -264,6 +269,78 @@ class MetaLearnerLSTM:
 
         return np.concatenate([X_stat, cb_probs, clusters, vis_embs], axis=-1).astype(np.float32)
 
+    @staticmethod
+    def _labels_from_long_probs(long_probs: np.ndarray, threshold: float) -> np.ndarray:
+        probs = np.asarray(long_probs, dtype=np.float32).reshape(-1)
+        thr = float(np.clip(threshold, 0.0, 1.0))
+        return np.where(probs >= thr, 0, 1).astype(np.int32)
+
+    @classmethod
+    def choose_bias_long_threshold(
+        cls,
+        long_probs: np.ndarray,
+        y_true: np.ndarray,
+        search_min: float = 0.35,
+        search_max: float = 0.65,
+        steps: int = 31,
+    ) -> tuple[float, dict]:
+        probs = np.asarray(long_probs, dtype=np.float32).reshape(-1)
+        y = np.asarray(y_true, dtype=np.int32).reshape(-1)
+        if probs.size == 0 or y.size == 0 or probs.size != y.size:
+            threshold = 0.50
+            return threshold, {'selected_threshold': threshold, 'reason': 'empty_validation'}
+
+        best_threshold = 0.50
+        best_metrics = None
+        thresholds = np.linspace(float(search_min), float(search_max), max(int(steps), 3))
+
+        for threshold in thresholds:
+            pred = cls._labels_from_long_probs(probs, float(threshold))
+            precision, recall, f1, support = precision_recall_fscore_support(
+                y,
+                pred,
+                labels=[0, 1],
+                zero_division=0,
+            )
+            macro_precision = float(np.mean(precision))
+            macro_recall = float(np.mean(recall))
+            macro_f1 = float(np.mean(f1))
+            recall_gap = float(abs(recall[0] - recall[1]))
+            threshold_metrics = {
+                'selected_threshold': float(threshold),
+                'macro_precision': macro_precision,
+                'macro_recall': macro_recall,
+                'macro_f1': macro_f1,
+                'long_precision': float(precision[0]),
+                'short_precision': float(precision[1]),
+                'long_recall': float(recall[0]),
+                'short_recall': float(recall[1]),
+                'long_f1': float(f1[0]),
+                'short_f1': float(f1[1]),
+                'long_support': int(support[0]),
+                'short_support': int(support[1]),
+                'recall_gap': recall_gap,
+            }
+            candidate_key = (
+                round(macro_f1, 6),
+                round(min(recall[0], recall[1]), 6),
+                round(macro_precision, 6),
+                round(-recall_gap, 6),
+                round(-abs(float(threshold) - 0.50), 6),
+            )
+            if best_metrics is None or candidate_key > best_metrics['selection_key']:
+                best_threshold = float(threshold)
+                best_metrics = {
+                    **threshold_metrics,
+                    'selection_key': candidate_key,
+                }
+
+        if best_metrics is None:
+            best_metrics = {'selected_threshold': best_threshold, 'reason': 'fallback_default'}
+        else:
+            best_metrics.pop('selection_key', None)
+        return float(best_threshold), best_metrics
+
     # ── Fit ─────────────────────────────────────────────────────
     def fit(self,
             X_meta:  np.ndarray,
@@ -372,24 +449,42 @@ class MetaLearnerLSTM:
         )
 
         self._fitted = True
-        self._report(X_val, yb_val, output_dir)
+        pred_cache = self.model.predict(X_val, verbose=0) if len(X_val) else None
+        if pred_cache is not None and 'bias_out' in pred_cache:
+            self.bias_long_threshold, self.bias_threshold_metrics = self.choose_bias_long_threshold(
+                pred_cache['bias_out'][:, 0],
+                yb_val,
+            )
+            print(
+                "  🎚️ Bias threshold calibration → "
+                f"LONG if p_long >= {self.bias_long_threshold:.3f} "
+                f"| macro_f1={self.bias_threshold_metrics.get('macro_f1', 0.0):.3f} "
+                f"| long_recall={self.bias_threshold_metrics.get('long_recall', 0.0):.3f} "
+                f"| short_recall={self.bias_threshold_metrics.get('short_recall', 0.0):.3f}"
+            )
+        self._report(X_val, yb_val, output_dir, pred_cache=pred_cache)
         return history
 
-    def _report(self, X_val, yb_val, output_dir):
+    def _report(self, X_val, yb_val, output_dir, pred_cache=None):
         """تقرير التحقق"""
         if not self._fitted:
             return
-        preds = self.model.predict(X_val, verbose=0)
-        bp    = np.argmax(preds['bias_out'], axis=1)
+        preds = pred_cache if pred_cache is not None else self.model.predict(X_val, verbose=0)
+        bp = self._labels_from_long_probs(preds['bias_out'][:, 0], self.bias_long_threshold)
         rep   = classification_report(
             yb_val, bp,
             labels=[0, 1],
             target_names=['LONG', 'SHORT'],
             zero_division=0)
-        print(f"\n📊 MetaLearner Validation:\n{rep}")
+        threshold_text = (
+            f"Bias LONG threshold: {self.bias_long_threshold:.3f}\n"
+            if self.bias_long_threshold is not None
+            else ""
+        )
+        print(f"\n📊 MetaLearner Validation:\n{threshold_text}{rep}")
         path = os.path.join(output_dir, 'meta_learner_report.txt')
         with open(path, 'w', encoding='utf-8') as f:
-            f.write(rep)
+            f.write(threshold_text + rep)
 
     # ── Predict ─────────────────────────────────────────────────
     def predict(self,
@@ -418,7 +513,7 @@ class MetaLearnerLSTM:
         conf_mean = float(np.mean(conf))
         conf_std  = float(np.std(conf))
 
-        bias_idx = int(np.argmax(bias_mean))
+        bias_idx = int(self._labels_from_long_probs(np.array([bias_mean[0]], dtype=np.float32), self.bias_long_threshold)[0])
         return {
             'bias':        BIAS_LABELS[bias_idx],
             'bias_idx':    bias_idx,
