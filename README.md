@@ -182,6 +182,11 @@ python3 stage1_refinery.py \
 - `outputs_v19/lob_tensor_timestamps.npy`
 - `outputs_v19/refinery_report.txt`
 
+ملاحظة:
+- `lob_tensors.npy` و`lob_tensor_timestamps.npy` يُبنيان من الـ shards نفسها إذا كان `MBP` موجودًا و`DeepLOB runtime` متاحًا.
+- إذا قررت Stage1 تخطي `Step 3e` بسبب الميزانية أو غياب runtime، ستجد السبب في `outputs_v19/lob_build_meta.json`.
+- على Windows native، TensorFlow سيعمل غالبًا على `CPU` فقط؛ إذا أردت `GPU` للـ DeepLOB فشغّل التدريب على Linux/WSL2.
+
 ### 1b. Regime Research Mode
 
 إذا أردت اختبار `Wasserstein` يدويًا على dataset أصغر أو في تجربة بحثية:
@@ -244,6 +249,8 @@ python3 train_v19.py \
   --output outputs_v19 \
   --phase full
 ```
+
+`train_v19.py --data outputs_v19` يبحث تلقائيًا عن `lob_tensors.npy` داخل نفس artifact dir، وليس في مجلد الأب.
 
 يمكن أيضًا تشغيل CatBoost فقط أو التدريب فقط من نفس الملف:
 

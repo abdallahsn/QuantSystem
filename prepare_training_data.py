@@ -553,6 +553,40 @@ def _load_records_frame(records: list[dict]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _load_records_columns(records: list[dict], columns: list[str]) -> pd.DataFrame:
+    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    frames: list[pd.DataFrame] = []
+    for record in ordered:
+        frame = read_table(record['path'])
+        keep = [col for col in columns if col in frame.columns]
+        if not keep:
+            continue
+        frames.append(frame.loc[:, keep].copy(deep=False))
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    out = pd.concat(frames, ignore_index=True)
+    if 'ts_event' in out.columns:
+        out['ts_event'] = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+        out = out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    return out
+
+
+def _load_lob_source_from_records(records: list[dict], kind: str) -> pd.DataFrame:
+    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    frames: list[pd.DataFrame] = []
+    for record in ordered:
+        frame = _lob_source_frame(read_table(record['path']), kind)
+        if len(frame):
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    if 'ts_event' in out.columns:
+        out['ts_event'] = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+        out = out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    return out
+
+
 def _rewrite_records_from_frame(
     df: pd.DataFrame,
     *,
@@ -1466,6 +1500,32 @@ def _deeplob_runtime_limits(lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT) ->
     }
 
 
+def _write_empty_lob_artifacts(
+    output_dir: str,
+    *,
+    status: str,
+    reason: str,
+    build_plan: dict | None = None,
+    error: str | None = None,
+) -> None:
+    lob_path = os.path.join(output_dir, 'lob_tensors.npy')
+    ts_path = os.path.join(output_dir, 'lob_tensor_timestamps.npy')
+    empty_lob = np.zeros((0, N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32)
+    empty_ts = np.array([], dtype=np.int64)
+    np.save(lob_path, empty_lob)
+    np.save(ts_path, empty_ts)
+    payload = dict(build_plan or {})
+    payload.update({
+        'status': str(status),
+        'built_tensors': 0,
+        'reason': str(reason),
+    })
+    if error is not None:
+        payload['error'] = str(error)
+    with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
 def _lob_source_frame(df: pd.DataFrame, kind: str) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return pd.DataFrame()
@@ -2140,10 +2200,10 @@ def run_refinery(
     _require_causal_label_runtime(label_mode)
 
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
-    deeplob_enabled = False
-    lob_mbo_src = None
-    lob_mbp_src = None
+    deeplob_enabled = bool(mbp_exists and _load_deeplob_components())
     lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
+    if mbp_exists and not deeplob_enabled:
+        print("  ⚠️ DeepLOB runtime غير متاح — Step 3e سيُنتج LOB artifacts فارغة")
 
     print(f"\n📥 Phase A — Canonical Ingest")
     print(f"  MBO: {mbo_path}")
@@ -2334,15 +2394,31 @@ def run_refinery(
         df_labeled = _label_sessions(df_merged)
 
     # ── V19 Step 3e: LOB Tensor Dataset (event-rich emit positions) ─────
-    if deeplob_enabled and lob_mbp_src is not None and len(lob_mbp_src) > 0:
+    lob_path = os.path.join(output_dir, 'lob_tensors.npy')
+    ts_path = os.path.join(output_dir, 'lob_tensor_timestamps.npy')
+    build_plan_path = os.path.join(output_dir, 'lob_build_plan.json')
+    lob_meta_path = os.path.join(output_dir, 'lob_build_meta.json')
+    existing_lob_meta = {}
+    if os.path.exists(lob_meta_path):
+        try:
+            with open(lob_meta_path) as f:
+                existing_lob_meta = json.load(f)
+        except Exception:
+            existing_lob_meta = {}
+    reusable_lob_statuses = {'built', 'skipped', 'empty_event_sample'}
+    if (
+        resume and
+        os.path.exists(lob_path) and
+        os.path.exists(ts_path) and
+        not lob_limits['force'] and
+        str(existing_lob_meta.get('status', '')).strip().lower() in reusable_lob_statuses
+    ):
+        print("\n⚙️  Step 3e — Reusing existing LOB Tensor Dataset (resume)...")
+    elif deeplob_enabled and mbp_records:
         print("\n⚙️  Step 3e — Building Event-Rich LOB Tensor Dataset (V19)...")
         try:
-            lob_path = os.path.join(output_dir, 'lob_tensors.npy')
-            ts_path = os.path.join(output_dir, 'lob_tensor_timestamps.npy')
-            empty_lob = np.zeros((0, N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32)
-            empty_ts = np.array([], dtype=np.int64)
-            mbo_rows = 0 if lob_mbo_src is None else int(len(lob_mbo_src))
-            mbp_rows = 0 if lob_mbp_src is None else int(len(lob_mbp_src))
+            mbo_rows = int(sum(int(record.get('rows', 0)) for record in mbo_final_records))
+            mbp_rows = int(sum(int(record.get('rows', 0)) for record in mbp_records))
             total_lob_events = mbo_rows + mbp_rows
             tensor_bytes = max(1, N_TIME_STEPS * N_PRICE_LEVELS * N_CHANNELS * np.dtype(np.float32).itemsize)
             max_tensors_by_bytes = max(0, lob_limits['max_bytes'] // tensor_bytes)
@@ -2350,11 +2426,6 @@ def run_refinery(
             if max_tensors_by_bytes > 0:
                 effective_max_tensors = min(effective_max_tensors, max_tensors_by_bytes)
             sample_cap = int(min(lob_limits['lob_event_sample'], max(effective_max_tensors, 0) or lob_limits['lob_event_sample']))
-            emit_positions, emit_meta = _select_event_rich_lob_emit_positions(
-                df_labeled,
-                lob_mbp_src,
-                max_events=sample_cap,
-            )
             build_plan = {
                 'force': lob_limits['force'],
                 'max_events': lob_limits['max_events'],
@@ -2366,73 +2437,107 @@ def run_refinery(
                 'mbo_rows': mbo_rows,
                 'mbp_rows': mbp_rows,
                 'total_events': total_lob_events,
-                **emit_meta,
             }
             skip_large = (
                 (total_lob_events > lob_limits['max_events']) or
                 (effective_max_tensors <= 0)
             ) and not lob_limits['force']
-            with open(os.path.join(output_dir, 'lob_build_plan.json'), 'w') as f:
+            with open(build_plan_path, 'w') as f:
                 json.dump(build_plan, f, indent=2)
 
             if skip_large:
-                np.save(lob_path, empty_lob)
-                np.save(ts_path, empty_ts)
-                with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
-                    json.dump({
-                        **build_plan,
-                        'status': 'skipped',
-                        'built_tensors': 0,
-                        'reason': 'auto_skip_large_step3e',
-                    }, f, indent=2)
+                _write_empty_lob_artifacts(
+                    output_dir,
+                    status='skipped',
+                    reason='auto_skip_large_step3e',
+                    build_plan=build_plan,
+                )
                 print(
                     "  ⚠️ Step 3e skipped تلقائيًا: "
                     f"events={total_lob_events:,}, budget_tensors={effective_max_tensors:,}. "
                     "استخدم QUANTSYSTEM_FORCE_LOB=1 لو أردت تشغيله يدويًا."
                 )
-            elif len(emit_positions) == 0:
-                np.save(lob_path, empty_lob)
-                np.save(ts_path, empty_ts)
-                with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
-                    json.dump({
-                        **build_plan,
-                        'status': 'empty_event_sample',
-                        'built_tensors': 0,
-                        'reason': 'no_event_emit_positions',
-                    }, f, indent=2)
-                print("  ⚠️ لا توجد event-rich positions كافية لبناء LOB tensors")
             else:
-                lob_meta = build_lob_tensor_dataset(
-                    lob_mbo_src,
-                    lob_mbp_src,
-                    time_steps=N_TIME_STEPS,
-                    output_path=lob_path,
-                    timestamps_path=ts_path,
-                    emit_positions=emit_positions,
+                lob_mbp_index = _load_records_columns(mbp_records, ['ts_event'])
+                emit_positions, emit_meta = _select_event_rich_lob_emit_positions(
+                    df_labeled,
+                    lob_mbp_index,
+                    max_events=sample_cap,
                 )
-                lob_meta = {**build_plan, **lob_meta}
-                with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
-                    json.dump(lob_meta, f, indent=2)
+                build_plan.update(emit_meta)
+                with open(build_plan_path, 'w') as f:
+                    json.dump(build_plan, f, indent=2)
 
-                if int(lob_meta.get('built_tensors', 0)) > 0:
-                    est_gb = lob_meta.get('estimated_tensor_bytes', 0) / (1024 ** 3)
-                    print(
-                        "  ✅ LOB Tensors built "
-                        f"({lob_meta.get('built_tensors', 0):,} tensors, "
-                        f"selected_emit_positions={len(emit_positions):,}, "
-                        f"~{est_gb:.2f} GB on disk)"
+                if len(emit_positions) == 0:
+                    _write_empty_lob_artifacts(
+                        output_dir,
+                        status='empty_event_sample',
+                        reason='no_event_emit_positions',
+                        build_plan=build_plan,
                     )
-                    print(f"  ✅ LOB Tensor file: {lob_path}")
-                    print(f"  ✅ LOB Timestamp file: {ts_path}")
+                    print("  ⚠️ لا توجد event-rich positions كافية لبناء LOB tensors")
                 else:
-                    print("  ⚠️ LOB Tensors فارغة بعد event sampling — visual embeddings ستعود للصفر")
+                    lob_mbo_src = _load_lob_source_from_records(mbo_final_records, 'mbo')
+                    lob_mbp_src = _load_lob_source_from_records(mbp_records, 'mbp')
+                    if len(lob_mbp_src) == 0:
+                        _write_empty_lob_artifacts(
+                            output_dir,
+                            status='empty_mbp_source',
+                            reason='mbp_source_unavailable',
+                            build_plan=build_plan,
+                        )
+                        print("  ⚠️ MBP source فارغ بعد canonical ingest — تعذر بناء LOB tensors")
+                    else:
+                        lob_meta = build_lob_tensor_dataset(
+                            lob_mbo_src,
+                            lob_mbp_src,
+                            time_steps=N_TIME_STEPS,
+                            output_path=lob_path,
+                            timestamps_path=ts_path,
+                            emit_positions=emit_positions,
+                        )
+                        lob_meta = {**build_plan, **lob_meta}
+                        with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
+                            json.dump(lob_meta, f, indent=2)
+
+                        if int(lob_meta.get('built_tensors', 0)) > 0:
+                            est_gb = lob_meta.get('estimated_tensor_bytes', 0) / (1024 ** 3)
+                            print(
+                                "  ✅ LOB Tensors built "
+                                f"({lob_meta.get('built_tensors', 0):,} tensors, "
+                                f"selected_emit_positions={len(emit_positions):,}, "
+                                f"~{est_gb:.2f} GB on disk)"
+                            )
+                            print(f"  ✅ LOB Tensor file: {lob_path}")
+                            print(f"  ✅ LOB Timestamp file: {ts_path}")
+                        else:
+                            print("  ⚠️ LOB Tensors فارغة بعد event sampling — visual embeddings ستعود للصفر")
+                    del lob_mbo_src, lob_mbp_src
         except Exception as e:
-            np.save(os.path.join(output_dir, 'lob_tensors.npy'), np.zeros((0, N_TIME_STEPS, N_PRICE_LEVELS, N_CHANNELS), dtype=np.float32))
-            np.save(os.path.join(output_dir, 'lob_tensor_timestamps.npy'), np.array([], dtype=np.int64))
-            with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
-                json.dump({'status': 'failed', 'built_tensors': 0, 'error': str(e)}, f, indent=2)
+            _write_empty_lob_artifacts(
+                output_dir,
+                status='failed',
+                reason='exception',
+                build_plan=build_plan if 'build_plan' in locals() else None,
+                error=str(e),
+            )
             print(f"  ⚠️ LOB Tensor build failed: {e}")
-    del lob_mbo_src, lob_mbp_src
+    else:
+        reason = 'mbp_missing'
+        if mbp_exists and not deeplob_enabled:
+            reason = 'deeplob_runtime_unavailable'
+        print(f"\n⚙️  Step 3e — Skipped ({reason})...")
+        _write_empty_lob_artifacts(
+            output_dir,
+            status='disabled',
+            reason=reason,
+            build_plan={
+                'force': lob_limits['force'],
+                'max_events': lob_limits['max_events'],
+                'max_tensors': lob_limits['max_tensors'],
+                'lob_event_sample': int(lob_limits['lob_event_sample']),
+            },
+        )
 
     # ⑦ FIX: del df_merged بعد انتهاء كل المسارات
     del df_merged

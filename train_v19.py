@@ -545,6 +545,19 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
     return copied
 
 
+def _resolve_default_lob_paths(csv_path: str) -> tuple[str | None, str | None]:
+    try:
+        src_dir = resolve_artifact_root(csv_path)
+    except Exception:
+        src_dir = os.path.dirname(os.path.abspath(csv_path))
+    lob_path = os.path.join(src_dir, 'lob_tensors.npy')
+    lob_ts_path = os.path.join(src_dir, 'lob_tensor_timestamps.npy')
+    return (
+        lob_path if os.path.exists(lob_path) else None,
+        lob_ts_path if os.path.exists(lob_ts_path) else None,
+    )
+
+
 def _load_source_refinery_contract(csv_path: str) -> dict:
     src_dir = resolve_artifact_root(csv_path)
     manifest_path = os.path.join(src_dir, 'artifact_manifest.json')
@@ -1480,14 +1493,17 @@ def run_training_pipeline(
         f"rows={scaler_info['scaler_train_rows']:,} | split={scaler_info['split_time']}"
     )
 
+    default_lob_path, default_lob_ts_path = _resolve_default_lob_paths(csv_path)
     if not lob_path:
-        guess = os.path.join(os.path.dirname(os.path.abspath(csv_path)), 'lob_tensors.npy')
-        if os.path.exists(guess):
-            lob_path = guess
+        lob_path = default_lob_path
     if not lob_ts_path:
-        guess_ts = os.path.join(os.path.dirname(os.path.abspath(csv_path)), 'lob_tensor_timestamps.npy')
-        if os.path.exists(guess_ts):
-            lob_ts_path = guess_ts
+        lob_ts_path = default_lob_ts_path
+    if resolved_phase in (PHASE_FULL, PHASE_VISUAL) and (not lob_path or not os.path.exists(lob_path)):
+        try:
+            artifact_root = resolve_artifact_root(csv_path)
+        except Exception:
+            artifact_root = os.path.dirname(os.path.abspath(csv_path))
+        print(f"  ⚠️ LOB tensors not found under artifact root: {artifact_root}")
 
     splits, split_t0, split_t1 = build_time_splits(
         event_df,
