@@ -1088,16 +1088,46 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         .fillna(1.0)
         .clip(lower=1e-9)
     )
+    # ── Spoofing Detection (Fixed) ─────────────────────────────────────────
+    # BUG FIXED: The old threshold (mean_size * 1.5) used the *total* top-3
+    # depth as reference, making it mathematically impossible for a single-
+    # level cancel drop to exceed it (single drop ≈ 1/3 of top-3 total).
+    # Fix: use per-level (L0) average size as the reference baseline.
+    mean_l0 = (
+        pd.Series(
+            np.where(
+                (bid_sz[:, 0] + ask_sz[:, 0]) > 0,
+                (bid_sz[:, 0] + ask_sz[:, 0]) / 2.0,
+                np.nan,
+            ),
+            index=df_mbp.index,
+        )
+        .rolling(200, min_periods=1)
+        .mean()
+        .bfill()
+        .fillna(1.0)
+        .clip(lower=1e-9)
+    )
     bid_drop = np.maximum(np.r_[top_bid_vol[0], top_bid_vol[:-1]] - top_bid_vol, 0.0)
     ask_drop = np.maximum(np.r_[top_ask_vol[0], top_ask_vol[:-1]] - top_ask_vol, 0.0)
-    drop_thr = mean_size.to_numpy(dtype=np.float64) * 1.5
+    # Threshold: 1.5× the typical single best-level size (realistic for a cancel)
+    drop_thr = mean_l0.to_numpy(dtype=np.float64) * 1.5
     trade_mask = action.isin(TRADE_ACTIONS).to_numpy()
+    # Spoof = Cancel action (not a trade) that removes more than 1.5× avg L0 size
+    cancel_mask = action.isin(['C']).to_numpy()
     max_drop = np.maximum(bid_drop, ask_drop)
-    is_spoof = (~trade_mask) & (max_drop > drop_thr)
+    is_spoof = cancel_mask & (max_drop > drop_thr)
     spoof_count = pd.Series(is_spoof.astype(np.int8), index=df_mbp.index).rolling(50, min_periods=1).sum()
     trade_count = pd.Series(trade_mask.astype(np.int8), index=df_mbp.index).rolling(50, min_periods=1).sum().clip(lower=1.0)
     out['spoofing_ratio'] = np.minimum(spoof_count / trade_count, 1.0).astype(np.float32)
-    out['spoofing_duration'] = np.where(is_spoof, max_drop / mean_size.to_numpy(dtype=np.float64), 0.0).astype(np.float32)
+    # spoofing_duration: rolling mean of relative cancel magnitude (sustained signal, not sparse)
+    spoof_magnitude = np.where(is_spoof, max_drop / mean_l0.to_numpy(dtype=np.float64), 0.0)
+    out['spoofing_duration'] = (
+        pd.Series(spoof_magnitude, index=df_mbp.index)
+        .rolling(50, min_periods=1)
+        .mean()
+        .astype(np.float32)
+    )
 
     tick = max(float(tick_size), 1e-8)
     bid_diff = np.abs(np.diff(bid_px, axis=1))
@@ -1255,7 +1285,7 @@ def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
                         f"(tolerance={tolerance_ms}ms)"
                     )
             df = df.drop(columns=[mbp_ts_col], errors='ignore')
-                       
+
     for c in [
         'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
         'mid_price', 'micro_price', 'spread',
@@ -1274,7 +1304,7 @@ def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
         df[col] = df[col].astype('float32')
     for col in df.select_dtypes(include='int64').columns:
         df[col] = df[col].astype('int32')
-        
+
     gc.collect()
     return df
 
@@ -1329,7 +1359,7 @@ def _compute_setup_threshold(group):
     if 'absorption_intensity' in group.columns and float(group['absorption_intensity'].mean()) > 0.3: signals.append('absorption')
     if 'spoofing_ratio' in group.columns and float(group['spoofing_ratio'].mean()) > 0.2: signals.append('spoofing')
     if 'obi' in group.columns and float(group['obi'].abs().mean()) > 0.3: signals.append('obi')
-    
+
     if len(signals) > 1: return SETUP_MIXED
     elif 'absorption' in signals: return SETUP_ABSORPTION
     elif 'spoofing' in signals: return SETUP_SPOOFING
@@ -1393,10 +1423,10 @@ def _compute_rolling_stats(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
     print(f"\n📊 Rolling Stats (window={window} ticks)...")
     df = df.copy()
     roll_cols = []
-    
+
     # لا نقوم بعمل Rolling للـ Embeddings
     base_features = [c for c in MODEL_FEATURE_COLS if not c.startswith('emb_')]
-    
+
     new_roll_dfs = []
     for col in base_features:
         if col not in df.columns: df[col] = 0.0
@@ -1965,7 +1995,7 @@ def _normalize_and_save(
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
-    
+
     final_dir = _artifact_phase_dir(output_dir, FINAL_FEATURE_DIR)
     final_shards = write_parquet_shards(
         df[out_cols],
@@ -1994,7 +2024,7 @@ def _report(df, mbo_p, mbp_p, elapsed, output_dir):
     L(f"🕐 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ⏱ {elapsed:.1f}s")
     L("="*70); L(f"  MBO  : {mbo_p}"); L(f"  MBP10: {mbp_p}")
     L(); L("─"*70); L("📊 حالة الـ Features (عينة):"); L("─"*70)
-    
+
     sample_cols = [c for c in MODEL_FEATURE_COLS if c in df.columns and (not c.startswith('emb_') or c == 'emb_0')]
     for col in sample_cols[:25]:
         nz=int((df[col]!=0).sum()); pct=nz/max(total,1)*100
@@ -2017,7 +2047,7 @@ def _report(df, mbo_p, mbp_p, elapsed, output_dir):
 def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
     """
     يُطبَّق في الـ Live Trading لتطبيع features بنفس معاملات التدريب.
-    
+
     الاستخدام:
         df_live = apply_scaler_params(df_live, 'outputs/scaler_params.json')
     """
@@ -2025,10 +2055,10 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
     if not os.path.exists(scaler_path):
         print(f"  ⚠️ scaler_params.json غير موجود: {scaler_path}")
         return df
-    
+
     with open(scaler_path) as f:
         params = json.load(f)
-    
+
     df = df.copy()
     for col, p in params.items():
         if col not in df.columns:
@@ -2036,7 +2066,7 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
             continue
         s = df[col].astype('float32').fillna(0.0)
         t = p.get('type', 'zero')
-        
+
         if t == 'binary':
             df[col] = s
         elif t == 'robust':
@@ -2046,7 +2076,7 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
             df[col] = ((s - p['min']) / rng * 2 - 1).clip(-10, 10)
         else:
             df[col] = 0.0
-    
+
     return df
 
 def run_refinery(
