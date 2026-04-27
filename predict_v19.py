@@ -29,7 +29,12 @@ from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLog
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
 from modules.preprocessing_v19 import V19FeaturePreprocessor
-from modules.regime_classifier import RegimeClassifier, REGIME_NAMES
+from modules.regime_classifier import (
+    REGIME_META_SCORE_COLS,
+    REGIME_NAMES,
+    REGIME_ONE_HOT_COLS,
+    RegimeClassifier,
+)
 from modules.slippage_model import DailyLossGuard
 try:
     from modules.deeplob_cnn import DeepLOBCNN
@@ -98,6 +103,7 @@ class V19PredictionEngine:
 
         self.pre = V19FeaturePreprocessor(models_dir)
         self.factory = self.pre.factory
+        self.schema = self.factory.schema
         self.seq_len = self.factory.seq_len
         self.stat_features = self.factory.stat_features
         self.meta_features = self.factory.meta_features
@@ -152,7 +158,14 @@ class V19PredictionEngine:
         else:
             print("  ⚠️ Regime classifier missing")
 
+        regime_meta_required = max(len(self.meta_features) - N_CB_PROBS, 0) > 0
+        if regime_meta_required and not regime_ok:
+            raise FileNotFoundError(
+                "❌ Regime classifier artifact is required by the feature schema but was not found."
+            )
+
         deeplob_path = os.path.join(models_dir, artifacts.get('deeplob_model', 'deeplob_cnn_v19.keras'))
+        deeplob_cfg = self.schema.get('deeplob', {}) or {}
         if DEEPLOB_AVAILABLE and os.path.exists(deeplob_path):
             self.cnn = DeepLOBCNN(brain_file=deeplob_path)
             if self.cnn is not None and not self.cnn._fitted:
@@ -163,6 +176,15 @@ class V19PredictionEngine:
             print("  ⚠️ DeepLOB V19 missing or not fitted")
         else:
             print("  ✅ DeepLOB V19 loaded")
+        if (
+            run_mode == 'live'
+            and bool(deeplob_cfg.get('required_runtime', False))
+            and len(self.visual_features) > 0
+            and self.cnn is None
+        ):
+            raise RuntimeError(
+                "❌ DeepLOB runtime/model required by schema, but inference runtime is unavailable."
+            )
 
         if os.path.exists(meta_path):
             self.meta = MetaLearnerLSTM(
@@ -264,18 +286,19 @@ class V19PredictionEngine:
         if expected_dim == 0:
             return out
         if not self.regime_clf._fitted:
-            out[:, 0] = 1.0
-            return out
-        try:
-            if n == 1 and len(self._regime_buffer):
-                recent_df = pd.DataFrame(list(self._regime_buffer))
-                meta_df = self.regime_clf.predict_regime_meta(recent_df).iloc[-1:]
-            else:
-                meta_df = self.regime_clf.predict_regime_meta(stat_df)
-            meta_cols = list(self.meta_features[N_CB_PROBS:])
-            out = meta_df.reindex(columns=meta_cols, fill_value=0.0).values.astype(np.float32)
-        except Exception:
-            out[:, 0] = 1.0
+            raise RuntimeError('❌ Regime meta surface required by schema but classifier is not fitted.')
+        if n == 1 and len(self._regime_buffer):
+            recent_df = pd.DataFrame(list(self._regime_buffer))
+            meta_df = self.regime_clf.predict_regime_meta(recent_df).iloc[-1:]
+        else:
+            meta_df = self.regime_clf.predict_regime_meta(stat_df)
+        meta_cols = list(self.meta_features[N_CB_PROBS:])
+        missing = [col for col in meta_cols if col not in meta_df.columns]
+        if missing:
+            raise ValueError(
+                f'❌ Regime meta surface missing required columns: {missing}'
+            )
+        out = meta_df.reindex(columns=meta_cols, fill_value=0.0).values.astype(np.float32)
         return out
 
     def _get_visual_embeddings(self, n: int, lob_tensor: np.ndarray = None) -> np.ndarray:

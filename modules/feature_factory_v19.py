@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 EXPECTED_SCHEMA_VERSION = 'v19-event-binary'
-EXPECTED_META_FEATURES = 6
+EXPECTED_META_FEATURES = 9
 
 
 DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')

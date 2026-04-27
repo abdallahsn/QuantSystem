@@ -213,6 +213,72 @@ def _load_csv(path: str) -> pd.DataFrame:
     return df
 
 
+def _load_json_if_exists(path: str) -> dict | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _load_backtest_contract(csv_path: str, models_dir: str) -> tuple[dict, dict]:
+    model_manifest = _load_json_if_exists(os.path.join(models_dir, 'manifest.json')) or {}
+    dataset_manifest = _load_json_if_exists(os.path.join(os.path.dirname(os.path.abspath(csv_path)), 'artifact_manifest.json')) or {}
+    return model_manifest, dataset_manifest
+
+
+def _enforce_oos_backtest_guard(
+    df: pd.DataFrame,
+    *,
+    csv_path: str,
+    models_dir: str,
+    allow_in_sample_data_override: bool = False,
+) -> dict:
+    info = {
+        'checked': True,
+        'allowed': True,
+        'reason': 'no_overlap_detected',
+    }
+    if allow_in_sample_data_override:
+        info['reason'] = 'override_enabled'
+        return info
+
+    if 'bias_label' not in df.columns and 'forward_return' not in df.columns:
+        info['reason'] = 'unlabeled_dataset'
+        return info
+
+    model_manifest, dataset_manifest = _load_backtest_contract(csv_path, models_dir)
+    source_contract = ((model_manifest.get('extra', {}) or {}).get('source_contract', {}) or {})
+    source_csv = os.path.abspath(str(source_contract.get('source_csv') or model_manifest.get('inputs', {}).get('csv') or ''))
+    backtest_csv = os.path.abspath(csv_path)
+    source_dataset_id = str(source_contract.get('dataset_id') or '')
+    backtest_dataset_id = str((dataset_manifest.get('extra', {}) or {}).get('dataset_id') or '')
+
+    dataset_slice = pd.Series(df.get('dataset_slice', pd.Series([], dtype='object'))).astype(str).str.lower()
+    is_pure_holdout = bool(len(dataset_slice) > 0 and dataset_slice.isin(['holdout']).all())
+
+    same_path = bool(source_csv) and source_csv == backtest_csv
+    same_dataset = bool(source_dataset_id) and source_dataset_id == backtest_dataset_id
+
+    if (same_path or same_dataset) and not is_pure_holdout:
+        info['allowed'] = False
+        info['reason'] = 'same_training_dataset'
+        raise ValueError(
+            '❌ Refusing in-sample labeled backtest by default. '
+            'Use a pure holdout/OOS dataset or pass --allow_in_sample_data_override intentionally.'
+        )
+
+    if same_dataset and is_pure_holdout:
+        info['reason'] = 'same_dataset_holdout_only'
+    elif same_path and is_pure_holdout:
+        info['reason'] = 'same_csv_holdout_only'
+
+    return info
+
+
 def _filter_backtest_window(
     df: pd.DataFrame,
     start_ts: str | None = None,
@@ -961,6 +1027,8 @@ def main():
     p.add_argument('--meta_npy', default=None, help='optional row-aligned stage-1 meta features file')
     p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
                    help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
+    p.add_argument('--allow_in_sample_data_override', action='store_true',
+                   help='dangerous: allow backtesting directly on the training dataset / non-holdout labeled CSV')
     p.add_argument('--input_scaled', action='store_true',
                    help='set when CSV is already scaled like training_features_ready.csv')
     p.add_argument('--tick_size', type=float, default=0.0001)
@@ -982,6 +1050,12 @@ def main():
     args = p.parse_args()
 
     df = _load_csv(args.csv)
+    oos_guard = _enforce_oos_backtest_guard(
+        df,
+        csv_path=args.csv,
+        models_dir=args.models,
+        allow_in_sample_data_override=args.allow_in_sample_data_override,
+    )
     engine = V19PredictionEngine(args.models)
     visual_embeddings = _load_visual_embeddings(
         df,
@@ -1017,6 +1091,7 @@ def main():
         single_position_only=(not args.disable_single_position_only),
         cooldown_rows=args.cooldown_rows,
     )
+    summary['oos_guard'] = oos_guard
 
     print("\n✅ V19 causal backtest complete")
     print(json.dumps(summary, indent=2))

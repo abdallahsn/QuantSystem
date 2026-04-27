@@ -16,6 +16,7 @@ from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.logging_v19 import EventLogWriter, ExecutionLogger, RiskLogger, log_event
 from modules.monitoring_v19 import MonitoringState, emit_alerts, load_baseline_from_artifacts, load_jsonl, write_monitoring_outputs
 from modules.slippage_model import SlippageModel, confidence_bet_size
+from backtest_v19 import _simulate_trade_path
 from predict_v19 import V19PredictionEngine
 
 
@@ -86,6 +87,11 @@ def run_paper(
     df = pd.read_csv(csv_path, low_memory=False)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
     visual_embeddings = _visual_embeddings(visual_npy, len(canonical_df), len(engine.visual_features))
+    prices = pd.to_numeric(canonical_df.get('price', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    horizons = pd.to_numeric(canonical_df.get('label_horizon_steps', 0), errors='coerce').fillna(0).astype(np.int32).to_numpy()
+    micro_atr = pd.to_numeric(canonical_df.get('micro_atr', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    tick_size = float(cfg.get('backtest', {}).get('tick_size', 0.0001))
+    tick_value = float(cfg.get('backtest', {}).get('tick_value', 10.0))
 
     slippage = SlippageModel()
     trades = []
@@ -116,19 +122,17 @@ def run_paper(
         runtime = decide_runtime_mode(health, {**failsafe_cfg, **rollout_cfg})
 
         if active is not None:
-            end_ts = active.get('label_end_ts')
-            if end_ts is not None and not pd.isna(end_ts) and pd.Timestamp(end_ts) <= pd.Timestamp(ts):
-                raw_pnl_pips = float(active['forward_return'] / max(float(cfg.get('backtest', {}).get('tick_size', 0.0001)), 1e-8))
-                if active['direction'] == 'SHORT':
-                    raw_pnl_pips *= -1.0
+            if i >= int(active.get('exit_idx', i + 1)):
+                raw_pnl_pips = float(active.get('raw_pnl_pips', 0.0) or 0.0)
                 adj = slippage.adjust_pnl(raw_pnl_pips, size=active['size'], direction=active['direction'].lower(), row=row.to_dict())
-                pnl = float(adj['real_pnl_pips']) * float(cfg.get('backtest', {}).get('tick_value', 10.0)) * active['size']
+                pnl = float(adj['real_pnl_pips']) * tick_value * active['size']
                 equity += pnl
                 engine.loss_guard.update_equity(equity)
                 engine.loss_guard.record_trade(pnl, ts=ts)
                 active['exit_ts'] = str(ts)
                 active['pnl_dollars'] = round(pnl, 2)
                 active['real_pnl_pips'] = adj['real_pnl_pips']
+                active['exit_reason'] = active.get('exit_reason', 'path_replay')
                 trades.append(active)
                 exec_logger.log_order(
                     'paper_trade_closed',
@@ -142,6 +146,7 @@ def run_paper(
                             'exit_ts': active['exit_ts'],
                             'pnl_dollars': active['pnl_dollars'],
                             'real_pnl_pips': active['real_pnl_pips'],
+                            'exit_reason': active['exit_reason'],
                             'equity_after': equity,
                         },
                     },
@@ -161,6 +166,7 @@ def run_paper(
                             'exit_ts': active['exit_ts'],
                             'pnl_dollars': active['pnl_dollars'],
                             'real_pnl_pips': active['real_pnl_pips'],
+                            'exit_reason': active['exit_reason'],
                             'equity_after': equity,
                         },
                     },
@@ -261,14 +267,29 @@ def run_paper(
 
         if active is None and pred.get('tradeable', False) and pred.get('bias') in ('LONG', 'SHORT'):
             fill = slippage.compute_fill(row.to_dict(), size=size, direction=pred['bias'].lower())
+            trade_path = _simulate_trade_path(
+                entry_idx=i,
+                direction=pred['bias'],
+                prices=prices,
+                horizons=horizons,
+                micro_atr=micro_atr,
+                tick_size=tick_size,
+                direction_threshold_ticks=1.0,
+                tp_mult=1.2,
+                sl_mult=1.0,
+                row_data=row.to_dict(),
+            )
+            if trade_path is None:
+                continue
             active = {
                 'direction': pred['bias'],
                 'confidence': float(pred.get('confidence', 0.0) or 0.0),
                 'size': size,
                 'entry_ts': str(ts),
                 'entry_price': float(fill.get('fill_price', row.get('price', 0.0)) or row.get('price', 0.0)),
-                'forward_return': float(row.get('forward_return', 0.0) or 0.0),
-                'label_end_ts': row.get('label_end_ts', ts),
+                'exit_idx': int(trade_path['exit_idx']),
+                'raw_pnl_pips': float(trade_path['raw_pnl_pips']),
+                'exit_reason': str(trade_path['exit_reason']),
                 'feature_hash': pred.get('feature_hash', ''),
             }
             exec_logger.log_order(

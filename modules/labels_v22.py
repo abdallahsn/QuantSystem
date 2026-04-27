@@ -7,7 +7,7 @@ v22 fixes three structural flaws that remained in v21:
           horizon now scales per volatility regime:
             slow market  → shorter horizon (don't wait forever)
             fast market  → longer horizon  (give the move space)
-          Formula: effective_horizon_i = clip(base × (ATR_median / ATR_i), min, max)
+          Formula: effective_horizon_i = clip(base × (ATR_i / ATR_median), min, max)
 
   FIX-10  Per-sample dynamic threshold in forward scan
           v21 used median(dynamic_threshold) — one scalar for the entire dataset.
@@ -72,6 +72,9 @@ SETUP_ABSORPTION = 0
 SETUP_SPOOFING   = 1
 SETUP_OBI        = 2
 SETUP_MIXED      = 3
+
+DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
+DEFAULT_V22_TP_MULT = 1.5
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -221,6 +224,8 @@ def _build_training_event_gate(
     wall_thr: float,
     shift_z_thr: float = 0.75,
     target_rate: float = 0.25,
+    causal_threshold_mode: str = "expanding",
+    fixed_score_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Build a stricter causal gate for dataset selection.
@@ -293,16 +298,31 @@ def _build_training_event_gate(
     candidate = np.zeros(n, dtype=bool)
     threshold = 0.0
     if base_mask.any():
-        base_rate = float(base_mask.mean())
-        desired_rate = min(max(float(target_rate), 0.05), base_rate)
-        keep_inside_base = min(max(desired_rate / max(base_rate, 1e-9), 0.0), 1.0)
-        if keep_inside_base >= 0.999:
-            candidate = base_mask.copy()
-            threshold = float(np.nanmin(score[base_mask]))
-        else:
-            q = min(max(1.0 - keep_inside_base, 0.0), 1.0)
-            threshold = float(np.nanquantile(score[base_mask], q))
+        mode = str(causal_threshold_mode or "expanding").strip().lower()
+        if mode == "fixed":
+            threshold = float(max(fixed_score_threshold or 0.0, 0.0))
             candidate = base_mask & (score >= threshold)
+        else:
+            past_scores: list[float] = []
+            past_base_count = 0
+            for i in range(n):
+                if not base_mask[i]:
+                    continue
+                if past_base_count <= 0 or len(past_scores) < max(int(roll_window), 10):
+                    current_threshold = 0.0
+                else:
+                    base_rate = float(past_base_count) / max(float(i), 1.0)
+                    desired_rate = min(max(float(target_rate), 0.05), base_rate)
+                    keep_inside_base = min(max(desired_rate / max(base_rate, 1e-9), 0.0), 1.0)
+                    if keep_inside_base >= 0.999:
+                        current_threshold = float(np.nanmin(past_scores))
+                    else:
+                        q = min(max(1.0 - keep_inside_base, 0.0), 1.0)
+                        current_threshold = float(np.nanquantile(np.asarray(past_scores, dtype=np.float64), q))
+                threshold = float(max(current_threshold, 0.0))
+                candidate[i] = bool(score[i] >= threshold)
+                past_scores.append(float(score[i]))
+                past_base_count += 1
         if not candidate.any():
             fallback = base_mask & (trigger_count >= 2)
             candidate = fallback if fallback.any() else base_mask.copy()
@@ -329,10 +349,10 @@ def _compute_adaptive_horizons(
         → don't wait forever for a move that isn't coming
 
     Formula:
-        h_i = base × clip(ATR_median_t / ATR_i, min_mult, max_mult)
+        h_i = base × clip(ATR_i / ATR_median_t, min_mult, max_mult)
 
     ATR_median_t is causal/expanding, so row i never sees future volatility.
-    This is the inverse of ATR: slow = short horizon, fast = long horizon.
+    This is proportional to ATR: slow = short horizon, fast = long horizon.
     Result is rounded to the nearest integer and bounded.
 
     Returns
@@ -345,10 +365,10 @@ def _compute_adaptive_horizons(
         # degenerate case: flat price, return base horizon everywhere
         return np.full(len(atr), base_horizon, dtype=np.int32)
 
-    atr_med = _causal_expanding_median(atr_hist, min_periods=20, fallback=float(base_horizon))
+    atr_med = _causal_expanding_median(atr_hist, min_periods=20, fallback=float(np.nanmedian(atr_hist)))
     safe_atr = np.where(atr < 1e-10, atr_med, atr)
-    ratio    = np.clip(atr_med / np.where(safe_atr < 1e-10, atr_med, safe_atr),
-                       min_mult, max_mult)
+    denom = np.where(atr_med < 1e-10, safe_atr, atr_med)
+    ratio = np.clip(safe_atr / np.where(denom < 1e-10, safe_atr, denom), min_mult, max_mult)
     horizons = np.round(base_horizon * ratio).astype(np.int32)
     return horizons
 
@@ -641,8 +661,8 @@ def build_causal_event_labels(
     horizon: int = 50,
     event_roll_window: int = 30,
     feature_roll_window: int = 150,
-    direction_threshold_ticks: float = 8.0,   # FIX: كان 5.0 → TP أكبر للـ GBPUSD
-    tp_mult: float = 2.5,                  # FIX: كان 1.5 → TP ≈ 20-30pip
+    direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    tp_mult: float = DEFAULT_V22_TP_MULT,
     sl_mult: float = 1.0,
     neutral_mult: float = 0.45,
     tick_size: float = 1e-4,
@@ -658,6 +678,8 @@ def build_causal_event_labels(
     # رُفع من 1e-5 (≈ صفر بعد التطبيع) → 0.05 = 5% من أقوى ميل مرصود
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
     trend_strength_min: float = 0.05,
+    causal_threshold_mode: str = "expanding",
+    training_event_score_threshold: float | None = None,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
     # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
 ) -> pd.DataFrame:
@@ -667,7 +689,7 @@ def build_causal_event_labels(
     v22 fixes (on top of all v21 fixes):
 
     FIX-9   Adaptive horizon ∝ ATR
-            effective_horizon_i = base × clip(ATR_median / ATR_i, min_mult, max_mult)
+            effective_horizon_i = base × clip(ATR_i / ATR_median, min_mult, max_mult)
             → fast markets get longer horizon, slow markets get shorter.
 
     FIX-10  Per-sample dynamic threshold in forward scan
@@ -697,6 +719,7 @@ def build_causal_event_labels(
     trend_filter_strict   : If True, also filter NEUTRAL rows by trend.
     trend_strength_min    : Minimum opposite-trend strength required to veto a
                             directional label.
+    causal_threshold_mode : `expanding` (default) أو `fixed` للـ training-event gate.
     """
 
     out = df.copy()
@@ -781,6 +804,8 @@ def build_causal_event_labels(
         vol_mult=vol_mult,
         obi_thr=obi_thr,
         wall_thr=wall_thr,
+        causal_threshold_mode=causal_threshold_mode,
+        fixed_score_threshold=training_event_score_threshold,
     )
 
     # ── 4. ATR: compute once, used by FIX-9 and FIX-10 ───────────────────────
@@ -799,9 +824,9 @@ def build_causal_event_labels(
     # ── 5. FIX-9: adaptive horizon ∝ ATR ─────────────────────────────────────
     #
     #  v21: effective_horizon = int(horizon × 1.5)  — same for all rows
-    #  v22: effective_horizon_i = base × clip(ATR_med / ATR_i, min, max)
+    #  v22: effective_horizon_i = base × clip(ATR_i / ATR_med, min, max)
     #
-    #  Why inverse ATR?
+    #  Why proportional ATR?
     #    High ATR → price moves fast → needs MORE bars to reach TP → longer horizon
     #    Low ATR  → price moves slow → DON'T wait → shorter horizon
     #

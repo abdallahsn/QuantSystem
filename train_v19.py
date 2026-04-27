@@ -58,7 +58,11 @@ from modules.oof_stacking import (
     run_sequential_oof,
 )
 from modules.purging_embargo import embargo_observations, purge_overlapping, walk_forward_expanding
-from modules.regime_classifier import RegimeClassifier
+from modules.regime_classifier import (
+    REGIME_META_SCORE_COLS,
+    REGIME_ONE_HOT_COLS,
+    RegimeClassifier,
+)
 
 try:
     from catboost import CatBoostClassifier, Pool
@@ -84,7 +88,8 @@ STAGE_TO_PHASE = {
 }
 META_FEATURE_NAMES = [
     'cb_prob_long', 'cb_prob_short',
-    'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',
+    *REGIME_ONE_HOT_COLS,
+    *REGIME_META_SCORE_COLS,
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
@@ -453,17 +458,35 @@ def _sequence_split_context(
     df: pd.DataFrame,
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
+    split_time: pd.Timestamp | None = None,
 ) -> dict:
     n = len(df)
     split_idx = max(seq_len * 2, int(n * train_frac))
     split_idx = min(max(split_idx, seq_len), n)
-    split_time = _time_series(df, 'ts_event').iloc[min(split_idx, n - 1)]
+    ts_event = _time_series(df, 'ts_event')
+    split_source = 'train_frac'
+    if split_time is None:
+        split_time = ts_event.iloc[min(split_idx, n - 1)]
+    else:
+        split_time = pd.to_datetime(split_time, utc=True, errors='coerce')
+        if pd.isna(split_time):
+            split_time = ts_event.iloc[min(split_idx, n - 1)]
+        else:
+            split_time = split_time.tz_localize(None)
+            split_source = 'explicit_time'
+            split_idx = int(np.searchsorted(ts_event.values.astype('datetime64[ns]'), split_time.to_datetime64(), side='left'))
+            split_idx = min(max(split_idx, seq_len), n)
     label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
-    train_row_ok = (np.arange(n) < split_idx) & (label_end < split_time)
+    if split_source == 'explicit_time':
+        time_ok = label_end <= split_time
+    else:
+        time_ok = label_end < split_time
+    train_row_ok = (np.arange(n) < split_idx) & time_ok
     val_row_ok = np.arange(n) >= split_idx
     return {
         'split_idx': int(split_idx),
         'split_time': split_time,
+        'split_source': split_source,
         'label_end': label_end,
         'train_row_ok': train_row_ok,
         'val_row_ok': val_row_ok,
@@ -474,8 +497,9 @@ def build_inference_scaler_params(
     df: pd.DataFrame,
     cols: list[str],
     train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
 ) -> tuple[dict, dict]:
-    split_ctx = _sequence_split_context(df, seq_len=SEQ_LEN, train_frac=train_frac)
+    split_ctx = _sequence_split_context(df, seq_len=SEQ_LEN, train_frac=train_frac, split_time=split_time)
     raw_frame = _raw_stat_frame(df, cols)
     train_mask = split_ctx['train_row_ok']
     if not np.any(train_mask):
@@ -488,6 +512,7 @@ def build_inference_scaler_params(
         'split_idx': int(split_ctx['split_idx']),
         'split_time': str(split_ctx['split_time']),
         'scaler_train_rows': int(len(train_frame)),
+        'split_source': str(split_ctx.get('split_source', 'train_frac')),
     }
     return scaler_params, info
 
@@ -502,7 +527,14 @@ def _save_scaler_params(output_dir: str, scaler_params: dict) -> str:
 def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
     copied = {}
     src_dir = os.path.dirname(os.path.abspath(csv_path))
-    for name in ('selected_features.txt', 'refinery_report.txt', 'lob_tensor_timestamps.npy'):
+    for name in (
+        'selected_features.txt',
+        'refinery_report.txt',
+        'lob_tensor_timestamps.npy',
+        'artifact_manifest.json',
+        'refinery_split.json',
+        'lob_build_meta.json',
+    ):
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
         if os.path.exists(src):
@@ -512,6 +544,65 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
             shutil.copy2(src, dst)
             copied[name] = dst
     return copied
+
+
+def _load_source_refinery_contract(csv_path: str) -> dict:
+    src_dir = os.path.dirname(os.path.abspath(csv_path))
+    manifest_path = os.path.join(src_dir, 'artifact_manifest.json')
+    split_path = os.path.join(src_dir, 'refinery_split.json')
+    out = {
+        'source_csv': os.path.abspath(csv_path),
+        'dataset_id': None,
+        'schema_version': None,
+        'label_mode': None,
+        'split_time': None,
+        'manifest_path': manifest_path if os.path.exists(manifest_path) else None,
+    }
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            extra = manifest.get('extra', {}) or {}
+            out['dataset_id'] = extra.get('dataset_id')
+            out['schema_version'] = extra.get('schema_version')
+            out['label_mode'] = extra.get('label_mode')
+            split_meta = extra.get('split_meta', {}) or {}
+            out['split_time'] = split_meta.get('split_time')
+        except Exception:
+            pass
+    if out['split_time'] is None and os.path.exists(split_path):
+        try:
+            with open(split_path) as f:
+                split_meta = json.load(f)
+            out['split_time'] = split_meta.get('split_time')
+        except Exception:
+            pass
+    return out
+
+
+def _resolve_meta_learner_profile(
+    train_sequences: int,
+    visual_seq_coverage: float,
+) -> dict:
+    train_sequences = int(max(train_sequences, 0))
+    visual_seq_coverage = float(np.clip(visual_seq_coverage, 0.0, 1.0))
+    if train_sequences < 2500 or visual_seq_coverage < 0.85:
+        return {
+            'name': 'compact',
+            'lstm_units_1': 48,
+            'lstm_units_2': 24,
+            'visual_dropout_rate': 0.35,
+            'confidence_threshold': 0.62,
+            'force_rebuild': True,
+        }
+    return {
+        'name': 'standard',
+        'lstm_units_1': 128,
+        'lstm_units_2': 64,
+        'visual_dropout_rate': 0.25,
+        'confidence_threshold': 0.65,
+        'force_rebuild': False,
+    }
 
 
 def build_time_splits(
@@ -686,22 +777,23 @@ def stage1_oof_meta(
     )
     oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
 
+    regime_meta_dim = len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)
+
     def _regime_predict(train_idx, test_idx, fold_no):
         clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         clf.fit(df.iloc[train_idx].copy(), output_dir=regime_tmp_dir)
-        labels = clf.predict(df.iloc[test_idx].copy())
-        out = np.zeros((len(test_idx), N_CLUSTERS), dtype=np.float32)
-        for i, label in enumerate(labels):
-            if 0 <= int(label) < N_CLUSTERS:
-                out[i, int(label)] = 1.0
-            else:
-                out[i, 0] = 1.0
-        return out, {'cluster_counts': np.bincount(labels.astype(np.int32), minlength=N_CLUSTERS).tolist()}
+        meta = clf.predict_regime_meta(df.iloc[test_idx].copy())
+        labels = np.argmax(meta.loc[:, list(REGIME_ONE_HOT_COLS)].values, axis=1).astype(np.int32)
+        return meta.values.astype(np.float32), {
+            'cluster_counts': np.bincount(labels, minlength=N_CLUSTERS).tolist(),
+        }
 
     regime_raw, regime_covered, regime_reports = run_sequential_oof(
-        n, N_CLUSTERS, splits, _regime_predict
+        n, regime_meta_dim, splits, _regime_predict
     )
-    regime_oh = fill_uncovered_one_hot(regime_raw, regime_covered, default_class=0)
+    regime_meta = np.zeros((n, regime_meta_dim), dtype=np.float32)
+    regime_meta[:, 0] = 1.0
+    regime_meta[regime_covered] = regime_raw[regime_covered]
     coverage = prob_covered & regime_covered
 
     fold_metrics = {
@@ -751,19 +843,13 @@ def stage1_oof_meta(
         N_CB_PROBS,
         classes=final_cb_classes,
     )
-    live_regime_labels = final_regime.predict(df.copy())
-    live_regime_oh = np.zeros((n, N_CLUSTERS), dtype=np.float32)
-    for i, label in enumerate(live_regime_labels):
-        if 0 <= int(label) < N_CLUSTERS:
-            live_regime_oh[i, int(label)] = 1.0
-        else:
-            live_regime_oh[i, 0] = 1.0
+    live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
     np.save(
         os.path.join(output_dir, 'meta_features_live_v19.npy'),
-        np.concatenate([live_probs, live_regime_oh], axis=1).astype(np.float32),
+        np.concatenate([live_probs, live_regime_meta], axis=1).astype(np.float32),
     )
 
-    meta = np.concatenate([oof_probs, regime_oh], axis=1).astype(np.float32)
+    meta = np.concatenate([oof_probs, regime_meta], axis=1).astype(np.float32)
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
     print(f"  ✅ OOF Meta Features: {meta.shape}")
@@ -851,19 +937,16 @@ def stage2_oof_visual_embeddings(
     zero_cov = np.zeros(n_rows, dtype=bool)
 
     if lob_tensors is None or lob_timestamps is None or len(lob_tensors) == 0:
-        print("  ⚠️ LOB inputs غير متاحة — visual embeddings = 0")
-        np.save(os.path.join(output_dir, 'visual_embeddings_v19.npy'), zero_emb)
-        np.save(os.path.join(output_dir, 'visual_embeddings_live_v19.npy'), zero_emb)
-        np.save(os.path.join(output_dir, 'visual_coverage_v19.npy'), zero_cov.astype(np.uint8))
-        return zero_emb, zero_cov
+        raise RuntimeError(
+            '❌ DeepLOB stage requested but LOB tensors/timestamps are unavailable. '
+            'Re-run stage1 with valid MBP inputs and Step 3e enabled.'
+        )
 
     DeepLOBCNN, DEEPLOB_IMPORT_OK = _load_deeplob_runtime()
     if not DEEPLOB_IMPORT_OK:
-        print("  ⚠️ DeepLOB import غير متاح — visual embeddings = 0")
-        np.save(os.path.join(output_dir, 'visual_embeddings_v19.npy'), zero_emb)
-        np.save(os.path.join(output_dir, 'visual_embeddings_live_v19.npy'), zero_emb)
-        np.save(os.path.join(output_dir, 'visual_coverage_v19.npy'), zero_cov.astype(np.uint8))
-        return zero_emb, zero_cov
+        raise RuntimeError(
+            '❌ DeepLOB runtime is required for the visual stage but TensorFlow/DeepLOB is unavailable.'
+        )
 
     row_to_tensor, tensor_targets, tensor_target_seen = _align_lob_to_rows(
         df,
@@ -1112,6 +1195,31 @@ def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
     return event_cfg
 
 
+def _resolve_meta_learner_profile(
+    train_sequences: int,
+    visual_seq_coverage: float,
+) -> dict:
+    train_sequences = int(max(train_sequences, 0))
+    visual_seq_coverage = float(np.clip(visual_seq_coverage, 0.0, 1.0))
+    if train_sequences < 2500 or visual_seq_coverage < 0.85:
+        return {
+            'name': 'compact',
+            'lstm_units_1': 48,
+            'lstm_units_2': 24,
+            'visual_dropout_rate': 0.35,
+            'confidence_threshold': 0.62,
+            'force_rebuild': True,
+        }
+    return {
+        'name': 'standard',
+        'lstm_units_1': 128,
+        'lstm_units_2': 64,
+        'visual_dropout_rate': 0.25,
+        'confidence_threshold': 0.65,
+        'force_rebuild': False,
+    }
+
+
 def stage3_meta_learner_v19(
     df: pd.DataFrame,
     meta_features: np.ndarray,
@@ -1170,16 +1278,30 @@ def stage3_meta_learner_v19(
             )
         )
 
+    visual_seq_coverage = float(
+        np.mean(np.linalg.norm(np.asarray(visual_embeddings, dtype=np.float32), axis=1) > 0)
+    ) if len(visual_embeddings) else 0.0
+    profile = _resolve_meta_learner_profile(
+        train_sequences=len(X_tr),
+        visual_seq_coverage=visual_seq_coverage,
+    )
+    meta_brain_path = os.path.join(output_dir, 'meta_learner_v19.keras')
+    if profile.get('force_rebuild') and os.path.exists(meta_brain_path):
+        try:
+            os.remove(meta_brain_path)
+        except OSError:
+            pass
+
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
         n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
         n_meta_feat=int(meta_features.shape[1]),
         n_visual_emb=VISUAL_EMB_DIM,
-        brain_file=os.path.join(output_dir, 'meta_learner_v19.keras'),
-        lstm_units_1=128,
-        lstm_units_2=64,
-        dropout=0.25,
-        confidence_threshold=0.65,
+        brain_file=meta_brain_path,
+        lstm_units_1=int(profile['lstm_units_1']),
+        lstm_units_2=int(profile['lstm_units_2']),
+        dropout=float(profile['visual_dropout_rate']),
+        confidence_threshold=float(profile['confidence_threshold']),
     )
 
     history = meta.fit_train_val(
@@ -1201,6 +1323,7 @@ def stage3_meta_learner_v19(
                     'split': split_stats,
                     'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
                     'event_gate': event_gate_cfg,
+                    'profile': profile,
                 },
                 f,
                 indent=2,
@@ -1215,6 +1338,11 @@ def stage3_meta_learner_v19(
             'passthrough_cols': TRAINING_PASSTHROUGH_COLS,
             'timestamp_cols': ['ts_event', 'label_end_ts'],
             'input_dim': int(X_rows.shape[1]),
+            'regime_meta_features': [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
+            'deeplob': {
+                'enabled': bool(len(VISUAL_FEATURE_NAMES)),
+                'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
+            },
             'artifacts': {
                 'catboost_model': 'catboost_advisor_v19.cbm',
                 'catboost_classes': 'catboost_classes_v19.json',
@@ -1256,6 +1384,12 @@ def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) 
 
     meta_features = np.load(meta_path)
     coverage = np.load(coverage_path).astype(bool)
+    expected_meta_dim = len(META_FEATURE_NAMES)
+    meta_arr = np.asarray(meta_features)
+    if meta_arr.ndim != 2 or int(meta_arr.shape[1]) != expected_meta_dim:
+        raise ValueError(
+            f'❌ Stage1 cached meta surface mismatch: expected {expected_meta_dim} columns, got {meta_arr.shape}'
+        )
     if n_rows is not None and (len(meta_features) != int(n_rows) or len(coverage) != int(n_rows)):
         raise ValueError(
             f'❌ Stage1 cached artifacts shape mismatch: meta={len(meta_features)}, coverage={len(coverage)}, expected={int(n_rows)}'
@@ -1332,6 +1466,7 @@ def run_training_pipeline(
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
+    source_contract = _load_source_refinery_contract(csv_path)
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
 
@@ -1428,6 +1563,10 @@ def run_training_pipeline(
                 'lob_ts': lob_ts_path,
             },
             metrics=summary,
+            extra={
+                'source_contract': source_contract,
+                'meta_feature_dim': len(META_FEATURE_NAMES),
+            },
         )
         print('\n' + '=' * 65)
         print('✅ CatBoost stage completed independently')
@@ -1491,6 +1630,10 @@ def run_training_pipeline(
                 'lob_ts': lob_ts_path,
             },
             metrics=summary,
+            extra={
+                'source_contract': source_contract,
+                'meta_feature_dim': len(META_FEATURE_NAMES),
+            },
         )
         print('\n' + '=' * 65)
         print('✅ Visual stage completed independently')
@@ -1564,6 +1707,10 @@ def run_training_pipeline(
             'lob_ts': lob_ts_path,
         },
         metrics=summary,
+        extra={
+            'source_contract': source_contract,
+            'meta_feature_dim': len(META_FEATURE_NAMES),
+        },
     )
     print('\n' + '=' * 65)
     print(f'✅ V19 training slice اكتمل في {elapsed:.0f}s ({elapsed/60:.1f} دقيقة)')

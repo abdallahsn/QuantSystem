@@ -17,23 +17,27 @@
   "refinery": {
     "label_mode": "v19",
     "chunksize": 0,
-    "n_workers": null,
+    "n_workers": 1,
+    "deterministic_stage1": true,
     "target_bars": 500,
     "label_horizon": 150,
     "event_roll_window": 50,
     "direction_threshold_ticks": 1.5,
+    "causal_threshold_mode": "expanding",
     "tp_mult": 1.5,
     "sl_mult": 1.0,
     "kalman_slope_threshold": 0.05,
     "trend_strength_min": 0.05,
-    "lob_event_sample": 100000
+    "lob_event_sample": 100000,
+    "merge_tolerance_ms": 500
   },
   "backtest": {
     "tick_size": 0.0001,
     "tick_value": 10.0,
     "round_trip_cost_pips": 1.0,
     "max_size": 5,
-    "starting_equity": 100000.0
+    "starting_equity": 100000.0,
+    "allow_in_sample_data_override": false
   },
   "walkforward": {
     "n_splits": 3,
@@ -61,6 +65,10 @@
     "allow_missing_features_in_paper": true,
     "kill_switch_file": "outputs_v19/kill_switch.flag",
     "manual_override_state": "auto"
+  },
+  "deeplob": {
+    "enabled": true,
+    "require_runtime": true
   },
   "shadow": {
     "output_dir": "outputs_v19_shadow",

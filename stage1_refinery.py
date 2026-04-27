@@ -32,6 +32,7 @@ def main():
     # FIX: خُفّض من 5.0 → 2.0 tick
     # 5 tick floor كان يرفع TP/SL بشكل مبالغ فيه على بيانات منخفضة التذبذب
     p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 1.0)))
+    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default=str(defaults.get('causal_threshold_mode', 'expanding')))
 
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
     p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
@@ -47,6 +48,8 @@ def main():
     p.add_argument('--trend_strength_min', type=float,
                    default=float(defaults.get('trend_strength_min', 0.05)),
                    help='الحد الأدنى لقوة الترند المعاكس لتفعيل فلتر الحذف (default: 0.05)')
+    p.add_argument('--allow_unsafe_multiprocessing', action='store_true')
+    p.add_argument('--merge_tolerance_ms', type=int, default=int(defaults.get('merge_tolerance_ms', 500)))
 
     args = p.parse_args()
 
@@ -62,11 +65,15 @@ def main():
         label_horizon=args.label_horizon,
         event_roll_window=args.event_roll_window,
         direction_threshold_ticks=args.direction_threshold_ticks,
+        causal_threshold_mode=args.causal_threshold_mode,
         lob_event_sample=args.lob_event_sample,
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
         kalman_slope_threshold=args.kalman_slope_threshold,
         trend_strength_min=args.trend_strength_min,
+        deterministic_stage1=(not args.allow_unsafe_multiprocessing),
+        allow_unsafe_multiprocessing=args.allow_unsafe_multiprocessing,
+        merge_tolerance_ms=args.merge_tolerance_ms,
     )
 
 

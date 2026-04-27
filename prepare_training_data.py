@@ -11,7 +11,7 @@ prepare_training_data.py — V19 Data Refinery
 """
 
 # QuantSystem V19
-import argparse, datetime, os, sys, multiprocessing, json, inspect
+import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib
 import numpy as np
 import pandas as pd
 import gc
@@ -49,6 +49,7 @@ from modules.session_features        import add_cyclical_session_features, CYCLI
 from modules.context_features        import GARCHVolatilityProxy                                         # التعديل 2
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
+from modules.manifest_v19            import write_manifest
 # ── V19: DeepLOB Tensor Builder ──────────────────────────────────
 DEEPLOB_AVAILABLE = False
 LOBTensorBuilder = None
@@ -127,6 +128,67 @@ def _call_build_causal_event_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         print(f"  ℹ️ Label builder compatibility: ignoring unsupported args {dropped}")
 
     return build_causal_event_labels(df, **filtered_kwargs)
+
+
+def _require_causal_label_runtime(label_mode: str) -> None:
+    mode = str(label_mode or '').strip().lower()
+    if mode not in {'v19', 'v22'}:
+        return
+    if V19_LABELS_AVAILABLE:
+        return
+    if os.environ.get('QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS', '').strip() == '1':
+        print("  ⚠️ Fallback session labeling allowed by QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1")
+        return
+    source = V19_LABELS_SOURCE or 'unavailable'
+    detail = f'{V19_LABELS_IMPORT_ERROR}' if V19_LABELS_IMPORT_ERROR is not None else 'missing runtime'
+    raise RuntimeError(
+        f"❌ Causal label runtime required for {mode.upper()} is unavailable "
+        f"({source}: {detail}). Set QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1 "
+        "only إذا كنت تقبل fallback غير سببي لأغراض التشخيص فقط."
+    )
+
+
+def _refinery_dataset_contract(
+    df: pd.DataFrame,
+    *,
+    mbo_path: str,
+    mbp_path: str,
+    label_mode: str,
+    output_dir: str,
+    split_meta: dict | None,
+    requested_workers: int | None,
+    effective_workers: int,
+    deeplob_enabled: bool,
+    deterministic_stage1: bool,
+    merge_tolerance_ms: int,
+) -> dict:
+    ts = pd.to_datetime(df.get('ts_event', pd.Series(dtype='datetime64[ns]')), utc=True, errors='coerce').dt.tz_localize(None)
+    ts = ts.dropna()
+    contract_seed = {
+        'mbo': os.path.abspath(mbo_path),
+        'mbp': os.path.abspath(mbp_path),
+        'label_mode': str(label_mode),
+        'rows': int(len(df)),
+        'ts_min': None if ts.empty else str(ts.min()),
+        'ts_max': None if ts.empty else str(ts.max()),
+        'split_time': (split_meta or {}).get('split_time'),
+    }
+    dataset_id = hashlib.sha256(json.dumps(contract_seed, sort_keys=True).encode('utf-8')).hexdigest()[:16]
+    return {
+        'dataset_id': dataset_id,
+        'schema_version': 'v19-event-binary',
+        'label_mode': str(label_mode),
+        'rows': int(len(df)),
+        'ts_min': contract_seed['ts_min'],
+        'ts_max': contract_seed['ts_max'],
+        'split_meta': split_meta or {},
+        'requested_workers': None if requested_workers is None else int(requested_workers),
+        'effective_workers': int(effective_workers),
+        'effective_worker_mode': 'sequential' if int(effective_workers) <= 1 else 'multiprocess',
+        'deterministic_stage1': bool(deterministic_stage1),
+        'deeplob_enabled': bool(deeplob_enabled),
+        'merge_tolerance_ms': int(merge_tolerance_ms),
+    }
 
 # 🔴 تحديث قائمة الميزات لتشمل حواس الماكرو الجديدة والـ Embeddings
 EMBEDDINGS_DIM = 8
@@ -434,7 +496,7 @@ def _process_mbo_chunk(args):
 
     return pd.DataFrame(out)
 
-def _process_mbo(df_mbo, n_workers: int = None):
+def _process_mbo(df_mbo, n_workers: int = None, allow_unsafe_multiprocessing: bool = False):
     print("  🔧 Auto-Calibration...")
     cal     = AutoCalibrator(n_ticks=2000).fit(df_mbo)
     engines = cal.build_engines(include_extended=True)
@@ -448,7 +510,15 @@ def _process_mbo(df_mbo, n_workers: int = None):
     }
 
     if n_workers is None:
-        n_workers = get_multiprocessing_workers()
+        n_workers = 1
+
+    if n_workers > 1 and not allow_unsafe_multiprocessing:
+        print(
+            "  🛡️ Deterministic stage1 active — forcing sequential MBO processing "
+            f"(requested_workers={n_workers}). "
+            "استخدم --allow_unsafe_multiprocessing فقط إذا كنت تقبل حدود chunk-state الحالية."
+        )
+        n_workers = 1
 
     if n_workers <= 1 or len(df_mbo) < 10_000:
         return _process_mbo_sequential(df_mbo, engines, cal_params)
@@ -647,7 +717,7 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
 
     return pd.DataFrame(out)
 
-def _merge(df_mbo, df_mbp):
+def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
     print("  🔗 merge_asof MBO + MBP10...")
     df_mbo = df_mbo.copy()
     df_mbp = df_mbp.copy()
@@ -671,8 +741,32 @@ def _merge(df_mbo, df_mbp):
         ]:
             df[c] = 0.0
     else:
-        df = pd.merge_asof(df_mbo, df_mbp, on='ts_event',
-                           direction='backward', tolerance=pd.Timedelta('5s'))
+        mbp_ts_col = 'mbp_ts_event'
+        df_mbp[mbp_ts_col] = df_mbp['ts_event']
+        tolerance = pd.Timedelta(milliseconds=max(int(tolerance_ms), 1))
+        df = pd.merge_asof(
+            df_mbo,
+            df_mbp,
+            on='ts_event',
+            direction='backward',
+            tolerance=tolerance,
+        )
+        if mbp_ts_col in df.columns:
+            matched = df[mbp_ts_col].notna()
+            if bool(matched.any()):
+                lag_ms = (
+                    (df.loc[matched, 'ts_event'] - df.loc[matched, mbp_ts_col])
+                    .dt.total_seconds()
+                    .mul(1000.0)
+                )
+                lag_warn_ratio = float((lag_ms > max(tolerance_ms * 0.5, 1.0)).mean()) if len(lag_ms) else 0.0
+                if lag_warn_ratio > 0.10:
+                    print(
+                        "  ⚠️ merge_asof lag warning: "
+                        f"{lag_warn_ratio:.1%} من الصفوف المطابقة تستخدم MBP snapshot قديم نسبيًا "
+                        f"(tolerance={tolerance_ms}ms)"
+                    )
+            df = df.drop(columns=[mbp_ts_col], errors='ignore')
                        
     for c in [
         'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
@@ -872,6 +966,7 @@ def _select_event_rich_lob_emit_positions(
     df_labeled: pd.DataFrame,
     lob_mbp_src: pd.DataFrame,
     max_events: int = LOB_EVENT_SAMPLE_DEFAULT,
+    max_positions: int | None = None,
 ) -> tuple[np.ndarray, dict]:
     if (
         df_labeled is None or len(df_labeled) == 0 or
@@ -926,12 +1021,43 @@ def _select_event_rich_lob_emit_positions(
         direction='backward',
     ).dropna(subset=['mbp_pos'])
     emit_positions = aligned['mbp_pos'].astype(np.int32).drop_duplicates().to_numpy()
+    base_emit_positions = int(len(emit_positions))
+    emit_neighbor_radius = 0
+    emit_neighbor_positions_capped = False
+
+    if max_positions is not None and base_emit_positions > 0:
+        limit = min(max(int(max_positions), 1), int(len(mbp_df)))
+        if base_emit_positions < limit:
+            selected_positions = {int(pos) for pos in emit_positions.tolist()}
+            radius = 0
+            while len(selected_positions) < limit:
+                radius += 1
+                changed = False
+                for pos in emit_positions.tolist():
+                    for neighbor in (int(pos) - radius, int(pos) + radius):
+                        if 0 <= neighbor < len(mbp_df) and neighbor not in selected_positions:
+                            selected_positions.add(int(neighbor))
+                            changed = True
+                            if len(selected_positions) >= limit:
+                                break
+                    if len(selected_positions) >= limit:
+                        break
+                if not changed:
+                    break
+            emit_neighbor_radius = int(radius)
+            emit_neighbor_positions_capped = bool(len(selected_positions) >= limit)
+            emit_positions = np.asarray(sorted(selected_positions)[:limit], dtype=np.int32)
+            emit_neighbor_radius = max(emit_neighbor_radius, int(len(emit_positions) - base_emit_positions))
+
     meta = {
         'directional_events_available': int(len(candidates)),
         'event_col': event_col,
         'strong_available': int(len(strong)),
         'weak_available': int(len(weak)),
         'selected_events': int(len(selected)),
+        'base_emit_positions': int(base_emit_positions),
+        'emit_neighbor_radius': int(emit_neighbor_radius),
+        'emit_neighbor_positions_capped': bool(emit_neighbor_positions_capped),
         'selected_emit_positions': int(len(emit_positions)),
         'selected_strong': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_STRONG) if selected_parts else 0),
         'selected_weak': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_WEAK) if selected_parts else 0),
@@ -1291,6 +1417,7 @@ def run_refinery(
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
     direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    causal_threshold_mode: str = 'expanding',
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
@@ -1298,6 +1425,9 @@ def run_refinery(
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
+    deterministic_stage1: bool = True,
+    allow_unsafe_multiprocessing: bool = False,
+    merge_tolerance_ms: int = 500,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -1309,6 +1439,10 @@ def run_refinery(
     print("="*70)
     mode = f"Chunked ({chunksize:,}/دفعة)" if chunksize else "Full Load"
     print(f"  ⚡ {mode}")
+    if chunksize:
+        print("  ⚠️ Chunked input reading is compatibility-mode only in this build; it still materializes the full frame before stage processing.")
+
+    _require_causal_label_runtime(label_mode)
 
     def _read(path):
         ext = os.path.splitext(path)[1].lower()
@@ -1337,7 +1471,15 @@ def run_refinery(
     lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
     lob_mbo_src = _lob_source_frame(df_mbo, 'mbo') if deeplob_enabled else None
     lob_mbp_src = None
-    df_mbo_p = _process_mbo(df_mbo, n_workers=n_workers)
+    requested_workers = n_workers if n_workers is not None else get_multiprocessing_workers()
+    effective_workers = requested_workers
+    if deterministic_stage1 and not allow_unsafe_multiprocessing:
+        effective_workers = 1
+    df_mbo_p = _process_mbo(
+        df_mbo,
+        n_workers=effective_workers,
+        allow_unsafe_multiprocessing=allow_unsafe_multiprocessing and not deterministic_stage1,
+    )
 
     _tick = float(AutoCalibrator(200).fit(df_mbo).tick_size) if len(df_mbo) > 0 else 0.0001
     del df_mbo
@@ -1355,7 +1497,7 @@ def run_refinery(
         del df_mbp
 
         print("\n⚙️  Step 3 — Merge MBO & MBP...")
-        df_merged = _merge(df_mbo_p, df_mbp_p)
+        df_merged = _merge(df_mbo_p, df_mbp_p, tolerance_ms=merge_tolerance_ms)
         del df_mbo_p, df_mbp_p
     else:
         df_merged = df_mbo_p.copy()
@@ -1394,6 +1536,7 @@ def run_refinery(
             horizon=label_horizon,
             event_roll_window=event_roll_window,
             direction_threshold_ticks=direction_threshold_ticks,
+            causal_threshold_mode=causal_threshold_mode,
             tp_mult=tp_mult,
             sl_mult=sl_mult,
             neutral_mult=0.45,
@@ -1520,6 +1663,58 @@ def run_refinery(
     )
     del df_labeled
 
+    split_meta = {}
+    split_path = os.path.join(output_dir, 'refinery_split.json')
+    if os.path.exists(split_path):
+        try:
+            with open(split_path) as f:
+                split_meta = json.load(f)
+        except Exception:
+            split_meta = {}
+    contract = _refinery_dataset_contract(
+        df_final,
+        mbo_path=mbo_path,
+        mbp_path=mbp_path,
+        label_mode=label_mode,
+        output_dir=output_dir,
+        split_meta=split_meta,
+        requested_workers=requested_workers,
+        effective_workers=effective_workers,
+        deeplob_enabled=deeplob_enabled,
+        deterministic_stage1=deterministic_stage1,
+        merge_tolerance_ms=merge_tolerance_ms,
+    )
+    artifact_manifest_path = write_manifest(
+        output_dir=output_dir,
+        kind='refinery_v19',
+        config={
+            'label_mode': label_mode,
+            'chunksize': chunksize,
+            'requested_workers': requested_workers,
+            'effective_workers': effective_workers,
+            'deterministic_stage1': bool(deterministic_stage1),
+            'allow_unsafe_multiprocessing': bool(allow_unsafe_multiprocessing),
+            'label_horizon': int(label_horizon),
+            'event_roll_window': int(event_roll_window),
+            'direction_threshold_ticks': float(direction_threshold_ticks),
+            'causal_threshold_mode': str(causal_threshold_mode),
+            'tp_mult': float(tp_mult),
+            'sl_mult': float(sl_mult),
+            'merge_tolerance_ms': int(merge_tolerance_ms),
+        },
+        inputs={
+            'mbo': os.path.abspath(mbo_path),
+            'mbp': os.path.abspath(mbp_path),
+        },
+        metrics={
+            'rows': int(len(df_final)),
+            'event_rows': int(pd.to_numeric(df_final.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8).sum()) if len(df_final) else 0,
+        },
+        extra=contract,
+        filename='artifact_manifest.json',
+    )
+    print(f"  ✅ Artifact manifest: {artifact_manifest_path}")
+
     elapsed = (datetime.datetime.now()-t0).total_seconds()
     _report(df_final, mbo_path, mbp_path, elapsed, output_dir)
     return df_final
@@ -1573,6 +1768,8 @@ if __name__=='__main__':
                    help='Rolling window for event filter (default: 50)')
     p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
                    help=f'Directional threshold floor in ticks (default: {DEFAULT_V22_DIRECTION_THRESHOLD_TICKS:.1f})')
+    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='expanding',
+                   help='threshold mode for train_event_flag selection (default: expanding)')
     p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
                    help='Max event-rich emit positions for LOB tensors')
     p.add_argument('--tp_mult', type=float, default=DEFAULT_V22_TP_MULT,
@@ -1583,6 +1780,10 @@ if __name__=='__main__':
                    help='Kalman slope threshold for trend direction (default: 0.05)')
     p.add_argument('--trend_strength_min', type=float, default=0.05,
                    help='Minimum opposite-trend strength required to veto directional labels (default: 0.05)')
+    p.add_argument('--allow_unsafe_multiprocessing', action='store_true',
+                   help='allow legacy multi-worker MBO path رغم حدود state الحالية')
+    p.add_argument('--merge_tolerance_ms', type=int, default=500,
+                   help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
     a  = p.parse_args()
     cs = None if a.chunksize == 0 else a.chunksize
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
@@ -1591,8 +1792,12 @@ if __name__=='__main__':
                  label_horizon=a.label_horizon,
                  event_roll_window=a.event_roll_window,
                  direction_threshold_ticks=a.direction_threshold_ticks,
+                 causal_threshold_mode=a.causal_threshold_mode,
                  lob_event_sample=a.lob_event_sample,
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,
                  kalman_slope_threshold=a.kalman_slope_threshold,
-                 trend_strength_min=a.trend_strength_min)
+                 trend_strength_min=a.trend_strength_min,
+                 deterministic_stage1=(not a.allow_unsafe_multiprocessing),
+                 allow_unsafe_multiprocessing=a.allow_unsafe_multiprocessing,
+                 merge_tolerance_ms=a.merge_tolerance_ms)

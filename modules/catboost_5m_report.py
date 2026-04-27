@@ -20,6 +20,12 @@ from plotly.subplots import make_subplots
 from modules.oof_stacking import align_probability_columns
 from prepare_training_data import CATBOOST_ADVISOR_FEATURES
 from train_v19 import _apply_scaler_to_stat_frame, _raw_stat_frame, load_training_csv
+try:
+    from modules.range_state_machine import apply_range_filter_to_dataframe
+    RSM_AVAILABLE = True
+except ImportError:
+    apply_range_filter_to_dataframe = None
+    RSM_AVAILABLE = False
 
 try:
     from catboost import CatBoostClassifier
@@ -235,6 +241,9 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             bars["kyle_lambda"].fillna(0.0).astype(float).values,
             bars["hawkes_intensity"].fillna(0.0).astype(float).values,
             bars["regime_label"].fillna("Ranging").astype(str).values,
+            bars.get("cb_direction_raw", bars["cb_direction"]).fillna("UNKNOWN").astype(str).values,
+            bars.get("rsm_action", pd.Series(["N/A"] * len(bars), index=bars.index)).fillna("N/A").astype(str).values,
+            bars.get("rsm_reason", pd.Series(["N/A"] * len(bars), index=bars.index)).fillna("N/A").astype(str).values,
         ]
     )
     return go.Scatter(
@@ -262,7 +271,10 @@ def _build_price_hover_trace(bars: pd.DataFrame) -> go.Scatter:
             "Absorption=%{customdata[12]:.3f}<br>"
             "Kyle λ=%{customdata[13]:.3f}<br>"
             "Hawkes=%{customdata[14]:.3f}<br>"
-            "Regime=%{customdata[15]}<extra></extra>"
+            "Regime=%{customdata[15]}<br>"
+            "Raw Signal=%{customdata[16]}<br>"
+            "RSM Action=%{customdata[17]}<br>"
+            "RSM Reason=%{customdata[18]}<extra></extra>"
         ),
     )
 
@@ -692,8 +704,21 @@ def generate_catboost_5m_report(
 
     pred_df = predict_catboost_frame(csv_path, models_dir)
     bars = _resample_catboost_bars(pred_df, freq=freq)
-    if len(bars) > max_bars:
+    bars_before_limit = int(len(bars))
+    if RSM_AVAILABLE and len(bars):
+        bars["cb_direction_raw"] = bars["cb_direction"].astype(str)
+        bars = apply_range_filter_to_dataframe(bars, regime_col="regime_label")
+        if "rsm_direction" in bars.columns:
+            bars["cb_direction"] = np.where(
+                bars.get("rsm_action", "HOLD").astype(str).eq("ENTER"),
+                bars.get("rsm_direction", bars["cb_direction"]).astype(str),
+                "NEUTRAL",
+            )
+            bars["cb_direction_idx"] = bars["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+    bars_limit_applied = 0
+    if max_bars and len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
+        bars_limit_applied = int(max_bars)
 
     t_min = bars["ts_event"].min() if not bars.empty else pd.Timestamp.min
     t_max = bars["signal_time"].max() if not bars.empty and "signal_time" in bars.columns else pd.Timestamp.max
@@ -750,6 +775,8 @@ def generate_catboost_5m_report(
     summary = {
         "rows": int(len(pred_df)),
         "bars": int(len(bars)),
+        "bars_before_limit": int(bars_before_limit),
+        "bars_limit_applied": int(bars_limit_applied),
         "transitions": int(len(turns)),
         "direction_counts": bars["cb_direction"].value_counts().to_dict() if not bars.empty else {},
         "files": {

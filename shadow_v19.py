@@ -50,7 +50,6 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
     visual_embeddings = _load_visual_embeddings(visual_npy, len(canonical_df), len(engine.visual_features))
 
-    pending = []
     realized = 0
     emitted = 0
     blocked = 0
@@ -66,75 +65,34 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
         pred['idx'] = i
         if pred.get('sequence_ready', False):
             emitted += 1
-            pending.append({
-                'idx': i,
-                'ts_event': ts,
-                'label_end_ts': row.get('label_end_ts', None),
-                'bias': pred.get('bias', 'NEUTRAL'),
-                'bias_idx': pred.get('bias_idx', -1),
-                'confidence': float(pred.get('confidence', 0.0) or 0.0),
-                'tradeable': bool(pred.get('tradeable', False)),
-                'feature_hash': (((pred.get('feature_hash')) or '') if isinstance(pred, dict) else ''),
-                'forward_return': float(row.get('forward_return', 0.0) or 0.0),
-                'true_bias': int(row.get('bias_label', 2) or 2) if 'bias_label' in row else 2,
-            })
-        else:
-            blocked += 1
-
-        current_ts = pd.Timestamp(ts) if ts is not None and not pd.isna(ts) else None
-        still_pending = []
-        for item in pending:
-            end_ts = item.get('label_end_ts')
-            if current_ts is not None and end_ts is not None and not pd.isna(end_ts) and pd.Timestamp(end_ts) <= current_ts:
-                correct = item['bias_idx'] == item['true_bias']
+            if 'bias_label' in canonical_df.columns:
+                true_bias = int(row.get('bias_label', 2) or 2)
+                correct = pred.get('bias_idx', -1) == true_bias
                 log_event(
                     outcome_writer,
                     'shadow_outcome_realized',
                     {
                         'run_mode': 'shadow',
-                        'bias': item['bias'],
-                        'bias_idx': item['bias_idx'],
-                        'confidence': item['confidence'],
-                        'tradeable': item['tradeable'],
-                        'feature_hash': item['feature_hash'],
+                        'bias': pred.get('bias', 'NEUTRAL'),
+                        'bias_idx': pred.get('bias_idx', -1),
+                        'confidence': float(pred.get('confidence', 0.0) or 0.0),
+                        'tradeable': bool(pred.get('tradeable', False)),
+                        'feature_hash': (((pred.get('feature_hash')) or '') if isinstance(pred, dict) else ''),
                         'extra': {
-                            'prediction_idx': item['idx'],
-                            'true_bias': item['true_bias'],
+                            'prediction_idx': i,
+                            'true_bias': true_bias,
                             'correct': bool(correct),
-                            'forward_return': item['forward_return'],
+                            'resolved_immediately': True,
                         },
                     },
-                    ts=current_ts,
+                    ts=ts,
                 )
                 realized += 1
-            else:
-                still_pending.append(item)
-        pending = still_pending
+        else:
+            blocked += 1
 
         if (i + 1) % int(log_cfg.get('heartbeat_every_rows', 100) or 100) == 0:
             log_event(writer, 'heartbeat', {'run_mode': 'shadow', 'extra': {'row_idx': i + 1}}, ts=ts)
-
-    for item in pending:
-        log_event(
-            outcome_writer,
-            'shadow_outcome_realized',
-            {
-                'run_mode': 'shadow',
-                'bias': item['bias'],
-                'bias_idx': item['bias_idx'],
-                'confidence': item['confidence'],
-                'tradeable': item['tradeable'],
-                'extra': {
-                    'prediction_idx': item['idx'],
-                    'true_bias': item['true_bias'],
-                    'correct': bool(item['bias_idx'] == item['true_bias']),
-                    'forward_return': item['forward_return'],
-                    'resolved_late': True,
-                },
-            },
-            ts=item.get('label_end_ts') or item.get('ts_event'),
-        )
-        realized += 1
 
     summary = {
         'rows': int(len(canonical_df)),

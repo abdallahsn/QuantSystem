@@ -214,11 +214,13 @@ def run_walkforward(
             label_horizon=int(ref_cfg.get('label_horizon', 150)),
             event_roll_window=int(ref_cfg.get('event_roll_window', 50)),
             direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 1.0)),
+            causal_threshold_mode=str(ref_cfg.get('causal_threshold_mode', 'expanding')),
             tp_mult=float(ref_cfg.get('tp_mult', 1.2)),
             sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
             kalman_slope_threshold=float(ref_cfg.get('kalman_slope_threshold', 0.05)),
             trend_strength_min=float(ref_cfg.get('trend_strength_min', 0.05)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
+            merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
         )
         train_summary = run_training_pipeline(
             csv_path=train_build['csv'],
@@ -253,11 +255,13 @@ def run_walkforward(
             label_horizon=int(ref_cfg.get('label_horizon', 150)),
             event_roll_window=int(ref_cfg.get('event_roll_window', 50)),
             direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 1.0)),
+            causal_threshold_mode=str(ref_cfg.get('causal_threshold_mode', 'expanding')),
             tp_mult=float(ref_cfg.get('tp_mult', 1.2)),
             sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
             kalman_slope_threshold=float(ref_cfg.get('kalman_slope_threshold', 0.05)),
             trend_strength_min=float(ref_cfg.get('trend_strength_min', 0.05)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
+            merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
             external_scaler_path=os.path.join(model_dir, 'scaler_params.json'),
             fit_aux_models=False,
         )
