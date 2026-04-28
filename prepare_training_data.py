@@ -2386,6 +2386,7 @@ def run_refinery(
             tick_size=_tick,
             kalman_slope_threshold=kalman_slope_threshold,
             trend_strength_min=trend_strength_min,
+            n_workers=effective_workers,
         )
     else:
         print("\n⚙️  Step 4 — Fallback Session Labeling...")

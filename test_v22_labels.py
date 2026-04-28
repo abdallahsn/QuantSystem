@@ -18,7 +18,12 @@ os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 import pandas as pd
 
 from modules.catboost_5m_report import _build_dashboard, _compute_signal_stats
-from modules.labels_v22 import DIR_LONG, DIR_SHORT, build_causal_event_labels
+from modules.labels_v22 import (
+    DIR_LONG,
+    DIR_SHORT,
+    _forward_scan_per_row,
+    build_causal_event_labels,
+)
 from prepare_training_data import (
     run_refinery,
 )
@@ -85,6 +90,50 @@ class V22LabelsRegressionTests(unittest.TestCase):
         self.assertIn("train_event_flag", out.columns)
         self.assertIn("event_score", out.columns)
         self.assertEqual(len(out), len(df))
+
+    def test_forward_scan_parallel_matches_sequential(self):
+        prices = pd.Series(
+            [1.2000, 1.2002, 1.2004, 1.2001, 1.2006, 1.2003, 1.2008, 1.2005] * 4,
+            dtype="float64",
+        ).to_numpy()
+        dynamic_threshold = pd.Series([0.0001] * len(prices), dtype="float64").to_numpy()
+        adaptive_horizons = pd.Series([4] * len(prices), dtype="int32").to_numpy()
+        bid_wall_px = pd.Series([1.1990] * len(prices), dtype="float64").to_numpy()
+        ask_wall_px = pd.Series([1.2020] * len(prices), dtype="float64").to_numpy()
+        bid_wall_strength = pd.Series([3.0] * len(prices), dtype="float64").to_numpy()
+        ask_wall_strength = pd.Series([3.0] * len(prices), dtype="float64").to_numpy()
+
+        seq = _forward_scan_per_row(
+            prices=prices,
+            dynamic_threshold=dynamic_threshold,
+            adaptive_horizons=adaptive_horizons,
+            tick_size=0.0001,
+            tp_mult=1.2,
+            sl_mult=1.0,
+            bid_wall_px=bid_wall_px,
+            ask_wall_px=ask_wall_px,
+            bid_wall_strength=bid_wall_strength,
+            ask_wall_strength=ask_wall_strength,
+            n_workers=1,
+            min_parallel_rows=1,
+        )
+        par = _forward_scan_per_row(
+            prices=prices,
+            dynamic_threshold=dynamic_threshold,
+            adaptive_horizons=adaptive_horizons,
+            tick_size=0.0001,
+            tp_mult=1.2,
+            sl_mult=1.0,
+            bid_wall_px=bid_wall_px,
+            ask_wall_px=ask_wall_px,
+            bid_wall_strength=bid_wall_strength,
+            ask_wall_strength=ask_wall_strength,
+            n_workers=2,
+            min_parallel_rows=1,
+        )
+
+        for seq_arr, par_arr in zip(seq, par):
+            self.assertEqual(seq_arr.tolist(), par_arr.tolist())
 
     def test_sample_step4_prints_bias_layers_and_aggressive_is_more_directional(self):
         legacy, legacy_stdout = _run_sample_refinery(

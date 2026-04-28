@@ -37,6 +37,8 @@ New optional parameters:
 
 from __future__ import annotations
 
+import multiprocessing
+import sys
 import warnings
 from typing import Optional
 
@@ -75,6 +77,9 @@ SETUP_MIXED      = 3
 
 DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
 DEFAULT_V22_TP_MULT = 1.5
+
+
+_FORWARD_SCAN_SHARED: dict[str, object] = {}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -460,6 +465,127 @@ def _find_liquidity_tp_distance(
 
 # ── FIX-10: Per-row forward scan ──────────────────────────────────────────────
 
+
+def _forward_scan_rows(
+    start: int,
+    stop: int,
+    *,
+    prices: np.ndarray,
+    dynamic_threshold: np.ndarray,
+    adaptive_horizons: np.ndarray,
+    tick_size: float,
+    tp_mult: float = 2.5,
+    sl_mult: float = 1.0,
+    bid_wall_px: Optional[np.ndarray] = None,
+    ask_wall_px: Optional[np.ndarray] = None,
+    bid_wall_strength: Optional[np.ndarray] = None,
+    ask_wall_strength: Optional[np.ndarray] = None,
+    min_wall_strength: float = 2.5,
+    wall_exit_buffer_ticks: float = 1.0,
+    min_wall_tp_ticks: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate a contiguous row range using the full read-only price arrays."""
+    n = len(prices)
+    size = max(0, int(stop) - int(start))
+    bias_arr = np.full(size, DIR_NEUTRAL, dtype=np.int8)
+    quality_arr = np.full(size, QUALITY_WEAK, dtype=np.int8)
+    end_idx_arr = np.arange(int(start), int(stop), dtype=np.int32)
+
+    for local_idx, i in enumerate(range(int(start), int(stop))):
+        p0 = prices[i]
+        thr = max(dynamic_threshold[i], tick_size)
+        tp = thr * tp_mult
+        sl = thr * sl_mult
+        h = int(adaptive_horizons[i])
+        end = min(i + h, n - 1)
+        tp_long = tp
+        tp_short = tp
+
+        liquidity_tp_long = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_LONG,
+            tick_size=tick_size,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=min_wall_tp_ticks,
+        )
+        if liquidity_tp_long is not None:
+            tp_long = min(tp_long, liquidity_tp_long)
+
+        liquidity_tp_short = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_SHORT,
+            tick_size=tick_size,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=min_wall_tp_ticks,
+        )
+        if liquidity_tp_short is not None:
+            tp_short = min(tp_short, liquidity_tp_short)
+
+        tp_long_hit = False
+        sl_long_hit = False
+        tp_short_hit = False
+        sl_short_hit = False
+        first_long_hit_idx = end
+        first_short_hit_idx = end
+
+        for j in range(i + 1, end + 1):
+            move = prices[j] - p0
+            if not tp_long_hit and move >= tp_long:
+                tp_long_hit = True
+                first_long_hit_idx = j
+                break
+            if not sl_long_hit and move <= -sl:
+                sl_long_hit = True
+                first_long_hit_idx = j
+                break
+
+        for j in range(i + 1, end + 1):
+            move = prices[j] - p0
+            if not tp_short_hit and move <= -tp_short:
+                tp_short_hit = True
+                first_short_hit_idx = j
+                break
+            if not sl_short_hit and move >= sl:
+                sl_short_hit = True
+                first_short_hit_idx = j
+                break
+
+        if tp_long_hit and (not tp_short_hit or first_long_hit_idx <= first_short_hit_idx):
+            bias_arr[local_idx] = DIR_LONG
+            quality_arr[local_idx] = QUALITY_STRONG
+            end_idx_arr[local_idx] = first_long_hit_idx
+        elif tp_short_hit:
+            bias_arr[local_idx] = DIR_SHORT
+            quality_arr[local_idx] = QUALITY_STRONG
+            end_idx_arr[local_idx] = first_short_hit_idx
+        elif sl_long_hit or sl_short_hit:
+            quality_arr[local_idx] = QUALITY_WEAK
+            end_idx_arr[local_idx] = min(first_long_hit_idx, first_short_hit_idx)
+
+    return bias_arr, quality_arr, end_idx_arr
+
+
+def _forward_scan_pool_worker(bounds: tuple[int, int]) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    start, stop = bounds
+    if not _FORWARD_SCAN_SHARED:
+        raise RuntimeError("forward scan pool worker missing shared arrays")
+    bias_arr, quality_arr, end_idx_arr = _forward_scan_rows(
+        start,
+        stop,
+        **_FORWARD_SCAN_SHARED,
+    )
+    return start, bias_arr, quality_arr, end_idx_arr
+
 def _forward_scan_per_row(
     prices: np.ndarray,
     dynamic_threshold: np.ndarray,
@@ -474,6 +600,8 @@ def _forward_scan_per_row(
     min_wall_strength: float = 2.5,
     wall_exit_buffer_ticks: float = 1.0,
     min_wall_tp_ticks: float = 2.0,
+    n_workers: int | None = None,
+    min_parallel_rows: int = 250_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     FIX-10: Vectorised per-row forward scan with row-specific threshold AND horizon.
@@ -504,96 +632,67 @@ def _forward_scan_per_row(
     quality_arr  : int8 array  — QUALITY_STRONG / QUALITY_WEAK
     end_idx_arr  : int32 array — index where scan terminated
     """
-    n          = len(prices)
-    bias_arr   = np.full(n, DIR_NEUTRAL,    dtype=np.int8)
-    quality_arr= np.full(n, QUALITY_WEAK,   dtype=np.int8)
-    end_idx_arr= np.arange(n,              dtype=np.int32)
+    n = len(prices)
+    workers = 1 if n_workers is None else max(1, int(n_workers))
+    shared_payload = {
+        'prices': prices,
+        'dynamic_threshold': dynamic_threshold,
+        'adaptive_horizons': adaptive_horizons,
+        'tick_size': tick_size,
+        'tp_mult': tp_mult,
+        'sl_mult': sl_mult,
+        'bid_wall_px': bid_wall_px,
+        'ask_wall_px': ask_wall_px,
+        'bid_wall_strength': bid_wall_strength,
+        'ask_wall_strength': ask_wall_strength,
+        'min_wall_strength': min_wall_strength,
+        'wall_exit_buffer_ticks': wall_exit_buffer_ticks,
+        'min_wall_tp_ticks': min_wall_tp_ticks,
+    }
 
-    for i in range(n):
-        p0  = prices[i]
-        thr = max(dynamic_threshold[i], tick_size)
-        tp  = thr * tp_mult
-        sl  = thr * sl_mult
-        h   = int(adaptive_horizons[i])
-        end = min(i + h, n - 1)
-        tp_long = tp
-        tp_short = tp
+    if workers <= 1 or n < int(min_parallel_rows):
+        return _forward_scan_rows(0, n, **shared_payload)
 
-        liquidity_tp_long = _find_liquidity_tp_distance(
-            current_price=p0,
-            direction=DIR_LONG,
-            tick_size=tick_size,
-            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
-            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
-            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
-            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
-            min_wall_strength=min_wall_strength,
-            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
-            min_tp_ticks=min_wall_tp_ticks,
+    available_methods = set(multiprocessing.get_all_start_methods())
+    use_fork = sys.platform != "win32" and "fork" in available_methods
+    if not use_fork:
+        warnings.warn(
+            "Parallel Step 4 forward scan requires fork-capable multiprocessing; "
+            "falling back to sequential scan on this platform.",
+            RuntimeWarning,
         )
-        if liquidity_tp_long is not None:
-            # Wall acts as a TP cap: don't force price through the first barrier.
-            tp_long = min(tp_long, liquidity_tp_long)
+        return _forward_scan_rows(0, n, **shared_payload)
 
-        liquidity_tp_short = _find_liquidity_tp_distance(
-            current_price=p0,
-            direction=DIR_SHORT,
-            tick_size=tick_size,
-            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
-            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
-            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
-            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
-            min_wall_strength=min_wall_strength,
-            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
-            min_tp_ticks=min_wall_tp_ticks,
-        )
-        if liquidity_tp_short is not None:
-            tp_short = min(tp_short, liquidity_tp_short)
+    workers = min(workers, n)
+    task_count = min(n, max(workers, workers * 2))
+    chunk_rows = max(1, (n + task_count - 1) // task_count)
+    bounds = [(start, min(start + chunk_rows, n)) for start in range(0, n, chunk_rows)]
+    if len(bounds) <= 1:
+        return _forward_scan_rows(0, n, **shared_payload)
 
-        tp_long_hit  = False
-        sl_long_hit  = False
-        tp_short_hit = False
-        sl_short_hit = False
-        first_long_hit_idx  = end
-        first_short_hit_idx = end
+    print(
+        f"  ⚡ Step 4 forward scan parallel: workers={workers} "
+        f"| chunks={len(bounds)} | rows={n:,}",
+        flush=True,
+    )
 
-        for j in range(i + 1, end + 1):
-            move = prices[j] - p0
-            if not tp_long_hit and move >= tp_long:
-                tp_long_hit = True
-                first_long_hit_idx = j
-                break                          # LONG TP → best case, stop here
-            if not sl_long_hit and move <= -sl:
-                sl_long_hit = True
-                first_long_hit_idx = j
-                break
+    global _FORWARD_SCAN_SHARED
+    _FORWARD_SCAN_SHARED = shared_payload
+    ctx_mp = multiprocessing.get_context("fork")
+    try:
+        with ctx_mp.Pool(processes=min(workers, len(bounds))) as pool:
+            parts = pool.map(_forward_scan_pool_worker, bounds)
+    finally:
+        _FORWARD_SCAN_SHARED = {}
 
-        for j in range(i + 1, end + 1):
-            move = prices[j] - p0
-            if not tp_short_hit and move <= -tp_short:
-                tp_short_hit = True
-                first_short_hit_idx = j
-                break
-            if not sl_short_hit and move >= sl:
-                sl_short_hit = True
-                first_short_hit_idx = j
-                break
-
-        # Determine direction
-        if tp_long_hit and (not tp_short_hit or first_long_hit_idx <= first_short_hit_idx):
-            bias_arr[i]    = DIR_LONG
-            quality_arr[i] = QUALITY_STRONG
-            end_idx_arr[i] = first_long_hit_idx
-        elif tp_short_hit:
-            bias_arr[i]    = DIR_SHORT
-            quality_arr[i] = QUALITY_STRONG
-            end_idx_arr[i] = first_short_hit_idx
-        elif sl_long_hit or sl_short_hit:
-            # SL hit first → WEAK signal in whichever direction lost
-            quality_arr[i] = QUALITY_WEAK
-            end_idx_arr[i] = min(first_long_hit_idx, first_short_hit_idx)
-        # else: no move within horizon → NEUTRAL / WEAK (defaults above)
-
+    bias_arr = np.empty(n, dtype=np.int8)
+    quality_arr = np.empty(n, dtype=np.int8)
+    end_idx_arr = np.empty(n, dtype=np.int32)
+    for start, bias_part, quality_part, end_part in parts:
+        stop = start + len(bias_part)
+        bias_arr[start:stop] = bias_part
+        quality_arr[start:stop] = quality_part
+        end_idx_arr[start:stop] = end_part
     return bias_arr, quality_arr, end_idx_arr
 
 
@@ -713,6 +812,7 @@ def build_causal_event_labels(
     causal_threshold_mode: str = "expanding",
     raw_event_target_rate: float = 0.70,
     training_event_score_threshold: float | None = None,
+    n_workers: int | None = None,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
     # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
 ) -> pd.DataFrame:
@@ -910,6 +1010,7 @@ def build_causal_event_labels(
         ask_wall_px = ask_wall_px_arr,
         bid_wall_strength = bid_wall_strength_arr,
         ask_wall_strength = ask_wall_strength_arr,
+        n_workers = n_workers,
     )
 
     # Merge into labeled DataFrame (keeping all columns from engineer_features)
