@@ -1452,7 +1452,6 @@ def _load_or_init_visual_artifacts(output_dir: str, n_rows: int) -> tuple[np.nda
     np.save(visual_cov_path, visual_cov.astype(np.uint8))
     return visual, visual_cov, 'zeros'
 
-
 def run_training_pipeline(
     csv_path: str,
     output_dir: str = 'outputs_v19',
