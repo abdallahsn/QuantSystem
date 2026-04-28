@@ -17,6 +17,39 @@ GPU_AVAILABLE    = False
 GPU_NAME         = 'CPU'
 GPU_MEMORY_GB    = 0.0
 
+def _query_nvidia_smi_gpus() -> list[dict]:
+    """يرجع قائمة بالكروت من nvidia-smi مع إجمالي الذاكرة لكل كرت."""
+    try:
+        proc = subprocess.run(
+            [
+                'nvidia-smi',
+                '--query-gpu=name,memory.total',
+                '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return []
+
+        gpus = []
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            first = line.split(',', 1)
+            name = first[0].strip() if first else 'NVIDIA GPU'
+            mem_mb = float(first[1].strip()) if len(first) > 1 else 0.0
+            gpus.append({
+                'name': name or 'NVIDIA GPU',
+                'memory_gb': round(mem_mb / 1024.0, 1),
+            })
+        return gpus
+    except Exception:
+        return []
+
 def detect_gpu() -> dict:
     """
     يكتشف الـ GPU المتاح ويرجع معلوماته بأمان تام
@@ -28,6 +61,7 @@ def detect_gpu() -> dict:
         'available':   False,
         'name':        'CPU only',
         'memory_gb':   0.0,
+        'memory_total_gb': 0.0,
         'n_gpus':      0,
         'framework':   None,
         'catboost_device': 'CPU',
@@ -62,13 +96,17 @@ def detect_gpu() -> dict:
             info['catboost_device'] = 'GPU'
             info['tf_device']       = '/GPU:0'
 
-            # حساب الـ VRAM بأمان (TF 2.x يستخدم 'GPU:0' وليس '/GPU:0')
-            try:
-                mem = tf.config.experimental.get_memory_info('GPU:0')
-                info['memory_gb'] = round(mem['limit'] / (1024**3), 1)
-            except Exception:
+            # TensorFlow لا يعطينا دائمًا إجمالي VRAM بشكل موثوق،
+            # لذلك نعتمد على nvidia-smi أولًا لقراءة السعة الحقيقية لكل كرت.
+            smi_gpus = _query_nvidia_smi_gpus()
+            if smi_gpus:
+                info['memory_gb'] = smi_gpus[0]['memory_gb']
+                info['memory_total_gb'] = round(sum(g['memory_gb'] for g in smi_gpus), 1)
+            else:
                 # Fallback Estimate
-                if 'RTX' in name.upper() or 'PRO' in name.upper() or 'A100' in name.upper():
+                if 'A40' in name.upper():
+                    info['memory_gb'] = 45.0
+                elif 'RTX' in name.upper() or 'PRO' in name.upper() or 'A100' in name.upper():
                     info['memory_gb'] = 80.0
                 elif 'V100' in name.upper():
                     info['memory_gb'] = 32.0
@@ -76,6 +114,7 @@ def detect_gpu() -> dict:
                     info['memory_gb'] = 16.0
                 else:
                     info['memory_gb'] = 12.0
+                info['memory_total_gb'] = round(info['memory_gb'] * max(len(gpus), 1), 1)
 
             GPU_AVAILABLE  = True
             GPU_NAME       = name
@@ -86,35 +125,24 @@ def detect_gpu() -> dict:
 
     # 2. NVIDIA SMI Fallback (safer than importing torch on some headless/macOS setups)
     try:
-        proc = subprocess.run(
-            [
-                'nvidia-smi',
-                '--query-gpu=name,memory.total',
-                '--format=csv,noheader,nounits',
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-            if lines:
-                first = lines[0].split(',', 1)
-                name = first[0].strip()
-                mem_mb = float(first[1].strip()) if len(first) > 1 else 0.0
-                info['available'] = True
-                info['name'] = name or 'NVIDIA GPU'
-                info['memory_gb'] = round(mem_mb / 1024.0, 1)
-                info['n_gpus'] = len(lines)
-                info['framework'] = 'nvidia-smi'
-                info['catboost_device'] = 'GPU'
-                info['tf_device'] = '/GPU:0'
+        smi_gpus = _query_nvidia_smi_gpus()
+        if smi_gpus:
+            first = smi_gpus[0]
+            name = first['name']
+            mem_gb = first['memory_gb']
+            info['available'] = True
+            info['name'] = name or 'NVIDIA GPU'
+            info['memory_gb'] = mem_gb
+            info['memory_total_gb'] = round(sum(g['memory_gb'] for g in smi_gpus), 1)
+            info['n_gpus'] = len(smi_gpus)
+            info['framework'] = 'nvidia-smi'
+            info['catboost_device'] = 'GPU'
+            info['tf_device'] = '/GPU:0'
 
-                GPU_AVAILABLE = True
-                GPU_NAME = info['name']
-                GPU_MEMORY_GB = info['memory_gb']
-                return info
+            GPU_AVAILABLE = True
+            GPU_NAME = info['name']
+            GPU_MEMORY_GB = info['memory_gb']
+            return info
     except Exception:
         pass
 
@@ -129,6 +157,7 @@ def detect_gpu() -> dict:
                 info['available']       = True
                 info['name']            = name
                 info['memory_gb']       = round(mem / (1024**3), 1)
+                info['memory_total_gb'] = round((mem / (1024**3)) * max(torch.cuda.device_count(), 1), 1)
                 info['n_gpus']          = torch.cuda.device_count()
                 info['framework']       = 'torch'
                 info['catboost_device'] = 'GPU'
@@ -176,7 +205,11 @@ def print_gpu_report():
     print('⚡ Hardware & GPU Configuration:')
     if info['available']:
         print(f'   GPU:       {info["name"]}')
-        print(f'   VRAM:      {info["memory_gb"]} GB')
+        total_vram = info.get("memory_total_gb", 0.0)
+        if total_vram and info.get("n_gpus", 0) > 1:
+            print(f'   VRAM:      {info["memory_gb"]} GB per GPU | Total: {total_vram} GB')
+        else:
+            print(f'   VRAM:      {info["memory_gb"]} GB')
         print(f'   GPUs:      {info["n_gpus"]}')
         print(f'   Framework: {info["framework"]}')
         batch = get_optimal_batch_size()
