@@ -21,6 +21,11 @@ PY
 echo "TensorFlow package dir: $TF_DIR"
 pushd "$TF_DIR" >/dev/null
 
+# Clean up stale top-level GPU symlinks from older mismatched installs first.
+find . -maxdepth 1 -type l \
+  \( -name 'libcu*.so*' -o -name 'libnv*.so*' -o -name 'libcudnn*.so*' -o -name 'libnccl*.so*' \) \
+  -print -delete || true
+
 shopt -s nullglob
 libs=(../nvidia/*/lib/*.so*)
 if (( ${#libs[@]} == 0 )); then
