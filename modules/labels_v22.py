@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import time
 import warnings
 from typing import Optional
 
@@ -860,8 +861,14 @@ def build_causal_event_labels(
     n   = len(out)
     if n == 0:
         return _empty_output(out)
+    step4_t0 = time.perf_counter()
+
+    def _log_step4(msg: str) -> None:
+        elapsed = time.perf_counter() - step4_t0
+        print(f"  ⏳ Step 4: {msg} | t={elapsed:,.1f}s", flush=True)
 
     # ── 0. resolve price column ───────────────────────────────────────────────
+    _log_step4(f"start rows={n:,}")
     price_col = (
         "price"       if "price"       in out.columns else
         "close"       if "close"       in out.columns else
@@ -917,13 +924,16 @@ def build_causal_event_labels(
     feat_window = max(int(feature_roll_window), 20)
     ev_window   = max(int(event_roll_window),   10)
 
+    _log_step4(f"engineer_features window={feat_window}")
     out = engineer_features(out, roll_window=feat_window)
+    _log_step4("engineer_features done")
 
     # ── 3. FIX-1: broad event filter + stronger training gate ───────────────
     vol_mult = 1.10
     obi_thr  = 0.08
     wall_thr = 0.70
 
+    _log_step4(f"event gates window={ev_window}")
     raw_event_mask = build_event_filter(
         out,
         vol_mult=vol_mult,
@@ -951,8 +961,10 @@ def build_causal_event_labels(
         causal_threshold_mode=causal_threshold_mode,
         fixed_score_threshold=training_event_score_threshold,
     )
+    _log_step4("event gates done")
 
     # ── 4. ATR: compute once, used by FIX-9 and FIX-10 ───────────────────────
+    _log_step4("ATR + adaptive horizons")
     prices_arr = out["close"].astype(np.float64).values
     micro_atr  = (
         pd.to_numeric(out.get("micro_atr", pd.Series(np.ones(n))), errors="coerce")
@@ -990,6 +1002,7 @@ def build_causal_event_labels(
     ask_wall_px_arr = pd.to_numeric(out.get("ask_wall_px", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     bid_wall_strength_arr = pd.to_numeric(out.get("bid_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     ask_wall_strength_arr = pd.to_numeric(out.get("ask_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    _log_step4("ATR + adaptive horizons done")
 
     # ── 6. FIX-10: per-row forward scan ──────────────────────────────────────
     #
@@ -999,6 +1012,7 @@ def build_causal_event_labels(
     #  v22: _forward_scan_per_row(dynamic_threshold[i], adaptive_horizons[i])
     #       → each row evaluated against its own ATR threshold and horizon
     #
+    _log_step4("forward scan start")
     bias_raw, quality_raw, end_idx_arr = _forward_scan_per_row(
         prices     = prices_arr,
         dynamic_threshold = dynamic_threshold,
@@ -1012,6 +1026,7 @@ def build_causal_event_labels(
         ask_wall_strength = ask_wall_strength_arr,
         n_workers = n_workers,
     )
+    _log_step4("forward scan done")
 
     # Merge into labeled DataFrame (keeping all columns from engineer_features)
     labeled = out.copy()
