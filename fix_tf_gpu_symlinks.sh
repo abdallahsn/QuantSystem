@@ -36,17 +36,28 @@ popd >/dev/null
 
 PTXAS_SRC="$("$PYTHON_BIN" - <<'PY'
 import os
-import nvidia.cuda_nvcc
-print(os.path.dirname(os.path.dirname(nvidia.cuda_nvcc.__file__)))
+try:
+    import nvidia.cuda_nvcc
+    print(os.path.dirname(os.path.dirname(nvidia.cuda_nvcc.__file__)))
+except Exception:
+    print("")
 PY
 )"
 
-PTXAS_BIN="$(find "$PTXAS_SRC" -path '*/bin/ptxas' -print -quit || true)"
+PTXAS_BIN=""
+if [[ -n "$PTXAS_SRC" ]]; then
+  PTXAS_BIN="$(find "$PTXAS_SRC" -path '*/bin/ptxas' -print -quit || true)"
+fi
+if [[ -z "$PTXAS_BIN" ]]; then
+  SITE_PACKAGES_DIR="$(dirname "$TF_DIR")"
+  PTXAS_BIN="$(find "$SITE_PACKAGES_DIR"/nvidia -path '*/bin/ptxas' -print -quit 2>/dev/null || true)"
+fi
+
 if [[ -n "$PTXAS_BIN" ]]; then
   ln -svf "$PTXAS_BIN" "${VIRTUAL_ENV}/bin/ptxas"
   echo "Linked ptxas: ${VIRTUAL_ENV}/bin/ptxas -> $PTXAS_BIN"
 else
-  echo "ptxas not found under $PTXAS_SRC"
+  echo "ptxas not found. Continuing without a ptxas symlink."
 fi
 
 echo
