@@ -2285,21 +2285,38 @@ def run_refinery(
         {'processed_shards': len(mbo_pass1_records), 'rows': int(sum(r['rows'] for r in mbo_pass1_records))},
     )
 
-    print("  🔁 Rebuilding global trade-driven stateful features...")
-    mbo_pass1_df = _load_records_frame(mbo_pass1_records)
-    mbo_final_df = _rebuild_trade_stateful_features(mbo_pass1_df, cal_params)
-    del mbo_pass1_df
-    mbo_final_records = _rewrite_records_from_frame(
-        mbo_final_df,
-        records=mbo_pass1_records,
-        output_dir=output_dir,
-        phase_name='mbo_final',
-    )
-    write_checkpoint(
-        output_dir,
-        'mbo_pass2',
-        {'processed_shards': len(mbo_final_records), 'rows': int(len(mbo_final_df))},
-    )
+    mbo_final_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_final')
+    reusable_mbo_final_records: list[dict] = []
+    if resume:
+        ordered_pass1 = sorted(mbo_pass1_records, key=lambda item: int(item['shard_idx']))
+        reusable_mbo_final_records = []
+        for record in ordered_pass1:
+            shard_idx = int(record['shard_idx'])
+            final_path = os.path.join(mbo_final_dir, f'mbo_final_{shard_idx:05d}.parquet')
+            if not os.path.exists(final_path):
+                reusable_mbo_final_records = []
+                break
+            reusable_mbo_final_records.append(_read_existing_shard_record(final_path, shard_idx))
+
+    if reusable_mbo_final_records:
+        print("  ♻️ Reusing existing global trade-driven stateful features (resume)...")
+        mbo_final_records = reusable_mbo_final_records
+    else:
+        print("  🔁 Rebuilding global trade-driven stateful features...")
+        mbo_pass1_df = _load_records_frame(mbo_pass1_records)
+        mbo_final_df = _rebuild_trade_stateful_features(mbo_pass1_df, cal_params)
+        del mbo_pass1_df
+        mbo_final_records = _rewrite_records_from_frame(
+            mbo_final_df,
+            records=mbo_pass1_records,
+            output_dir=output_dir,
+            phase_name='mbo_final',
+        )
+        write_checkpoint(
+            output_dir,
+            'mbo_pass2',
+            {'processed_shards': len(mbo_final_records), 'rows': int(len(mbo_final_df))},
+        )
 
     print("\n⚙️  Phase D — Merge MBO & MBP Shards...")
     merged_records: list[dict] = []
