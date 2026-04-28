@@ -2317,6 +2317,7 @@ def run_refinery(
             'mbo_pass2',
             {'processed_shards': len(mbo_final_records), 'rows': int(len(mbo_final_df))},
         )
+        del mbo_final_df
 
     print("\n⚙️  Phase D — Merge MBO & MBP Shards...")
     merged_records: list[dict] = []
@@ -2361,7 +2362,6 @@ def run_refinery(
         {'processed_shards': len(merged_records), 'rows': int(sum(r['rows'] for r in merged_records))},
     )
     df_merged = _finalize_merged_frame(_load_records_frame(merged_records))
-    del mbo_final_df
     gc.collect()
 
     print("\n⚙️  Step 3b — Rolling Context Features...")
