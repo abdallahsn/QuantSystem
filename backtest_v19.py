@@ -231,6 +231,41 @@ def _load_backtest_contract(csv_path: str, models_dir: str) -> tuple[dict, dict]
     return model_manifest, dataset_manifest
 
 
+def _load_model_training_window(models_dir: str) -> dict:
+    manifest = _load_json_if_exists(os.path.join(models_dir, 'manifest.json')) or {}
+    extra = manifest.get('extra', {}) or {}
+    training_window = extra.get('training_window', {}) or {}
+    if training_window:
+        return training_window
+    source_contract = extra.get('source_contract', {}) or {}
+    split_time = source_contract.get('split_time')
+    return {'holdout_start_time': split_time} if split_time else {}
+
+
+def _build_backtest_window_mask(
+    df: pd.DataFrame,
+    start_ts: str | None = None,
+    end_ts: str | None = None,
+) -> pd.Series:
+    if 'ts_event' not in df.columns or (start_ts is None and end_ts is None):
+        return pd.Series(True, index=df.index)
+
+    ts = pd.to_datetime(df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    mask = pd.Series(True, index=df.index)
+
+    if start_ts is not None:
+        start = pd.to_datetime(start_ts, utc=True, errors='coerce')
+        if not pd.isna(start):
+            mask &= ts >= start.tz_localize(None)
+
+    if end_ts is not None:
+        end = pd.to_datetime(end_ts, utc=True, errors='coerce')
+        if not pd.isna(end):
+            mask &= ts < end.tz_localize(None)
+
+    return mask
+
+
 def _enforce_oos_backtest_guard(
     df: pd.DataFrame,
     *,
@@ -296,6 +331,13 @@ def _enforce_oos_backtest_guard(
     same_dataset = bool(source_dataset_id) and source_dataset_id == backtest_dataset_id
 
     if (same_path or same_dataset) and not is_pure_holdout:
+        split_ts = pd.to_datetime(source_split_time, utc=True, errors='coerce')
+        row_ts = pd.to_datetime(df.get('ts_event', pd.Series(dtype='datetime64[ns]')), utc=True, errors='coerce').dt.tz_localize(None).dropna()
+        if not pd.isna(split_ts) and len(row_ts):
+            split_ts = split_ts.tz_localize(None)
+            if row_ts.min() >= split_ts:
+                info['reason'] = 'post_split_window_only'
+                return info
         info['allowed'] = False
         info['reason'] = 'same_training_dataset'
         raise ValueError(
@@ -316,24 +358,8 @@ def _filter_backtest_window(
     start_ts: str | None = None,
     end_ts: str | None = None,
 ) -> pd.DataFrame:
-    if 'ts_event' not in df.columns or (start_ts is None and end_ts is None):
-        return df.copy()
-
-    out = df.copy()
-    ts = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
-    mask = pd.Series(True, index=out.index)
-
-    if start_ts is not None:
-        start = pd.to_datetime(start_ts, utc=True, errors='coerce')
-        if not pd.isna(start):
-            mask &= ts >= start.tz_localize(None)
-
-    if end_ts is not None:
-        end = pd.to_datetime(end_ts, utc=True, errors='coerce')
-        if not pd.isna(end):
-            mask &= ts < end.tz_localize(None)
-
-    return out.loc[mask].reset_index(drop=True)
+    mask = _build_backtest_window_mask(df, start_ts=start_ts, end_ts=end_ts)
+    return df.loc[mask].reset_index(drop=True)
 
 
 def _directional_event_mask(df: pd.DataFrame) -> np.ndarray:
@@ -1064,6 +1090,8 @@ def main():
     p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
     p.add_argument('--tp_mult', type=float, default=1.2)
     p.add_argument('--sl_mult', type=float, default=1.0)
+    p.add_argument('--start_ts', default=None, help='optional inclusive start timestamp for the backtest window')
+    p.add_argument('--end_ts', default=None, help='optional exclusive end timestamp for the backtest window')
     p.add_argument('--max_horizon_steps', type=int, default=0,
                    help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
     p.add_argument('--allow_oracle_forward_return', action='store_true',
@@ -1074,7 +1102,28 @@ def main():
                    help='rows to wait after closing a trade before opening a new one')
     args = p.parse_args()
 
-    df = _load_csv(args.data)
+    df_raw = _load_csv(args.data)
+    model_window = _load_model_training_window(args.models)
+    align_start_ts = model_window.get('train_start_time')
+    align_end_ts = model_window.get('holdout_end_time_exclusive')
+    align_mask = _build_backtest_window_mask(
+        df_raw,
+        start_ts=align_start_ts,
+        end_ts=align_end_ts,
+    )
+    df_aligned = df_raw.loc[align_mask].reset_index(drop=True)
+
+    start_ts = args.start_ts if args.start_ts is not None else model_window.get('holdout_start_time')
+    end_ts = args.end_ts if args.end_ts is not None else model_window.get('holdout_end_time_exclusive')
+    eval_mask = _build_backtest_window_mask(
+        df_aligned,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    df = df_aligned.loc[eval_mask].reset_index(drop=True)
+    if df.empty:
+        raise ValueError('❌ نافذة الباك تست المطلوبة فارغة. راجع start_ts/end_ts أو training_window في manifest.')
+
     oos_guard = _enforce_oos_backtest_guard(
         df,
         csv_path=args.data,
@@ -1082,19 +1131,28 @@ def main():
         allow_in_sample_data_override=args.allow_in_sample_data_override,
     )
     engine = V19PredictionEngine(args.models)
-    visual_embeddings = _load_visual_embeddings(
-        df,
+    visual_full = _load_visual_embeddings(
+        df_aligned,
         explicit_path=args.visual_npy,
         default_path=engine.visual_emb_path,
         expected_dim=len(engine.visual_features),
         models_dir=args.models,
     )
-    meta_features = _load_meta_features(
-        df,
-        explicit_path=args.meta_npy,
+    visual_embeddings = visual_full[eval_mask.to_numpy()]
+
+    meta_path = args.meta_npy
+    if meta_path is None:
+        default_meta_oof = os.path.join(args.models, 'meta_features_oof_v19.npy')
+        if os.path.exists(default_meta_oof):
+            meta_path = default_meta_oof
+
+    meta_full = _load_meta_features(
+        df_aligned,
+        explicit_path=meta_path,
         expected_dim=len(engine.meta_features),
         allow_in_sample_live_override=args.allow_in_sample_live_meta_override,
     )
+    meta_features = meta_full[eval_mask.to_numpy()] if meta_full is not None else None
 
     _, _, summary = run_causal_backtest(
         df=df,
@@ -1117,6 +1175,13 @@ def main():
         cooldown_rows=args.cooldown_rows,
     )
     summary['oos_guard'] = oos_guard
+    summary['backtest_window'] = {
+        'aligned_start_ts': align_start_ts,
+        'aligned_end_ts': align_end_ts,
+        'start_ts': start_ts,
+        'end_ts': end_ts,
+        'rows': int(len(df)),
+    }
 
     print("\n✅ V19 causal backtest complete")
     print(json.dumps(summary, indent=2))

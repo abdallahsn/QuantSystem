@@ -120,30 +120,35 @@ QuantSystem V19/
 
 ### Python
 - يوصى بـ `Python 3.10` أو `Python 3.11`
+- `Python 3.12` مدعوم أيضًا إذا كنت ستثبّت TensorFlow الحديث عبر `pip`
+- بيئة `venv` كافية ومفضّلة؛ `conda` اختياري وليس مطلوبًا
 
 ### Base Dependencies
 الموجودة في [requirements.txt](/Users/abdallah/Downloads/QS_FINAL/requirements.txt):
 - `numpy`
 - `pandas`
-- `tensorflow`
 - `scikit-learn`
+- `scipy`
 - `matplotlib`
+- `plotly`
 - `openpyxl`
+- `pyyaml`
+- `pyarrow`
+- `catboost`
+- `tensorflow`
 - `tqdm`
 
 ### Common Optional Dependencies
 بعض أجزاء المشروع تستخدم أو تستفيد من:
-- `catboost`
 - `jupyterlab`
 - `ipykernel`
-- `pyarrow`
 - `hmmlearn`
 
 إذا كنت ستعمل على سيرفر خارجي مع Jupyter Notebook فالأفضل تثبيت:
 
 ```bash
 pip install -r requirements.txt
-pip install catboost jupyterlab ipykernel pyarrow hmmlearn
+pip install jupyterlab ipykernel hmmlearn
 ```
 
 
@@ -341,7 +346,13 @@ python -m pip install --upgrade pip
 
 ```bash
 pip install -r requirements.txt
-pip install catboost jupyterlab ipykernel pyarrow hmmlearn
+pip install jupyterlab ipykernel hmmlearn
+```
+
+إذا كان السيرفر Linux وفيه NVIDIA GPU وتريد تشغيل `TensorFlow/DeepLOB` على الـ GPU:
+
+```bash
+bash install_tf_gpu_cu12.sh
 ```
 
 ### 5. أضف kernel خاص بالمشروع
@@ -546,13 +557,21 @@ TensorFlow غير مثبّت — MetaLearner غير متاح
 الحل:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+bash install_tf_gpu_cu12.sh
+```
+
+إذا كنت تريد CPU فقط:
+
+```bash
 pip install tensorflow
 ```
 
 ### 2. CatBoost غير مثبت
 
 ```bash
-pip install catboost
+pip install -r requirements.txt
 ```
 
 ### 3. مشاكل `OpenMP SHM`

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_VENV="$ROOT_DIR/.venv"
+
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  echo "Activate your .venv first."
-  exit 1
+  if [[ -x "$DEFAULT_VENV/bin/python" ]]; then
+    export VIRTUAL_ENV="$DEFAULT_VENV"
+  else
+    echo "Activate your .venv first, or create $DEFAULT_VENV."
+    exit 1
+  fi
 fi
 
 PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
@@ -67,4 +74,4 @@ done
 
 echo
 echo "[4/4] Linking libraries into the venv and verifying GPU visibility..."
-bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fix_tf_gpu_symlinks.sh"
+bash "$ROOT_DIR/fix_tf_gpu_symlinks.sh"

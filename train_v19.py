@@ -452,6 +452,137 @@ def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.
     return s
 
 
+def _parse_optional_timestamp(value) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, utc=True, errors='coerce')
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize(None)
+
+
+def _build_row_time_mask(
+    df: pd.DataFrame,
+    *,
+    start_ts: pd.Timestamp | str | None = None,
+    end_ts: pd.Timestamp | str | None = None,
+) -> np.ndarray:
+    if len(df) == 0:
+        return np.array([], dtype=bool)
+    ts = _time_series(df, 'ts_event')
+    mask = np.ones(len(df), dtype=bool)
+    start = _parse_optional_timestamp(start_ts)
+    end = _parse_optional_timestamp(end_ts)
+    if start is not None:
+        mask &= ts.values >= start.to_datetime64()
+    if end is not None:
+        mask &= ts.values < end.to_datetime64()
+    return mask
+
+
+def _resolve_training_window(
+    df: pd.DataFrame,
+    *,
+    train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
+    train_days: float | None = None,
+    backtest_days: float | None = None,
+    window_end: pd.Timestamp | str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    if len(df) == 0:
+        return df.copy(), {
+            'mode': 'empty',
+            'split_time': None,
+            'split_source': 'empty',
+            'train_start_time': None,
+            'holdout_start_time': None,
+            'holdout_end_time_exclusive': None,
+            'ts_min': None,
+            'ts_max': None,
+            'rows_total': 0,
+            'train_rows': 0,
+            'holdout_rows': 0,
+            'requested_train_days': None,
+            'requested_backtest_days': None,
+        }
+
+    ts_all = _time_series(df, 'ts_event')
+    source_ts_min = ts_all.min()
+    source_ts_max = ts_all.max()
+    end_exclusive = _parse_optional_timestamp(window_end)
+    if end_exclusive is None:
+        end_exclusive = source_ts_max + pd.Timedelta(microseconds=1)
+
+    requested_train_days = float(train_days) if train_days is not None else None
+    requested_backtest_days = float(backtest_days) if backtest_days is not None else None
+    explicit_split = _parse_optional_timestamp(split_time)
+
+    filtered = df.copy().reset_index(drop=True)
+    mode = 'full_dataset'
+    split_source = 'train_frac'
+    train_start_time = None
+
+    if (
+        requested_train_days is not None
+        or requested_backtest_days is not None
+        or window_end is not None
+    ):
+        if explicit_split is None:
+            if requested_backtest_days is None:
+                raise ValueError(
+                    '❌ backtest_days مطلوب عند استخدام train_days/window_end بدون split_time صريح.'
+                )
+            explicit_split = end_exclusive - pd.Timedelta(days=requested_backtest_days)
+            split_source = 'backtest_days'
+        else:
+            split_source = 'explicit_time'
+
+        if requested_train_days is not None:
+            train_start_time = explicit_split - pd.Timedelta(days=requested_train_days)
+
+        row_mask = _build_row_time_mask(df, start_ts=train_start_time, end_ts=end_exclusive)
+        filtered = df.loc[row_mask].reset_index(drop=True)
+        ts_filtered = ts_all.loc[row_mask].reset_index(drop=True)
+        mode = 'fixed_day_window'
+
+        if filtered.empty:
+            raise RuntimeError('❌ النافذة الزمنية المطلوبة للتدريب/الباك تست فارغة.')
+        if not (ts_filtered < explicit_split).any():
+            raise RuntimeError('❌ لا توجد صفوف تدريب قبل split_time داخل النافذة المطلوبة.')
+        if not (ts_filtered >= explicit_split).any():
+            raise RuntimeError('❌ لا توجد صفوف holdout بعد split_time داخل النافذة المطلوبة.')
+    elif explicit_split is not None:
+        split_source = 'artifact_split_time'
+
+    split_ctx = _sequence_split_context(
+        filtered,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=explicit_split,
+    )
+    ts_filtered = _time_series(filtered, 'ts_event')
+    train_start_effective = train_start_time if train_start_time is not None else ts_filtered.min()
+
+    info = {
+        'mode': mode,
+        'split_time': str(split_ctx['split_time']),
+        'split_source': split_source if explicit_split is not None else str(split_ctx.get('split_source', 'train_frac')),
+        'train_start_time': None if pd.isna(train_start_effective) else str(train_start_effective),
+        'holdout_start_time': str(split_ctx['split_time']),
+        'holdout_end_time_exclusive': None if end_exclusive is None else str(end_exclusive),
+        'ts_min': None if pd.isna(ts_filtered.min()) else str(ts_filtered.min()),
+        'ts_max': None if pd.isna(ts_filtered.max()) else str(ts_filtered.max()),
+        'rows_total': int(len(filtered)),
+        'train_rows': int(np.sum(split_ctx['train_row_ok'])),
+        'holdout_rows': int(np.sum(split_ctx['val_row_ok'])),
+        'requested_train_days': requested_train_days,
+        'requested_backtest_days': requested_backtest_days,
+        'source_ts_min': None if pd.isna(source_ts_min) else str(source_ts_min),
+        'source_ts_max': None if pd.isna(source_ts_max) else str(source_ts_max),
+    }
+    return filtered, info
+
+
 def _sequence_split_context(
     df: pd.DataFrame,
     seq_len: int = SEQ_LEN,
@@ -725,7 +856,7 @@ def stage1_oof_meta(
         raise RuntimeError(
             "❌ CatBoost غير مثبّت. هذه المرحلة لم تتدرب فعليًا.\n"
             "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
-            "pip install catboost"
+            "pip install -r requirements.txt"
         )
 
     regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
@@ -1093,12 +1224,18 @@ def build_safe_sequences(
     coverage_mask: np.ndarray,
     seq_len: int = SEQ_LEN,
     train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
     min_seq_coverage: float = 0.80,
     n_stat_feat: int = len(CATBOOST_ADVISOR_FEATURES),
     sequence_aux_mode: str = SEQUENCE_AUX_LAST_STEP_ONLY,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     n = len(df)
-    split_ctx = _sequence_split_context(df, seq_len=seq_len, train_frac=train_frac)
+    split_ctx = _sequence_split_context(
+        df,
+        seq_len=seq_len,
+        train_frac=train_frac,
+        split_time=split_time,
+    )
     split_idx = split_ctx['split_idx']
     split_time = split_ctx['split_time']
 
@@ -1261,6 +1398,7 @@ def stage3_meta_learner_v19(
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
     min_seq_coverage: float = 0.80,
 ) -> None:
     print("\n" + "═" * 65)
@@ -1281,6 +1419,7 @@ def stage3_meta_learner_v19(
         coverage_mask=coverage_mask,
         seq_len=SEQ_LEN,
         train_frac=train_frac,
+        split_time=split_time,
         min_seq_coverage=min_seq_coverage,
         n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
         sequence_aux_mode=sequence_aux_mode,
@@ -1471,6 +1610,10 @@ def run_training_pipeline(
     training_mode: str | None = None,
     quality_weight_strong: float | None = None,
     quality_weight_weak: float | None = None,
+    split_time: str | None = None,
+    train_days: float | None = None,
+    backtest_days: float | None = None,
+    window_end: str | None = None,
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
@@ -1492,7 +1635,25 @@ def run_training_pipeline(
         quality_weight_weak if quality_weight_weak is not None else train_cfg.get('quality_weight_weak', 1.0)
     )
 
-    df_full = load_training_csv(csv_path)
+    df_loaded = load_training_csv(csv_path)
+    source_contract = _load_source_refinery_contract(csv_path)
+    effective_split_time = split_time if split_time is not None else source_contract.get('split_time')
+    df_full, training_window = _resolve_training_window(
+        df_loaded,
+        train_frac=train_frac,
+        split_time=effective_split_time,
+        train_days=train_days,
+        backtest_days=backtest_days,
+        window_end=window_end,
+    )
+    print(
+        "  🗓️ Training Window: "
+        f"mode={training_window['mode']} | "
+        f"rows={training_window['rows_total']:,} | "
+        f"train_rows={training_window['train_rows']:,} | "
+        f"holdout_rows={training_window['holdout_rows']:,} | "
+        f"split={training_window['split_time']}"
+    )
     event_df, event_view_info = build_event_training_view(
         df_full,
         mode=training_mode,
@@ -1502,15 +1663,25 @@ def run_training_pipeline(
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
-    source_contract = _load_source_refinery_contract(csv_path)
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
+
+    effective_source_contract = dict(source_contract)
+    effective_source_contract.update({
+        'split_time': training_window.get('split_time'),
+        'train_start_time': training_window.get('train_start_time'),
+        'holdout_start_time': training_window.get('holdout_start_time'),
+        'holdout_end_time_exclusive': training_window.get('holdout_end_time_exclusive'),
+        'requested_train_days': training_window.get('requested_train_days'),
+        'requested_backtest_days': training_window.get('requested_backtest_days'),
+        'window_mode': training_window.get('mode'),
+    })
 
     inference_scaler_params, scaler_info = build_inference_scaler_params(
         event_df,
         CATBOOST_ADVISOR_FEATURES,
         train_frac=train_frac,
-        split_time=source_contract.get('split_time'),
+        split_time=training_window.get('split_time'),
     )
     scaler_path = _save_scaler_params(output_dir, inference_scaler_params)
     print(
@@ -1576,6 +1747,7 @@ def run_training_pipeline(
             'visual_shape': None,
             'visual_coverage_ratio': None,
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
+            'training_window': training_window,
             'elapsed_seconds': float(elapsed),
             'stage': int(stage),
             'phase': resolved_phase,
@@ -1596,6 +1768,10 @@ def run_training_pipeline(
                 'mode': training_mode,
                 'quality_weight_strong': quality_weight_strong,
                 'quality_weight_weak': quality_weight_weak,
+                'split_time': training_window.get('split_time'),
+                'train_days': train_days,
+                'backtest_days': backtest_days,
+                'window_end': window_end,
             },
             inputs={
                 'csv': csv_path,
@@ -1604,7 +1780,8 @@ def run_training_pipeline(
             },
             metrics=summary,
             extra={
-                'source_contract': source_contract,
+                'source_contract': effective_source_contract,
+                'training_window': training_window,
                 'meta_feature_dim': len(META_FEATURE_NAMES),
             },
         )
@@ -1643,6 +1820,7 @@ def run_training_pipeline(
             'visual_shape': list(visual_embeddings.shape),
             'visual_coverage_ratio': float(np.mean(visual_coverage)),
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
+            'training_window': training_window,
             'elapsed_seconds': float(elapsed),
             'stage': int(stage),
             'phase': resolved_phase,
@@ -1663,6 +1841,10 @@ def run_training_pipeline(
                 'mode': training_mode,
                 'quality_weight_strong': quality_weight_strong,
                 'quality_weight_weak': quality_weight_weak,
+                'split_time': training_window.get('split_time'),
+                'train_days': train_days,
+                'backtest_days': backtest_days,
+                'window_end': window_end,
             },
             inputs={
                 'csv': csv_path,
@@ -1671,7 +1853,8 @@ def run_training_pipeline(
             },
             metrics=summary,
             extra={
-                'source_contract': source_contract,
+                'source_contract': effective_source_contract,
+                'training_window': training_window,
                 'meta_feature_dim': len(META_FEATURE_NAMES),
             },
         )
@@ -1692,7 +1875,7 @@ def run_training_pipeline(
         except Exception as e:
             raise RuntimeError(
                 "❌ TensorFlow/MetaLearner غير متاح. المرحلة الثالثة لا يمكن تشغيلها الآن.\n"
-                "ثبّت TensorFlow أولًا أو شغّل المرحلة الثالثة على Linux/WSL2."
+                "شغّل bash install_tf_gpu_cu12.sh داخل .venv، أو ثبّت TensorFlow للـ CPU فقط إذا كنت لا تحتاج DeepLOB GPU."
             ) from e
         stage3_meta_learner_v19(
             event_df,
@@ -1705,6 +1888,7 @@ def run_training_pipeline(
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,
+            split_time=training_window.get('split_time'),
             min_seq_coverage=min_seq_coverage,
         )
 
@@ -1718,6 +1902,7 @@ def run_training_pipeline(
         'visual_shape': list(visual_embeddings.shape),
         'visual_coverage_ratio': float(np.mean(visual_coverage)),
         'scaler_train_rows': int(scaler_info['scaler_train_rows']),
+        'training_window': training_window,
         'elapsed_seconds': float(elapsed),
         'stage': int(stage),
         'phase': resolved_phase,
@@ -1740,6 +1925,10 @@ def run_training_pipeline(
             'mode': training_mode,
             'quality_weight_strong': quality_weight_strong,
             'quality_weight_weak': quality_weight_weak,
+            'split_time': training_window.get('split_time'),
+            'train_days': train_days,
+            'backtest_days': backtest_days,
+            'window_end': window_end,
         },
         inputs={
             'csv': csv_path,
@@ -1748,7 +1937,8 @@ def run_training_pipeline(
         },
         metrics=summary,
         extra={
-            'source_contract': source_contract,
+            'source_contract': effective_source_contract,
+            'training_window': training_window,
             'meta_feature_dim': len(META_FEATURE_NAMES),
         },
     )
@@ -1787,6 +1977,10 @@ def main():
     p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
+    p.add_argument('--split_time', default=None, help='explicit holdout start timestamp (UTC/parsible string)')
+    p.add_argument('--train_days', type=float, default=None, help='limit training window to N days immediately before split_time')
+    p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
+    p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -1810,6 +2004,10 @@ def main():
         training_mode=args.training_mode,
         quality_weight_strong=args.quality_weight_strong,
         quality_weight_weak=args.quality_weight_weak,
+        split_time=args.split_time,
+        train_days=args.train_days,
+        backtest_days=args.backtest_days,
+        window_end=args.window_end,
         config_snapshot=cfg,
     )
 

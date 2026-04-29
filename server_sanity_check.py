@@ -19,6 +19,7 @@ REQUIREMENTS_FILE = ROOT / "requirements.txt"
 
 IMPORT_NAME_OVERRIDES = {
     "scikit-learn": "sklearn",
+    "pyyaml": "yaml",
 }
 
 
@@ -54,17 +55,21 @@ def run_command(command: list[str], timeout: int = 15) -> dict:
     }
 
 
-def parse_requirements(path: Path) -> list[str]:
+def parse_requirements(path: Path) -> list[dict]:
     if not path.exists():
         return [
-            "numpy",
-            "pandas",
-            "tensorflow",
-            "scikit-learn",
-            "matplotlib",
-            "plotly",
-            "openpyxl",
-            "tqdm",
+            {"distribution": "numpy", "min_version": "1.24"},
+            {"distribution": "pandas", "min_version": "2.0"},
+            {"distribution": "scikit-learn", "min_version": "1.3"},
+            {"distribution": "scipy", "min_version": "1.11"},
+            {"distribution": "matplotlib", "min_version": "3.7"},
+            {"distribution": "plotly", "min_version": "5.0"},
+            {"distribution": "openpyxl", "min_version": "3.1"},
+            {"distribution": "pyyaml", "min_version": "6.0"},
+            {"distribution": "pyarrow", "min_version": "12.0"},
+            {"distribution": "catboost", "min_version": "1.2"},
+            {"distribution": "tensorflow", "min_version": "2.13"},
+            {"distribution": "tqdm", "min_version": "4.66"},
         ]
 
     packages = []
@@ -72,9 +77,14 @@ def parse_requirements(path: Path) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        match = re.match(r"^([A-Za-z0-9_.-]+)", line)
+        match = re.match(r"^([A-Za-z0-9_.-]+)(?:\s*>=\s*([A-Za-z0-9_.-]+))?", line)
         if match:
-            packages.append(match.group(1))
+            packages.append(
+                {
+                    "distribution": match.group(1),
+                    "min_version": match.group(2) or "",
+                }
+            )
     return packages
 
 
@@ -98,6 +108,12 @@ def import_name_for(distribution_name: str) -> str:
 
 
 def check_python_and_env() -> dict:
+    env_kind = "system"
+    if os.environ.get("VIRTUAL_ENV"):
+        env_kind = "venv"
+    elif os.environ.get("CONDA_PREFIX"):
+        env_kind = "conda"
+
     return {
         "python_version": sys.version.split()[0],
         "python_executable": sys.executable,
@@ -107,6 +123,7 @@ def check_python_and_env() -> dict:
         "conda_prefix": os.environ.get("CONDA_PREFIX", ""),
         "conda_env": os.environ.get("CONDA_DEFAULT_ENV", ""),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "env_kind": env_kind,
     }
 
 
@@ -208,13 +225,17 @@ def check_nvidia() -> dict:
     return info
 
 
-def check_package(distribution_name: str) -> dict:
+def check_package(requirement: dict) -> dict:
+    distribution_name = requirement["distribution"]
+    min_version = requirement.get("min_version", "")
     import_name = import_name_for(distribution_name)
     result = {
         "distribution": distribution_name,
         "import_name": import_name,
+        "required_min_version": min_version,
         "ok": False,
         "version": "",
+        "version_ok": True,
         "path": "",
         "error": "",
     }
@@ -224,6 +245,10 @@ def check_package(distribution_name: str) -> dict:
         result["ok"] = True
         result["version"] = safe_version(distribution_name, module)
         result["path"] = str(getattr(module, "__file__", "") or "")
+        if min_version and version_tuple(result["version"]) and version_tuple(min_version):
+            result["version_ok"] = version_tuple(result["version"]) >= version_tuple(min_version)
+            if not result["version_ok"]:
+                result["error"] = f"installed version {result['version']} is below required >= {min_version}"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -303,10 +328,11 @@ def evaluate(env_info: dict, conda_info: dict, nvidia_info: dict, tf_info: dict,
     warns = []
     fails = []
 
-    if not conda_info["installed"]:
-        warns.append("Conda command not found.")
-    elif not conda_info["active"]:
+    if conda_info["installed"] and not conda_info["active"] and not env_info.get("venv"):
         warns.append("Conda is installed but no active Conda environment was detected.")
+
+    if env_info.get("env_kind") == "system":
+        warns.append("No isolated Python environment detected; prefer a project .venv before training.")
 
     conda_prefix = conda_info.get("active_prefix", "") or env_info.get("conda_prefix", "")
     venv_prefix = env_info.get("venv", "")
@@ -327,9 +353,21 @@ def evaluate(env_info: dict, conda_info: dict, nvidia_info: dict, tf_info: dict,
     elif venv_prefix and not python_in_venv:
         fails.append("Active virtualenv detected, but current Python executable is outside VIRTUAL_ENV.")
 
-    missing_packages = [pkg["distribution"] for pkg in packages if not pkg["ok"]]
+    missing_packages = [
+        pkg["distribution"]
+        for pkg in packages
+        if not pkg["ok"] and pkg["distribution"].lower() != "tensorflow"
+    ]
     if missing_packages:
         fails.append("Missing or broken required packages: " + ", ".join(missing_packages))
+
+    version_mismatches = [
+        f"{pkg['distribution']} ({pkg['version']} < {pkg['required_min_version']})"
+        for pkg in packages
+        if pkg["ok"] and not pkg["version_ok"]
+    ]
+    if version_mismatches:
+        fails.append("Installed package versions are below requirements: " + ", ".join(version_mismatches))
 
     if not tf_info["installed"]:
         fails.append("TensorFlow is not installed or failed to import.")
@@ -390,8 +428,8 @@ def main() -> int:
     env_info = check_python_and_env()
     conda_info = check_conda()
     nvidia_info = check_nvidia()
-    package_names = parse_requirements(REQUIREMENTS_FILE)
-    packages = [check_package(name) for name in package_names]
+    package_requirements = parse_requirements(REQUIREMENTS_FILE)
+    packages = [check_package(req) for req in package_requirements]
     tf_info = check_tensorflow()
     verdict = evaluate(env_info, conda_info, nvidia_info, tf_info, packages)
 
@@ -400,6 +438,7 @@ def main() -> int:
     print_kv("Executable", env_info["python_executable"])
     print_kv("Platform", env_info["platform"])
     print_kv("Working Dir", env_info["cwd"])
+    print_kv("Environment", env_info["env_kind"])
     print_kv("VIRTUAL_ENV", env_info["venv"] or "-")
     print_kv("CONDA_DEFAULT_ENV", env_info["conda_env"] or "-")
     print_kv("CONDA_PREFIX", env_info["conda_prefix"] or "-")
@@ -411,7 +450,9 @@ def main() -> int:
     print_kv("Conda Version", conda_info["version"] or "-")
     print_kv("Env Name", conda_info["env_name"] or "-")
     print_kv("Active Prefix", conda_info["active_prefix"] or "-")
-    if conda_info["error"]:
+    if not conda_info["installed"]:
+        print_kv("Conda Note", "optional; this repo works with venv + pip")
+    elif conda_info["error"]:
         print_kv("Conda Note", conda_info["error"])
 
     print_header("NVIDIA / CUDA")
@@ -429,9 +470,14 @@ def main() -> int:
 
     print_header("CORE PACKAGES")
     for package in packages:
-        if package["ok"]:
+        if package["ok"] and package["version_ok"]:
             where = package["path"] or "-"
             print(f"[OK]   {package['distribution']:<16} version={package['version']:<12} path={where}")
+        elif package["ok"]:
+            print(
+                f"[FAIL] {package['distribution']:<16} version={package['version']:<12} "
+                f"requires>={package['required_min_version']}"
+            )
         else:
             print(f"[FAIL] {package['distribution']:<16} {package['error']}")
 
