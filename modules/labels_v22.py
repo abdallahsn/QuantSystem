@@ -117,6 +117,55 @@ def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -
         return None
     return (total - done) / rate
 
+
+def _fenwick_add(tree: np.ndarray, idx_zero_based: int, delta: int) -> None:
+    i = int(idx_zero_based) + 1
+    size = len(tree)
+    while i < size:
+        tree[i] += int(delta)
+        i += i & -i
+
+
+def _fenwick_find_by_order(tree: np.ndarray, order_one_based: int) -> int:
+    if order_one_based <= 0:
+        return 0
+    idx = 0
+    bit = 1 << (len(tree).bit_length() - 1)
+    while bit:
+        nxt = idx + bit
+        if nxt < len(tree) and tree[nxt] < order_one_based:
+            order_one_based -= int(tree[nxt])
+            idx = nxt
+        bit >>= 1
+    return min(idx, len(tree) - 2)
+
+
+def _fenwick_quantile_linear(
+    tree: np.ndarray,
+    sorted_values: np.ndarray,
+    q: float,
+    count: int,
+) -> float:
+    count = int(count)
+    if count <= 0:
+        return 0.0
+    if count == 1:
+        only_idx = _fenwick_find_by_order(tree, 1)
+        return float(sorted_values[only_idx])
+
+    q = min(max(float(q), 0.0), 1.0)
+    h = (count - 1) * q
+    lo_rank = int(np.floor(h))
+    hi_rank = int(np.ceil(h))
+    lo_idx = _fenwick_find_by_order(tree, lo_rank + 1)
+    lo_val = float(sorted_values[lo_idx])
+    if hi_rank == lo_rank:
+        return lo_val
+    hi_idx = _fenwick_find_by_order(tree, hi_rank + 1)
+    hi_val = float(sorted_values[hi_idx])
+    frac = float(h - lo_rank)
+    return lo_val + frac * (hi_val - lo_val)
+
 def _safe_series(df: pd.DataFrame, col: str, n: int) -> np.ndarray:
     """Return a numeric numpy array for *col*, falling back to zeros."""
     return (
@@ -341,25 +390,41 @@ def _build_training_event_gate(
             threshold = float(max(fixed_score_threshold or 0.0, 0.0))
             candidate = base_mask & (score >= threshold)
         else:
-            past_scores: list[float] = []
+            score64 = np.asarray(score, dtype=np.float64)
+            base_scores_all = score64[base_mask]
+            if base_scores_all.size == 0:
+                return candidate.astype(np.int8), score, trigger_count, threshold
+            sorted_values = np.unique(base_scores_all)
+            fenwick_tree = np.zeros(len(sorted_values) + 1, dtype=np.int32)
+            compressed = np.searchsorted(sorted_values, score64, side="left")
             past_base_count = 0
             for i in range(n):
                 if not base_mask[i]:
                     continue
-                if past_base_count <= 0 or len(past_scores) < max(int(roll_window), 10):
+                if past_base_count <= 0 or past_base_count < max(int(roll_window), 10):
                     current_threshold = 0.0
                 else:
                     base_rate = float(past_base_count) / max(float(i), 1.0)
                     desired_rate = min(max(float(target_rate), 0.05), base_rate)
                     keep_inside_base = min(max(desired_rate / max(base_rate, 1e-9), 0.0), 1.0)
                     if keep_inside_base >= 0.999:
-                        current_threshold = float(np.nanmin(past_scores))
+                        current_threshold = _fenwick_quantile_linear(
+                            fenwick_tree,
+                            sorted_values,
+                            q=0.0,
+                            count=past_base_count,
+                        )
                     else:
                         q = min(max(1.0 - keep_inside_base, 0.0), 1.0)
-                        current_threshold = float(np.nanquantile(np.asarray(past_scores, dtype=np.float64), q))
+                        current_threshold = _fenwick_quantile_linear(
+                            fenwick_tree,
+                            sorted_values,
+                            q=q,
+                            count=past_base_count,
+                        )
                 threshold = float(max(current_threshold, 0.0))
                 candidate[i] = bool(score[i] >= threshold)
-                past_scores.append(float(score[i]))
+                _fenwick_add(fenwick_tree, int(compressed[i]), 1)
                 past_base_count += 1
         if not candidate.any():
             fallback = base_mask & (trigger_count >= 2)
@@ -685,8 +750,11 @@ def _forward_scan_per_row(
     """
     n = len(prices)
     workers = 1 if n_workers is None else max(1, int(n_workers))
+    platform_note = ""
+    if sys.platform == "win32":
+        platform_note = " | platform=win32 (parallel Step 4 currently unavailable because fork is not supported)"
     if progress_every_rows is None:
-        auto_progress_every_rows = 0 if n < 100_000 else min(500_000, max(100_000, n // 20))
+        auto_progress_every_rows = 0 if n < 10_000 else min(250_000, max(2_500, n // 10))
     else:
         auto_progress_every_rows = max(0, int(progress_every_rows))
     shared_payload = {
@@ -707,7 +775,7 @@ def _forward_scan_per_row(
 
     if workers <= 1:
         print(
-            f"  ℹ️ Step 4 forward scan sequential: workers={workers} | rows={n:,}",
+            f"  ℹ️ Step 4 forward scan sequential: workers={workers} | rows={n:,}{platform_note}",
             flush=True,
         )
         return _forward_scan_rows(
@@ -720,7 +788,7 @@ def _forward_scan_per_row(
     if n < int(min_parallel_rows):
         print(
             f"  ℹ️ Step 4 forward scan sequential: rows={n:,} "
-            f"< min_parallel_rows={int(min_parallel_rows):,}",
+            f"< min_parallel_rows={int(min_parallel_rows):,} | requested_workers={workers}{platform_note}",
             flush=True,
         )
         return _forward_scan_rows(
@@ -738,6 +806,11 @@ def _forward_scan_per_row(
             "Parallel Step 4 forward scan requires fork-capable multiprocessing; "
             "falling back to sequential scan on this platform.",
             RuntimeWarning,
+        )
+        print(
+            f"  ℹ️ Step 4 forward scan sequential: fork start-method unavailable "
+            f"| requested_workers={workers} | rows={n:,}{platform_note}",
+            flush=True,
         )
         return _forward_scan_rows(
             0,
@@ -919,6 +992,7 @@ def build_causal_event_labels(
     raw_event_target_rate: float = 0.70,
     training_event_score_threshold: float | None = None,
     n_workers: int | None = None,
+    min_parallel_rows: int = 250_000,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
     # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
 ) -> pd.DataFrame:
@@ -1039,6 +1113,7 @@ def build_causal_event_labels(
     wall_thr = 0.70
 
     _log_step4(f"event gates window={ev_window}")
+    _log_step4("event gates 1/3 raw_event_filter start")
     raw_event_mask = build_event_filter(
         out,
         vol_mult=vol_mult,
@@ -1046,6 +1121,9 @@ def build_causal_event_labels(
         wall_str_thr=wall_thr,
         roll_window=ev_window,
     )
+    raw_keep_rate = float(np.mean(np.asarray(raw_event_mask, dtype=np.float32))) if len(raw_event_mask) else 0.0
+    _log_step4(f"event gates 1/3 raw_event_filter done keep={raw_keep_rate:.1%}")
+    _log_step4("event gates 2/3 broad_event_gate start")
     event_flag, _, _, raw_event_score_threshold = _build_broad_event_gate(
         out,
         base_event_mask=raw_event_mask,
@@ -1056,6 +1134,12 @@ def build_causal_event_labels(
         target_rate=raw_event_target_rate,
         causal_threshold_mode=causal_threshold_mode,
     )
+    broad_keep_rate = float(np.mean(np.asarray(event_flag, dtype=np.float32))) if len(event_flag) else 0.0
+    _log_step4(
+        f"event gates 2/3 broad_event_gate done keep={broad_keep_rate:.1%} "
+        f"| score_thr={float(raw_event_score_threshold):.3f}"
+    )
+    _log_step4("event gates 3/3 training_event_gate start")
     train_event_flag, event_score, event_trigger_count, event_score_threshold = _build_training_event_gate(
         out,
         base_event_mask=event_flag.astype(bool),
@@ -1065,6 +1149,11 @@ def build_causal_event_labels(
         wall_thr=wall_thr,
         causal_threshold_mode=causal_threshold_mode,
         fixed_score_threshold=training_event_score_threshold,
+    )
+    train_keep_rate = float(np.mean(np.asarray(train_event_flag, dtype=np.float32))) if len(train_event_flag) else 0.0
+    _log_step4(
+        f"event gates 3/3 training_event_gate done keep={train_keep_rate:.1%} "
+        f"| score_thr={float(event_score_threshold):.3f}"
     )
     _log_step4("event gates done")
 
@@ -1108,6 +1197,15 @@ def build_causal_event_labels(
     bid_wall_strength_arr = pd.to_numeric(out.get("bid_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     ask_wall_strength_arr = pd.to_numeric(out.get("ask_wall_strength", nan_series), errors="coerce").to_numpy(dtype=np.float64, copy=False)
     _log_step4("ATR + adaptive horizons done")
+    approx_price_checks = int(np.asarray(adaptive_horizons, dtype=np.int64).sum()) * 2
+    requested_workers = 1 if n_workers is None else max(1, int(n_workers))
+    _log_step4(
+        "forward scan plan "
+        f"workers={requested_workers} | rows={n:,} | "
+        f"horizon_med={int(np.median(adaptive_horizons)):,} | "
+        f"horizon_max={int(np.max(adaptive_horizons)):,} | "
+        f"approx_price_checks≈{approx_price_checks:,}"
+    )
 
     # ── 6. FIX-10: per-row forward scan ──────────────────────────────────────
     #
@@ -1130,6 +1228,7 @@ def build_causal_event_labels(
         bid_wall_strength = bid_wall_strength_arr,
         ask_wall_strength = ask_wall_strength_arr,
         n_workers = n_workers,
+        min_parallel_rows = min_parallel_rows,
     )
     _log_step4("forward scan done")
 

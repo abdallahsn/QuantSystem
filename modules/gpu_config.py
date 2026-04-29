@@ -10,7 +10,12 @@ try:
 except AttributeError:
     N_CPU_CORES = os.cpu_count() or 4
 
-N_WORKERS = max(1, min(N_CPU_CORES - 2, 16))  # حجز نواتين للنظام
+try:
+    _MAX_AUTO_WORKERS = int(os.environ.get('QUANTSYSTEM_MAX_AUTO_WORKERS', '64'))
+except ValueError:
+    _MAX_AUTO_WORKERS = 64
+_MAX_AUTO_WORKERS = max(1, _MAX_AUTO_WORKERS)
+N_WORKERS = max(1, min(N_CPU_CORES - 2, _MAX_AUTO_WORKERS))  # حجز نواتين للنظام
 
 # ── Global State ──────────────────────────────────────────────────
 GPU_AVAILABLE    = False

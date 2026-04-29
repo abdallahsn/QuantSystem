@@ -18,9 +18,9 @@
     "label_mode": "v19",
     "chunksize": 2000000,
     "chunk_rows": 2000000,
-    "n_workers": 32,
-    "mbo_workers": 32,
-    "mbp_workers": 32,
+    "n_workers": null,
+    "mbo_workers": null,
+    "mbp_workers": null,
     "resume": false,
     "shard_warmup_rows": 5000,
     "deterministic_stage1": true,
@@ -38,7 +38,8 @@
     "regime_window": 50,
     "regime_progress_every": 25000,
     "lob_event_sample": 100000,
-    "merge_tolerance_ms": 500
+    "merge_tolerance_ms": 500,
+    "step4_min_parallel_rows": 250000
   },
   "backtest": {
     "tick_size": 0.0001,

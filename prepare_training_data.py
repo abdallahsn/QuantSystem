@@ -12,6 +12,15 @@ prepare_training_data.py — V19 Data Refinery
 
 # QuantSystem V19
 import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib, time
+
+# Default runtime threading guards for multiprocessing-heavy refinery stages.
+# Respect user-provided env overrides when present.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+
 import numpy as np
 import pandas as pd
 import gc
@@ -654,6 +663,17 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     total = len(tasks)
     results = []
     rows_done = 0
+    active_workers = min(max(int(workers), 1), total)
+
+    if progress_label:
+        mode = 'sequential' if int(workers) <= 1 else 'multiprocess'
+        note = ''
+        if int(workers) > 1 and total < int(workers):
+            note = f" | requested_workers={int(workers)} but shards={total:,} so active_workers={active_workers}"
+        print(
+            f"  ℹ️ {progress_label}: mode={mode} | shards={total:,} | active_workers={active_workers}{note}",
+            flush=True,
+        )
 
     def _collect(result):
         nonlocal rows_done
@@ -740,6 +760,33 @@ def _process_mbp_shard_task(task: dict) -> dict:
     processed = processed.drop(columns=['__emit'], errors='ignore')
     write_table(processed, out_path, compression='snappy')
     return _shard_record(out_path, processed, shard_idx)
+
+
+def _merge_shard_task(task: dict) -> dict:
+    current_record = task['current']
+    tolerance_ms = int(task.get('tolerance_ms', 500))
+    out_path = task['out_path']
+    resume = bool(task.get('resume', False))
+    shard_idx = int(current_record['shard_idx'])
+    relevant_mbp_records = task.get('relevant_mbp_records', []) or []
+
+    if resume and os.path.exists(out_path):
+        return _read_existing_shard_record(out_path, shard_idx)
+
+    mbo_shard = read_table(current_record['path'])
+    if len(mbo_shard) == 0:
+        merged = mbo_shard.copy()
+    elif relevant_mbp_records:
+        mbp_frames = [read_table(record['path']) for record in relevant_mbp_records]
+        mbp_slice = pd.concat(mbp_frames, ignore_index=True) if mbp_frames else pd.DataFrame()
+        merged = _merge_mbo_mbp_chunk(mbo_shard, mbp_slice, tolerance_ms=tolerance_ms)
+    else:
+        merged = mbo_shard.copy()
+        for c in ['obi','spoofing_ratio','spoofing_duration','liquidity_trap','liquidity_gaps','dist_to_bid_wall','dist_to_ask_wall']:
+            merged[c] = 0.0
+
+    write_table(merged, out_path, compression='snappy')
+    return _shard_record(out_path, merged, shard_idx)
 
 
 def _load_records_frame(records: list[dict]) -> pd.DataFrame:
@@ -834,7 +881,7 @@ def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.D
         'vwap_slope', 'session_cvd',
     ]}
     total_rows = int(len(df))
-    progress_every = 0 if total_rows < 100_000 else min(500_000, max(100_000, total_rows // 20))
+    progress_every = 0 if total_rows < 10_000 else min(250_000, max(2_500, total_rows // 10))
     rebuild_started_at = time.perf_counter()
 
     for idx, row in enumerate(df.itertuples(index=False), start=1):
@@ -911,6 +958,8 @@ def _select_relevant_mbp_records(
     tolerance_ms: int,
 ) -> list[dict]:
     selected = []
+    if pd.isna(ts_min) or pd.isna(ts_max):
+        return list(records)
     lower = ts_min - pd.Timedelta(milliseconds=max(int(tolerance_ms), 1))
     upper = ts_max
     for record in records:
@@ -975,7 +1024,7 @@ def _finalize_merged_frame(df: pd.DataFrame) -> pd.DataFrame:
     trap_values = []
     trap_source = df[['price', 'obi']].fillna(0.0)
     total_rows = int(len(trap_source))
-    progress_every = 0 if total_rows < 100_000 else min(500_000, max(100_000, total_rows // 20))
+    progress_every = 0 if total_rows < 10_000 else min(250_000, max(2_500, total_rows // 10))
     trap_started_at = time.perf_counter()
     for idx, (_, row) in enumerate(trap_source.iterrows(), start=1):
         trap_values.append(
@@ -1067,8 +1116,12 @@ def _process_mbo_chunk(args):
     vwap_eng   = SessionVWAPEngine()
 
     cvd = 0; last_cancel_ratio = 0.0; out = []
+    total_rows = int(len(df_chunk))
+    chunk_id = int(df_chunk['__chunk_id'].iloc[0]) if '__chunk_id' in df_chunk.columns and total_rows > 0 else -1
+    progress_every = 0 if total_rows < 10_000 else min(100_000, max(2_500, total_rows // 10))
+    chunk_started_at = time.perf_counter()
 
-    for row in df_chunk.itertuples(index=False):
+    for idx, row in enumerate(df_chunk.itertuples(index=False), start=1):
         price  = float(getattr(row,'price',0) or 0)
         size   = int(getattr(row,'size', getattr(row,'qty', getattr(row,'volume',0))) or 0)
         action = str(getattr(row,'action','')).strip().upper()
@@ -1128,6 +1181,18 @@ def _process_mbo_chunk(args):
                 'current_vwap': cur_vwap, 'vwap_z_score': v_zscore, 
                 'vwap_slope': v_slope, 'session_cvd': sess_cvd
             })
+
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total_rows):
+            elapsed = time.perf_counter() - chunk_started_at
+            eta = _estimate_remaining_seconds(idx, total_rows, elapsed)
+            print(
+                f"  ⏳ Phase C / MBO pass1 core: shard={chunk_id:,} "
+                f"| rows={idx:,}/{total_rows:,} ({idx/max(total_rows, 1):.1%}) "
+                f"| trades_emitted={len(out):,} "
+                f"| elapsed={_format_duration_brief(elapsed)} "
+                f"| eta≈{_format_duration_brief(eta)}",
+                flush=True,
+            )
 
     return pd.DataFrame(out)
 
@@ -2426,6 +2491,7 @@ def run_refinery(
     allow_unsafe_multiprocessing: bool = False,
     merge_tolerance_ms: int = 500,
     shard_warmup_rows: int = 5_000,
+    step4_min_parallel_rows: int = 250_000,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -2496,6 +2562,14 @@ def run_refinery(
         mbo_rows=int(sum(int(r.get('rows', 0)) for r in mbo_records)),
         mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
     )
+    max_phase_a_shards = max(len(mbo_records), len(mbp_records) if mbp_records else 0)
+    if max_phase_a_shards <= 1 and effective_workers > 1:
+        print(
+            "  ℹ️ Parallelism note: canonical ingest produced a single shard, "
+            f"so later shard-based phases can use at most 1 active worker. "
+            f"لزيادة الاستفادة من CPU خفّض --chunk_rows عن {resolved_chunk_rows:,}.",
+            flush=True,
+        )
 
     sample_mbo_source = read_table(mbo_records[0]['path'])
     sample_mbo = sample_mbo_source.head(min(5_000, max(100, len(sample_mbo_source))))
@@ -2595,7 +2669,11 @@ def run_refinery(
         print("  ♻️ Reusing existing global trade-driven stateful features (resume)...")
         mbo_final_records = reusable_mbo_final_records
     else:
-        print("  🔁 Rebuilding global trade-driven stateful features...")
+        print(
+            "  🔁 Rebuilding global trade-driven stateful features... "
+            "(exact stateful pass; sequential by design to preserve cross-row causality)",
+            flush=True,
+        )
         mbo_pass1_df = _load_records_frame(mbo_pass1_records)
         mbo_final_df = _rebuild_trade_stateful_features(mbo_pass1_df, cal_params)
         del mbo_pass1_df
@@ -2625,59 +2703,36 @@ def run_refinery(
         mbo_final_shards=int(len(mbo_final_records)),
         mbp_feature_shards=int(len(mbp_feature_records)),
     )
-    merged_records: list[dict] = []
     merged_dir = _artifact_phase_dir(output_dir, 'features', 'merged')
-    mbp_cache: dict[str, pd.DataFrame] = {}
     ordered_mbo_final = sorted(mbo_final_records, key=lambda item: int(item['shard_idx']))
-    merge_started_at = time.perf_counter()
+    merge_tasks = []
     for record in ordered_mbo_final:
         shard_idx = int(record['shard_idx'])
         merged_path = os.path.join(merged_dir, f'merged_{shard_idx:05d}.parquet')
-        if resume and os.path.exists(merged_path):
-            merged_records.append(_read_existing_shard_record(merged_path, shard_idx))
-            _print_step_progress(
-                'Phase D / merge shards',
-                done=len(merged_records),
-                total=len(ordered_mbo_final),
-                started_at=merge_started_at,
-                rows_done=int(sum(int(r.get('rows', 0)) for r in merged_records)),
-                unit='shards',
-            )
-            continue
-        mbo_shard = read_table(record['path'])
-        if len(mbo_shard) == 0:
-            merged = mbo_shard.copy()
-        elif mbp_feature_records:
-            ts_min = pd.to_datetime(mbo_shard['ts_event'].min())
-            ts_max = pd.to_datetime(mbo_shard['ts_event'].max())
+        if mbp_feature_records:
+            ts_min = pd.to_datetime(record.get('ts_min'), errors='coerce')
+            ts_max = pd.to_datetime(record.get('ts_max'), errors='coerce')
             relevant_records = _select_relevant_mbp_records(
                 mbp_feature_records,
                 ts_min=ts_min,
                 ts_max=ts_max,
                 tolerance_ms=merge_tolerance_ms,
             )
-            mbp_frames = []
-            for mbp_record in relevant_records:
-                cache_key = mbp_record['path']
-                if cache_key not in mbp_cache:
-                    mbp_cache[cache_key] = read_table(cache_key)
-                mbp_frames.append(mbp_cache[cache_key])
-            mbp_slice = pd.concat(mbp_frames, ignore_index=True) if mbp_frames else pd.DataFrame()
-            merged = _merge_mbo_mbp_chunk(mbo_shard, mbp_slice, tolerance_ms=merge_tolerance_ms)
         else:
-            merged = mbo_shard.copy()
-            for c in ['obi','spoofing_ratio','spoofing_duration','liquidity_trap','liquidity_gaps','dist_to_bid_wall','dist_to_ask_wall']:
-                merged[c] = 0.0
-        write_table(merged, merged_path, compression='snappy')
-        merged_records.append(_shard_record(merged_path, merged, shard_idx))
-        _print_step_progress(
-            'Phase D / merge shards',
-            done=len(merged_records),
-            total=len(ordered_mbo_final),
-            started_at=merge_started_at,
-            rows_done=int(sum(int(r.get('rows', 0)) for r in merged_records)),
-            unit='shards',
-        )
+            relevant_records = []
+        merge_tasks.append({
+            'current': record,
+            'relevant_mbp_records': relevant_records,
+            'tolerance_ms': int(merge_tolerance_ms),
+            'out_path': merged_path,
+            'resume': resume,
+        })
+    merged_records = _run_shard_tasks(
+        merge_tasks,
+        _merge_shard_task,
+        effective_workers,
+        progress_label='Phase D / merge shards',
+    )
     write_checkpoint(
         output_dir,
         'merge',
@@ -2743,6 +2798,7 @@ def run_refinery(
             kalman_slope_threshold=kalman_slope_threshold,
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
+            min_parallel_rows=step4_min_parallel_rows,
         )
         pipeline_tracker.finish(rows=int(len(df_labeled)))
     else:
@@ -3015,6 +3071,7 @@ def run_refinery(
             'regime_window': int(max(regime_window, 10)),
             'regime_progress_every': int(max(regime_progress_every, 0)),
             'merge_tolerance_ms': int(merge_tolerance_ms),
+            'step4_min_parallel_rows': int(step4_min_parallel_rows),
         },
         inputs={
             'mbo': os.path.abspath(mbo_path),
@@ -3108,6 +3165,8 @@ if __name__=='__main__':
                    help='progress print cadence for Wasserstein rolling loops (default: 25000, 0 disables)')
     p.add_argument('--merge_tolerance_ms', type=int, default=500,
                    help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
+    p.add_argument('--step4_min_parallel_rows', type=int, default=250_000,
+                   help='minimum rows before Step 4 forward scan enables multiprocessing on fork-capable platforms (default: 250000)')
     a  = p.parse_args()
     cs = None if a.chunk_rows == 0 else a.chunk_rows
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
@@ -3128,4 +3187,5 @@ if __name__=='__main__':
                  regime_stride=a.regime_stride,
                  regime_window=a.regime_window,
                  regime_progress_every=a.regime_progress_every,
-                 merge_tolerance_ms=a.merge_tolerance_ms)
+                 merge_tolerance_ms=a.merge_tolerance_ms,
+                 step4_min_parallel_rows=a.step4_min_parallel_rows)

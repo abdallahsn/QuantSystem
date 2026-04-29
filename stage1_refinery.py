@@ -5,13 +5,25 @@ stage1_refinery.py - Standalone entrypoint for the refinery stage
 from __future__ import annotations
 
 import argparse
+import os
 
 from modules.config_v19 import load_v19_config
-from prepare_training_data import run_refinery
+
+
+def _configure_stage1_runtime_env() -> None:
+    # Multiprocessing-heavy stages perform best when BLAS/OpenMP stay single-threaded
+    # per worker. Respect user overrides if already set.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
 
 def main():
     defaults = load_v19_config().get('refinery', {})
+    _configure_stage1_runtime_env()
+    from prepare_training_data import run_refinery
     p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 1 refinery only')
     p.add_argument('--mbo', required=True)
     p.add_argument('--mbp', required=True)
@@ -58,6 +70,7 @@ def main():
     p.add_argument('--regime_window', type=int, default=int(defaults.get('regime_window', 50)))
     p.add_argument('--regime_progress_every', type=int, default=int(defaults.get('regime_progress_every', 25000)))
     p.add_argument('--merge_tolerance_ms', type=int, default=int(defaults.get('merge_tolerance_ms', 500)))
+    p.add_argument('--step4_min_parallel_rows', type=int, default=int(defaults.get('step4_min_parallel_rows', 250000)))
 
     args = p.parse_args()
 
@@ -89,6 +102,7 @@ def main():
         regime_progress_every=args.regime_progress_every,
         shard_warmup_rows=args.shard_warmup_rows,
         merge_tolerance_ms=args.merge_tolerance_ms,
+        step4_min_parallel_rows=args.step4_min_parallel_rows,
     )
 
 
