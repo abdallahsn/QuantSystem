@@ -85,6 +85,38 @@ _FORWARD_SCAN_SHARED: dict[str, object] = {}
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _format_duration_brief(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if not np.isfinite(seconds) or seconds < 0:
+        return "?"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -> float | None:
+    done = int(done)
+    total = int(total)
+    if done <= 0 or total <= done:
+        return 0.0 if total == done and total > 0 else None
+    elapsed_seconds = float(elapsed_seconds)
+    if elapsed_seconds <= 0:
+        return None
+    rate = done / elapsed_seconds
+    if rate <= 0:
+        return None
+    return (total - done) / rate
+
 def _safe_series(df: pd.DataFrame, col: str, n: int) -> np.ndarray:
     """Return a numeric numpy array for *col*, falling back to zeros."""
     return (
@@ -484,6 +516,8 @@ def _forward_scan_rows(
     min_wall_strength: float = 2.5,
     wall_exit_buffer_ticks: float = 1.0,
     min_wall_tp_ticks: float = 2.0,
+    progress_every_rows: int = 0,
+    progress_prefix: str = "Step 4 forward scan",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate a contiguous row range using the full read-only price arrays."""
     n = len(prices)
@@ -491,6 +525,7 @@ def _forward_scan_rows(
     bias_arr = np.full(size, DIR_NEUTRAL, dtype=np.int8)
     quality_arr = np.full(size, QUALITY_WEAK, dtype=np.int8)
     end_idx_arr = np.arange(int(start), int(stop), dtype=np.int32)
+    loop_started_at = time.perf_counter() if progress_every_rows > 0 and size > 0 else 0.0
 
     for local_idx, i in enumerate(range(int(start), int(stop))):
         p0 = prices[i]
@@ -573,6 +608,20 @@ def _forward_scan_rows(
             quality_arr[local_idx] = QUALITY_WEAK
             end_idx_arr[local_idx] = min(first_long_hit_idx, first_short_hit_idx)
 
+        processed = local_idx + 1
+        if (
+            progress_every_rows > 0 and
+            (processed % int(progress_every_rows) == 0 or processed == size)
+        ):
+            elapsed = time.perf_counter() - loop_started_at
+            eta = _estimate_remaining_seconds(processed, size, elapsed)
+            print(
+                f"  ⏳ {progress_prefix}: rows={processed:,}/{size:,} "
+                f"({processed/max(size, 1):.1%}) | elapsed={_format_duration_brief(elapsed)} "
+                f"| eta≈{_format_duration_brief(eta)}",
+                flush=True,
+            )
+
     return bias_arr, quality_arr, end_idx_arr
 
 
@@ -603,6 +652,7 @@ def _forward_scan_per_row(
     min_wall_tp_ticks: float = 2.0,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
+    progress_every_rows: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     FIX-10: Vectorised per-row forward scan with row-specific threshold AND horizon.
@@ -635,6 +685,10 @@ def _forward_scan_per_row(
     """
     n = len(prices)
     workers = 1 if n_workers is None else max(1, int(n_workers))
+    if progress_every_rows is None:
+        auto_progress_every_rows = 0 if n < 100_000 else min(500_000, max(100_000, n // 20))
+    else:
+        auto_progress_every_rows = max(0, int(progress_every_rows))
     shared_payload = {
         'prices': prices,
         'dynamic_threshold': dynamic_threshold,
@@ -651,8 +705,31 @@ def _forward_scan_per_row(
         'min_wall_tp_ticks': min_wall_tp_ticks,
     }
 
-    if workers <= 1 or n < int(min_parallel_rows):
-        return _forward_scan_rows(0, n, **shared_payload)
+    if workers <= 1:
+        print(
+            f"  ℹ️ Step 4 forward scan sequential: workers={workers} | rows={n:,}",
+            flush=True,
+        )
+        return _forward_scan_rows(
+            0,
+            n,
+            progress_every_rows=auto_progress_every_rows,
+            progress_prefix="Step 4 forward scan",
+            **shared_payload,
+        )
+    if n < int(min_parallel_rows):
+        print(
+            f"  ℹ️ Step 4 forward scan sequential: rows={n:,} "
+            f"< min_parallel_rows={int(min_parallel_rows):,}",
+            flush=True,
+        )
+        return _forward_scan_rows(
+            0,
+            n,
+            progress_every_rows=auto_progress_every_rows,
+            progress_prefix="Step 4 forward scan",
+            **shared_payload,
+        )
 
     available_methods = set(multiprocessing.get_all_start_methods())
     use_fork = sys.platform != "win32" and "fork" in available_methods
@@ -662,14 +739,26 @@ def _forward_scan_per_row(
             "falling back to sequential scan on this platform.",
             RuntimeWarning,
         )
-        return _forward_scan_rows(0, n, **shared_payload)
+        return _forward_scan_rows(
+            0,
+            n,
+            progress_every_rows=auto_progress_every_rows,
+            progress_prefix="Step 4 forward scan",
+            **shared_payload,
+        )
 
     workers = min(workers, n)
     task_count = min(n, max(workers, workers * 2))
     chunk_rows = max(1, (n + task_count - 1) // task_count)
     bounds = [(start, min(start + chunk_rows, n)) for start in range(0, n, chunk_rows)]
     if len(bounds) <= 1:
-        return _forward_scan_rows(0, n, **shared_payload)
+        return _forward_scan_rows(
+            0,
+            n,
+            progress_every_rows=auto_progress_every_rows,
+            progress_prefix="Step 4 forward scan",
+            **shared_payload,
+        )
 
     print(
         f"  ⚡ Step 4 forward scan parallel: workers={workers} "
@@ -680,12 +769,28 @@ def _forward_scan_per_row(
     global _FORWARD_SCAN_SHARED
     _FORWARD_SCAN_SHARED = shared_payload
     ctx_mp = multiprocessing.get_context("fork")
+    parts: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+    scan_started_at = time.perf_counter()
+    done_rows = 0
+    total_chunks = len(bounds)
     try:
         with ctx_mp.Pool(processes=min(workers, len(bounds))) as pool:
-            parts = pool.map(_forward_scan_pool_worker, bounds)
+            for part in pool.imap_unordered(_forward_scan_pool_worker, bounds):
+                parts.append(part)
+                done_rows += len(part[1])
+                elapsed = time.perf_counter() - scan_started_at
+                eta = _estimate_remaining_seconds(done_rows, n, elapsed)
+                print(
+                    f"  ⏳ Step 4 forward scan: chunks={len(parts):,}/{total_chunks:,} "
+                    f"| rows={done_rows:,}/{n:,} ({done_rows/max(n, 1):.1%}) "
+                    f"| elapsed={_format_duration_brief(elapsed)} "
+                    f"| eta≈{_format_duration_brief(eta)}",
+                    flush=True,
+                )
     finally:
         _FORWARD_SCAN_SHARED = {}
 
+    parts.sort(key=lambda item: int(item[0]))
     bias_arr = np.empty(n, dtype=np.int8)
     quality_arr = np.empty(n, dtype=np.int8)
     end_idx_arr = np.empty(n, dtype=np.int32)

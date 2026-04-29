@@ -11,7 +11,7 @@ prepare_training_data.py — V19 Data Refinery
 """
 
 # QuantSystem V19
-import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib
+import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib, time
 import numpy as np
 import pandas as pd
 import gc
@@ -138,6 +138,155 @@ def _call_build_causal_event_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         print(f"  ℹ️ Label builder compatibility: ignoring unsupported args {dropped}")
 
     return build_causal_event_labels(df, **filtered_kwargs)
+
+
+def _format_duration_brief(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if not np.isfinite(seconds) or seconds < 0:
+        return "?"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -> float | None:
+    done = int(done)
+    total = int(total)
+    if done <= 0 or total <= done:
+        return 0.0 if total == done and total > 0 else None
+    elapsed_seconds = float(elapsed_seconds)
+    if elapsed_seconds <= 0:
+        return None
+    rate = done / elapsed_seconds
+    if rate <= 0:
+        return None
+    return (total - done) / rate
+
+
+class _RefineryProgressTracker:
+    def __init__(self, total_steps: int, output_dir: str):
+        self.total_steps = max(1, int(total_steps))
+        self.output_dir = output_dir
+        self.started_at = time.perf_counter()
+        self.completed_steps: list[dict] = []
+        self.current_step: dict | None = None
+
+    def _pipeline_elapsed(self) -> float:
+        return time.perf_counter() - self.started_at
+
+    def _pipeline_eta(self) -> float | None:
+        done = len(self.completed_steps)
+        if done <= 0:
+            return None
+        remaining = self.total_steps - done
+        if remaining <= 0:
+            return 0.0
+        avg_step = sum(float(step.get("duration_seconds", 0.0)) for step in self.completed_steps) / done
+        return avg_step * remaining
+
+    def _snapshot(self, status: str) -> dict:
+        return {
+            "status": str(status),
+            "total_steps": int(self.total_steps),
+            "completed_steps": int(len(self.completed_steps)),
+            "elapsed_seconds": round(self._pipeline_elapsed(), 3),
+            "pipeline_eta_seconds": None if self._pipeline_eta() is None else round(float(self._pipeline_eta()), 3),
+            "current_step": self.current_step,
+            "steps": self.completed_steps,
+        }
+
+    def _persist(self, status: str) -> None:
+        try:
+            path = os.path.join(self.output_dir, "refinery_timing.json")
+            with open(path, "w") as f:
+                json.dump(self._snapshot(status), f, indent=2)
+        except Exception:
+            pass
+
+    def start(self, name: str, **meta) -> None:
+        index = len(self.completed_steps) + 1
+        pipeline_progress = len(self.completed_steps) / max(self.total_steps, 1)
+        self.current_step = {
+            "index": int(index),
+            "name": str(name),
+            "status": "running",
+            "started_after_seconds": round(self._pipeline_elapsed(), 3),
+            "meta": meta,
+        }
+        eta = self._pipeline_eta()
+        eta_txt = _format_duration_brief(eta)
+        print(
+            f"  ⏱️  [{index}/{self.total_steps}] start {name} "
+            f"| phase_progress=0.0% "
+            f"| pipeline_progress={pipeline_progress:.1%} "
+            f"| elapsed={_format_duration_brief(self._pipeline_elapsed())} "
+            f"| pipeline_eta≈{eta_txt}",
+            flush=True,
+        )
+        self._persist(status="running")
+
+    def finish(self, **metrics) -> None:
+        if self.current_step is None:
+            return
+        finished_at = self._pipeline_elapsed()
+        started_after = float(self.current_step.get("started_after_seconds", 0.0))
+        duration = max(0.0, finished_at - started_after)
+        record = {
+            **self.current_step,
+            "status": "completed",
+            "duration_seconds": round(duration, 3),
+            "finished_after_seconds": round(finished_at, 3),
+            "metrics": metrics,
+        }
+        self.completed_steps.append(record)
+        remaining_eta = self._pipeline_eta()
+        pipeline_progress = len(self.completed_steps) / max(self.total_steps, 1)
+        print(
+            f"  ✅ [{record['index']}/{self.total_steps}] done {record['name']} "
+            f"in {_format_duration_brief(duration)} "
+            f"| phase_progress=100.0% "
+            f"| pipeline_progress={pipeline_progress:.1%} "
+            f"| total_elapsed={_format_duration_brief(finished_at)} "
+            f"| remaining≈{_format_duration_brief(remaining_eta)}",
+            flush=True,
+        )
+        self.current_step = None
+        status = "completed" if len(self.completed_steps) >= self.total_steps else "running"
+        self._persist(status=status)
+
+
+def _print_step_progress(
+    label: str,
+    done: int,
+    total: int,
+    started_at: float,
+    *,
+    rows_done: int | None = None,
+    unit: str = "items",
+) -> None:
+    total = max(int(total), 1)
+    done = max(0, min(int(done), total))
+    elapsed = max(0.0, time.perf_counter() - float(started_at))
+    eta = _estimate_remaining_seconds(done, total, elapsed)
+    pct = done / total
+    text = (
+        f"  ⏳ {label}: {done:,}/{total:,} {unit} "
+        f"({pct:.1%}) | elapsed={_format_duration_brief(elapsed)} "
+        f"| eta≈{_format_duration_brief(eta)}"
+    )
+    if rows_done is not None:
+        text += f" | rows={int(rows_done):,}"
+    print(text, flush=True)
 
 
 def _require_causal_label_runtime(label_mode: str) -> None:
@@ -445,13 +594,26 @@ def _canonicalize_input_file(
     output_dir: str,
     chunk_rows: int,
     resume: bool = False,
+    progress_label: str | None = None,
 ) -> list[dict]:
     phase_dir = _artifact_phase_dir(output_dir, 'normalized', kind)
     records: list[dict] = []
+    rows_done = 0
+    started_at = time.perf_counter()
     for shard_idx, chunk in enumerate(iter_table_chunks(path, chunk_rows)):
         shard_path = os.path.join(phase_dir, f'{kind}_{shard_idx:05d}.parquet')
         if resume and os.path.exists(shard_path):
-            records.append(_read_existing_shard_record(shard_path, shard_idx))
+            record = _read_existing_shard_record(shard_path, shard_idx)
+            records.append(record)
+            rows_done += int(record.get('rows', 0))
+            if progress_label:
+                print(
+                    f"  ⏳ {progress_label}: shard={shard_idx + 1:,} "
+                    f"| rows={rows_done:,} "
+                    f"| elapsed={_format_duration_brief(time.perf_counter() - started_at)} "
+                    f"| status=reused",
+                    flush=True,
+                )
             continue
 
         normalized = _normalize_databento_columns(chunk)
@@ -461,6 +623,15 @@ def _canonicalize_input_file(
         write_table(normalized, shard_path, compression='snappy')
         record = _shard_record(shard_path, normalized, shard_idx)
         records.append(record)
+        rows_done += int(record.get('rows', 0))
+        if progress_label:
+            print(
+                f"  ⏳ {progress_label}: shard={shard_idx + 1:,} "
+                f"| rows={rows_done:,} "
+                f"| elapsed={_format_duration_brief(time.perf_counter() - started_at)} "
+                f"| status=written",
+                flush=True,
+            )
         write_checkpoint(
             output_dir,
             f'canonical_{kind}',
@@ -476,16 +647,39 @@ def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
     return prev_df.tail(int(warmup_rows)).copy()
 
 
-def _run_shard_tasks(tasks, worker_fn, workers: int):
+def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None = None):
     if not tasks:
         return []
+    started_at = time.perf_counter()
+    total = len(tasks)
+    results = []
+    rows_done = 0
+
+    def _collect(result):
+        nonlocal rows_done
+        results.append(result)
+        rows_done += int(result.get('rows', 0))
+        if progress_label:
+            _print_step_progress(
+                progress_label,
+                done=len(results),
+                total=total,
+                started_at=started_at,
+                rows_done=rows_done,
+                unit='shards',
+            )
+
     if workers <= 1:
-        return [worker_fn(task) for task in tasks]
+        for task in tasks:
+            _collect(worker_fn(task))
+        return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
     available_methods = set(multiprocessing.get_all_start_methods())
     preferred_method = 'fork' if sys.platform != 'win32' and 'fork' in available_methods else 'spawn'
     ctx_mp = multiprocessing.get_context(preferred_method)
     with ctx_mp.Pool(processes=min(int(workers), len(tasks))) as pool:
-        return pool.map(worker_fn, tasks)
+        for result in pool.imap_unordered(worker_fn, tasks):
+            _collect(result)
+    return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
 
 
 def _process_mbo_shard_task(task: dict) -> dict:
@@ -512,7 +706,8 @@ def _process_mbo_shard_task(task: dict) -> dict:
         work_df = current_df
 
     processed = _process_mbo_chunk((work_df, cal_params))
-    processed = processed[processed.get('__emit', 1) == 1].reset_index(drop=True)
+    emit_mask = (processed['__emit'] == 1) if '__emit' in processed.columns else np.ones(len(processed), dtype=bool)
+    processed = processed.loc[emit_mask].reset_index(drop=True)
     processed = processed.drop(columns=['__emit'], errors='ignore')
     write_table(processed, out_path, compression='snappy')
     return _shard_record(out_path, processed, shard_idx)
@@ -540,7 +735,8 @@ def _process_mbp_shard_task(task: dict) -> dict:
         work_df = current_df
 
     processed = _process_mbp10(work_df, tick_size=tick_size)
-    processed = processed[processed.get('__emit', 1) == 1].reset_index(drop=True)
+    emit_mask = (processed['__emit'] == 1) if '__emit' in processed.columns else np.ones(len(processed), dtype=bool)
+    processed = processed.loc[emit_mask].reset_index(drop=True)
     processed = processed.drop(columns=['__emit'], errors='ignore')
     write_table(processed, out_path, compression='snappy')
     return _shard_record(out_path, processed, shard_idx)
@@ -637,8 +833,11 @@ def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.D
         'ib_status', 'remaining_fuel', 'fuel_exhausted', 'current_vwap', 'vwap_z_score',
         'vwap_slope', 'session_cvd',
     ]}
+    total_rows = int(len(df))
+    progress_every = 0 if total_rows < 100_000 else min(500_000, max(100_000, total_rows // 20))
+    rebuild_started_at = time.perf_counter()
 
-    for row in df.itertuples(index=False):
+    for idx, row in enumerate(df.itertuples(index=False), start=1):
         price = float(getattr(row, 'price', 0.0) or 0.0)
         size = int(getattr(row, 'size', 0) or 0)
         side = str(getattr(row, 'side', '')).strip().upper()
@@ -685,6 +884,16 @@ def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.D
         rebuilt['vwap_z_score'].append(v_zscore)
         rebuilt['vwap_slope'].append(v_slope)
         rebuilt['session_cvd'].append(sess_cvd)
+
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total_rows):
+            elapsed = time.perf_counter() - rebuild_started_at
+            eta = _estimate_remaining_seconds(idx, total_rows, elapsed)
+            print(
+                f"  ⏳ Phase C / rebuild trade-state: rows={idx:,}/{total_rows:,} "
+                f"({idx/max(total_rows, 1):.1%}) | elapsed={_format_duration_brief(elapsed)} "
+                f"| eta≈{_format_duration_brief(eta)}",
+                flush=True,
+            )
 
     for col, values in rebuilt.items():
         if col in {'fisher_signal', 'anomaly', 'fuel_exhausted'}:
@@ -751,12 +960,37 @@ def _merge_mbo_mbp_chunk(
 
 
 def _finalize_merged_frame(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy().sort_values('ts_event').reset_index(drop=True)
+    if df is None or len(df) == 0:
+        return df.copy() if df is not None else pd.DataFrame()
+    df = df.copy()
+    if 'ts_event' in df.columns:
+        df = df.sort_values('ts_event').reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+    if 'price' not in df.columns:
+        df['price'] = 0.0
+    if 'obi' not in df.columns:
+        df['obi'] = 0.0
     liq = LiquidityTrapDetector()
-    df['liquidity_trap'] = [
-        liq.update(float(r.get('price', 0.0) or 0.0), float(r.get('obi', 0.0) or 0.0))
-        for _, r in df[['price', 'obi']].fillna(0.0).iterrows()
-    ]
+    trap_values = []
+    trap_source = df[['price', 'obi']].fillna(0.0)
+    total_rows = int(len(trap_source))
+    progress_every = 0 if total_rows < 100_000 else min(500_000, max(100_000, total_rows // 20))
+    trap_started_at = time.perf_counter()
+    for idx, (_, row) in enumerate(trap_source.iterrows(), start=1):
+        trap_values.append(
+            liq.update(float(row.get('price', 0.0) or 0.0), float(row.get('obi', 0.0) or 0.0))
+        )
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total_rows):
+            elapsed = time.perf_counter() - trap_started_at
+            eta = _estimate_remaining_seconds(idx, total_rows, elapsed)
+            print(
+                f"  ⏳ Phase D / finalize merged frame: rows={idx:,}/{total_rows:,} "
+                f"({idx/max(total_rows, 1):.1%}) | elapsed={_format_duration_brief(elapsed)} "
+                f"| eta≈{_format_duration_brief(eta)}",
+                flush=True,
+            )
+    df['liquidity_trap'] = trap_values
     for col in df.select_dtypes(include='float64').columns:
         df[col] = df[col].astype('float32')
     for col in df.select_dtypes(include='int64').columns:
@@ -1838,6 +2072,21 @@ def _normalize_and_save(
     print("\n📐 Normalization (RobustScaler — train-only fit)...")
     df = df.copy()
     fit_aux_models = fit_aux_models and os.environ.get('QUANTSYSTEM_SKIP_HEAVY_ML', '').strip() != '1'
+    substep_total = 6
+    substep_done = 0
+    substep_started_at = time.perf_counter()
+
+    def _advance_step5(label: str) -> None:
+        nonlocal substep_done
+        substep_done += 1
+        _print_step_progress(
+            f"Step 5 / {label}",
+            done=substep_done,
+            total=substep_total,
+            started_at=substep_started_at,
+            rows_done=int(len(df)),
+            unit='substeps',
+        )
 
     # Preserve raw model inputs so train_v19.py can fit fold-specific scalers
     # instead of inheriting a globally pre-scaled CSV.
@@ -1941,10 +2190,12 @@ def _normalize_and_save(
     with open(scaler_path, 'w') as f:
         json.dump(scaler_params, f, indent=2)
     print(f"  ✅ Scaler params محفوظة: {scaler_path} ({len(scaler_params)} features)")
+    _advance_step5("split + scaler")
 
     # 2. Compute Rolling Stats
     df, roll_cols = _compute_rolling_stats(df, window=rolling_window)
     roll_col_list = [c for c in roll_cols if c in df.columns]
+    _advance_step5("rolling stats")
 
     # ══════════════════════════════════════════════════════════
     # ANTI-LEAKAGE FIX [AE]: train AE على train split فقط
@@ -1973,6 +2224,7 @@ def _normalize_and_save(
     else:
         df['dl_anomaly_score'] = 0.0
         for i in range(EMBEDDINGS_DIM): df[f'emb_{i}'] = 0.0
+    _advance_step5("deep autoencoder")
 
     # ══════════════════════════════════════════════════════════
     # ANTI-LEAKAGE FIX [mRMR]: feature selection على train split فقط
@@ -2005,6 +2257,7 @@ def _normalize_and_save(
     except Exception as e:
         print(f"  ⚠️ mRMR skipped: {e}")
         selected = feat_cols_available
+    _advance_step5("mrmr feature selection")
 
     # ══════════════════════════════════════════════════════════
     # ANTI-LEAKAGE FIX [Regime]: fit على train split فقط
@@ -2045,6 +2298,7 @@ def _normalize_and_save(
         if 'regime_label' not in df.columns:
             df['regime_label'] = 0
         print(f"  ⚠️ Regime skipped: {e}")
+    _advance_step5("regime surface")
 
     # SESSION_LEAK_COLS تُحفظ كـ metadata للتحليل لكن لا تدخل FEATURE_COLS
     session_meta = [c for c in SESSION_LEAK_COLS if c in df.columns]
@@ -2073,6 +2327,7 @@ def _normalize_and_save(
         f"{len(final_shards)} shard(s) | "
         f"{len(MODEL_FEATURE_COLS)} raw + {len(roll_cols)} rolling + meta"
     )
+    _advance_step5("final parquet")
     return df, path, roll_cols
 
 def _report(df, mbo_p, mbp_p, elapsed, output_dir):
@@ -2202,10 +2457,16 @@ def run_refinery(
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
     deeplob_enabled = bool(mbp_exists and _load_deeplob_components())
     lob_limits = _deeplob_runtime_limits(lob_event_sample=lob_event_sample)
+    pipeline_tracker = _RefineryProgressTracker(total_steps=11, output_dir=output_dir)
     if mbp_exists and not deeplob_enabled:
         print("  ⚠️ DeepLOB runtime غير متاح — Step 3e سيُنتج LOB artifacts فارغة")
 
     print(f"\n📥 Phase A — Canonical Ingest")
+    pipeline_tracker.start(
+        "Phase A — Canonical Ingest",
+        chunk_rows=int(resolved_chunk_rows),
+        resume=bool(resume),
+    )
     print(f"  MBO: {mbo_path}")
     mbo_records = _canonicalize_input_file(
         mbo_path,
@@ -2213,6 +2474,7 @@ def run_refinery(
         output_dir=output_dir,
         chunk_rows=resolved_chunk_rows,
         resume=resume,
+        progress_label='Phase A / MBO canonicalize',
     )
     if not mbo_records:
         raise RuntimeError("❌ No canonical MBO shards were produced")
@@ -2226,7 +2488,14 @@ def run_refinery(
             output_dir=output_dir,
             chunk_rows=resolved_chunk_rows,
             resume=resume,
+            progress_label='Phase A / MBP canonicalize',
         )
+    pipeline_tracker.finish(
+        mbo_shards=len(mbo_records),
+        mbp_shards=len(mbp_records),
+        mbo_rows=int(sum(int(r.get('rows', 0)) for r in mbo_records)),
+        mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
+    )
 
     sample_mbo_source = read_table(mbo_records[0]['path'])
     sample_mbo = sample_mbo_source.head(min(5_000, max(100, len(sample_mbo_source))))
@@ -2242,6 +2511,11 @@ def run_refinery(
     _tick = float(cal.tick_size) if float(cal.tick_size) > 0 else 0.0001
 
     print("\n⚙️  Phase B — MBP Vectorized Shards...")
+    pipeline_tracker.start(
+        "Phase B — MBP Vectorized Shards",
+        mbp_enabled=bool(mbp_records),
+        workers=int(mbp_workers),
+    )
     mbp_feature_records: list[dict] = []
     if mbp_records:
         mbp_feature_dir = _artifact_phase_dir(output_dir, 'features', 'mbp')
@@ -2256,14 +2530,28 @@ def run_refinery(
                 'out_path': os.path.join(mbp_feature_dir, f'mbp_{int(record["shard_idx"]):05d}.parquet'),
                 'resume': resume,
             })
-        mbp_feature_records = _run_shard_tasks(mbp_tasks, _process_mbp_shard_task, mbp_workers)
+        mbp_feature_records = _run_shard_tasks(
+            mbp_tasks,
+            _process_mbp_shard_task,
+            mbp_workers,
+            progress_label='Phase B / MBP feature shards',
+        )
         write_checkpoint(
             output_dir,
             'mbp_features',
             {'processed_shards': len(mbp_feature_records), 'rows': int(sum(r['rows'] for r in mbp_feature_records))},
         )
+    pipeline_tracker.finish(
+        feature_shards=len(mbp_feature_records),
+        feature_rows=int(sum(int(r.get('rows', 0)) for r in mbp_feature_records)),
+    )
 
     print("\n⚙️  Phase C — MBO Two-Pass...")
+    pipeline_tracker.start(
+        "Phase C — MBO Two-Pass",
+        workers=int(mbo_workers),
+        warmup_rows=int(max(shard_warmup_rows, 0)),
+    )
     mbo_pass1_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_pass1')
     mbo_tasks = []
     for idx, record in enumerate(sorted(mbo_records, key=lambda item: int(item['shard_idx']))):
@@ -2276,7 +2564,12 @@ def run_refinery(
             'out_path': os.path.join(mbo_pass1_dir, f'mbo_{int(record["shard_idx"]):05d}.parquet'),
             'resume': resume,
         })
-    mbo_pass1_records = _run_shard_tasks(mbo_tasks, _process_mbo_shard_task, mbo_workers)
+    mbo_pass1_records = _run_shard_tasks(
+        mbo_tasks,
+        _process_mbo_shard_task,
+        mbo_workers,
+        progress_label='Phase C / MBO pass1 shards',
+    )
     if not mbo_pass1_records:
         raise RuntimeError("❌ مفيش trades في MBO — تأكد أن الملف يحتوي action=T أو F")
     write_checkpoint(
@@ -2318,17 +2611,38 @@ def run_refinery(
             {'processed_shards': len(mbo_final_records), 'rows': int(len(mbo_final_df))},
         )
         del mbo_final_df
+    pipeline_tracker.finish(
+        pass1_shards=len(mbo_pass1_records),
+        final_shards=len(mbo_final_records),
+        pass1_rows=int(sum(int(r.get('rows', 0)) for r in mbo_pass1_records)),
+        final_rows=int(sum(int(r.get('rows', 0)) for r in mbo_final_records)),
+        reused_pass2=bool(reusable_mbo_final_records),
+    )
 
     print("\n⚙️  Phase D — Merge MBO & MBP Shards...")
+    pipeline_tracker.start(
+        "Phase D — Merge MBO & MBP Shards",
+        mbo_final_shards=int(len(mbo_final_records)),
+        mbp_feature_shards=int(len(mbp_feature_records)),
+    )
     merged_records: list[dict] = []
     merged_dir = _artifact_phase_dir(output_dir, 'features', 'merged')
     mbp_cache: dict[str, pd.DataFrame] = {}
     ordered_mbo_final = sorted(mbo_final_records, key=lambda item: int(item['shard_idx']))
+    merge_started_at = time.perf_counter()
     for record in ordered_mbo_final:
         shard_idx = int(record['shard_idx'])
         merged_path = os.path.join(merged_dir, f'merged_{shard_idx:05d}.parquet')
         if resume and os.path.exists(merged_path):
             merged_records.append(_read_existing_shard_record(merged_path, shard_idx))
+            _print_step_progress(
+                'Phase D / merge shards',
+                done=len(merged_records),
+                total=len(ordered_mbo_final),
+                started_at=merge_started_at,
+                rows_done=int(sum(int(r.get('rows', 0)) for r in merged_records)),
+                unit='shards',
+            )
             continue
         mbo_shard = read_table(record['path'])
         if len(mbo_shard) == 0:
@@ -2356,6 +2670,14 @@ def run_refinery(
                 merged[c] = 0.0
         write_table(merged, merged_path, compression='snappy')
         merged_records.append(_shard_record(merged_path, merged, shard_idx))
+        _print_step_progress(
+            'Phase D / merge shards',
+            done=len(merged_records),
+            total=len(ordered_mbo_final),
+            started_at=merge_started_at,
+            rows_done=int(sum(int(r.get('rows', 0)) for r in merged_records)),
+            unit='shards',
+        )
     write_checkpoint(
         output_dir,
         'merge',
@@ -2363,11 +2685,18 @@ def run_refinery(
     )
     df_merged = _finalize_merged_frame(_load_records_frame(merged_records))
     gc.collect()
+    pipeline_tracker.finish(
+        merged_shards=len(merged_records),
+        merged_rows=int(sum(int(r.get('rows', 0)) for r in merged_records)),
+    )
 
     print("\n⚙️  Step 3b — Rolling Context Features...")
+    pipeline_tracker.start("Step 3b — Rolling Context Features", rows=int(len(df_merged)))
     df_merged = _add_rolling_context(df_merged)
+    pipeline_tracker.finish(rows=int(len(df_merged)))
 
     print("\n⚙️  Step 3b-ii — Session Zone Features (metadata only)...")
+    pipeline_tracker.start("Step 3b-ii — Session + GARCH Features", rows=int(len(df_merged)))
     df_merged = add_session_features(df_merged, ts_col='ts_event')
 
     # ── التعديل 1: Cyclical Session Encoding ─────────────────────
@@ -2381,16 +2710,26 @@ def run_refinery(
     df_merged['garch_vol']    = garch_df['garch_vol'].values
     df_merged['garch_regime'] = garch_df['garch_regime'].values
     print(f"  ✅ GARCH: vol range=[{df_merged['garch_vol'].min():.6f}, {df_merged['garch_vol'].max():.6f}]")
+    pipeline_tracker.finish(rows=int(len(df_merged)))
 
     print("\n⚙️  Step 3c — Fractional Differentiation...")
+    pipeline_tracker.start("Step 3c — Fractional Differentiation", rows=int(len(df_merged)))
     df_merged, frac_cols = apply_fractional_diff(df_merged, d=0.4)
+    pipeline_tracker.finish(rows=int(len(df_merged)), frac_cols=int(len(frac_cols)))
 
     print("\n⚙️  Step 3d — Daily/Weekly Levels...")
+    pipeline_tracker.start("Step 3d — Daily/Weekly Levels", rows=int(len(df_merged)))
     df_merged = compute_daily_weekly_levels(df_merged)
+    pipeline_tracker.finish(rows=int(len(df_merged)))
 
     if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
         label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
         print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
+        pipeline_tracker.start(
+            f"Step 4 — {label_runtime} Causal Event Labels",
+            rows=int(len(df_merged)),
+            workers=int(effective_workers),
+        )
         df_labeled = _call_build_causal_event_labels(
             df_merged,
             horizon=label_horizon,
@@ -2405,13 +2744,21 @@ def run_refinery(
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
         )
+        pipeline_tracker.finish(rows=int(len(df_labeled)))
     else:
         print("\n⚙️  Step 4 — Fallback Session Labeling...")
+        pipeline_tracker.start("Step 4 — Fallback Session Labeling", rows=int(len(df_merged)))
         if V19_LABELS_IMPORT_ERROR is not None:
             print(f"  ⚠️ V19 labels import failed: {V19_LABELS_IMPORT_ERROR}")
         df_labeled = _label_sessions(df_merged)
+        pipeline_tracker.finish(rows=int(len(df_labeled)))
 
     # ── V19 Step 3e: LOB Tensor Dataset (event-rich emit positions) ─────
+    pipeline_tracker.start(
+        "Step 3e — LOB Tensor Dataset",
+        mbp_exists=bool(mbp_exists),
+        deeplob_enabled=bool(deeplob_enabled),
+    )
     lob_path = os.path.join(output_dir, 'lob_tensors.npy')
     ts_path = os.path.join(output_dir, 'lob_tensor_timestamps.npy')
     build_plan_path = os.path.join(output_dir, 'lob_build_plan.json')
@@ -2423,6 +2770,7 @@ def run_refinery(
                 existing_lob_meta = json.load(f)
         except Exception:
             existing_lob_meta = {}
+    step3e_status = str(existing_lob_meta.get('status', 'pending')) if isinstance(existing_lob_meta, dict) else 'pending'
     reusable_lob_statuses = {'built', 'skipped', 'empty_event_sample'}
     if (
         resume and
@@ -2432,6 +2780,7 @@ def run_refinery(
         str(existing_lob_meta.get('status', '')).strip().lower() in reusable_lob_statuses
     ):
         print("\n⚙️  Step 3e — Reusing existing LOB Tensor Dataset (resume)...")
+        step3e_status = 'reused'
     elif deeplob_enabled and mbp_records:
         print("\n⚙️  Step 3e — Building Event-Rich LOB Tensor Dataset (V19)...")
         try:
@@ -2470,6 +2819,7 @@ def run_refinery(
                     reason='auto_skip_large_step3e',
                     build_plan=build_plan,
                 )
+                step3e_status = 'skipped'
                 print(
                     "  ⚠️ Step 3e skipped تلقائيًا: "
                     f"events={total_lob_events:,}, budget_tensors={effective_max_tensors:,}. "
@@ -2493,6 +2843,7 @@ def run_refinery(
                         reason='no_event_emit_positions',
                         build_plan=build_plan,
                     )
+                    step3e_status = 'empty_event_sample'
                     print("  ⚠️ لا توجد event-rich positions كافية لبناء LOB tensors")
                 else:
                     lob_mbo_src = _load_lob_source_from_records(mbo_final_records, 'mbo')
@@ -2504,6 +2855,7 @@ def run_refinery(
                             reason='mbp_source_unavailable',
                             build_plan=build_plan,
                         )
+                        step3e_status = 'empty_mbp_source'
                         print("  ⚠️ MBP source فارغ بعد canonical ingest — تعذر بناء LOB tensors")
                     else:
                         lob_meta = build_lob_tensor_dataset(
@@ -2517,6 +2869,7 @@ def run_refinery(
                         lob_meta = {**build_plan, **lob_meta}
                         with open(os.path.join(output_dir, 'lob_build_meta.json'), 'w') as f:
                             json.dump(lob_meta, f, indent=2)
+                        step3e_status = 'built' if int(lob_meta.get('built_tensors', 0)) > 0 else 'built_empty'
 
                         if int(lob_meta.get('built_tensors', 0)) > 0:
                             est_gb = lob_meta.get('estimated_tensor_bytes', 0) / (1024 ** 3)
@@ -2539,6 +2892,7 @@ def run_refinery(
                 build_plan=build_plan if 'build_plan' in locals() else None,
                 error=str(e),
             )
+            step3e_status = 'failed'
             print(f"  ⚠️ LOB Tensor build failed: {e}")
     else:
         reason = 'mbp_missing'
@@ -2556,11 +2910,22 @@ def run_refinery(
                 'lob_event_sample': int(lob_limits['lob_event_sample']),
             },
         )
+        step3e_status = f'disabled:{reason}'
+    pipeline_tracker.finish(
+        lob_path=lob_path,
+        timestamps_path=ts_path,
+        lob_status=step3e_status,
+    )
 
     # ⑦ FIX: del df_merged بعد انتهاء كل المسارات
     del df_merged
 
     print("\n⚙️  Step 5 — Deep Autoencoder + Normalize + Save...")
+    pipeline_tracker.start(
+        "Step 5 — Deep Autoencoder + Normalize + Save",
+        rows=int(len(df_labeled)),
+        fit_aux_models=bool(fit_aux_models),
+    )
     df_final, out_path, roll_cols = _normalize_and_save(
         df_labeled,
         output_dir,
@@ -2572,6 +2937,11 @@ def run_refinery(
         regime_progress_every=regime_progress_every,
     )
     del df_labeled
+    pipeline_tracker.finish(
+        rows=int(len(df_final)),
+        out_path=out_path,
+        rolling_cols=int(len(roll_cols)),
+    )
 
     split_meta = {}
     split_path = os.path.join(output_dir, 'refinery_split.json')
