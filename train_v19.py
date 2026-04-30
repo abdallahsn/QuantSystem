@@ -1116,9 +1116,9 @@ def stage1_oof_meta(
         )
         model = CatBoostClassifier(
             iterations=1000,
-            depth=6,
+            depth=5,
             learning_rate=0.01,
-            l2_leaf_reg=5.0,
+            l2_leaf_reg=3.0,
             loss_function='Logloss',
             eval_metric='Logloss',
             early_stopping_rounds=50 if inner_val is not None else None,
@@ -1209,9 +1209,9 @@ def stage1_oof_meta(
     )
     final_model = CatBoostClassifier(
         iterations=1000,
-        depth=6,
+        depth=5,
         learning_rate=0.01,
-        l2_leaf_reg=5.0,
+        l2_leaf_reg=3.0,
         loss_function='Logloss',
         eval_metric='Logloss',
         early_stopping_rounds=50,
