@@ -50,9 +50,9 @@ class CatBoostQuantBrain:
                  feature_cols: list,
                  brain_filename: str = 'outputs/catboost_brain.cbm',
                  depth: int = 6,
-                 iterations: int = 500,
-                 learning_rate: float = 0.05,
-                 l2_leaf_reg: float = 3.0,
+                 iterations: int = 1000,
+                 learning_rate: float = 0.01,
+                 l2_leaf_reg: float = 7.0,
                  confidence_threshold: float = 0.60,
                  embeddings_dim: int = 8,
                  # ── FIX: Rolling Context Window ──────────────────────────

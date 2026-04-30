@@ -1115,15 +1115,15 @@ def stage1_oof_meta(
             weak_weight=quality_weight_weak,
         )
         model = CatBoostClassifier(
-            iterations=400,
+            iterations=1000,
             depth=6,
-            learning_rate=0.05,
-            l2_leaf_reg=3.0,
+            learning_rate=0.01,
+            l2_leaf_reg=5.0,
             loss_function='Logloss',
             eval_metric='Logloss',
             early_stopping_rounds=50 if inner_val is not None else None,
             use_best_model=inner_val is not None,
-            verbose=0,
+            verbose=50,
             random_seed=42 + fold_no,
             task_type=cb_task_type,
             devices=cb_devices,
@@ -1208,10 +1208,10 @@ def stage1_oof_meta(
         weak_weight=quality_weight_weak,
     )
     final_model = CatBoostClassifier(
-        iterations=500,
+        iterations=1000,
         depth=6,
-        learning_rate=0.05,
-        l2_leaf_reg=3.0,
+        learning_rate=0.01,
+        l2_leaf_reg=5.0,
         loss_function='Logloss',
         eval_metric='Logloss',
         early_stopping_rounds=50,
