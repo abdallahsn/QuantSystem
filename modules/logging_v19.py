@@ -19,13 +19,18 @@ DEFAULT_EVENT_FIELDS = {
     'event_type': '',
     'level': 'INFO',
     'run_mode': 'shadow',
+    'dataset_id': '',
+    'model_id': '',
     'model_version': 'v19',
     'schema_version': 'v19',
     'symbol': '',
     'sequence_ready': False,
+    'event_gate_passed': False,
+    'event_gate_reason': '',
     'bias': 'NEUTRAL',
     'bias_idx': -1,
     'confidence': 0.0,
+    'chosen_threshold': 0.0,
     'tradeable': False,
     'reject_reason': '',
     'cluster': 0,
@@ -117,10 +122,24 @@ class BaseRuntimeLogger:
         self.model_version = model_version
         self.schema_version = schema_version
         self.symbol = symbol
+        self.dataset_id = ''
+        self.model_id = os.path.basename(os.path.abspath(os.path.dirname(manifest_path))) if manifest_path else ''
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+                extra = manifest.get('extra', {}) or {}
+                source_contract = extra.get('source_contract', {}) or {}
+                self.dataset_id = str(source_contract.get('dataset_id') or extra.get('dataset_id') or '')
+                self.model_id = str(extra.get('model_id') or self.model_id)
+            except Exception:
+                pass
 
     def _base_payload(self, **kwargs) -> dict:
         return {
             'run_mode': self.run_mode,
+            'dataset_id': self.dataset_id,
+            'model_id': self.model_id,
             'model_version': self.model_version,
             'schema_version': self.schema_version,
             'symbol': self.symbol,
@@ -134,9 +153,12 @@ class PredictionLogger(BaseRuntimeLogger):
         missing = sorted([k for k, v in features.items() if v is None or (isinstance(v, float) and np.isnan(v))])
         payload = self._base_payload(
             sequence_ready=prediction.get('sequence_ready', False),
+            event_gate_passed=bool(prediction.get('event_gate_passed', False)),
+            event_gate_reason=str(prediction.get('event_gate_reason', '') or ''),
             bias=prediction.get('bias', 'NEUTRAL'),
             bias_idx=int(prediction.get('bias_idx', -1)) if prediction.get('bias_idx') is not None else -1,
             confidence=float(prediction.get('confidence', 0.0) or 0.0),
+            chosen_threshold=float(prediction.get('chosen_threshold', 0.0) or 0.0),
             tradeable=bool(prediction.get('tradeable', False)),
             reject_reason=str(prediction.get('reason', '') or ''),
             cluster=int(prediction.get('cluster', 0) or 0),
@@ -149,6 +171,8 @@ class PredictionLogger(BaseRuntimeLogger):
             extra={
                 'stat_features': safe_jsonable(features),
                 'cb_probs': prediction.get('cb_probs', {}),
+                'raw_direction_probs': prediction.get('raw_direction_probs', {}),
+                'direction_probs': prediction.get('direction_probs', {}),
                 'source': prediction.get('source', ''),
                 'missing_features': missing,
             },

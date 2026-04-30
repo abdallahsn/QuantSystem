@@ -77,6 +77,7 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
                         'bias': pred.get('bias', 'NEUTRAL'),
                         'bias_idx': pred.get('bias_idx', -1),
                         'confidence': float(pred.get('confidence', 0.0) or 0.0),
+                        'chosen_threshold': float(pred.get('chosen_threshold', 0.0) or 0.0),
                         'tradeable': bool(pred.get('tradeable', False)),
                         'feature_hash': (((pred.get('feature_hash')) or '') if isinstance(pred, dict) else ''),
                         'extra': {
@@ -84,6 +85,10 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
                             'true_bias': true_bias,
                             'correct': bool(correct),
                             'resolved_immediately': True,
+                            'direction_probs': pred.get('direction_probs', {}),
+                            'raw_direction_probs': pred.get('raw_direction_probs', {}),
+                            'realized_path_outcome': int(row.get('path_outcome', 4) or 4) if 'path_outcome' in canonical_df.columns else None,
+                            'adverse_path_flag': int(row.get('adverse_path_flag', 0) or 0) if 'adverse_path_flag' in canonical_df.columns else 0,
                         },
                     },
                     ts=ts,

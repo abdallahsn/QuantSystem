@@ -64,6 +64,45 @@ def _series_or_default(df: pd.DataFrame, col: str, default, dtype=None) -> pd.Se
     return series
 
 
+def _frame_symbol_counts(df: pd.DataFrame) -> tuple[str | None, dict[str, int]]:
+    if 'symbol' in df.columns:
+        col = 'symbol'
+    elif 'instrument_id' in df.columns:
+        col = 'instrument_id'
+    else:
+        return None, {}
+    counts = df[col].fillna('UNKNOWN').astype(str).value_counts()
+    return col, {str(key): int(value) for key, value in counts.items()}
+
+
+def _assert_single_contract_df(df: pd.DataFrame, *, context: str) -> None:
+    col, counts = _frame_symbol_counts(df)
+    if col is None or len(counts) <= 1:
+        return
+    raise RuntimeError(
+        "❌ Mixed-contract/symbol data is not allowed in V19 hardened backtests "
+        f"| context={context} | column={col} | counts={counts}"
+    )
+
+
+def _binary_ece(y_true: np.ndarray, p_long: np.ndarray, n_bins: int = 10) -> float:
+    y_true = np.asarray(y_true, dtype=np.int32)
+    p_long = np.clip(np.asarray(p_long, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    if y_true.size == 0:
+        return 0.0
+    bins = np.linspace(0.0, 1.0, int(max(n_bins, 2)) + 1)
+    bucket = np.digitize(p_long, bins[1:-1], right=False)
+    ece = 0.0
+    for idx in range(len(bins) - 1):
+        mask = bucket == idx
+        if not np.any(mask):
+            continue
+        conf = float(np.mean(p_long[mask]))
+        acc = float(np.mean(y_true[mask] == 0))
+        ece += abs(conf - acc) * (float(np.sum(mask)) / float(y_true.size))
+    return float(ece)
+
+
 def _realized_fill_pricing(
     *,
     entry_row: dict,
@@ -73,12 +112,30 @@ def _realized_fill_pricing(
     raw_pnl_pips: float,
     tick_size: float,
     round_trip_cost_pips: float,
+    tick_value: float,
+    commission_per_side: float = 0.0,
+    min_spread_ticks: float = 1.0,
+    min_slippage_ticks: float = 1.0,
+    spread_multiplier: float = 0.5,
 ) -> dict:
     tick = max(float(tick_size), 1e-8)
     raw_pnl_pips = float(raw_pnl_pips)
     floor_cost = max(float(round_trip_cost_pips), 0.0)
 
-    fill_model = SlippageModel(tick_size=tick, tick_value=1.0, commission=0.0)
+    def _spread_ticks(row_like: dict | None) -> float:
+        row_like = row_like or {}
+        best_bid = _safe_float(row_like.get('bid_px_00', 0.0))
+        best_ask = _safe_float(row_like.get('ask_px_00', 0.0))
+        if best_bid > 0 and best_ask > best_bid:
+            return max((best_ask - best_bid) / tick, float(min_spread_ticks))
+        return float(min_spread_ticks)
+
+    commission_one_way_pips = max(float(commission_per_side), 0.0) / max(float(tick_value), 1e-8)
+    fill_model = SlippageModel(
+        tick_size=tick,
+        tick_value=max(float(tick_value), 1e-8),
+        commission=max(float(commission_per_side), 0.0),
+    )
     entry_fill = fill_model.compute_fill(entry_row or {}, size=max(int(size), 1), direction=str(direction).lower())
     exit_direction = 'short' if str(direction).upper() == 'LONG' else 'long'
     exit_fill = fill_model.compute_fill(exit_row or {}, size=max(int(size), 1), direction=exit_direction)
@@ -86,13 +143,20 @@ def _realized_fill_pricing(
     entry_price = _safe_float(entry_fill.get('fill_price', 0.0))
     exit_price = _safe_float(exit_fill.get('fill_price', 0.0))
     if entry_fill.get('filled', 0) <= 0 or exit_fill.get('filled', 0) <= 0 or entry_price <= 0 or exit_price <= 0:
+        fallback_cost = max(
+            floor_cost,
+            2.0 * (
+                max(float(min_slippage_ticks), float(spread_multiplier) * _spread_ticks(entry_row))
+                + commission_one_way_pips
+            ),
+        )
         return {
             'used_dynamic_fill': False,
             'entry_fill': entry_fill,
             'exit_fill': exit_fill,
             'fill_pnl_pips': raw_pnl_pips,
-            'dynamic_cost_pips': float(floor_cost),
-            'net_pnl_pips': float(raw_pnl_pips - floor_cost),
+            'dynamic_cost_pips': float(fallback_cost),
+            'net_pnl_pips': float(raw_pnl_pips - fallback_cost),
         }
 
     if str(direction).upper() == 'LONG':
@@ -100,8 +164,14 @@ def _realized_fill_pricing(
     else:
         fill_pnl_pips = float((entry_price - exit_price) / tick)
 
+    entry_spread_ticks = _spread_ticks(entry_row)
+    exit_spread_ticks = _spread_ticks(exit_row)
+    entry_slip_floor = max(float(min_slippage_ticks), float(spread_multiplier) * entry_spread_ticks)
+    exit_slip_floor = max(float(min_slippage_ticks), float(spread_multiplier) * exit_spread_ticks)
+    realized_entry_cost = max(float(entry_fill.get('slippage_pips', 0.0) or 0.0), entry_slip_floor) + commission_one_way_pips
+    realized_exit_cost = max(float(exit_fill.get('slippage_pips', 0.0) or 0.0), exit_slip_floor) + commission_one_way_pips
     dynamic_cost_pips = max(float(raw_pnl_pips - fill_pnl_pips), 0.0)
-    total_cost_pips = max(dynamic_cost_pips, floor_cost)
+    total_cost_pips = max(dynamic_cost_pips, realized_entry_cost + realized_exit_cost, floor_cost)
     return {
         'used_dynamic_fill': True,
         'entry_fill': entry_fill,
@@ -877,8 +947,14 @@ def run_causal_backtest(
     tick_size: float,
     tick_value: float,
     round_trip_cost_pips: float,
-    max_size: int,
-    starting_equity: float,
+    commission_per_side: float = 0.0,
+    min_spread_ticks: float = 1.0,
+    min_slippage_ticks: float = 1.0,
+    spread_multiplier: float = 0.5,
+    max_size: int = 5,
+    starting_equity: float = 100000.0,
+    latency_rows: int = 1,
+    max_daily_loss_pct: float = 0.02,
     direction_threshold_ticks: float = 1.0,
     tp_mult: float = 1.2,
     sl_mult: float = 1.0,
@@ -889,10 +965,13 @@ def run_causal_backtest(
     visual_diagnostics: dict | None = None,
     score_start_ts: str | None = None,
     score_end_ts: str | None = None,
+    scenario_name: str = 'base',
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
+    engine.loss_guard.max_daily_loss_pct = float(max_daily_loss_pct)
     engine.loss_guard.update_equity(starting_equity)
+    _assert_single_contract_df(df, context='run_causal_backtest_input')
     source_has_labels = 'bias_label' in df.columns
     source_has_fwd = 'forward_return' in df.columns
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
@@ -996,8 +1075,10 @@ def run_causal_backtest(
                 base_size=1,
                 max_size=max_size,
             ))
+            entry_idx = min(i + max(int(latency_rows), 0), len(replay_df) - 1)
+            entry_row_data = replay_df.iloc[entry_idx].to_dict() if 0 <= entry_idx < len(replay_df) else row.to_dict()
             trade_path = _simulate_trade_path(
-                entry_idx=i,
+                entry_idx=entry_idx,
                 direction=direction,
                 prices=price_arr,
                 horizons=horizon_arr,
@@ -1007,7 +1088,7 @@ def run_causal_backtest(
                 tp_mult=tp_mult,
                 sl_mult=sl_mult,
                 max_horizon_steps=max_horizon_steps,
-                row_data=row.to_dict(),  # FIX: تمرير بيانات الجدران للـ DynamicTargetManager
+                row_data=entry_row_data,  # FIX: تمرير بيانات الجدران للـ DynamicTargetManager
             )
 
             pnl_source = 'path_replay'
@@ -1036,13 +1117,18 @@ def run_causal_backtest(
             exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
             exit_row = replay_df.iloc[exit_idx].to_dict() if 0 <= exit_idx < len(replay_df) else {}
             fill_pricing = _realized_fill_pricing(
-                entry_row=row.to_dict(),
+                entry_row=entry_row_data,
                 exit_row=exit_row,
                 direction=direction,
                 size=size,
                 raw_pnl_pips=raw_pnl_pips,
                 tick_size=tick_size,
                 round_trip_cost_pips=round_trip_cost_pips,
+                tick_value=tick_value,
+                commission_per_side=commission_per_side,
+                min_spread_ticks=min_spread_ticks,
+                min_slippage_ticks=min_slippage_ticks,
+                spread_multiplier=spread_multiplier,
             )
             net_pnl_pips = float(fill_pricing['net_pnl_pips'])
             net_pnl_dollars = net_pnl_pips * tick_value * size
@@ -1055,6 +1141,7 @@ def run_causal_backtest(
             trade = {
                 'idx': i,
                 'ts_event': pred['ts_event'],
+                'entry_idx': int(entry_idx),
                 'dir': direction,
                 'confidence': round(_safe_float(pred.get('confidence', 0.0)), 4),
                 'size': size,
@@ -1082,6 +1169,7 @@ def run_causal_backtest(
             }
             pred['executed'] = True
             pred['position_size'] = size
+            pred['entry_idx'] = int(entry_idx)
             pred['pending_exit_idx'] = exit_idx
             pred['pending_exit_ts'] = '' if pd.isna(exit_ts) else str(exit_ts)
             pred['exit_reason'] = str(trade_path['exit_reason'])
@@ -1127,6 +1215,7 @@ def run_causal_backtest(
     summary = {
         'predictions': int(len(results_df)),
         'trades': int(len(trades_df)),
+        'scenario': str(scenario_name),
         'tradeable_signals': int(results_df['tradeable'].sum()) if 'tradeable' in results_df.columns else 0,
         **_directional_metrics(results_df),
         'event_gate_rate': round(float(results_df['event_gate_passed'].mean()), 4)
@@ -1135,6 +1224,7 @@ def run_causal_backtest(
         'total_pnl_dollars': round(float(trades_df['pnl'].sum()), 2) if len(trades_df) else 0.0,
         'avg_trade_pnl_dollars': round(float(trades_df['pnl'].mean()), 2) if len(trades_df) else 0.0,
         'avg_trade_pips': round(float(trades_df['pips'].mean()), 4) if len(trades_df) else 0.0,
+        'avg_trade_expectancy_dollars': round(float(trades_df['pnl'].mean()), 2) if len(trades_df) else 0.0,
         'profit_factor': round(float(wins['pnl'].sum() / abs(losses['pnl'].sum())), 4)
             if len(losses) and abs(float(losses['pnl'].sum())) > 1e-9 else 0.0,
         'trade_sharpe': round(_trade_sharpe(trade_pnls), 4),
@@ -1149,6 +1239,12 @@ def run_causal_backtest(
         'skipped_trade_replays': int(skipped_trade_replays),
         'single_position_only': bool(single_position_only),
         'cooldown_rows': int(max(cooldown_rows, 0)),
+        'latency_rows': int(max(latency_rows, 0)),
+        'commission_per_side': float(commission_per_side),
+        'min_spread_ticks': float(min_spread_ticks),
+        'min_slippage_ticks': float(min_slippage_ticks),
+        'spread_multiplier': float(spread_multiplier),
+        'max_daily_loss_pct': float(max_daily_loss_pct),
         'context_rows': int(len(replay_df)),
         'scored_rows': int(scoring_mask.sum()),
         'score_start_ts': None if score_start_ts is None else str(score_start_ts),
@@ -1156,6 +1252,21 @@ def run_causal_backtest(
         'visual_coverage': float(visual_diag.get('coverage_ratio', 0.0)),
         'visual_diagnostics': visual_diag,
     }
+    if 'true_bias' in results_df.columns and 'direction_probs' in results_df.columns and len(results_df):
+        directional = results_df[results_df['true_bias'].isin([0, 1])].copy()
+        if len(directional):
+            p_long = directional['direction_probs'].apply(
+                lambda x: float((x or {}).get('LONG', 0.0)) if isinstance(x, dict) else 0.0
+            ).to_numpy(dtype=np.float64)
+            y_true = directional['true_bias'].to_numpy(dtype=np.int32)
+            summary['brier_score'] = float(np.mean((p_long - (y_true == 0).astype(np.float64)) ** 2))
+            summary['ece'] = _binary_ece(y_true, p_long)
+        else:
+            summary['brier_score'] = 0.0
+            summary['ece'] = 0.0
+    else:
+        summary['brier_score'] = 0.0
+        summary['ece'] = 0.0
 
     os.makedirs(output_dir, exist_ok=True)
     results_df.to_csv(os.path.join(output_dir, 'backtest_v19_results.csv'), index=False)
@@ -1200,8 +1311,14 @@ def main():
     p.add_argument('--tick_size', type=float, default=0.0001)
     p.add_argument('--tick_value', type=float, default=10.0)
     p.add_argument('--round_trip_cost_pips', type=float, default=1.0)
+    p.add_argument('--commission_per_side', type=float, default=0.0)
+    p.add_argument('--min_spread_ticks', type=float, default=1.0)
+    p.add_argument('--min_slippage_ticks', type=float, default=1.0)
+    p.add_argument('--spread_multiplier', type=float, default=0.5)
     p.add_argument('--max_size', type=int, default=5)
     p.add_argument('--starting_equity', type=float, default=100000.0)
+    p.add_argument('--latency_rows', type=int, default=1)
+    p.add_argument('--max_daily_loss_pct', type=float, default=0.02)
     p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
     p.add_argument('--tp_mult', type=float, default=1.2)
     p.add_argument('--sl_mult', type=float, default=1.0)
@@ -1277,8 +1394,14 @@ def main():
         tick_size=args.tick_size,
         tick_value=args.tick_value,
         round_trip_cost_pips=args.round_trip_cost_pips,
+        commission_per_side=args.commission_per_side,
+        min_spread_ticks=args.min_spread_ticks,
+        min_slippage_ticks=args.min_slippage_ticks,
+        spread_multiplier=args.spread_multiplier,
         max_size=args.max_size,
         starting_equity=args.starting_equity,
+        latency_rows=args.latency_rows,
+        max_daily_loss_pct=args.max_daily_loss_pct,
         direction_threshold_ticks=args.direction_threshold_ticks,
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
@@ -1295,7 +1418,7 @@ def main():
         'aligned_end_ts': align_end_ts,
         'start_ts': start_ts,
         'end_ts': end_ts,
-        'rows': int(len(df)),
+        'rows': int(len(df_score)),
     }
 
     print("\n✅ V19 causal backtest complete")

@@ -52,6 +52,8 @@ from modules.dynamic_labels import (
     DIR_SHORT,
     EVENT_SHIFT_COLS,
     LABEL_CANCEL,
+    LABEL_LOSE,
+    LABEL_WIN,
     QUALITY_NONE,
     QUALITY_STRONG,
     QUALITY_WEAK,
@@ -75,6 +77,23 @@ SETUP_ABSORPTION = 0
 SETUP_SPOOFING   = 1
 SETUP_OBI        = 2
 SETUP_MIXED      = 3
+
+PATH_LONG_TP_FIRST  = 0
+PATH_SHORT_TP_FIRST = 1
+PATH_LONG_SL_FIRST  = 2
+PATH_SHORT_SL_FIRST = 3
+PATH_TIMEOUT        = 4
+
+DETAIL_LONG = 0
+DETAIL_SHORT = 1
+DETAIL_TIMEOUT = 2
+DETAIL_LONG_SL = 3
+DETAIL_SHORT_SL = 4
+
+NEUTRAL_REASON_NONE = 0
+NEUTRAL_REASON_TIMEOUT = 1
+NEUTRAL_REASON_LONG_SL = 2
+NEUTRAL_REASON_SHORT_SL = 3
 
 DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
 DEFAULT_V19_TP_MULT = 1.5
@@ -249,6 +268,11 @@ def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
     out["label_horizon_steps"]  = empty_int32
     out["long_label"]           = empty_int8
     out["short_label"]          = empty_int8
+    out["path_outcome"]         = empty_int8
+    out["adverse_path_flag"]    = empty_int8
+    out["bias_label_detail"]    = empty_int8
+    out["neutral_reason"]       = empty_int8
+    out["timeout_move_exceeded_band"] = empty_int8
     out["event_flag"]           = empty_int8
     out["train_event_flag"]     = empty_int8
     out["event_score"]          = empty_float32
@@ -256,6 +280,9 @@ def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
     out["is_event"]             = empty_int8
     out["trend_label"]          = empty_int8
     out["trend_strength"]       = empty_float32
+    out["kalman_trend_label"]   = empty_int8
+    out["kalman_trend_strength"] = empty_float32
+    out["kalman_price"]         = empty_float32
     out["effective_horizon"]    = empty_int32
     return out
 
@@ -583,13 +610,14 @@ def _forward_scan_rows(
     min_wall_tp_ticks: float = 2.0,
     progress_every_rows: int = 0,
     progress_prefix: str = "Step 4 forward scan",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate a contiguous row range using the full read-only price arrays."""
     n = len(prices)
     size = max(0, int(stop) - int(start))
     bias_arr = np.full(size, DIR_NEUTRAL, dtype=np.int8)
     quality_arr = np.full(size, QUALITY_WEAK, dtype=np.int8)
     end_idx_arr = np.arange(int(start), int(stop), dtype=np.int32)
+    path_outcome_arr = np.full(size, PATH_TIMEOUT, dtype=np.int8)
     loop_started_at = time.perf_counter() if progress_every_rows > 0 and size > 0 else 0.0
 
     for local_idx, i in enumerate(range(int(start), int(stop))):
@@ -665,13 +693,27 @@ def _forward_scan_rows(
             bias_arr[local_idx] = DIR_LONG
             quality_arr[local_idx] = QUALITY_STRONG
             end_idx_arr[local_idx] = first_long_hit_idx
+            path_outcome_arr[local_idx] = PATH_LONG_TP_FIRST
         elif tp_short_hit:
             bias_arr[local_idx] = DIR_SHORT
             quality_arr[local_idx] = QUALITY_STRONG
             end_idx_arr[local_idx] = first_short_hit_idx
+            path_outcome_arr[local_idx] = PATH_SHORT_TP_FIRST
         elif sl_long_hit or sl_short_hit:
             quality_arr[local_idx] = QUALITY_WEAK
-            end_idx_arr[local_idx] = min(first_long_hit_idx, first_short_hit_idx)
+            if sl_long_hit and sl_short_hit:
+                if first_long_hit_idx <= first_short_hit_idx:
+                    end_idx_arr[local_idx] = first_long_hit_idx
+                    path_outcome_arr[local_idx] = PATH_LONG_SL_FIRST
+                else:
+                    end_idx_arr[local_idx] = first_short_hit_idx
+                    path_outcome_arr[local_idx] = PATH_SHORT_SL_FIRST
+            elif sl_long_hit:
+                end_idx_arr[local_idx] = first_long_hit_idx
+                path_outcome_arr[local_idx] = PATH_LONG_SL_FIRST
+            else:
+                end_idx_arr[local_idx] = first_short_hit_idx
+                path_outcome_arr[local_idx] = PATH_SHORT_SL_FIRST
 
         processed = local_idx + 1
         if (
@@ -687,19 +729,19 @@ def _forward_scan_rows(
                 flush=True,
             )
 
-    return bias_arr, quality_arr, end_idx_arr
+    return bias_arr, quality_arr, end_idx_arr, path_outcome_arr
 
 
-def _forward_scan_pool_worker(bounds: tuple[int, int]) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+def _forward_scan_pool_worker(bounds: tuple[int, int]) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     start, stop = bounds
     if not _FORWARD_SCAN_SHARED:
         raise RuntimeError("forward scan pool worker missing shared arrays")
-    bias_arr, quality_arr, end_idx_arr = _forward_scan_rows(
+    bias_arr, quality_arr, end_idx_arr, path_outcome_arr = _forward_scan_rows(
         start,
         stop,
         **_FORWARD_SCAN_SHARED,
     )
-    return start, bias_arr, quality_arr, end_idx_arr
+    return start, bias_arr, quality_arr, end_idx_arr, path_outcome_arr
 
 def _forward_scan_per_row(
     prices: np.ndarray,
@@ -718,7 +760,7 @@ def _forward_scan_per_row(
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
     progress_every_rows: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     FIX-10: Vectorised per-row forward scan with row-specific threshold AND horizon.
 
@@ -744,9 +786,10 @@ def _forward_scan_per_row(
 
     Returns
     -------
-    bias_arr     : int8 array  — DIR_LONG / DIR_SHORT / DIR_NEUTRAL
-    quality_arr  : int8 array  — QUALITY_STRONG / QUALITY_WEAK
-    end_idx_arr  : int32 array — index where scan terminated
+    bias_arr         : int8 array  — DIR_LONG / DIR_SHORT / DIR_NEUTRAL
+    quality_arr      : int8 array  — QUALITY_STRONG / QUALITY_WEAK
+    end_idx_arr      : int32 array — index where scan terminated
+    path_outcome_arr : int8 array  — TP/SL/timeout path diagnostics
     """
     n = len(prices)
     workers = 1 if n_workers is None else max(1, int(n_workers))
@@ -842,7 +885,7 @@ def _forward_scan_per_row(
     global _FORWARD_SCAN_SHARED
     _FORWARD_SCAN_SHARED = shared_payload
     ctx_mp = multiprocessing.get_context("fork")
-    parts: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+    parts: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     scan_started_at = time.perf_counter()
     done_rows = 0
     total_chunks = len(bounds)
@@ -867,12 +910,14 @@ def _forward_scan_per_row(
     bias_arr = np.empty(n, dtype=np.int8)
     quality_arr = np.empty(n, dtype=np.int8)
     end_idx_arr = np.empty(n, dtype=np.int32)
-    for start, bias_part, quality_part, end_part in parts:
+    path_outcome_arr = np.empty(n, dtype=np.int8)
+    for start, bias_part, quality_part, end_part, path_part in parts:
         stop = start + len(bias_part)
         bias_arr[start:stop] = bias_part
         quality_arr[start:stop] = quality_part
         end_idx_arr[start:stop] = end_part
-    return bias_arr, quality_arr, end_idx_arr
+        path_outcome_arr[start:stop] = path_part
+    return bias_arr, quality_arr, end_idx_arr, path_outcome_arr
 
 
 # ── FIX-11: Kalman trend gate ─────────────────────────────────────────────────
@@ -1105,6 +1150,8 @@ def build_causal_event_labels(
 
     _log_step4(f"engineer_features window={feat_window}")
     out = engineer_features(out, roll_window=feat_window)
+    if "trend_strength" not in out.columns:
+        out["trend_strength"] = np.zeros(n, dtype=np.float32)
     _log_step4("engineer_features done")
 
     # ── 3. FIX-1: broad event filter + stronger training gate ───────────────
@@ -1216,7 +1263,7 @@ def build_causal_event_labels(
     #       → each row evaluated against its own ATR threshold and horizon
     #
     _log_step4("forward scan start")
-    bias_raw, quality_raw, end_idx_arr = _forward_scan_per_row(
+    bias_raw, quality_raw, end_idx_arr, path_outcome_raw = _forward_scan_per_row(
         prices     = prices_arr,
         dynamic_threshold = dynamic_threshold,
         adaptive_horizons = adaptive_horizons,
@@ -1236,13 +1283,52 @@ def build_causal_event_labels(
     labeled = out.copy()
     labeled["bias_label"]     = bias_raw.astype(np.int8)
     labeled["signal_quality"] = quality_raw.astype(np.int8)
+    labeled["path_outcome"]   = path_outcome_raw.astype(np.int8)
+    labeled["adverse_path_flag"] = np.isin(
+        path_outcome_raw,
+        np.array([PATH_LONG_SL_FIRST, PATH_SHORT_SL_FIRST], dtype=np.int8),
+    ).astype(np.int8)
+    labeled["bias_label_detail"] = np.select(
+        [
+            path_outcome_raw == PATH_LONG_TP_FIRST,
+            path_outcome_raw == PATH_SHORT_TP_FIRST,
+            path_outcome_raw == PATH_TIMEOUT,
+            path_outcome_raw == PATH_LONG_SL_FIRST,
+            path_outcome_raw == PATH_SHORT_SL_FIRST,
+        ],
+        [
+            DETAIL_LONG,
+            DETAIL_SHORT,
+            DETAIL_TIMEOUT,
+            DETAIL_LONG_SL,
+            DETAIL_SHORT_SL,
+        ],
+        default=DETAIL_TIMEOUT,
+    ).astype(np.int8)
+    labeled["neutral_reason"] = np.select(
+        [
+            path_outcome_raw == PATH_TIMEOUT,
+            path_outcome_raw == PATH_LONG_SL_FIRST,
+            path_outcome_raw == PATH_SHORT_SL_FIRST,
+        ],
+        [
+            NEUTRAL_REASON_TIMEOUT,
+            NEUTRAL_REASON_LONG_SL,
+            NEUTRAL_REASON_SHORT_SL,
+        ],
+        default=NEUTRAL_REASON_NONE,
+    ).astype(np.int8)
 
     # Populate ancillary forward-scan columns expected downstream
     labeled["long_label"]  = np.where(
-        bias_raw == DIR_LONG,  QUALITY_STRONG, LABEL_CANCEL
+        path_outcome_raw == PATH_LONG_TP_FIRST,
+        LABEL_WIN,
+        np.where(path_outcome_raw == PATH_LONG_SL_FIRST, LABEL_LOSE, LABEL_CANCEL),
     ).astype(np.int8)
     labeled["short_label"] = np.where(
-        bias_raw == DIR_SHORT, QUALITY_STRONG, LABEL_CANCEL
+        path_outcome_raw == PATH_SHORT_TP_FIRST,
+        LABEL_WIN,
+        np.where(path_outcome_raw == PATH_SHORT_SL_FIRST, LABEL_LOSE, LABEL_CANCEL),
     ).astype(np.int8)
 
     # ── 7. FIX-3: replace any residual QUALITY_NONE with QUALITY_WEAK ─────────
@@ -1281,9 +1367,9 @@ def build_causal_event_labels(
         trend_strength = np.zeros(n, dtype=np.float32)
         kalman_price   = prices_arr.astype(np.float32)
 
-    labeled["trend_label"]    = trend_lbl.astype(np.int8)
-    labeled["trend_strength"] = trend_strength.astype(np.float32)
-    labeled["kalman_price"]   = kalman_price.astype(np.float32)
+    labeled["kalman_trend_label"] = trend_lbl.astype(np.int8)
+    labeled["kalman_trend_strength"] = trend_strength.astype(np.float32)
+    labeled["kalman_price"] = kalman_price.astype(np.float32)
 
     trend_filter_applied = bool(trend_filter and trend_runtime_available)
     if trend_filter_applied:
@@ -1297,10 +1383,14 @@ def build_causal_event_labels(
         labeled["bias_label"] = bias_filtered.astype(np.int8)
         # Re-sync long_label / short_label after trend filter
         labeled["long_label"]  = np.where(
-            labeled["bias_label"] == DIR_LONG,  QUALITY_STRONG, LABEL_CANCEL
+            labeled["bias_label"] == DIR_LONG,
+            np.where(labeled["path_outcome"].astype(np.int8) == PATH_LONG_TP_FIRST, LABEL_WIN, LABEL_CANCEL),
+            LABEL_CANCEL,
         ).astype(np.int8)
         labeled["short_label"] = np.where(
-            labeled["bias_label"] == DIR_SHORT, QUALITY_STRONG, LABEL_CANCEL
+            labeled["bias_label"] == DIR_SHORT,
+            np.where(labeled["path_outcome"].astype(np.int8) == PATH_SHORT_TP_FIRST, LABEL_WIN, LABEL_CANCEL),
+            LABEL_CANCEL,
         ).astype(np.int8)
 
     # ── 9. timestamps ─────────────────────────────────────────────────────────
@@ -1313,6 +1403,13 @@ def build_causal_event_labels(
 
     end_idx = np.minimum(end_idx_arr, n - 1).astype(np.int32)
     prices  = labeled["close"].astype(np.float64).values
+    terminal_abs_move = np.abs(prices[end_idx] - prices)
+    timeout_band = np.maximum(float(neutral_mult), 0.0) * dynamic_threshold
+    timeout_exceeded_mask = (
+        (labeled["path_outcome"].to_numpy(dtype=np.int8, copy=False) == PATH_TIMEOUT)
+        & (terminal_abs_move >= timeout_band)
+    )
+    labeled["timeout_move_exceeded_band"] = timeout_exceeded_mask.astype(np.int8)
 
     # ── 10. derived columns ───────────────────────────────────────────────────
     labeled["setup_label"] = _infer_setup_labels(labeled)
@@ -1353,9 +1450,9 @@ def build_causal_event_labels(
     n_none    = qual_counts.get(QUALITY_NONE,   0)
     n_events  = int(labeled["event_flag"].sum())
     n_train_events = int(labeled["train_event_flag"].sum())
-    n_up      = int((labeled["trend_label"] == TREND_UP).sum())
-    n_down    = int((labeled["trend_label"] == TREND_DOWN).sum())
-    n_trend_neutral = int((labeled["trend_label"] == TREND_NEUTRAL).sum())
+    n_up      = int((labeled["kalman_trend_label"] == TREND_UP).sum())
+    n_down    = int((labeled["kalman_trend_label"] == TREND_DOWN).sum())
+    n_trend_neutral = int((labeled["kalman_trend_label"] == TREND_NEUTRAL).sum())
     n_directional = int(n_long + n_short)
     event_slice = labeled[labeled["event_flag"].astype(np.int8) == 1]
     train_event_slice = labeled[labeled["train_event_flag"].astype(np.int8) == 1]
@@ -1432,6 +1529,14 @@ def build_causal_event_labels(
         f"UP={n_up:,} ({n_up/total:.1%})  "
         f"DOWN={n_down:,} ({n_down/total:.1%})  "
         f"NEUTRAL={n_trend_neutral:,} ({n_trend_neutral/total:.1%})"
+    )
+    print(
+        f"[v19] Paths  → long_tp={int((labeled['path_outcome'] == PATH_LONG_TP_FIRST).sum()):,}  "
+        f"short_tp={int((labeled['path_outcome'] == PATH_SHORT_TP_FIRST).sum()):,}  "
+        f"long_sl={int((labeled['path_outcome'] == PATH_LONG_SL_FIRST).sum()):,}  "
+        f"short_sl={int((labeled['path_outcome'] == PATH_SHORT_SL_FIRST).sum()):,}  "
+        f"timeout={int((labeled['path_outcome'] == PATH_TIMEOUT).sum()):,}  "
+        f"| timeout>|neutral_band|={int(timeout_exceeded_mask.sum()):,}"
     )
     print(
         f"[v19] Horizon→ adaptive={'ON' if adaptive_horizon else 'OFF'}  "

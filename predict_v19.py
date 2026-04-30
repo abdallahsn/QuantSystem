@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 import time
 from collections import deque
@@ -136,6 +137,7 @@ class V19PredictionEngine:
         self.visual_emb_path = os.path.join(models_dir, visual_artifact)
 
         self.cb_advisor = None
+        self.cb_calibrator = None
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
         self.cb_classes = None
         cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
@@ -151,6 +153,15 @@ class V19PredictionEngine:
             print(f"  ✅ CatBoost V19: {cb_path}")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
+        calibrator_path = os.path.join(models_dir, artifacts.get('catboost_calibrator', 'catboost_calibrator_v19.pkl'))
+        if os.path.exists(calibrator_path):
+            try:
+                with open(calibrator_path, 'rb') as f:
+                    self.cb_calibrator = pickle.load(f)
+                print("  ✅ CatBoost calibrator loaded")
+            except Exception as exc:
+                self.cb_calibrator = None
+                print(f"  ⚠️ CatBoost calibrator unavailable: {exc}")
 
         self.regime_clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         regime_ok = self.regime_clf.load(models_dir)
@@ -205,6 +216,18 @@ class V19PredictionEngine:
             print("  ⚠️ MetaLearner V19 missing or not fitted")
         else:
             print("  ✅ MetaLearner V19 loaded")
+        self.meta_temperature = None
+        meta_temp_path = os.path.join(models_dir, artifacts.get('meta_temperature', 'meta_temperature_v19.json'))
+        if os.path.exists(meta_temp_path):
+            try:
+                with open(meta_temp_path) as f:
+                    temp_payload = json.load(f)
+                temp_value = temp_payload.get('temperature')
+                if temp_payload.get('enabled', False) and temp_value is not None:
+                    self.meta_temperature = float(temp_value)
+                    print(f"  ✅ Meta temperature loaded: T={self.meta_temperature:.3f}")
+            except Exception as exc:
+                print(f"  ⚠️ Meta temperature unavailable: {exc}")
 
         self.loss_guard = DailyLossGuard(
             max_daily_loss_pct=0.02,
@@ -268,13 +291,37 @@ class V19PredictionEngine:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
         try:
             probs = self.cb_advisor.predict_proba(X_stat)
-            return align_probability_columns(
+            aligned = align_probability_columns(
                 probs,
                 N_CB_PROBS,
                 classes=getattr(self.cb_advisor, 'classes_', None) or self.cb_classes,
             )
+            return self._apply_long_calibrator(aligned)
         except Exception:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
+
+    def _apply_long_calibrator(self, probs: np.ndarray) -> np.ndarray:
+        arr = np.asarray(probs, dtype=np.float32)
+        if self.cb_calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
+            return arr
+        p_long = np.clip(arr[:, 0].astype(np.float64), 1e-6, 1.0 - 1e-6)
+        cal_long = np.asarray(self.cb_calibrator.transform(p_long), dtype=np.float64)
+        cal_long = np.clip(cal_long, 1e-6, 1.0 - 1e-6)
+        out = np.zeros_like(arr, dtype=np.float32)
+        out[:, 0] = cal_long.astype(np.float32)
+        out[:, 1] = (1.0 - cal_long).astype(np.float32)
+        return out
+
+    def _apply_temperature(self, probs: np.ndarray) -> np.ndarray:
+        arr = np.asarray(probs, dtype=np.float32)
+        temp = self.meta_temperature
+        if temp is None or temp <= 0 or arr.ndim != 2 or arr.shape[1] < 2:
+            return arr
+        logits = np.log(np.clip(arr.astype(np.float64), 1e-6, 1.0 - 1e-6)) / float(temp)
+        logits -= logits.max(axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        cal = exp_logits / np.clip(exp_logits.sum(axis=1, keepdims=True), 1e-9, None)
+        return cal.astype(np.float32)
 
     def _update_regime_context(self, stat_df: pd.DataFrame) -> None:
         if stat_df is None or len(stat_df) == 0:
@@ -476,6 +523,23 @@ class V19PredictionEngine:
         seq = np.array(list(self._seq_buffer), dtype=np.float32)
         seq = self._project_sequence_for_meta(seq)
         result = self._meta_decision(seq)
+        raw_bias_probs = np.asarray(result.get('bias_probs', cb_probs[0]), dtype=np.float32).reshape(1, -1)
+        calibrated_bias_probs = self._apply_temperature(raw_bias_probs)
+        if calibrated_bias_probs.shape[1] >= 2:
+            result['raw_bias_probs'] = raw_bias_probs[0].tolist()
+            result['bias_probs'] = calibrated_bias_probs[0].tolist()
+            if self.meta is not None and hasattr(self.meta, '_labels_from_long_probs'):
+                bias_idx = int(
+                    self.meta._labels_from_long_probs(
+                        np.array([calibrated_bias_probs[0, 0]], dtype=np.float32),
+                        getattr(self.meta, 'bias_long_threshold', 0.5),
+                    )[0]
+                )
+            else:
+                bias_idx = int(np.argmax(calibrated_bias_probs[0]))
+            result['bias_idx'] = bias_idx
+            result['bias'] = BIAS_LABELS.get(bias_idx, 'NEUTRAL')
+            result['chosen_threshold'] = float(getattr(self.meta, 'bias_long_threshold', 0.5)) if self.meta is not None else 0.5
         if self.run_mode == 'rollout' and not runtime_mode.get('allow_rollout', False):
             result['tradeable'] = False
             result['reason'] = runtime_mode.get('reason', 'Rollout blocked')
@@ -491,6 +555,12 @@ class V19PredictionEngine:
             'SHORT': round(float(bias_probs[1]) if len(bias_probs) > 1 else 0.0, 4),
         }
         result['direction_probs'] = direction_probs
+        if 'raw_bias_probs' in result:
+            raw_bias_probs_flat = np.asarray(result['raw_bias_probs'], dtype=np.float32).reshape(-1)
+            result['raw_direction_probs'] = {
+                'LONG': round(float(raw_bias_probs_flat[0]) if len(raw_bias_probs_flat) > 0 else 0.0, 4),
+                'SHORT': round(float(raw_bias_probs_flat[1]) if len(raw_bias_probs_flat) > 1 else 0.0, 4),
+            }
         result['cb_probs'] = {
             'LONG': round(float(cb_probs[0, 0]), 4),
             'SHORT': round(float(cb_probs[0, 1]), 4),

@@ -17,13 +17,15 @@ import argparse
 import datetime
 import json
 import os
+import pickle
 import shutil
 import sys
 import tempfile
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_fscore_support
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import log_loss, precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -110,6 +112,11 @@ FORBIDDEN_MODEL_INPUT_COLS = {
     'event_trigger_count',
     'is_expansion',
     'label_horizon_steps',
+    'path_outcome',
+    'adverse_path_flag',
+    'kalman_trend_label',
+    'kalman_trend_strength',
+    'kalman_price',
 }
 TRAINING_PASSTHROUGH_COLS = [
     col for col in (list(DEFAULT_PASSTHROUGH_COLS) + RAW_STAT_FEATURE_COLS)
@@ -221,6 +228,197 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
         print(f"  🛡️ Anti-Leakage Drop: {dropped}")
     return df.drop(columns=dropped, errors='ignore')
 
+
+def _frame_symbol_counts(df: pd.DataFrame) -> tuple[str | None, dict[str, int]]:
+    if 'symbol' in df.columns:
+        col = 'symbol'
+    elif 'instrument_id' in df.columns:
+        col = 'instrument_id'
+    else:
+        return None, {}
+    counts = df[col].fillna('UNKNOWN').astype(str).value_counts()
+    return col, {str(key): int(value) for key, value in counts.items()}
+
+
+def _assert_single_contract_df(df: pd.DataFrame, *, context: str) -> None:
+    col, counts = _frame_symbol_counts(df)
+    if col is None or len(counts) <= 1:
+        return
+    raise RuntimeError(
+        "❌ Mixed-contract/symbol data is not allowed in V19 hardened training "
+        f"| context={context} | column={col} | counts={counts}"
+    )
+
+
+def _safe_prob(p: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(p, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+
+
+def _binary_ece(y_true: np.ndarray, p_long: np.ndarray, n_bins: int = 10) -> float:
+    y_true = np.asarray(y_true, dtype=np.int32)
+    p_long = _safe_prob(p_long)
+    if y_true.size == 0:
+        return 0.0
+    bins = np.linspace(0.0, 1.0, int(max(n_bins, 2)) + 1)
+    bucket = np.digitize(p_long, bins[1:-1], right=False)
+    ece = 0.0
+    for b in range(len(bins) - 1):
+        mask = bucket == b
+        if not np.any(mask):
+            continue
+        conf = float(np.mean(p_long[mask]))
+        acc = float(np.mean(y_true[mask] == 0))
+        ece += abs(conf - acc) * (float(np.sum(mask)) / float(y_true.size))
+    return float(ece)
+
+
+def _fit_long_isotonic_calibrator(
+    y_bias: np.ndarray,
+    p_long: np.ndarray,
+) -> tuple[IsotonicRegression | None, dict]:
+    y_bias = np.asarray(y_bias, dtype=np.int32)
+    p_long = _safe_prob(p_long)
+    mask = np.isin(y_bias, [0, 1])
+    if int(mask.sum()) < 32:
+        return None, {
+            'enabled': False,
+            'reason': 'insufficient_directional_oof_rows',
+            'rows': int(mask.sum()),
+        }
+    y_long = (y_bias[mask] == 0).astype(np.int32)
+    if np.unique(y_long).size < 2:
+        return None, {
+            'enabled': False,
+            'reason': 'single_class_directional_oof_rows',
+            'rows': int(mask.sum()),
+        }
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+    calibrated = calibrator.fit_transform(p_long[mask], y_long)
+    report = {
+        'enabled': True,
+        'rows': int(mask.sum()),
+        'raw_brier': float(np.mean((p_long[mask] - y_long) ** 2)),
+        'calibrated_brier': float(np.mean((calibrated - y_long) ** 2)),
+        'raw_ece': _binary_ece(y_bias[mask], p_long[mask]),
+        'calibrated_ece': _binary_ece(y_bias[mask], calibrated),
+        'raw_nll': float(log_loss(y_long, np.c_[p_long[mask], 1.0 - p_long[mask]], labels=[1, 0])),
+        'calibrated_nll': float(log_loss(y_long, np.c_[calibrated, 1.0 - calibrated], labels=[1, 0])),
+    }
+    return calibrator, report
+
+
+def _apply_long_calibrator(calibrator: IsotonicRegression | None, probs: np.ndarray) -> np.ndarray:
+    arr = np.asarray(probs, dtype=np.float32)
+    if calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
+        return arr.astype(np.float32, copy=True)
+    p_long = _safe_prob(arr[:, 0])
+    cal_long = np.asarray(calibrator.transform(p_long), dtype=np.float64)
+    cal_long = np.clip(cal_long, 1e-6, 1.0 - 1e-6)
+    out = np.zeros_like(arr, dtype=np.float32)
+    out[:, 0] = cal_long.astype(np.float32)
+    out[:, 1] = (1.0 - cal_long).astype(np.float32)
+    return out
+
+
+def _fit_temperature_from_probs(y_bias: np.ndarray, probs: np.ndarray) -> tuple[float | None, dict]:
+    y_bias = np.asarray(y_bias, dtype=np.int32)
+    probs = np.asarray(probs, dtype=np.float64)
+    mask = np.isin(y_bias, [0, 1])
+    if int(mask.sum()) < 32 or probs.ndim != 2 or probs.shape[1] < 2:
+        return None, {'enabled': False, 'reason': 'insufficient_validation_probs', 'rows': int(mask.sum())}
+    y_dir = y_bias[mask]
+    probs = np.clip(probs[mask], 1e-6, 1.0 - 1e-6)
+    logits = np.log(probs)
+    temperatures = np.linspace(0.5, 3.0, 51)
+    best_t = None
+    best_nll = None
+    raw_nll = float(log_loss(y_dir, probs, labels=[0, 1]))
+    for temp in temperatures:
+        scaled = logits / float(temp)
+        scaled -= scaled.max(axis=1, keepdims=True)
+        exp_scaled = np.exp(scaled)
+        cal_probs = exp_scaled / np.clip(exp_scaled.sum(axis=1, keepdims=True), 1e-9, None)
+        nll = float(log_loss(y_dir, cal_probs, labels=[0, 1]))
+        if best_nll is None or nll < best_nll:
+            best_nll = nll
+            best_t = float(temp)
+    if best_t is None:
+        return None, {'enabled': False, 'reason': 'temperature_search_failed', 'rows': int(mask.sum())}
+    scaled = logits / best_t
+    scaled -= scaled.max(axis=1, keepdims=True)
+    exp_scaled = np.exp(scaled)
+    cal_probs = exp_scaled / np.clip(exp_scaled.sum(axis=1, keepdims=True), 1e-9, None)
+    return best_t, {
+        'enabled': True,
+        'rows': int(mask.sum()),
+        'temperature': float(best_t),
+        'raw_nll': raw_nll,
+        'calibrated_nll': float(log_loss(y_dir, cal_probs, labels=[0, 1])),
+        'raw_brier': float(np.mean((probs[:, 0] - (y_dir == 0).astype(np.float64)) ** 2)),
+        'calibrated_brier': float(np.mean((cal_probs[:, 0] - (y_dir == 0).astype(np.float64)) ** 2)),
+        'raw_ece': _binary_ece(y_dir, probs[:, 0]),
+        'calibrated_ece': _binary_ece(y_dir, cal_probs[:, 0]),
+    }
+
+
+def _write_feature_coverage_drift_report(
+    df: pd.DataFrame,
+    *,
+    split_time: pd.Timestamp | str | None,
+    output_dir: str,
+    protected_features: set[str] | None = None,
+) -> str:
+    protected_features = protected_features or set()
+    ts = _time_series(df, 'ts_event')
+    months = ts.dt.to_period('M').astype(str)
+    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
+    split_ts = _parse_optional_timestamp(split_time)
+    train_mask = np.ones(len(df), dtype=bool) if split_ts is None else (ts < split_ts).to_numpy(dtype=bool)
+    train_ref = raw_stat.loc[train_mask] if np.any(train_mask) else raw_stat
+
+    report: dict[str, object] = {
+        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'split_time': None if split_ts is None else str(split_ts),
+        'months': [],
+        'dead_features_3m': [],
+    }
+    dead_streak = {feat: 0 for feat in CATBOOST_ADVISOR_FEATURES}
+    for month in sorted(months.unique()):
+        month_mask = (months == month).to_numpy(dtype=bool)
+        month_frame = raw_stat.loc[month_mask]
+        feature_stats = {}
+        for feat in CATBOOST_ADVISOR_FEATURES:
+            vals = pd.to_numeric(month_frame[feat], errors='coerce')
+            ref_vals = pd.to_numeric(train_ref[feat], errors='coerce')
+            non_zero_rate = float((vals.fillna(0.0) != 0.0).mean()) if len(vals) else 0.0
+            missing_rate = float(vals.isna().mean()) if len(vals) else 0.0
+            ref_mean = float(ref_vals.fillna(0.0).mean()) if len(ref_vals) else 0.0
+            ref_std = float(ref_vals.fillna(0.0).std(ddof=0)) if len(ref_vals) else 1.0
+            ref_std = ref_std if abs(ref_std) > 1e-8 else 1.0
+            obs_mean = float(vals.fillna(0.0).mean()) if len(vals) else 0.0
+            obs_std = float(vals.fillna(0.0).std(ddof=0)) if len(vals) else 0.0
+            psi = abs(obs_mean - ref_mean) / ref_std + abs(obs_std - ref_std) / ref_std
+            feature_stats[feat] = {
+                'non_zero_rate': round(non_zero_rate, 4),
+                'missing_rate': round(missing_rate, 4),
+                'psi': round(float(psi), 4),
+                'protected': bool(feat in protected_features),
+            }
+            if feat not in protected_features and non_zero_rate < 0.01:
+                dead_streak[feat] += 1
+            else:
+                dead_streak[feat] = 0
+        report['months'].append({
+            'month': str(month),
+            'rows': int(month_mask.sum()),
+            'features': feature_stats,
+        })
+    report['dead_features_3m'] = sorted([feat for feat, streak in dead_streak.items() if streak >= 3])
+    path = os.path.join(output_dir, 'feature_coverage_drift_report.json')
+    with open(path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return path
+
 def handle_rare_classes(df, label_col="bias_label", min_samples=10, strategy="auto"):
     """
     min_samples: الحد الأدنى المقبول لكل class
@@ -253,6 +451,7 @@ def handle_rare_classes(df, label_col="bias_label", min_samples=10, strategy="au
 def load_training_csv(csv_path: str) -> pd.DataFrame:
     print(f"\n📥 قراءة artifact: {csv_path}")
     df = load_feature_artifact(csv_path)
+    _assert_single_contract_df(df, context='load_training_csv')
 
     if 'bias_label' not in df.columns:
         raise ValueError("❌ 'bias_label' غير موجود — شغّل prepare_training_data.py --label_mode v19 أولاً")
@@ -777,16 +976,29 @@ def build_time_splits(
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
     min_train_pct: float = 0.20,
+    embargo_min_pct: float | None = None,
+    embargo_horizon_quantile: float = 0.95,
 ):
     n = len(df)
     t0 = _time_series(df, 'ts_event')
     t1 = _time_series(df, 'label_end_ts', fallback='ts_event')
+    directional_h = pd.to_numeric(
+        df.loc[df['bias_label'].isin([0, 1]), 'label_horizon_steps']
+        if 'bias_label' in df.columns and 'label_horizon_steps' in df.columns
+        else pd.Series(dtype=np.float64),
+        errors='coerce',
+    ).dropna()
+    dynamic_embargo_rows = max(
+        int(np.ceil(n * float(embargo_min_pct if embargo_min_pct is not None else embargo_pct))),
+        int(np.ceil(np.percentile(directional_h, float(embargo_horizon_quantile) * 100.0))) if len(directional_h) else 0,
+    )
+    effective_embargo_pct = float(dynamic_embargo_rows / max(n, 1))
     splits = list(
         walk_forward_expanding(
             n,
             n_folds=n_folds,
             test_size=test_size,
-            embargo_pct=embargo_pct,
+            embargo_pct=effective_embargo_pct,
             t0=t0,
             t1=t1,
             min_train_pct=min_train_pct,
@@ -794,7 +1006,11 @@ def build_time_splits(
     )
     if not splits:
         raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
-    return splits, t0, t1
+    return splits, t0, t1, {
+        'dynamic_embargo_rows': int(dynamic_embargo_rows),
+        'effective_embargo_pct': float(effective_embargo_pct),
+        'embargo_horizon_quantile': float(embargo_horizon_quantile),
+    }
 
 
 def _build_inner_time_split(
@@ -853,7 +1069,7 @@ def stage1_oof_meta(
     raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
     y = df['bias_label'].fillna(1).astype(np.int32).values
     if splits is None:
-        splits, t0, t1 = build_time_splits(
+        splits, t0, t1, _ = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
@@ -861,7 +1077,7 @@ def stage1_oof_meta(
             min_train_pct=min_train_pct,
         )
     elif t0 is None or t1 is None:
-        _, t0, t1 = build_time_splits(
+        _, t0, t1, _ = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
@@ -970,6 +1186,15 @@ def stage1_oof_meta(
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
         json.dump(fold_metrics, f, indent=2)
 
+    calibrator, calibrator_report = _fit_long_isotonic_calibrator(y, oof_probs[:, 0])
+    calibrated_oof_probs = _apply_long_calibrator(calibrator, oof_probs)
+    calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
+    if calibrator is not None:
+        with open(calibrator_path, 'wb') as f:
+            pickle.dump(calibrator, f)
+    else:
+        calibrator_path = ''
+
     if not inference_scaler_params:
         raise RuntimeError(
             '❌ inference_scaler_params is required for the final CatBoost fit. '
@@ -1009,15 +1234,24 @@ def stage1_oof_meta(
         N_CB_PROBS,
         classes=final_cb_classes,
     )
+    live_probs = _apply_long_calibrator(calibrator, live_probs)
     live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
     np.save(
         os.path.join(output_dir, 'meta_features_live_v19.npy'),
         np.concatenate([live_probs, live_regime_meta], axis=1).astype(np.float32),
     )
 
-    meta = np.concatenate([oof_probs, regime_meta], axis=1).astype(np.float32)
+    meta = np.concatenate([calibrated_oof_probs, regime_meta], axis=1).astype(np.float32)
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
+    calibration_report = {
+        'stage1_catboost_isotonic': calibrator_report,
+        'catboost_calibrator_artifact': calibrator_path or None,
+        'long_threshold': 0.5,
+        'short_threshold': 0.5,
+    }
+    with open(os.path.join(output_dir, 'calibration_report.json'), 'w') as f:
+        json.dump(calibration_report, f, indent=2)
     print(f"  ✅ OOF Meta Features: {meta.shape}")
     print(f"  ✅ Coverage: {coverage.sum():,}/{len(coverage):,} ({coverage.mean():.1%})")
     return meta, coverage
@@ -1517,6 +1751,23 @@ def stage3_meta_learner_v19(
     )
 
     if history is not None:
+        val_pred = meta.model.predict(X_val, verbose=0) if getattr(meta, 'model', None) is not None else None
+        bias_val_probs = (
+            np.asarray(val_pred.get('bias_out'), dtype=np.float32)
+            if isinstance(val_pred, dict) and 'bias_out' in val_pred
+            else np.zeros((len(X_val), 2), dtype=np.float32)
+        )
+        temperature, temperature_report = _fit_temperature_from_probs(yb_val, bias_val_probs)
+        temperature_path = os.path.join(output_dir, 'meta_temperature_v19.json')
+        with open(temperature_path, 'w') as f:
+            json.dump(
+                {
+                    **temperature_report,
+                    'temperature': None if temperature is None else float(temperature),
+                },
+                f,
+                indent=2,
+            )
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
         event_gate_cfg = event_gate_cfg or _infer_event_gate_schema(df)
         with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
@@ -1532,6 +1783,7 @@ def stage3_meta_learner_v19(
                     'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
                     'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
                     'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
+                    'temperature_scaling': temperature_report,
                 },
                 f,
                 indent=2,
@@ -1558,11 +1810,14 @@ def stage3_meta_learner_v19(
                 'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
                 'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
                 'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
+                'temperature_scaling': temperature_report,
             },
             'artifacts': {
                 'catboost_model': 'catboost_advisor_v19.cbm',
                 'catboost_classes': 'catboost_classes_v19.json',
+                'catboost_calibrator': 'catboost_calibrator_v19.pkl',
                 'meta_model': 'meta_learner_v19.keras',
+                'meta_temperature': 'meta_temperature_v19.json',
                 'regime_model': 'regime_classifier.pkl',
                 'scaler_params': 'scaler_params.json',
                 'deeplob_model': 'deeplob_cnn_v19.keras',
@@ -1686,6 +1941,7 @@ def run_training_pipeline(
         backtest_days=backtest_days,
         window_end=window_end,
     )
+    _assert_single_contract_df(df_full, context='resolved_training_window')
     print(
         "  🗓️ Training Window: "
         f"mode={training_window['mode']} | "
@@ -1728,6 +1984,13 @@ def run_training_pipeline(
         f"  ✅ Model scaler saved: {scaler_path} | "
         f"rows={scaler_info['scaler_train_rows']:,} | split={scaler_info['split_time']}"
     )
+    feature_drift_report_path = _write_feature_coverage_drift_report(
+        event_df,
+        split_time=training_window.get('split_time'),
+        output_dir=output_dir,
+        protected_features={'cvd', 'obi', 'micro_atr', 'kyle_lambda', 'hawkes_intensity', 'vwap_z_score'},
+    )
+    print(f"  ✅ Feature coverage/drift report: {feature_drift_report_path}")
 
     default_lob_path, default_lob_ts_path = _resolve_default_lob_paths(csv_path)
     if not lob_path:
@@ -1741,13 +2004,37 @@ def run_training_pipeline(
             artifact_root = os.path.dirname(os.path.abspath(csv_path))
         print(f"  ⚠️ LOB tensors not found under artifact root: {artifact_root}")
 
-    splits, split_t0, split_t1 = build_time_splits(
+    splits, split_t0, split_t1, split_meta = build_time_splits(
         event_df,
         n_folds=n_folds,
         test_size=test_size,
         embargo_pct=embargo_pct,
         min_train_pct=min_train_pct,
+        embargo_min_pct=float(train_cfg.get('embargo_min_pct', embargo_pct)),
+        embargo_horizon_quantile=float(train_cfg.get('embargo_horizon_quantile', 0.95)),
     )
+    with open(os.path.join(output_dir, 'time_split_report.json'), 'w') as f:
+        json.dump(
+            {
+                **split_meta,
+                'n_splits': int(len(splits)),
+                'rows': int(len(event_df)),
+                'folds': [
+                    {
+                        'fold': int(i + 1),
+                        'train_rows': int(len(train_idx)),
+                        'test_rows': int(len(test_idx)),
+                        'train_start_ts': str(split_t0.iloc[train_idx[0]]) if len(train_idx) else None,
+                        'train_end_ts': str(split_t0.iloc[train_idx[-1]]) if len(train_idx) else None,
+                        'test_start_ts': str(split_t0.iloc[test_idx[0]]) if len(test_idx) else None,
+                        'test_end_ts': str(split_t0.iloc[test_idx[-1]]) if len(test_idx) else None,
+                    }
+                    for i, (train_idx, test_idx) in enumerate(splits)
+                ],
+            },
+            f,
+            indent=2,
+        )
 
     meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
     coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
@@ -1788,6 +2075,7 @@ def run_training_pipeline(
             'visual_coverage_ratio': None,
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
             'training_window': training_window,
+            'split_meta': split_meta,
             'elapsed_seconds': float(elapsed),
             'stage': int(stage),
             'phase': resolved_phase,
@@ -1834,6 +2122,9 @@ def run_training_pipeline(
             'output_dir': output_dir,
             'manifest': manifest_path,
             'meta_features': meta_path,
+            'feature_coverage_drift_report': feature_drift_report_path,
+            'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
+            'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
         }
 
     lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
@@ -1861,6 +2152,7 @@ def run_training_pipeline(
             'visual_coverage_ratio': float(np.mean(visual_coverage)),
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
             'training_window': training_window,
+            'split_meta': split_meta,
             'elapsed_seconds': float(elapsed),
             'stage': int(stage),
             'phase': resolved_phase,
@@ -1907,6 +2199,9 @@ def run_training_pipeline(
             'output_dir': output_dir,
             'manifest': manifest_path,
             'visual_embeddings': visual_path,
+            'feature_coverage_drift_report': feature_drift_report_path,
+            'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
+            'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
         }
 
     if resolved_phase in (PHASE_FULL, PHASE_TRAIN):
@@ -1943,6 +2238,7 @@ def run_training_pipeline(
         'visual_coverage_ratio': float(np.mean(visual_coverage)),
         'scaler_train_rows': int(scaler_info['scaler_train_rows']),
         'training_window': training_window,
+        'split_meta': split_meta,
         'elapsed_seconds': float(elapsed),
         'stage': int(stage),
         'phase': resolved_phase,
@@ -1993,6 +2289,9 @@ def run_training_pipeline(
         'feature_schema': os.path.join(output_dir, 'feature_schema_v19.json'),
         'visual_embeddings': visual_path,
         'meta_features': meta_path,
+        'feature_coverage_drift_report': feature_drift_report_path,
+        'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
+        'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
     }
 
 

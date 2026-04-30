@@ -819,6 +819,103 @@ def _write_data_integrity_report(
     return path
 
 
+def _symbol_count_map_from_integrity(integrity: dict | None) -> dict[str, int]:
+    payload = (((integrity or {}).get('normalized') or {}).get('symbol_top_counts') or {})
+    out: dict[str, int] = {}
+    for key, value in payload.items():
+        try:
+            out[str(key)] = int(value)
+        except Exception:
+            continue
+    return out
+
+
+def _frame_symbol_count_map(df: pd.DataFrame) -> tuple[str | None, dict[str, int]]:
+    if 'symbol' in df.columns:
+        col = 'symbol'
+    elif 'instrument_id' in df.columns:
+        col = 'instrument_id'
+    else:
+        return None, {}
+    counts = (
+        df[col]
+        .fillna('UNKNOWN')
+        .astype(str)
+        .value_counts()
+    )
+    return col, {str(key): int(value) for key, value in counts.items()}
+
+
+def _assert_single_contract(
+    *,
+    symbol_counts: dict[str, int],
+    context: str,
+) -> None:
+    cleaned = {str(key): int(value) for key, value in (symbol_counts or {}).items() if int(value) > 0}
+    if len(cleaned) <= 1:
+        return
+    raise RuntimeError(
+        "❌ Mixed-contract/symbol input is not allowed for V19 hardening. "
+        f"context={context} | counts={cleaned}"
+    )
+
+
+def _write_label_quality_report(df: pd.DataFrame, output_dir: str) -> str:
+    ts = pd.to_datetime(df.get('ts_event'), utc=True, errors='coerce').dt.tz_localize(None)
+    if ts.isna().all():
+        ts = pd.Series(pd.date_range('2026-01-01', periods=len(df), freq='s'))
+    month_key = ts.dt.to_period('M').astype(str)
+    work = df.copy()
+    work['_month'] = month_key
+    work['bias_label'] = pd.to_numeric(work.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
+    work['path_outcome'] = pd.to_numeric(work.get('path_outcome', 4), errors='coerce').fillna(4).astype(np.int8)
+    work['label_horizon_steps'] = pd.to_numeric(work.get('label_horizon_steps', 0), errors='coerce').fillna(0).astype(np.int32)
+    work['adverse_path_flag'] = pd.to_numeric(work.get('adverse_path_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+
+    report = {
+        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'rows': int(len(work)),
+        'months': [],
+    }
+
+    for month, group in work.groupby('_month', sort=True):
+        directional = group[group['bias_label'].isin([0, 1])]
+        overlap_rate = float((directional['label_horizon_steps'] > 1).mean()) if len(directional) else 0.0
+
+        report['months'].append({
+            'month': str(month),
+            'rows': int(len(group)),
+            'class_counts': {
+                'LONG': int((group['bias_label'] == 0).sum()),
+                'SHORT': int((group['bias_label'] == 1).sum()),
+                'NEUTRAL': int((group['bias_label'] == 2).sum()),
+            },
+            'path_outcome_counts': {
+                'long_tp_first': int((group['path_outcome'] == 0).sum()),
+                'short_tp_first': int((group['path_outcome'] == 1).sum()),
+                'long_sl_first': int((group['path_outcome'] == 2).sum()),
+                'short_sl_first': int((group['path_outcome'] == 3).sum()),
+                'timeout': int((group['path_outcome'] == 4).sum()),
+            },
+            'label_horizon_steps': {
+                'median': float(np.median(group['label_horizon_steps'])) if len(group) else 0.0,
+                'p95': float(np.percentile(group['label_horizon_steps'], 95)) if len(group) else 0.0,
+            },
+            'directional_overlap_rate': round(float(overlap_rate), 4),
+            'directional_rows': int(len(directional)),
+            'long_short_balance': {
+                'long_share': round(float((directional['bias_label'] == 0).mean()), 4) if len(directional) else 0.0,
+                'short_share': round(float((directional['bias_label'] == 1).mean()), 4) if len(directional) else 0.0,
+            },
+            'adverse_path_share': round(float(group['adverse_path_flag'].mean()), 4) if len(group) else 0.0,
+        })
+
+    path = os.path.join(output_dir, 'label_quality_report.json')
+    with open(path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return path
+
+
 def _shard_record(path: str, df: pd.DataFrame, shard_idx: int) -> dict:
     ts_min, ts_max = _shard_ts_bounds(df)
     return {
@@ -2860,6 +2957,15 @@ def run_refinery(
         mbo_rows=int(sum(int(r.get('rows', 0)) for r in mbo_records)),
         mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
     )
+    _assert_single_contract(
+        symbol_counts=_symbol_count_map_from_integrity(mbo_integrity),
+        context='canonical_mbo_input',
+    )
+    if mbp_integrity is not None:
+        _assert_single_contract(
+            symbol_counts=_symbol_count_map_from_integrity(mbp_integrity),
+            context='canonical_mbp_input',
+        )
     max_phase_a_shards = max(len(mbo_records), len(mbp_records) if mbp_records else 0)
     if max_phase_a_shards <= 1 and effective_workers > 1:
         print(
@@ -3315,6 +3421,11 @@ def run_refinery(
         rolling_cols=int(len(roll_cols)),
     )
     final_integrity = _frame_integrity_snapshot(df_final)
+    _, final_symbol_counts = _frame_symbol_count_map(df_final)
+    _assert_single_contract(
+        symbol_counts=final_symbol_counts,
+        context='final_labeled_artifact',
+    )
 
     split_meta = {}
     split_path = os.path.join(output_dir, 'refinery_split.json')
@@ -3411,6 +3522,8 @@ def run_refinery(
         merge_tolerance_ms=merge_tolerance_ms,
     )
     print(f"  ✅ Data integrity report: {integrity_report_path}")
+    label_quality_report_path = _write_label_quality_report(df_final, output_dir)
+    print(f"  ✅ Label quality report: {label_quality_report_path}")
 
     elapsed = (datetime.datetime.now()-t0).total_seconds()
     _report(df_final, mbo_path, mbp_path, elapsed, output_dir)

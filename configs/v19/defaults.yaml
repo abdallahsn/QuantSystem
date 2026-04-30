@@ -6,6 +6,8 @@
     "n_folds": 6,
     "test_size": 0.10,
     "embargo_pct": 0.02,
+    "embargo_min_pct": 0.02,
+    "embargo_horizon_quantile": 0.95,
     "min_train_pct": 0.20,
     "train_frac": 0.80,
     "min_seq_coverage": 0.80,
@@ -45,6 +47,12 @@
     "tick_size": 0.0001,
     "tick_value": 10.0,
     "round_trip_cost_pips": 1.0,
+    "latency_rows": 1,
+    "commission_per_side": 5.0,
+    "min_spread_ticks": 1.0,
+    "min_slippage_ticks": 1.0,
+    "spread_multiplier": 0.5,
+    "max_daily_loss_pct": 0.02,
     "max_size": 5,
     "starting_equity": 100000.0,
     "allow_in_sample_data_override": false
@@ -66,7 +74,12 @@
     "fallback_frequency_max": 0.10,
     "reject_ratio_max": 0.15,
     "data_gap_events_max": 0,
-    "psi_proxy_max": 0.25
+    "psi_proxy_max": 0.25,
+    "psi_warn": 0.20,
+    "psi_critical": 0.35,
+    "event_gate_shift_warn": 0.30,
+    "shadow_brier_deterioration_critical": 0.20,
+    "shadow_win_rate_drop_critical": 0.10
   },
   "failsafe": {
     "critical_features": ["cvd", "obi", "micro_atr", "kyle_lambda", "hawkes_intensity", "vwap_z_score"],

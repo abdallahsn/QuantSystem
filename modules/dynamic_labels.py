@@ -396,8 +396,20 @@ def engineer_features(df: pd.DataFrame, roll_window: int = 20) -> pd.DataFrame:
         df[f"{col}_rmean"] = roll_mean.fillna(0.0)
 
     if "obi" in df.columns:
-        obi_std = pd.to_numeric(df["obi"], errors="coerce").fillna(0.0).rolling(roll_window, min_periods=1).std().fillna(0.0)
-        df["regime"] = (obi_std > float(obi_std.median())).astype(np.int8)
+        obi_std = (
+            pd.to_numeric(df["obi"], errors="coerce")
+            .fillna(0.0)
+            .rolling(roll_window, min_periods=1)
+            .std()
+            .fillna(0.0)
+        )
+        causal_median = (
+            obi_std.expanding(min_periods=1)
+            .median()
+            .ffill()
+            .fillna(0.0)
+        )
+        df["regime"] = (obi_std > causal_median).astype(np.int8)
     else:
         df["regime"] = REGIME_RANGING
 
@@ -962,7 +974,10 @@ def kalman_trend(
         kalman_price[i] = x[0]
         slopes[i] = x[1]
 
-    max_abs_slope = float(np.abs(slopes).max()) + 1e-10
+    # Causal normalization: each row may only use slope scale seen up to that row.
+    abs_slopes = np.abs(slopes)
+    max_abs_slope = np.maximum.accumulate(abs_slopes)
+    max_abs_slope = np.where(max_abs_slope > 1e-10, max_abs_slope, 1e-10)
     norm_slope = slopes / max_abs_slope
 
     trend_label = np.where(

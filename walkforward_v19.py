@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 
 import numpy as np
@@ -36,16 +37,43 @@ def build_walkforward_windows(
     ts = normalize_ts(pd.DataFrame({'ts_event': timestamps}))['ts_event']
     n = len(ts)
     windows = []
+    months = ts.dt.to_period('M')
+    unique_months = list(months.dropna().unique())
+    if len(unique_months) >= 6:
+        fold_no = 1
+        for month in unique_months[1:]:
+            test_mask = (months == month).to_numpy(dtype=bool)
+            train_mask = (months < month).to_numpy(dtype=bool)
+            train_rows = int(train_mask.sum())
+            test_rows = int(test_mask.sum())
+            if train_rows < int(min_train_rows) or test_rows <= 10:
+                continue
+            test_ts = ts.loc[test_mask]
+            train_ts = ts.loc[train_mask]
+            windows.append({
+                'fold': fold_no,
+                'mode': 'monthly_expanding',
+                'train_start': train_ts.iloc[0],
+                'train_end': train_ts.iloc[-1],
+                'test_start': test_ts.iloc[0],
+                'test_end': test_ts.iloc[-1] + pd.Timedelta(microseconds=1),
+                'train_rows_est': train_rows,
+                'test_rows_est': test_rows,
+                'test_month': str(month),
+            })
+            fold_no += 1
+        return windows
+
     base_train_end = max(int(n * initial_train_frac), min_train_rows)
     test_rows = max(int(n * test_frac), 1)
-
-    for fold in range(n_splits):
+    for fold in range(max(int(n_splits), 3)):
         train_end_idx = base_train_end + fold * test_rows
         test_end_idx = min(train_end_idx + test_rows, n)
         if train_end_idx >= n or (test_end_idx - train_end_idx) <= 10:
             break
         windows.append({
             'fold': fold + 1,
+            'mode': 'chronological_expanding',
             'train_start': ts.iloc[0],
             'train_end': ts.iloc[train_end_idx - 1],
             'test_start': ts.iloc[train_end_idx],
@@ -148,10 +176,13 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
             'mean_directional_recall': 0.0,
             'mean_directional_f1': 0.0,
             'mean_event_gate_rate': 0.0,
+            'mean_brier_score': 0.0,
+            'mean_ece': 0.0,
             'mean_win_rate': 0.0,
             'mean_profit_factor': 0.0,
             'mean_trade_sharpe': 0.0,
             'mean_trade_pnl_dollars': 0.0,
+            'mean_expectancy_dollars': 0.0,
             'max_drawdown_pct': 0.0,
             'total_trades': 0,
             'total_pnl_dollars': 0.0,
@@ -159,17 +190,20 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
 
     return {
         'n_folds': int(len(fold_reports)),
-        'mean_directional_precision': float(np.mean([r['backtest'].get('directional_precision_macro', 0.0) for r in fold_reports])),
-        'mean_directional_recall': float(np.mean([r['backtest'].get('directional_recall_macro', 0.0) for r in fold_reports])),
-        'mean_directional_f1': float(np.mean([r['backtest'].get('directional_f1_macro', 0.0) for r in fold_reports])),
-        'mean_event_gate_rate': float(np.mean([r['backtest'].get('event_gate_rate', 0.0) for r in fold_reports])),
-        'mean_win_rate': float(np.mean([r['backtest'].get('win_rate', 0.0) for r in fold_reports])),
-        'mean_profit_factor': float(np.mean([r['backtest'].get('profit_factor', 0.0) for r in fold_reports])),
-        'mean_trade_sharpe': float(np.mean([r['backtest'].get('trade_sharpe', 0.0) for r in fold_reports])),
-        'mean_trade_pnl_dollars': float(np.mean([r['backtest'].get('avg_trade_pnl_dollars', 0.0) for r in fold_reports])),
-        'max_drawdown_pct': float(np.max([r['backtest'].get('max_drawdown_pct', 0.0) for r in fold_reports])),
-        'total_trades': int(np.sum([r['backtest'].get('trades', 0) for r in fold_reports])),
-        'total_pnl_dollars': float(np.sum([r['backtest'].get('total_pnl_dollars', 0.0) for r in fold_reports])),
+        'mean_directional_precision': float(np.mean([r['backtest_base'].get('directional_precision_macro', 0.0) for r in fold_reports])),
+        'mean_directional_recall': float(np.mean([r['backtest_base'].get('directional_recall_macro', 0.0) for r in fold_reports])),
+        'mean_directional_f1': float(np.mean([r['backtest_base'].get('directional_f1_macro', 0.0) for r in fold_reports])),
+        'mean_event_gate_rate': float(np.mean([r['backtest_base'].get('event_gate_rate', 0.0) for r in fold_reports])),
+        'mean_brier_score': float(np.mean([r['backtest_base'].get('brier_score', 0.0) for r in fold_reports])),
+        'mean_ece': float(np.mean([r['backtest_base'].get('ece', 0.0) for r in fold_reports])),
+        'mean_win_rate': float(np.mean([r['backtest_base'].get('win_rate', 0.0) for r in fold_reports])),
+        'mean_profit_factor': float(np.mean([r['backtest_base'].get('profit_factor', 0.0) for r in fold_reports])),
+        'mean_trade_sharpe': float(np.mean([r['backtest_base'].get('trade_sharpe', 0.0) for r in fold_reports])),
+        'mean_trade_pnl_dollars': float(np.mean([r['backtest_base'].get('avg_trade_pnl_dollars', 0.0) for r in fold_reports])),
+        'mean_expectancy_dollars': float(np.mean([r['backtest_base'].get('avg_trade_expectancy_dollars', 0.0) for r in fold_reports])),
+        'max_drawdown_pct': float(np.max([r['backtest_base'].get('max_drawdown_pct', 0.0) for r in fold_reports])),
+        'total_trades': int(np.sum([r['backtest_base'].get('trades', 0) for r in fold_reports])),
+        'total_pnl_dollars': float(np.sum([r['backtest_base'].get('total_pnl_dollars', 0.0) for r in fold_reports])),
     }
 
 
@@ -201,6 +235,7 @@ def run_walkforward(
     )
 
     fold_reports = []
+    release_blockers: list[dict] = []
     for window in windows:
         fold_name = f"fold_{window['fold']:02d}"
         fold_dir = os.path.join(output_dir, fold_name)
@@ -291,24 +326,65 @@ def run_walkforward(
             test_lob_ts=test_build['lob_ts'],
             models_dir=model_dir,
         )
-        _, _, backtest_summary = run_causal_backtest(
+        base_bt_cfg = {
+            'tick_size': float(bt_cfg.get('tick_size', 0.0001)),
+            'tick_value': float(bt_cfg.get('tick_value', 10.0)),
+            'round_trip_cost_pips': float(bt_cfg.get('round_trip_cost_pips', 1.0)),
+            'commission_per_side': float(bt_cfg.get('commission_per_side', 0.5 * float(bt_cfg.get('tick_value', 10.0)))),
+            'min_spread_ticks': float(bt_cfg.get('min_spread_ticks', 1.0)),
+            'min_slippage_ticks': float(bt_cfg.get('min_slippage_ticks', 1.0)),
+            'spread_multiplier': float(bt_cfg.get('spread_multiplier', 0.5)),
+            'max_size': int(bt_cfg.get('max_size', 5)),
+            'starting_equity': float(bt_cfg.get('starting_equity', 100000.0)),
+            'latency_rows': int(bt_cfg.get('latency_rows', 1)),
+            'max_daily_loss_pct': float(bt_cfg.get('max_daily_loss_pct', 0.02)),
+            'direction_threshold_ticks': float(ref_cfg.get('direction_threshold_ticks', 1.0)),
+            'tp_mult': float(ref_cfg.get('tp_mult', 1.2)),
+            'sl_mult': float(ref_cfg.get('sl_mult', 1.0)),
+            'score_start_ts': str(window['test_start']),
+            'score_end_ts': str(window['test_end']),
+        }
+        _, _, backtest_base = run_causal_backtest(
             df=test_df,
             models_dir=model_dir,
-            output_dir=eval_dir,
+            output_dir=os.path.join(eval_dir, 'base'),
             visual_embeddings=test_visual,
             meta_features=None,
             input_scaled=True,
-            tick_size=float(bt_cfg.get('tick_size', 0.0001)),
-            tick_value=float(bt_cfg.get('tick_value', 10.0)),
-            round_trip_cost_pips=float(bt_cfg.get('round_trip_cost_pips', 1.0)),
-            max_size=int(bt_cfg.get('max_size', 5)),
-            starting_equity=float(bt_cfg.get('starting_equity', 100000.0)),
-            direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 1.0)),
-            tp_mult=float(ref_cfg.get('tp_mult', 1.2)),
-            sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
-            score_start_ts=str(window['test_start']),
-            score_end_ts=str(window['test_end']),
+            scenario_name='base',
+            **base_bt_cfg,
         )
+        stress_bt_cfg = {
+            **base_bt_cfg,
+            'commission_per_side': float(base_bt_cfg['commission_per_side']) * 2.0,
+            'min_slippage_ticks': float(base_bt_cfg['min_slippage_ticks']) * 2.0,
+            'latency_rows': max(int(base_bt_cfg['latency_rows']), 2),
+        }
+        _, _, backtest_stress = run_causal_backtest(
+            df=test_df,
+            models_dir=model_dir,
+            output_dir=os.path.join(eval_dir, 'stress'),
+            visual_embeddings=test_visual,
+            meta_features=None,
+            input_scaled=True,
+            scenario_name='stress',
+            **stress_bt_cfg,
+        )
+
+        class_counts = {
+            'LONG': int((pd.to_numeric(test_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8) == 0).sum()),
+            'SHORT': int((pd.to_numeric(test_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8) == 1).sum()),
+            'NEUTRAL': int((pd.to_numeric(test_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8) == 2).sum()),
+        }
+        blockers = []
+        if int(backtest_base.get('trades', 0)) <= 0:
+            blockers.append('zero_directional_trades')
+        if min(class_counts['LONG'], class_counts['SHORT']) <= 0:
+            blockers.append('severe_class_collapse')
+        if float(backtest_base.get('avg_trade_expectancy_dollars', 0.0)) < 0 and float(backtest_stress.get('avg_trade_expectancy_dollars', 0.0)) < 0:
+            blockers.append('negative_expectancy_base_and_stress')
+        if blockers:
+            release_blockers.append({'fold': int(window['fold']), 'reasons': blockers})
 
         fold_report = {
             'fold': window['fold'],
@@ -318,29 +394,54 @@ def run_walkforward(
                 'test_start': str(window['test_start']),
                 'test_end': str(window['test_end']),
             },
+            'class_balance': class_counts,
             'train': train_summary,
-            'backtest': backtest_summary,
+            'backtest_base': backtest_base,
+            'backtest_stress': backtest_stress,
+            'release_blockers': blockers,
         }
         fold_reports.append(fold_report)
         with open(os.path.join(fold_dir, 'fold_report.json'), 'w') as f:
             json.dump(fold_report, f, indent=2)
 
     aggregate = aggregate_fold_metrics(fold_reports)
+    aggregate['release_blocker_count'] = int(len(release_blockers))
     gate_report = evaluate_release_gates(aggregate, gates)
     gates_path = save_gate_report(output_dir, gate_report)
+    walkforward_report = {
+        'folds': fold_reports,
+        'aggregate': aggregate,
+        'release_blockers': release_blockers,
+    }
+    with open(os.path.join(output_dir, 'walkforward_report.json'), 'w') as f:
+        json.dump(walkforward_report, f, indent=2)
+    monitor_baseline = {
+        'generated_at': pd.Timestamp.utcnow().replace(microsecond=0).isoformat(),
+        'prediction_baseline': {
+            'confidence_mean': 0.0,
+            'event_gate_rate': float(aggregate.get('mean_event_gate_rate', 0.0)),
+        },
+        'shadow_baseline': {
+            'brier_score': float(aggregate.get('mean_brier_score', 0.0)),
+            'win_rate': float(aggregate.get('mean_win_rate', 0.0)),
+        },
+    }
+    with open(os.path.join(output_dir, 'monitor_baseline.json'), 'w') as f:
+        json.dump(monitor_baseline, f, indent=2)
     manifest_path = write_manifest(
         output_dir=output_dir,
         kind='walkforward_v19',
         config=config,
         inputs={'mbo': mbo_path, 'mbp': mbp_path},
         metrics=aggregate,
-        extra={'release_gates': gate_report, 'windows': windows},
+        extra={'release_gates': gate_report, 'windows': windows, 'release_blockers': release_blockers},
     )
 
     out = {
         'folds': fold_reports,
         'aggregate': aggregate,
         'release_gates': gate_report,
+        'release_blockers': release_blockers,
         'manifest': manifest_path,
         'release_gates_report': gates_path,
     }

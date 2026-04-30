@@ -88,6 +88,7 @@ def compute_drift(events: list[dict], baseline: dict) -> dict:
         'confidence_mean': _safe_mean(confidences),
         'confidence_std': _safe_std(confidences),
         'confidence_mean_delta': _safe_mean(confidences) - float((baseline.get('prediction_baseline') or {}).get('confidence_mean', 0.0)),
+        'event_gate_rate': _safe_mean([1.0 if e.get('event_gate_passed', False) else 0.0 for e in events if e.get('event_type') in ('prediction_emitted', 'prediction_blocked')]),
     }
     return {
         'feature_drift': feature_drift,
@@ -102,6 +103,7 @@ class MonitoringState:
     def summarize(self, events: list[dict]) -> dict:
         pred_events = [e for e in events if e.get('event_type') in ('prediction_emitted', 'prediction_blocked')]
         emitted = [e for e in pred_events if e.get('event_type') == 'prediction_emitted']
+        shadow_outcomes = [e for e in events if e.get('event_type') == 'shadow_outcome_realized']
         blocked = [e for e in events if e.get('event_type') in ('prediction_blocked', 'risk_blocked', 'rollout_guard_triggered')]
         fills = [e for e in events if e.get('event_type') == 'order_filled']
         rejects = [e for e in events if e.get('event_type') == 'order_rejected']
@@ -111,6 +113,24 @@ class MonitoringState:
         confidences = [float(e.get('confidence', 0.0) or 0.0) for e in emitted]
         missing_counts = [len((((e.get('extra') or {}).get('missing_features')) or [])) for e in pred_events]
         slippages = [float(((e.get('extra') or {}).get('slippage_pips') or 0.0)) for e in fills]
+        event_gate_rate = _safe_mean([1.0 if e.get('event_gate_passed', False) else 0.0 for e in pred_events])
+        shadow_probs = []
+        shadow_true = []
+        shadow_correct = []
+        for e in shadow_outcomes:
+            extra = (e.get('extra') or {})
+            probs = extra.get('direction_probs') or {}
+            shadow_probs.append(float(probs.get('LONG', 0.0) or 0.0) if isinstance(probs, dict) else 0.0)
+            shadow_true.append(int(extra.get('true_bias', 2) or 2))
+            shadow_correct.append(bool(extra.get('correct', False)))
+        directional_mask = [yb in (0, 1) for yb in shadow_true]
+        brier = 0.0
+        if shadow_probs and any(directional_mask):
+            p = np.asarray([p for p, keep in zip(shadow_probs, directional_mask) if keep], dtype=np.float64)
+            y = np.asarray([yb for yb, keep in zip(shadow_true, directional_mask) if keep], dtype=np.int32)
+            brier = float(np.mean((p - (y == 0).astype(np.float64)) ** 2)) if len(y) else 0.0
+        shadow_win_rate = _safe_mean([1.0 if ok else 0.0 for ok in shadow_correct])
+        shadow_baseline = self.baseline.get('shadow_baseline', {}) or {}
 
         drift = compute_drift(events, self.baseline)
         return {
@@ -144,6 +164,15 @@ class MonitoringState:
             'prediction_health': {
                 'confidence_mean': _safe_mean(confidences),
                 'confidence_std': _safe_std(confidences),
+                'event_gate_rate': event_gate_rate,
+                'event_gate_rate_delta': event_gate_rate - float((self.baseline.get('prediction_baseline') or {}).get('event_gate_rate', 0.0)),
+            },
+            'shadow_health': {
+                'realized_outcomes': int(len(shadow_outcomes)),
+                'brier_score': float(brier),
+                'win_rate': shadow_win_rate,
+                'brier_score_delta': float(brier - float(shadow_baseline.get('brier_score', 0.0))),
+                'win_rate_delta': float(shadow_win_rate - float(shadow_baseline.get('win_rate', 0.0))),
             },
             'drift': drift,
         }
@@ -159,6 +188,11 @@ def _default_alert_rules(config: dict | None = None) -> dict:
         'reject_ratio_max': float(c.get('reject_ratio_max', 0.15)),
         'data_gap_events_max': int(c.get('data_gap_events_max', 0)),
         'psi_proxy_max': float(c.get('psi_proxy_max', 0.25)),
+        'psi_warn': float(c.get('psi_warn', c.get('psi_proxy_max', 0.20))),
+        'psi_critical': float(c.get('psi_critical', max(c.get('psi_proxy_max', 0.25), 0.35))),
+        'event_gate_shift_warn': float(c.get('event_gate_shift_warn', 0.30)),
+        'shadow_brier_deterioration_critical': float(c.get('shadow_brier_deterioration_critical', 0.20)),
+        'shadow_win_rate_drop_critical': float(c.get('shadow_win_rate_drop_critical', 0.10)),
     }
 
 
@@ -174,6 +208,7 @@ def emit_alerts(summary: dict, writer: EventLogWriter | None = None, config: dic
     ex = summary.get('execution_health', {})
     rh = summary.get('risk_health', {})
     ph = summary.get('prediction_health', {})
+    sh = summary.get('shadow_health', {})
     drift = summary.get('drift', {})
 
     if float(dq.get('missing_ratio_events', 0.0)) > rules['feature_missing_ratio_max']:
@@ -189,15 +224,24 @@ def emit_alerts(summary: dict, writer: EventLogWriter | None = None, config: dic
     if int(dq.get('data_gap_events', 0)) > rules['data_gap_events_max']:
         add_alert('data_gap_detected', f"data_gap_events {dq.get('data_gap_events')} > {rules['data_gap_events_max']}")
 
+    if abs(float(ph.get('event_gate_rate_delta', 0.0))) > rules['event_gate_shift_warn']:
+        add_alert('event_gate_shift_alert', 'event_gate_rate shifted materially from baseline')
+    if float(sh.get('brier_score_delta', 0.0)) > rules['shadow_brier_deterioration_critical']:
+        add_alert('shadow_brier_alert', 'shadow brier score deteriorated beyond baseline tolerance')
+    if float(-sh.get('win_rate_delta', 0.0)) > rules['shadow_win_rate_drop_critical']:
+        add_alert('shadow_win_rate_alert', 'shadow win rate dropped materially from baseline')
     for feat, stat in (drift.get('feature_drift') or {}).items():
-        if float(stat.get('psi_proxy', 0.0)) > rules['psi_proxy_max']:
-            add_alert('feature_drift_alert', f"{feat} psi_proxy {stat.get('psi_proxy')} > {rules['psi_proxy_max']}", extra={'feature': feat, 'stats': stat})
+        if float(stat.get('psi_proxy', 0.0)) > rules['psi_critical']:
+            add_alert('feature_drift_alert', f"{feat} psi_proxy {stat.get('psi_proxy')} > {rules['psi_critical']}", extra={'feature': feat, 'stats': stat})
+        elif float(stat.get('psi_proxy', 0.0)) > rules['psi_warn']:
+            add_alert('feature_drift_warning', f"{feat} psi_proxy {stat.get('psi_proxy')} > {rules['psi_warn']}", extra={'feature': feat, 'stats': stat})
     return alerts
 
 
 def load_baseline_from_artifacts(models_dir: str) -> dict:
     manifest_path = os.path.join(models_dir, 'manifest.json')
     scaler_path = os.path.join(models_dir, 'scaler_params.json')
+    monitor_baseline_path = os.path.join(models_dir, 'monitor_baseline.json')
     baseline = {'feature_baseline': {}, 'prediction_baseline': {}}
     if os.path.exists(manifest_path):
         with open(manifest_path) as f:
@@ -215,6 +259,14 @@ def load_baseline_from_artifacts(models_dir: str) -> dict:
                 baseline['feature_baseline'][feat] = {'mean': (mn + mx) / 2.0, 'std': max((mx - mn) / 2.0, 1e-8)}
             else:
                 baseline['feature_baseline'][feat] = {'mean': 0.0, 'std': 1.0}
+    if os.path.exists(monitor_baseline_path):
+        try:
+            with open(monitor_baseline_path) as f:
+                monitor_baseline = json.load(f)
+            baseline['prediction_baseline'].update((monitor_baseline.get('prediction_baseline') or {}))
+            baseline['shadow_baseline'] = monitor_baseline.get('shadow_baseline', {})
+        except Exception:
+            pass
     return baseline
 
 

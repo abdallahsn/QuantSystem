@@ -13,14 +13,15 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("QUANTSYSTEM_SKIP_HEAVY_ML", "1")
 os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 
-from backtest_v19 import _load_meta_features, _simulate_trade_path
+from backtest_v19 import _load_meta_features, _realized_fill_pricing, _simulate_trade_path
 from prepare_training_data import _fit_regime_surface, _frame_integrity_snapshot, _process_mbp10, _require_causal_label_runtime
-from modules.dynamic_labels import EventGate
+from modules.dynamic_labels import EventGate, engineer_features
 from modules.feature_factory_v19 import V19FeatureFactory
-from modules.labels_v19 import _compute_adaptive_horizons
+from modules.labels_v19 import _compute_adaptive_horizons, build_causal_event_labels
+from modules.dynamic_labels import kalman_trend
 from modules.meta_learner import _input_shape_matches
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
-from train_v19 import _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
+from train_v19 import _assert_single_contract_df, _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
 
 
 class LeakageGuardTests(unittest.TestCase):
@@ -40,6 +41,18 @@ class LeakageGuardTests(unittest.TestCase):
         spiked = _compute_adaptive_horizons(future_spike, base_horizon=100)
 
         np.testing.assert_array_equal(base[:40], spiked[:40])
+
+    def test_kalman_trend_is_causal_across_prefixes(self):
+        prefix = np.linspace(100.0, 101.0, 120, dtype=np.float64)
+        base = np.r_[prefix, np.linspace(101.0, 102.0, 80, dtype=np.float64)]
+        spiked = np.r_[prefix, np.linspace(101.0, 120.0, 80, dtype=np.float64)]
+
+        labels_base, strength_base, price_base = kalman_trend(base, slope_threshold=0.05)
+        labels_spiked, strength_spiked, price_spiked = kalman_trend(spiked, slope_threshold=0.05)
+
+        np.testing.assert_array_equal(labels_base[:120], labels_spiked[:120])
+        np.testing.assert_allclose(strength_base[:120], strength_spiked[:120], atol=1e-8)
+        np.testing.assert_allclose(price_base[:120], price_spiked[:120], atol=1e-8)
 
     def test_spoofing_baseline_does_not_backfill_future_depth(self):
         n = 32
@@ -167,6 +180,43 @@ class LeakageGuardTests(unittest.TestCase):
         self.assertEqual(trade['exit_reason'], 'sl')
         self.assertAlmostEqual(trade['raw_pnl_pips'], -1.0)
 
+    def test_cost_floors_do_not_improve_backtest_pnl(self):
+        row = {
+            'bid_px_00': 100.0,
+            'ask_px_00': 101.0,
+            'bid_sz_00': 10.0,
+            'ask_sz_00': 10.0,
+        }
+        base = _realized_fill_pricing(
+            entry_row=row,
+            exit_row=row,
+            direction='LONG',
+            size=1,
+            raw_pnl_pips=10.0,
+            tick_size=1.0,
+            round_trip_cost_pips=1.0,
+            tick_value=10.0,
+            commission_per_side=1.0,
+            min_spread_ticks=1.0,
+            min_slippage_ticks=1.0,
+            spread_multiplier=0.5,
+        )
+        stress = _realized_fill_pricing(
+            entry_row=row,
+            exit_row=row,
+            direction='LONG',
+            size=1,
+            raw_pnl_pips=10.0,
+            tick_size=1.0,
+            round_trip_cost_pips=1.0,
+            tick_value=10.0,
+            commission_per_side=2.0,
+            min_spread_ticks=1.0,
+            min_slippage_ticks=2.0,
+            spread_multiplier=0.5,
+        )
+        self.assertLessEqual(stress['net_pnl_pips'], base['net_pnl_pips'])
+
     def test_inference_scaler_can_reuse_refinery_split_time(self):
         n = 120
         ts = pd.date_range('2026-01-01', periods=n, freq='min')
@@ -214,6 +264,16 @@ class LeakageGuardTests(unittest.TestCase):
             else:
                 os.environ['QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS'] = old_override
 
+    def test_training_contract_guard_rejects_mixed_symbols(self):
+        df = pd.DataFrame(
+            {
+                'symbol': ['ES', 'NQ', 'ES'],
+                'bias_label': [0, 1, 2],
+            }
+        )
+        with self.assertRaises(RuntimeError):
+            _assert_single_contract_df(df, context='unit_test')
+
     def test_regime_rules_are_causal_across_prefixes(self):
         rng = np.random.default_rng(7)
         n = 180
@@ -235,6 +295,50 @@ class LeakageGuardTests(unittest.TestCase):
             prefix_last = np.array([clf.predict(df.iloc[:i + 1])[-1] for i in range(130, n)], dtype=np.int8)
 
         np.testing.assert_array_equal(full[130:], prefix_last)
+
+    def test_engineer_features_regime_is_causal_across_prefixes(self):
+        prefix = pd.DataFrame(
+            {
+                'obi': np.linspace(-0.5, 0.5, 120, dtype=np.float64),
+                'cvd': np.linspace(0.0, 5.0, 120, dtype=np.float64),
+            }
+        )
+        base = pd.concat([prefix, pd.DataFrame({'obi': np.linspace(0.1, 0.2, 40), 'cvd': np.linspace(5.0, 6.0, 40)})], ignore_index=True)
+        spiked = pd.concat([prefix, pd.DataFrame({'obi': np.linspace(0.1, 10.0, 40), 'cvd': np.linspace(5.0, 6.0, 40)})], ignore_index=True)
+
+        base_regime = engineer_features(base, roll_window=20)['regime'].to_numpy(dtype=np.int8)
+        spiked_regime = engineer_features(spiked, roll_window=20)['regime'].to_numpy(dtype=np.int8)
+
+        np.testing.assert_array_equal(base_regime[:120], spiked_regime[:120])
+
+    def test_bias_labels_are_causal_across_prefixes(self):
+        prefix_prices = np.linspace(100.0, 101.0, 120, dtype=np.float64)
+        base_prices = np.r_[prefix_prices, np.linspace(101.0, 102.0, 80, dtype=np.float64)]
+        spiked_prices = np.r_[prefix_prices, np.linspace(101.0, 120.0, 80, dtype=np.float64)]
+
+        def _label(price_arr: np.ndarray) -> np.ndarray:
+            df = pd.DataFrame(
+                {
+                    'ts_event': pd.date_range('2026-01-01', periods=len(price_arr), freq='s'),
+                    'price': price_arr,
+                    'size': np.ones(len(price_arr), dtype=np.float32),
+                    'cvd': np.linspace(0.0, 1.0, len(price_arr), dtype=np.float32),
+                }
+            )
+            out = build_causal_event_labels(
+                df,
+                horizon=20,
+                direction_threshold_ticks=1.0,
+                tp_mult=1.2,
+                sl_mult=1.0,
+                tick_size=0.01,
+                trend_strength_min=0.05,
+            )
+            return out['bias_label'].to_numpy(dtype=np.int8)
+
+        base_bias = _label(base_prices)
+        spiked_bias = _label(spiked_prices)
+        np.testing.assert_array_equal(base_bias[:100], spiked_bias[:100])
 
     def test_regime_scores_are_causal_across_prefixes(self):
         rng = np.random.default_rng(11)
