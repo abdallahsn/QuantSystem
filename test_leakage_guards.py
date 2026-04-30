@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import json
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ from modules.dynamic_labels import kalman_trend
 from modules.meta_learner import _input_shape_matches
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
 from train_v19 import _assert_single_contract_df, _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
+from modules.failsafe_v19 import evaluate_system_health, decide_runtime_mode
 
 
 class LeakageGuardTests(unittest.TestCase):
@@ -273,6 +275,28 @@ class LeakageGuardTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             _assert_single_contract_df(df, context='unit_test')
+
+    def test_rollout_requires_shadow_approval(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, 'feature_schema_v19.json'), 'w') as f:
+                json.dump({}, f)
+            with open(os.path.join(tmpdir, 'manifest.json'), 'w') as f:
+                json.dump({}, f)
+            health = evaluate_system_health(
+                models_dir=tmpdir,
+                engine_status={
+                    'catboost_available': True,
+                    'meta_available': True,
+                    'regime_available': True,
+                    'visual_available': True,
+                },
+                feature_row={'cvd': 1.0, 'obi': 0.1, 'micro_atr': 0.2, 'kyle_lambda': 0.1, 'hawkes_intensity': 0.1, 'vwap_z_score': 0.0},
+                policy={'require_shadow_approval_for_rollout': True},
+                manifest_path=os.path.join(tmpdir, 'manifest.json'),
+            )
+            runtime = decide_runtime_mode(health, {'require_shadow_approval_for_rollout': True})
+            self.assertFalse(runtime['allow_rollout'])
+            self.assertIn('shadow_approval_missing', runtime['reason'])
 
     def test_regime_rules_are_causal_across_prefixes(self):
         rng = np.random.default_rng(7)

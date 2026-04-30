@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 import pandas as pd
+import json
 
 
 def _manifest_exists(path: str | None) -> bool:
@@ -16,6 +17,32 @@ def _manifest_exists(path: str | None) -> bool:
 
 def _schema_manifest_match(models_dir: str) -> bool:
     return os.path.exists(os.path.join(models_dir, 'feature_schema_v19.json')) and os.path.exists(os.path.join(models_dir, 'manifest.json'))
+
+
+def _load_shadow_approval(models_dir: str, policy: dict) -> dict:
+    file_name = str(policy.get('shadow_approval_file', 'shadow_approval.json') or 'shadow_approval.json')
+    path = file_name if os.path.isabs(file_name) else os.path.join(models_dir, file_name)
+    if not os.path.exists(path):
+        return {'available': False, 'passed': False, 'reason': 'shadow_approval_missing', 'path': path}
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except Exception as exc:
+        return {'available': False, 'passed': False, 'reason': f'shadow_approval_unreadable:{exc}', 'path': path}
+
+    generated_at = pd.to_datetime(payload.get('generated_at'), utc=True, errors='coerce')
+    max_age_days = float(policy.get('shadow_approval_max_age_days', 14))
+    stale = False
+    if not pd.isna(generated_at):
+        stale = (pd.Timestamp.utcnow() - generated_at).total_seconds() > max_age_days * 86400.0
+    return {
+        'available': True,
+        'passed': bool(payload.get('passed', False)),
+        'stale': bool(stale),
+        'path': path,
+        'payload': payload,
+        'reason': 'shadow_approval_stale' if stale else ('shadow_approval_failed' if not bool(payload.get('passed', False)) else 'ok'),
+    }
 
 
 def evaluate_system_health(
@@ -72,6 +99,7 @@ def evaluate_system_health(
         'degraded_components': sorted(set(degraded)),
         'missing_critical_features': missing_critical,
         'engine_status': engine_status,
+        'shadow_approval': _load_shadow_approval(models_dir, policy),
     }
 
 
@@ -128,6 +156,18 @@ def decide_runtime_mode(health: dict, policy: dict | None = None) -> dict:
         allow_rollout = False
         reasons.append('critical_feature_missing_rollout_block')
 
+    if bool(policy.get('require_shadow_approval_for_rollout', True)):
+        shadow_approval = health.get('shadow_approval', {}) or {}
+        if not bool(shadow_approval.get('available', False)):
+            allow_rollout = False
+            reasons.append('shadow_approval_missing')
+        elif bool(shadow_approval.get('stale', False)):
+            allow_rollout = False
+            reasons.append('shadow_approval_stale')
+        elif not bool(shadow_approval.get('passed', False)):
+            allow_rollout = False
+            reasons.append('shadow_approval_failed')
+
     return {
         'allow_shadow': bool(allow_shadow),
         'allow_paper': bool(allow_paper),
@@ -135,4 +175,5 @@ def decide_runtime_mode(health: dict, policy: dict | None = None) -> dict:
         'degraded_components': sorted(degraded),
         'reason': '; '.join(reasons) if reasons else 'OK',
         'blocking_issues': sorted(issues),
+        'shadow_approval': health.get('shadow_approval', {}),
     }

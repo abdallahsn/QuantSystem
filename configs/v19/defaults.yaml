@@ -86,6 +86,9 @@
     "stale_timestamp_seconds": 120,
     "allow_visual_degraded_in_rollout": false,
     "allow_missing_features_in_paper": true,
+    "require_shadow_approval_for_rollout": true,
+    "shadow_approval_file": "shadow_approval.json",
+    "shadow_approval_max_age_days": 14,
     "kill_switch_file": "outputs_v19/kill_switch.flag",
     "manual_override_state": "auto"
   },
@@ -95,7 +98,12 @@
   },
   "shadow": {
     "output_dir": "outputs_v19_shadow",
-    "input_scaled": true
+    "input_scaled": true,
+    "min_emitted_predictions": 100,
+    "min_realized_outcomes": 100,
+    "max_brier_score_delta": 0.20,
+    "max_win_rate_drop": 0.10,
+    "max_alerts": 0
   },
   "paper": {
     "output_dir": "outputs_v19_paper",

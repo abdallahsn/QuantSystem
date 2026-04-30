@@ -115,7 +115,51 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
     monitoring = MonitoringState(baseline=baseline).summarize(load_jsonl(events_path) + load_jsonl(os.path.join(output_dir, 'shadow_outcomes.jsonl')))
     alerts = emit_alerts(monitoring, writer=None, config=cfg.get('monitoring', {}))
     monitor_paths = write_monitoring_outputs(output_dir, monitoring, alerts)
-    return {**summary, **monitor_paths}
+    shadow_cfg = cfg.get('shadow', {})
+    readiness = {
+        'generated_at': pd.Timestamp.utcnow().replace(microsecond=0).isoformat(),
+        'passed': True,
+        'requirements': {
+            'min_emitted_predictions': int(shadow_cfg.get('min_emitted_predictions', 100)),
+            'min_realized_outcomes': int(shadow_cfg.get('min_realized_outcomes', 100)),
+            'max_brier_score_delta': float(shadow_cfg.get('max_brier_score_delta', 0.20)),
+            'max_win_rate_drop': float(shadow_cfg.get('max_win_rate_drop', 0.10)),
+            'max_alerts': int(shadow_cfg.get('max_alerts', 0)),
+        },
+        'summary': {
+            'emitted_predictions': int(emitted),
+            'realized_outcomes': int(realized),
+            'shadow_health': monitoring.get('shadow_health', {}),
+            'alerts': int(len(alerts)),
+        },
+        'failures': [],
+    }
+    req = readiness['requirements']
+    if emitted < req['min_emitted_predictions']:
+        readiness['passed'] = False
+        readiness['failures'].append('insufficient_emitted_predictions')
+    if realized < req['min_realized_outcomes']:
+        readiness['passed'] = False
+        readiness['failures'].append('insufficient_realized_outcomes')
+    if float((monitoring.get('shadow_health') or {}).get('brier_score_delta', 0.0)) > float(req['max_brier_score_delta']):
+        readiness['passed'] = False
+        readiness['failures'].append('shadow_brier_delta_too_high')
+    if float(-((monitoring.get('shadow_health') or {}).get('win_rate_delta', 0.0))) > float(req['max_win_rate_drop']):
+        readiness['passed'] = False
+        readiness['failures'].append('shadow_win_rate_drop_too_large')
+    if len(alerts) > int(req['max_alerts']):
+        readiness['passed'] = False
+        readiness['failures'].append('too_many_monitoring_alerts')
+
+    readiness_path = os.path.join(output_dir, 'shadow_readiness_report.json')
+    with open(readiness_path, 'w') as f:
+        json.dump(readiness, f, indent=2)
+
+    approval_path = os.path.join(models_dir, 'shadow_approval.json')
+    with open(approval_path, 'w') as f:
+        json.dump(readiness, f, indent=2)
+
+    return {**summary, **monitor_paths, 'shadow_readiness_report': readiness_path, 'shadow_approval': approval_path, 'shadow_ready': bool(readiness['passed'])}
 
 
 def main():

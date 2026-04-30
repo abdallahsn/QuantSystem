@@ -850,14 +850,49 @@ def _assert_single_contract(
     *,
     symbol_counts: dict[str, int],
     context: str,
+    expected_symbol: str = '',
 ) -> None:
     cleaned = {str(key): int(value) for key, value in (symbol_counts or {}).items() if int(value) > 0}
+    expected = str(expected_symbol or '').strip()
     if len(cleaned) <= 1:
+        if expected and cleaned:
+            only_symbol = next(iter(cleaned.keys()))
+            if only_symbol != expected:
+                raise RuntimeError(
+                    "❌ Contract/symbol mismatch for V19 hardening. "
+                    f"context={context} | expected={expected} | detected={only_symbol}"
+                )
         return
     raise RuntimeError(
         "❌ Mixed-contract/symbol input is not allowed for V19 hardening. "
         f"context={context} | counts={cleaned}"
     )
+
+
+def _write_contract_consistency_report(
+    *,
+    output_dir: str,
+    expected_symbol: str,
+    input_symbol_counts: dict[str, int],
+    final_symbol_counts: dict[str, int],
+) -> str:
+    expected = str(expected_symbol or '').strip()
+    final_clean = {str(k): int(v) for k, v in (final_symbol_counts or {}).items() if int(v) > 0}
+    detected_symbol = next(iter(final_clean.keys())) if len(final_clean) == 1 else None
+    passed = len(final_clean) <= 1 and (not expected or detected_symbol == expected)
+    report = {
+        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'mode': 'single_contract_required',
+        'expected_symbol': expected or None,
+        'input_symbol_counts': {str(k): int(v) for k, v in (input_symbol_counts or {}).items()},
+        'final_symbol_counts': final_clean,
+        'detected_symbol': detected_symbol,
+        'passed': bool(passed),
+    }
+    path = os.path.join(output_dir, 'contract_consistency_report.json')
+    with open(path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return path
 
 
 def _write_label_quality_report(df: pd.DataFrame, output_dir: str) -> str:
@@ -871,6 +906,8 @@ def _write_label_quality_report(df: pd.DataFrame, output_dir: str) -> str:
     work['path_outcome'] = pd.to_numeric(work.get('path_outcome', 4), errors='coerce').fillna(4).astype(np.int8)
     work['label_horizon_steps'] = pd.to_numeric(work.get('label_horizon_steps', 0), errors='coerce').fillna(0).astype(np.int32)
     work['adverse_path_flag'] = pd.to_numeric(work.get('adverse_path_flag', 0), errors='coerce').fillna(0).astype(np.int8)
+    work['neutral_reason'] = pd.to_numeric(work.get('neutral_reason', 0), errors='coerce').fillna(0).astype(np.int8)
+    work['timeout_move_exceeded_band'] = pd.to_numeric(work.get('timeout_move_exceeded_band', 0), errors='coerce').fillna(0).astype(np.int8)
 
     report = {
         'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
@@ -897,6 +934,12 @@ def _write_label_quality_report(df: pd.DataFrame, output_dir: str) -> str:
                 'short_sl_first': int((group['path_outcome'] == 3).sum()),
                 'timeout': int((group['path_outcome'] == 4).sum()),
             },
+            'neutral_reason_counts': {
+                'none': int((group['neutral_reason'] == 0).sum()),
+                'timeout': int((group['neutral_reason'] == 1).sum()),
+                'long_sl_first': int((group['neutral_reason'] == 2).sum()),
+                'short_sl_first': int((group['neutral_reason'] == 3).sum()),
+            },
             'label_horizon_steps': {
                 'median': float(np.median(group['label_horizon_steps'])) if len(group) else 0.0,
                 'p95': float(np.percentile(group['label_horizon_steps'], 95)) if len(group) else 0.0,
@@ -908,6 +951,7 @@ def _write_label_quality_report(df: pd.DataFrame, output_dir: str) -> str:
                 'short_share': round(float((directional['bias_label'] == 1).mean()), 4) if len(directional) else 0.0,
             },
             'adverse_path_share': round(float(group['adverse_path_flag'].mean()), 4) if len(group) else 0.0,
+            'timeout_move_exceeded_band_share': round(float(group['timeout_move_exceeded_band'].mean()), 4) if len(group) else 0.0,
         })
 
     path = os.path.join(output_dir, 'label_quality_report.json')
@@ -2957,14 +3001,17 @@ def run_refinery(
         mbo_rows=int(sum(int(r.get('rows', 0)) for r in mbo_records)),
         mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
     )
+    input_symbol_counts = _symbol_count_map_from_integrity(mbo_integrity)
     _assert_single_contract(
-        symbol_counts=_symbol_count_map_from_integrity(mbo_integrity),
+        symbol_counts=input_symbol_counts,
         context='canonical_mbo_input',
+        expected_symbol=symbol,
     )
     if mbp_integrity is not None:
         _assert_single_contract(
             symbol_counts=_symbol_count_map_from_integrity(mbp_integrity),
             context='canonical_mbp_input',
+            expected_symbol=symbol,
         )
     max_phase_a_shards = max(len(mbo_records), len(mbp_records) if mbp_records else 0)
     if max_phase_a_shards <= 1 and effective_workers > 1:
@@ -3425,6 +3472,7 @@ def run_refinery(
     _assert_single_contract(
         symbol_counts=final_symbol_counts,
         context='final_labeled_artifact',
+        expected_symbol=symbol,
     )
 
     split_meta = {}
@@ -3522,6 +3570,13 @@ def run_refinery(
         merge_tolerance_ms=merge_tolerance_ms,
     )
     print(f"  ✅ Data integrity report: {integrity_report_path}")
+    contract_report_path = _write_contract_consistency_report(
+        output_dir=output_dir,
+        expected_symbol=symbol,
+        input_symbol_counts=input_symbol_counts,
+        final_symbol_counts=final_symbol_counts,
+    )
+    print(f"  ✅ Contract consistency report: {contract_report_path}")
     label_quality_report_path = _write_label_quality_report(df_final, output_dir)
     print(f"  ✅ Label quality report: {label_quality_report_path}")
 

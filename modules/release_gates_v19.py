@@ -32,6 +32,17 @@ def evaluate_release_gates(metrics: dict, gates: dict) -> dict:
         })
         passed = passed and ok
 
+    blocker_count = int(metrics.get('release_blocker_count', 0) or 0)
+    if blocker_count > 0:
+        passed = False
+        results.append({
+            'metric': 'release_blocker_count',
+            'value': float(blocker_count),
+            'rule': {'max': 0},
+            'passed': False,
+            'reason': f'{blocker_count} fold-level release blockers present',
+        })
+
     return {
         'passed': bool(passed),
         'results': results,
