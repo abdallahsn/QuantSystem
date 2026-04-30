@@ -123,6 +123,10 @@ class MetaLearnerLSTM:
         self.bias_threshold_metrics = {
             'selected_threshold': float(self.bias_long_threshold),
         }
+        self.base_conf_loss_weight = 0.3
+        self.current_conf_loss_weight = float(self.base_conf_loss_weight)
+        self.confidence_head_enabled = True
+        self.confidence_target_std = 0.0
 
         self.model   = None
         self._fitted = False
@@ -224,7 +228,10 @@ class MetaLearnerLSTM:
         model.summary(line_length=80)
         return model
 
-    def _recompile(self):
+    def _recompile(self, conf_loss_weight: float | None = None):
+        if conf_loss_weight is not None:
+            self.current_conf_loss_weight = float(max(conf_loss_weight, 0.0))
+            self.confidence_head_enabled = self.current_conf_loss_weight > 0.0
         lr = WarmupCosineDecay(d_model=self.lstm2, warmup_steps=500)
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
@@ -232,7 +239,7 @@ class MetaLearnerLSTM:
                 'bias_out': 'sparse_categorical_crossentropy',
                 'conf_out': 'binary_crossentropy',
             },
-            loss_weights={'bias_out': 1.0, 'conf_out': 0.3},
+            loss_weights={'bias_out': 1.0, 'conf_out': float(self.current_conf_loss_weight)},
         )
 
     # ── Build Input ──────────────────────────────────────────────
@@ -417,6 +424,19 @@ class MetaLearnerLSTM:
         class_w_arr   = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
         sample_w      = (class_w_arr * quality_boost).astype(np.float32)
         conf_w        = quality_boost.copy()
+        self.confidence_target_std = float(np.std(yc_arr)) if len(yc_arr) else 0.0
+        if self.confidence_target_std < 1e-4:
+            self._recompile(conf_loss_weight=0.0)
+            print(
+                "   Confidence head   → disabled "
+                f"(std(conf_target)={self.confidence_target_std:.6f})"
+            )
+        else:
+            self._recompile(conf_loss_weight=self.base_conf_loss_weight)
+            print(
+                "   Confidence head   → enabled "
+                f"(std(conf_target)={self.confidence_target_std:.6f})"
+            )
 
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
         print(f"   Class distribution → LONG={n_long:,} ({n_long/n_tr*100:.1f}%) | SHORT={n_short:,} ({n_short/n_tr*100:.1f}%)")
@@ -501,6 +521,18 @@ class MetaLearnerLSTM:
         single = (X_meta.ndim == 2)
         if single:
             X_meta = X_meta[np.newaxis]
+        if not self.confidence_head_enabled:
+            bias_out = self.model.predict(X_meta, verbose=0)['bias_out']
+            bias_mean = bias_out[0]
+            bias_idx = int(self._labels_from_long_probs(np.array([bias_mean[0]], dtype=np.float32), self.bias_long_threshold)[0])
+            return {
+                'bias':        BIAS_LABELS[bias_idx],
+                'bias_idx':    bias_idx,
+                'bias_probs':  bias_mean.tolist(),
+                'confidence':  1.0,
+                'uncertainty': 0.0,
+                'tradeable':   True,
+            }
 
         # MC Dropout: n_mc forward passes
         X_tiled = np.tile(X_meta, (n_mc, 1, 1))

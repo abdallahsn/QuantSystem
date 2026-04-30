@@ -3,9 +3,15 @@ import json
 import numpy as np
 import pandas as pd
 
-from prepare_training_data import _select_event_rich_lob_emit_positions
+from prepare_training_data import _build_refinery_split_context, _fit_regime_surface, _select_event_rich_lob_emit_positions
+from modules.regime_classifier import RegimeClassifier, _build_regime_features
 from modules.meta_learner import MetaLearnerLSTM
-from train_v19 import _align_lob_to_rows, _resolve_default_lob_paths, _resolve_meta_learner_profile
+from train_v19 import (
+    _align_lob_to_rows,
+    _resolve_default_lob_paths,
+    _resolve_meta_learner_profile,
+    build_event_training_view,
+)
 from walkforward_v19 import aggregate_fold_metrics
 
 
@@ -161,3 +167,100 @@ def test_meta_threshold_calibration_can_shift_off_argmax_default():
     assert metrics["macro_f1"] >= 0.99
     preds = MetaLearnerLSTM._labels_from_long_probs(long_probs, threshold)
     assert preds.tolist() == y_true.tolist()
+
+
+def test_build_event_training_view_uses_continuous_conf_target():
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-01 00:00:01",
+                    "2025-01-01 00:00:02",
+                    "2025-01-01 00:00:03",
+                    "2025-01-01 00:00:04",
+                ]
+            ),
+            "event_flag": [1, 1, 1, 1],
+            "train_event_flag": [1, 1, 1, 1],
+            "bias_label": [0, 1, 0, 1],
+            "signal_quality": [2, 1, 2, 1],
+            "event_score": [0.5, 0.8, 1.0, 1.4],
+        }
+    )
+
+    event_df, info = build_event_training_view(df)
+
+    assert "normalized_event_score" in event_df.columns
+    assert event_df["conf_target"].between(0.0, 1.0).all()
+    assert event_df["conf_target"].nunique() > 2
+    assert info["conf_target_std"] > 0.0
+
+
+def test_regime_features_build_cvd_persistence_from_constant_cvd_delta():
+    df = pd.DataFrame(
+        {
+            "price": np.linspace(100.0, 102.0, 80),
+            "size": np.full(80, 10.0),
+            "cvd_delta": np.ones(80, dtype=np.float64),
+            "inter_event_time": np.full(80, 0.1),
+            "obi": np.linspace(0.1, 0.9, 80),
+            "raw__micro_atr": np.linspace(0.01, 0.05, 80),
+        }
+    )
+
+    features = _build_regime_features(df)
+
+    assert float(features["cvd_persistence"].iloc[-1]) > 0.0
+    assert float(features["volatility"].iloc[-1]) > 0.0
+
+
+def test_regime_rules_prioritize_trending_over_volatile_overlap():
+    clf = RegimeClassifier(model_type="rules")
+    X = pd.DataFrame(
+        {
+            "volatility": [0.20, 0.95, 0.12, 0.18, 0.08, 0.05],
+            "activity": [0.75, 1.00, 0.25, 0.30, 0.12, 0.10],
+            "volume_ratio": [0.80, 1.00, 0.28, 0.35, 0.14, 0.10],
+            "cvd_impulse": [0.35, 0.90, 0.08, 0.12, 0.03, 0.02],
+            "cvd_persistence": [0.70, 0.98, 0.10, 0.15, 0.04, 0.03],
+            "trend_efficiency": [0.72, 0.99, 0.12, 0.18, 0.05, 0.04],
+            "imbalance": [0.55, 0.85, 0.12, 0.18, 0.04, 0.02],
+        }
+    )
+
+    clf._fit_rules(X)
+    labels = clf._predict_rules(X)
+
+    assert int(labels[1]) == 0
+    assert clf.last_rule_diagnostics["trend_volatile_overlap_count"] >= 1
+
+
+def test_fit_regime_surface_rules_uses_full_train_and_full_prediction(tmp_path):
+    n = 240
+    df = pd.DataFrame(
+        {
+            "price": np.linspace(100.0, 110.0, n),
+            "size": np.linspace(5.0, 25.0, n),
+            "cvd": np.cumsum(np.where(np.arange(n) % 3 == 0, 2.0, 1.0)),
+            "inter_event_time": np.where(np.arange(n) % 5 == 0, 0.05, 0.20),
+            "obi": np.sin(np.linspace(0.0, 5.0, n)),
+            "raw__micro_atr": np.linspace(0.01, 0.08, n),
+            "ts_event": pd.date_range("2025-01-01", periods=n, freq="s"),
+            "label_end_ts": pd.date_range("2025-01-01 00:00:01", periods=n, freq="s"),
+        }
+    )
+    split_ctx = _build_refinery_split_context(df, train_frac=0.80)
+
+    labels, info = _fit_regime_surface(
+        df,
+        train_idx=split_ctx["train_idx"],
+        split_ctx=split_ctx,
+        output_dir=str(tmp_path),
+        regime_mode="rules",
+        regime_stride=50,
+    )
+
+    assert len(labels) == n
+    assert info["effective_stride"] == 1
+    assert info["train_sample_rows"] == info["train_rows"]
+    assert info["full_sample_rows"] == info["full_rows"]

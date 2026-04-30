@@ -94,6 +94,7 @@ META_FEATURE_NAMES = [
 ]
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
+VISUAL_COVERAGE_FAIL_FAST = True
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
     'label_end_ts',
@@ -326,7 +327,28 @@ def build_event_training_view(
         float(quality_weight_strong),
         float(quality_weight_weak),
     ).astype(np.float32)
-    event_df['conf_target'] = (event_df['signal_quality'].values.astype(np.int8) == 2).astype(np.float32)
+    quality_term = np.where(
+        event_df['signal_quality'].values.astype(np.int8) == 2,
+        1.0,
+        np.where(event_df['signal_quality'].values.astype(np.int8) == 1, 0.5, 0.0),
+    ).astype(np.float32)
+    event_score_values = event_df.get('event_score')
+    if event_score_values is None:
+        event_score_values = pd.Series(0.0, index=event_df.index, dtype=np.float32)
+    event_scores = pd.to_numeric(event_score_values, errors='coerce').fillna(0.0).astype(np.float32)
+    score_min = float(event_scores.min()) if len(event_scores) else 0.0
+    score_max = float(event_scores.max()) if len(event_scores) else score_min
+    score_rng = score_max - score_min
+    if score_rng > 1e-8:
+        normalized_event_score = ((event_scores - score_min) / score_rng).clip(0.0, 1.0).astype(np.float32)
+    else:
+        normalized_event_score = pd.Series(np.zeros(len(event_df), dtype=np.float32), index=event_df.index)
+    event_df['normalized_event_score'] = normalized_event_score.astype(np.float32)
+    event_df['conf_target'] = np.clip(
+        0.5 * quality_term + 0.5 * normalized_event_score.values.astype(np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
     event_df['event_seq_idx'] = np.arange(len(event_df), dtype=np.int32)
 
     info = {
@@ -341,6 +363,8 @@ def build_event_training_view(
         'quality_weight_weak': float(quality_weight_weak),
         'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
         'quality_counts': {str(k): int(v) for k, v in event_df['signal_quality'].value_counts().to_dict().items()},
+        'conf_target_mean': float(event_df['conf_target'].mean()) if len(event_df) else 0.0,
+        'conf_target_std': float(event_df['conf_target'].std(ddof=0)) if len(event_df) else 0.0,
     }
     print(
         "  ✅ Event Training View: "
@@ -1213,8 +1237,18 @@ def stage2_oof_visual_embeddings(
             'coverage_ratio': float(row_cov.mean()),
         }, f, indent=2)
 
+    folds_with_test_tensors = int(
+        sum(1 for fold in metrics['folds'] if int(fold.get('test_tensors', 0)) > 0)
+    )
     print(f"  ✅ Visual Embeddings: {row_embs.shape}")
     print(f"  ✅ Visual Coverage: {row_cov.sum():,}/{n_rows:,} ({row_cov.mean():.1%})")
+    if VISUAL_COVERAGE_FAIL_FAST and (folds_with_test_tensors == 0 or not bool(row_cov.any())):
+        raise RuntimeError(
+            "❌ DeepLOB visual stage completed without usable coverage. "
+            f"folds_with_test_tensors={folds_with_test_tensors} | "
+            f"rows_with_visual={int(row_cov.sum()):,}/{n_rows:,}. "
+            "Rebuild Stage1 LOB artifacts from the same run before training the MetaLearner."
+        )
     return row_embs, row_cov
 
 
@@ -1495,6 +1529,9 @@ def stage3_meta_learner_v19(
                     'profile': profile,
                     'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
                     'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
+                    'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
+                    'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
+                    'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
                 },
                 f,
                 indent=2,
@@ -1518,6 +1555,9 @@ def stage3_meta_learner_v19(
             'meta_learner': {
                 'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
                 'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
+                'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
+                'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
+                'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
             },
             'artifacts': {
                 'catboost_model': 'catboost_advisor_v19.cbm',

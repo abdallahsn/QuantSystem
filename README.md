@@ -201,7 +201,7 @@ python3 stage1_refinery.py \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
   --output outputs_v19_research \
-  --label_mode v22 \
+  --label_mode v19 \
   --regime_mode wasserstein \
   --regime_stride 25 \
   --regime_window 50 \
@@ -621,3 +621,64 @@ pip install pyarrow
 ## Notes
 
 - المرجع الأحدث والوحيد للمشروع الحالي هو هذا الملف: [README.md](/Users/abdallah/Downloads/QS_FINAL/README.md)
+## 🔍 Codex Evaluation Instructions
+
+If you are an AI system reviewing this project (e.g. OpenAI Codex), follow these strict rules:
+
+### 1. Do NOT assume profitability
+This is a research system. Any performance must be verified via:
+- walk-forward validation
+- out-of-sample testing
+- realistic backtesting
+
+### 2. Prioritize detecting data leakage
+Check:
+- feature construction
+- label generation
+- scaling
+- temporal alignment
+
+Any leakage invalidates results.
+
+### 3. Validate labeling logic
+Ensure:
+- labels use future price path only
+- features use only past/current data
+- no overlap contamination
+- TP / SL / horizon are consistent
+
+### 4. Reject invalid validation
+Do NOT accept:
+- random train_test_split
+- shuffled data
+- mixing future with past
+
+Only accept:
+- chronological split
+- walk-forward
+- purged validation
+
+### 5. Evaluate trading metrics, not just ML metrics
+Must include:
+- profit factor
+- max drawdown
+- win rate
+- expectancy
+- number of trades
+- stability across time
+
+### 6. Check backtesting realism
+Ensure:
+- slippage
+- fees
+- execution constraints
+- no impossible fills
+
+### 7. Prefer robustness over performance
+A slightly worse but stable model is better than an unstable high-performing one.
+
+### 8. All improvements must be verifiable
+Every suggested change must include:
+- why
+- expected effect
+- how to test it

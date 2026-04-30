@@ -84,29 +84,21 @@ DEEPLOB_MAX_GB_DEFAULT = 0.30
 LOB_EVENT_SAMPLE_DEFAULT = 100_000
 
 try:
-    from modules.labels_v22 import (
-        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
-        DEFAULT_V22_TP_MULT,
+    from modules.labels_v19 import (
+        DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
+        DEFAULT_V19_TP_MULT,
         build_causal_event_labels,
     )
     V19_LABELS_AVAILABLE = True
     V19_LABELS_IMPORT_ERROR = None
-    V19_LABELS_SOURCE = 'modules.labels_v22'
-except ImportError:
-    try:
-        from modules.labels_v19 import build_causal_event_labels
-        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
-        DEFAULT_V22_TP_MULT = 1.5
-        V19_LABELS_AVAILABLE = True
-        V19_LABELS_IMPORT_ERROR = None
-        V19_LABELS_SOURCE = 'modules.labels_v19'
-    except ImportError as exc:
-        DEFAULT_V22_DIRECTION_THRESHOLD_TICKS = 1.5
-        DEFAULT_V22_TP_MULT = 1.5
-        V19_LABELS_AVAILABLE = False
-        V19_LABELS_IMPORT_ERROR = exc
-        V19_LABELS_SOURCE = None
-        build_causal_event_labels = None
+    V19_LABELS_SOURCE = 'modules.labels_v19'
+except ImportError as exc:
+    DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
+    DEFAULT_V19_TP_MULT = 1.5
+    V19_LABELS_AVAILABLE = False
+    V19_LABELS_IMPORT_ERROR = exc
+    V19_LABELS_SOURCE = None
+    build_causal_event_labels = None
 
 try:
     from tqdm import tqdm
@@ -121,7 +113,7 @@ except ImportError:
 
 def _call_build_causal_event_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     """
-    Keep label-builder invocation compatible across older v19/v22 module variants.
+    Keep label-builder invocation compatible across older module variants.
     Some environments may have a build_causal_event_labels implementation that
     does not yet accept newer keyword arguments like kalman_slope_threshold.
     """
@@ -300,7 +292,7 @@ def _print_step_progress(
 
 def _require_causal_label_runtime(label_mode: str) -> None:
     mode = str(label_mode or '').strip().lower()
-    if mode not in {'v19', 'v22'}:
+    if mode != 'v19':
         return
     if V19_LABELS_AVAILABLE:
         return
@@ -581,6 +573,252 @@ def _shard_ts_bounds(df: pd.DataFrame, ts_col: str = 'ts_event') -> tuple[str | 
     return str(ts.min()), str(ts.max())
 
 
+def _frame_integrity_snapshot(
+    df: pd.DataFrame,
+    *,
+    ts_col: str = 'ts_event',
+    price_col: str = 'price',
+    size_col: str = 'size',
+    symbol_col: str = 'symbol',
+) -> dict:
+    rows = int(len(df))
+    ts_source = df[ts_col] if ts_col in df.columns else pd.Series(index=df.index, dtype='object')
+    ts = pd.to_datetime(ts_source, utc=True, errors='coerce').dt.tz_localize(None)
+    valid_ts = ts.dropna()
+    diffs = valid_ts.diff().dropna() if len(valid_ts) else pd.Series(dtype='timedelta64[ns]')
+
+    price_source = df[price_col] if price_col in df.columns else pd.Series(index=df.index, dtype='float64')
+    price = pd.to_numeric(price_source, errors='coerce')
+    price_valid = price.dropna()
+    price_jump = price_valid.pct_change().abs().replace([np.inf, -np.inf], np.nan)
+
+    size_source = df[size_col] if size_col in df.columns else pd.Series(index=df.index, dtype='float64')
+    size = pd.to_numeric(size_source, errors='coerce')
+
+    if symbol_col in df.columns:
+        symbol_source = df[symbol_col]
+    elif 'instrument_id' in df.columns:
+        symbol_source = df['instrument_id']
+    else:
+        symbol_source = pd.Series(index=df.index, dtype='object')
+    symbol_series = symbol_source.fillna('UNKNOWN').astype(str)
+    symbol_counts = symbol_series.value_counts()
+
+    return {
+        'rows': rows,
+        'missing_ts_rows': int(ts.isna().sum()),
+        'duplicate_ts_rows': int(valid_ts.duplicated().sum()),
+        'non_monotonic_ts_steps': int((diffs < pd.Timedelta(0)).sum()) if len(diffs) else 0,
+        'gap_rows_over_1s': int((diffs > pd.Timedelta(seconds=1)).sum()) if len(diffs) else 0,
+        'max_gap_ms': float(max(diffs.max().total_seconds() * 1000.0, 0.0)) if len(diffs) else 0.0,
+        'price_missing_rows': int(price.isna().sum()),
+        'price_nonpositive_rows': int(((price <= 0) & price.notna()).sum()),
+        'price_jump_over_1pct_rows': int((price_jump > 0.01).sum()) if len(price_jump) else 0,
+        'size_missing_rows': int(size.isna().sum()),
+        'size_negative_rows': int(((size < 0) & size.notna()).sum()),
+        'size_zero_rows': int(((size == 0) & size.notna()).sum()),
+        'symbol_unique_count': int(symbol_counts.shape[0]),
+        'symbol_top_counts': {str(k): int(v) for k, v in symbol_counts.head(10).items()},
+        'first_ts': None if valid_ts.empty else str(valid_ts.iloc[0]),
+        'last_ts': None if valid_ts.empty else str(valid_ts.iloc[-1]),
+    }
+
+
+def _new_integrity_accumulator(kind: str) -> dict:
+    return {
+        'kind': str(kind),
+        'raw': {
+            'rows': 0,
+            'missing_ts_rows': 0,
+            'duplicate_ts_rows': 0,
+            'non_monotonic_ts_steps': 0,
+            'gap_rows_over_1s': 0,
+            'max_gap_ms': 0.0,
+            'price_missing_rows': 0,
+            'price_nonpositive_rows': 0,
+            'price_jump_over_1pct_rows': 0,
+            'size_missing_rows': 0,
+            'size_negative_rows': 0,
+            'size_zero_rows': 0,
+            'symbol_unique_count': 0,
+            'symbol_top_counts': {},
+            'first_ts': None,
+            'last_ts': None,
+        },
+        'normalized': {
+            'rows': 0,
+            'missing_ts_rows': 0,
+            'duplicate_ts_rows': 0,
+            'non_monotonic_ts_steps': 0,
+            'gap_rows_over_1s': 0,
+            'max_gap_ms': 0.0,
+            'price_missing_rows': 0,
+            'price_nonpositive_rows': 0,
+            'price_jump_over_1pct_rows': 0,
+            'size_missing_rows': 0,
+            'size_negative_rows': 0,
+            'size_zero_rows': 0,
+            'symbol_unique_count': 0,
+            'symbol_top_counts': {},
+            'first_ts': None,
+            'last_ts': None,
+        },
+        'rows_dropped_during_normalization': 0,
+        '_raw_symbol_counts': {},
+        '_normalized_symbol_counts': {},
+    }
+
+
+def _merge_symbol_counts(target: dict, frame: pd.DataFrame) -> None:
+    if 'symbol' in frame.columns:
+        series = frame['symbol']
+    elif 'instrument_id' in frame.columns:
+        series = frame['instrument_id']
+    else:
+        return
+    counts = series.fillna('UNKNOWN').astype(str).value_counts()
+    for key, value in counts.items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value)
+
+
+def _accumulate_integrity_snapshot(target: dict, snapshot: dict) -> None:
+    for key in [
+        'rows',
+        'missing_ts_rows',
+        'duplicate_ts_rows',
+        'non_monotonic_ts_steps',
+        'gap_rows_over_1s',
+        'price_missing_rows',
+        'price_nonpositive_rows',
+        'price_jump_over_1pct_rows',
+        'size_missing_rows',
+        'size_negative_rows',
+        'size_zero_rows',
+    ]:
+        target[key] = int(target.get(key, 0)) + int(snapshot.get(key, 0))
+    target['max_gap_ms'] = max(float(target.get('max_gap_ms', 0.0)), float(snapshot.get('max_gap_ms', 0.0)))
+    if target.get('first_ts') is None and snapshot.get('first_ts') is not None:
+        target['first_ts'] = snapshot['first_ts']
+    if snapshot.get('last_ts') is not None:
+        target['last_ts'] = snapshot['last_ts']
+
+
+def _update_integrity_boundary(target: dict, prev_last_ts: str | None, curr_first_ts: str | None) -> None:
+    if prev_last_ts is None or curr_first_ts is None:
+        return
+    prev_ts = pd.Timestamp(prev_last_ts)
+    curr_ts = pd.Timestamp(curr_first_ts)
+    if curr_ts < prev_ts:
+        target['non_monotonic_ts_steps'] = int(target.get('non_monotonic_ts_steps', 0)) + 1
+    elif curr_ts == prev_ts:
+        target['duplicate_ts_rows'] = int(target.get('duplicate_ts_rows', 0)) + 1
+    else:
+        gap_ms = float((curr_ts - prev_ts).total_seconds() * 1000.0)
+        if gap_ms > 1000.0:
+            target['gap_rows_over_1s'] = int(target.get('gap_rows_over_1s', 0)) + 1
+        target['max_gap_ms'] = max(float(target.get('max_gap_ms', 0.0)), gap_ms)
+
+
+def _update_integrity_accumulator(acc: dict, raw_chunk: pd.DataFrame, normalized_chunk: pd.DataFrame) -> None:
+    raw_snapshot = _frame_integrity_snapshot(raw_chunk)
+    normalized_snapshot = _frame_integrity_snapshot(normalized_chunk)
+
+    _update_integrity_boundary(acc['raw'], acc['raw'].get('last_ts'), raw_snapshot.get('first_ts'))
+    _accumulate_integrity_snapshot(acc['raw'], raw_snapshot)
+    _merge_symbol_counts(acc['_raw_symbol_counts'], raw_chunk)
+
+    _update_integrity_boundary(acc['normalized'], acc['normalized'].get('last_ts'), normalized_snapshot.get('first_ts'))
+    _accumulate_integrity_snapshot(acc['normalized'], normalized_snapshot)
+    _merge_symbol_counts(acc['_normalized_symbol_counts'], normalized_chunk)
+
+    acc['rows_dropped_during_normalization'] = int(acc.get('rows_dropped_during_normalization', 0)) + max(
+        int(len(raw_chunk)) - int(len(normalized_chunk)),
+        0,
+    )
+
+
+def _finalize_integrity_accumulator(acc: dict) -> dict:
+    out = {
+        'kind': acc.get('kind', ''),
+        'rows_dropped_during_normalization': int(acc.get('rows_dropped_during_normalization', 0)),
+        'raw': dict(acc.get('raw', {})),
+        'normalized': dict(acc.get('normalized', {})),
+    }
+    raw_symbols = acc.get('_raw_symbol_counts', {})
+    normalized_symbols = acc.get('_normalized_symbol_counts', {})
+    out['raw']['symbol_unique_count'] = int(len(raw_symbols))
+    out['raw']['symbol_top_counts'] = {
+        key: int(value)
+        for key, value in sorted(raw_symbols.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+    }
+    out['normalized']['symbol_unique_count'] = int(len(normalized_symbols))
+    out['normalized']['symbol_top_counts'] = {
+        key: int(value)
+        for key, value in sorted(normalized_symbols.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+    }
+    return out
+
+
+def _build_data_integrity_warnings(report: dict) -> list[str]:
+    warnings: list[str] = []
+    for key in ['mbo', 'mbp']:
+        section = ((report.get('inputs') or {}).get(key) or {})
+        if not section:
+            continue
+        raw = section.get('raw', {})
+        normalized = section.get('normalized', {})
+        dropped = int(section.get('rows_dropped_during_normalization', 0))
+        if dropped > 0:
+            warnings.append(f"{key}: dropped {dropped:,} rows during normalization")
+        if int(raw.get('missing_ts_rows', 0)) > 0:
+            warnings.append(f"{key}: raw input contains missing timestamps")
+        if int(raw.get('duplicate_ts_rows', 0)) > 0 or int(raw.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: raw input contains duplicate or non-monotonic timestamps")
+        if int(raw.get('price_nonpositive_rows', 0)) > 0 or int(raw.get('size_negative_rows', 0)) > 0:
+            warnings.append(f"{key}: raw input contains abnormal price/size values")
+        if int(normalized.get('duplicate_ts_rows', 0)) > 0 or int(normalized.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: normalized shards still contain duplicate or non-monotonic timestamps")
+
+    merged = ((report.get('intermediate') or {}).get('merged') or {})
+    if int(merged.get('missing_ts_rows', 0)) > 0:
+        warnings.append("merged: missing timestamps remain after MBO/MBP alignment")
+    if int(merged.get('price_nonpositive_rows', 0)) > 0:
+        warnings.append("merged: non-positive prices remain after alignment")
+
+    final = report.get('final', {}) or {}
+    if int(final.get('missing_ts_rows', 0)) > 0 or int(final.get('non_monotonic_ts_steps', 0)) > 0:
+        warnings.append("final: training artifact still has timestamp integrity issues")
+    return warnings
+
+
+def _write_data_integrity_report(
+    *,
+    output_dir: str,
+    mbo_integrity: dict,
+    mbp_integrity: dict | None,
+    merged_snapshot: dict,
+    final_snapshot: dict,
+    merge_tolerance_ms: int,
+) -> str:
+    report = {
+        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'merge_tolerance_ms': int(merge_tolerance_ms),
+        'inputs': {
+            'mbo': mbo_integrity,
+            'mbp': mbp_integrity or {},
+        },
+        'intermediate': {
+            'merged': merged_snapshot,
+        },
+        'final': final_snapshot,
+    }
+    report['warnings'] = _build_data_integrity_warnings(report)
+    path = os.path.join(output_dir, 'data_integrity_report.json')
+    with open(path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return path
+
+
 def _shard_record(path: str, df: pd.DataFrame, shard_idx: int) -> dict:
     ts_min, ts_max = _shard_ts_bounds(df)
     return {
@@ -604,15 +842,18 @@ def _canonicalize_input_file(
     chunk_rows: int,
     resume: bool = False,
     progress_label: str | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     phase_dir = _artifact_phase_dir(output_dir, 'normalized', kind)
     records: list[dict] = []
+    integrity = _new_integrity_accumulator(kind)
     rows_done = 0
     started_at = time.perf_counter()
     for shard_idx, chunk in enumerate(iter_table_chunks(path, chunk_rows)):
         shard_path = os.path.join(phase_dir, f'{kind}_{shard_idx:05d}.parquet')
         if resume and os.path.exists(shard_path):
-            record = _read_existing_shard_record(shard_path, shard_idx)
+            normalized = read_table(shard_path)
+            _update_integrity_accumulator(integrity, chunk, normalized)
+            record = _shard_record(shard_path, normalized, shard_idx)
             records.append(record)
             rows_done += int(record.get('rows', 0))
             if progress_label:
@@ -629,6 +870,7 @@ def _canonicalize_input_file(
         if 'ts_event' in normalized.columns:
             normalized['ts_event'] = pd.to_datetime(normalized['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
             normalized = normalized.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+        _update_integrity_accumulator(integrity, chunk, normalized)
         write_table(normalized, shard_path, compression='snappy')
         record = _shard_record(shard_path, normalized, shard_idx)
         records.append(record)
@@ -646,7 +888,7 @@ def _canonicalize_input_file(
             f'canonical_{kind}',
             {'kind': kind, 'processed_shards': int(shard_idx + 1), 'last_shard': record},
         )
-    return records
+    return records, _finalize_integrity_accumulator(integrity)
 
 
 def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
@@ -1426,18 +1668,21 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
     # depth as reference, making it mathematically impossible for a single-
     # level cancel drop to exceed it (single drop ≈ 1/3 of top-3 total).
     # Fix: use per-level (L0) average size as the reference baseline.
+    l0_now = pd.Series(
+        np.where(
+            (bid_sz[:, 0] + ask_sz[:, 0]) > 0,
+            (bid_sz[:, 0] + ask_sz[:, 0]) / 2.0,
+            np.nan,
+        ),
+        index=df_mbp.index,
+    )
+    # Strictly past-only baseline: current cancel/trade row may use its own
+    # book state, but must never borrow future best-level depth via backfill.
     mean_l0 = (
-        pd.Series(
-            np.where(
-                (bid_sz[:, 0] + ask_sz[:, 0]) > 0,
-                (bid_sz[:, 0] + ask_sz[:, 0]) / 2.0,
-                np.nan,
-            ),
-            index=df_mbp.index,
-        )
+        l0_now.shift(1)
         .rolling(200, min_periods=1)
         .mean()
-        .bfill()
+        .where(lambda s: s.notna(), l0_now)
         .fillna(1.0)
         .clip(lower=1e-9)
     )
@@ -1839,6 +2084,24 @@ def _lob_source_frame(df: pd.DataFrame, kind: str) -> pd.DataFrame:
     return df.loc[:, cols].copy(deep=False)
 
 
+def _time_stratified_sample(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df.iloc[:0].copy()
+
+    limit = max(int(max_rows), 1)
+    if len(df) <= limit:
+        return df.copy()
+
+    positions = np.linspace(0, len(df) - 1, num=limit, dtype=np.float64)
+    positions = np.unique(np.round(positions).astype(np.int64))
+    if len(positions) < limit:
+        remainder = np.setdiff1d(np.arange(len(df), dtype=np.int64), positions, assume_unique=False)
+        if len(remainder):
+            positions = np.concatenate([positions, remainder[:limit - len(positions)]])
+    positions = np.sort(positions[:limit])
+    return df.iloc[positions].copy()
+
+
 def _select_event_rich_lob_emit_positions(
     df_labeled: pd.DataFrame,
     lob_mbp_src: pd.DataFrame,
@@ -1876,10 +2139,10 @@ def _select_event_rich_lob_emit_positions(
 
     selected_parts = []
     if len(strong):
-        selected_parts.append(strong.iloc[:max_events].copy())
+        selected_parts.append(_time_stratified_sample(strong, max_events))
     remaining = max_events - sum(len(part) for part in selected_parts)
     if remaining > 0 and len(weak):
-        selected_parts.append(weak.iloc[:remaining].copy())
+        selected_parts.append(_time_stratified_sample(weak, remaining))
     if not selected_parts:
         return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
 
@@ -1938,6 +2201,7 @@ def _select_event_rich_lob_emit_positions(
         'selected_emit_positions': int(len(emit_positions)),
         'selected_strong': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_STRONG) if selected_parts else 0),
         'selected_weak': int(sum(len(part) for part in selected_parts if 'signal_quality' in part.columns and int(part['signal_quality'].iloc[0]) == QUALITY_WEAK) if selected_parts else 0),
+        'sampling_mode': 'time_stratified',
     }
     return emit_positions, meta
 
@@ -2078,18 +2342,24 @@ def _fit_regime_surface(
         train_regime_df = df.iloc[:fallback_end].copy()
 
     requested_stride = max(int(regime_stride), 1)
-    # Small datasets do not benefit from coarse sampling; keep full fidelity.
-    if len(df) <= max(5_000, requested_stride * 4):
-        requested_stride = 1
+    if mode == 'rules':
+        full_sample_df = df.copy()
+        full_positions = np.arange(len(df), dtype=np.int64)
+        train_sample_df = train_regime_df.copy()
+        effective_stride = 1
+    else:
+        # Small datasets do not benefit from coarse sampling; keep full fidelity.
+        if len(df) <= max(5_000, requested_stride * 4):
+            requested_stride = 1
 
-    full_sample_df, full_positions, effective_stride = _sample_regime_frame(
-        df,
-        stride=requested_stride,
-    )
-    train_sample_df, _, _ = _sample_regime_frame(
-        train_regime_df,
-        stride=effective_stride,
-    )
+        full_sample_df, full_positions, effective_stride = _sample_regime_frame(
+            df,
+            stride=requested_stride,
+        )
+        train_sample_df, _, _ = _sample_regime_frame(
+            train_regime_df,
+            stride=effective_stride,
+        )
 
     info.update({
         'effective_stride': int(effective_stride),
@@ -2236,8 +2506,35 @@ def _normalize_and_save(
             iqr      = q3 - q1
 
             if iqr > 1e-8:
-                df[col] = ((s - median_) / iqr).clip(-10, 10)
-                scaler_params[col] = {'type': 'robust', 'median': median_, 'iqr': iqr}
+                robust_train = ((s_train - median_) / iqr).astype(np.float32)
+                clip_rate = float((np.abs(robust_train) >= 9.5).mean()) if len(robust_train) else 0.0
+                if clip_rate > 0.80:
+                    smin = float(s_train.min()); smax = float(s_train.max()); rng = smax - smin
+                    if rng > 1e-8:
+                        df[col] = ((s - smin) / rng * 2 - 1).clip(-10, 10)
+                        scaler_params[col] = {
+                            'type': 'minmax',
+                            'min': smin,
+                            'max': smax,
+                            'fallback_from': 'robust',
+                            'robust_clip_rate': clip_rate,
+                        }
+                    else:
+                        df[col] = ((s - median_) / iqr).clip(-10, 10)
+                        scaler_params[col] = {
+                            'type': 'robust',
+                            'median': median_,
+                            'iqr': iqr,
+                            'robust_clip_rate': clip_rate,
+                        }
+                else:
+                    df[col] = ((s - median_) / iqr).clip(-10, 10)
+                    scaler_params[col] = {
+                        'type': 'robust',
+                        'median': median_,
+                        'iqr': iqr,
+                        'robust_clip_rate': clip_rate,
+                    }
             elif s_train.abs().max() > 1e-8:
                 smin = float(s_train.min()); smax = float(s_train.max()); rng = smax - smin
                 if rng > 1e-8:
@@ -2474,12 +2771,12 @@ def run_refinery(
     target_bars=500,
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
-    direction_threshold_ticks: float = DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
+    direction_threshold_ticks: float = DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
     causal_threshold_mode: str = 'expanding',
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
-    tp_mult: float = DEFAULT_V22_TP_MULT,
+    tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
@@ -2534,7 +2831,7 @@ def run_refinery(
         resume=bool(resume),
     )
     print(f"  MBO: {mbo_path}")
-    mbo_records = _canonicalize_input_file(
+    mbo_records, mbo_integrity = _canonicalize_input_file(
         mbo_path,
         kind='mbo',
         output_dir=output_dir,
@@ -2546,9 +2843,10 @@ def run_refinery(
         raise RuntimeError("❌ No canonical MBO shards were produced")
 
     mbp_records: list[dict] = []
+    mbp_integrity: dict | None = None
     if mbp_exists:
         print(f"  MBP: {mbp_path}")
-        mbp_records = _canonicalize_input_file(
+        mbp_records, mbp_integrity = _canonicalize_input_file(
             mbp_path,
             kind='mbp',
             output_dir=output_dir,
@@ -2739,6 +3037,7 @@ def run_refinery(
         {'processed_shards': len(merged_records), 'rows': int(sum(r['rows'] for r in merged_records))},
     )
     df_merged = _finalize_merged_frame(_load_records_frame(merged_records))
+    merged_integrity = _frame_integrity_snapshot(df_merged)
     gc.collect()
     pipeline_tracker.finish(
         merged_shards=len(merged_records),
@@ -2777,8 +3076,8 @@ def run_refinery(
     df_merged = compute_daily_weekly_levels(df_merged)
     pipeline_tracker.finish(rows=int(len(df_merged)))
 
-    if label_mode in {'v19', 'v22'} and V19_LABELS_AVAILABLE:
-        label_runtime = 'V22' if V19_LABELS_SOURCE == 'modules.labels_v22' else 'V19'
+    if label_mode == 'v19' and V19_LABELS_AVAILABLE:
+        label_runtime = 'V19'
         print(f"\n⚙️  Step 4 — {label_runtime} Causal Event Labels...")
         pipeline_tracker.start(
             f"Step 4 — {label_runtime} Causal Event Labels",
@@ -2860,19 +3159,16 @@ def run_refinery(
                 'mbo_rows': mbo_rows,
                 'mbp_rows': mbp_rows,
                 'total_events': total_lob_events,
+                'lob_sampling_mode': 'time_stratified',
             }
-            skip_large = (
-                (total_lob_events > lob_limits['max_events']) or
-                (effective_max_tensors <= 0)
-            ) and not lob_limits['force']
             with open(build_plan_path, 'w') as f:
                 json.dump(build_plan, f, indent=2)
 
-            if skip_large:
+            if effective_max_tensors <= 0 and not lob_limits['force']:
                 _write_empty_lob_artifacts(
                     output_dir,
                     status='skipped',
-                    reason='auto_skip_large_step3e',
+                    reason='auto_skip_zero_tensor_budget',
                     build_plan=build_plan,
                 )
                 step3e_status = 'skipped'
@@ -2887,8 +3183,15 @@ def run_refinery(
                     df_labeled,
                     lob_mbp_index,
                     max_events=sample_cap,
+                    max_positions=effective_max_tensors if effective_max_tensors > 0 else None,
                 )
+                planned_tensors = int(len(emit_positions))
+                planned_tensor_bytes = int(planned_tensors * tensor_bytes)
                 build_plan.update(emit_meta)
+                build_plan.update({
+                    'planned_tensors': planned_tensors,
+                    'planned_tensor_bytes': planned_tensor_bytes,
+                })
                 with open(build_plan_path, 'w') as f:
                     json.dump(build_plan, f, indent=2)
 
@@ -2901,6 +3204,19 @@ def run_refinery(
                     )
                     step3e_status = 'empty_event_sample'
                     print("  ⚠️ لا توجد event-rich positions كافية لبناء LOB tensors")
+                elif planned_tensor_bytes > lob_limits['max_bytes'] and not lob_limits['force']:
+                    _write_empty_lob_artifacts(
+                        output_dir,
+                        status='skipped',
+                        reason='planned_tensor_budget_exceeded',
+                        build_plan=build_plan,
+                    )
+                    step3e_status = 'skipped'
+                    print(
+                        "  ⚠️ Step 3e skipped بعد planning: "
+                        f"planned_tensors={planned_tensors:,}, "
+                        f"planned_bytes={planned_tensor_bytes:,} > budget={lob_limits['max_bytes']:,}."
+                    )
                 else:
                     lob_mbo_src = _load_lob_source_from_records(mbo_final_records, 'mbo')
                     lob_mbp_src = _load_lob_source_from_records(mbp_records, 'mbp')
@@ -2998,6 +3314,7 @@ def run_refinery(
         out_path=out_path,
         rolling_cols=int(len(roll_cols)),
     )
+    final_integrity = _frame_integrity_snapshot(df_final)
 
     split_meta = {}
     split_path = os.path.join(output_dir, 'refinery_split.json')
@@ -3085,6 +3402,15 @@ def run_refinery(
         filename='artifact_manifest.json',
     )
     print(f"  ✅ Artifact manifest: {artifact_manifest_path}")
+    integrity_report_path = _write_data_integrity_report(
+        output_dir=output_dir,
+        mbo_integrity=mbo_integrity,
+        mbp_integrity=mbp_integrity,
+        merged_snapshot=merged_integrity,
+        final_snapshot=final_integrity,
+        merge_tolerance_ms=merge_tolerance_ms,
+    )
+    print(f"  ✅ Data integrity report: {integrity_report_path}")
 
     elapsed = (datetime.datetime.now()-t0).total_seconds()
     _report(df_final, mbo_path, mbp_path, elapsed, output_dir)
@@ -3129,7 +3455,7 @@ if __name__=='__main__':
     p.add_argument('--symbol',     default='')
     p.add_argument('--output',     default='outputs')
     p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=2_000_000)
-    p.add_argument('--label_mode', choices=['v19', 'v22'], default='v19')
+    p.add_argument('--label_mode', choices=['v19'], default='v19')
     p.add_argument('--n_workers',   type=int, default=None)
     p.add_argument('--mbo_workers', type=int, default=None)
     p.add_argument('--mbp_workers', type=int, default=None)
@@ -3141,14 +3467,14 @@ if __name__=='__main__':
                    help='Base forward horizon for causal labels (default: 150)')
     p.add_argument('--event_roll_window', type=int, default=50,
                    help='Rolling window for event filter (default: 50)')
-    p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V22_DIRECTION_THRESHOLD_TICKS,
-                   help=f'Directional threshold floor in ticks (default: {DEFAULT_V22_DIRECTION_THRESHOLD_TICKS:.1f})')
+    p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
+                   help=f'Directional threshold floor in ticks (default: {DEFAULT_V19_DIRECTION_THRESHOLD_TICKS:.1f})')
     p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='expanding',
                    help='threshold mode for train_event_flag selection (default: expanding)')
     p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
                    help='Max event-rich emit positions for LOB tensors')
-    p.add_argument('--tp_mult', type=float, default=DEFAULT_V22_TP_MULT,
-                   help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V22_TP_MULT:.1f})')
+    p.add_argument('--tp_mult', type=float, default=DEFAULT_V19_TP_MULT,
+                   help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V19_TP_MULT:.1f})')
     p.add_argument('--sl_mult', type=float, default=1.0,
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
     p.add_argument('--kalman_slope_threshold', type=float, default=0.05,

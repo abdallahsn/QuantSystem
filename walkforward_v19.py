@@ -185,6 +185,11 @@ def run_walkforward(
     train_cfg = config.get('training', {})
     ref_cfg = config.get('refinery', {})
     bt_cfg = config.get('backtest', {})
+    label_horizon = int(ref_cfg.get('label_horizon', 150))
+    event_roll_window = int(ref_cfg.get('event_roll_window', 50))
+    regime_window = int(ref_cfg.get('regime_window', 50))
+    warmup_rows = max(500, event_roll_window * 6, regime_window * 4, 200)
+    tail_rows = max(label_horizon * 3, 50)
 
     mbo_df = normalize_ts(read_market_data(mbo_path))
     windows = build_walkforward_windows(
@@ -274,6 +279,8 @@ def run_walkforward(
             regime_progress_every=int(ref_cfg.get('regime_progress_every', 25000)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
             merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
+            warmup_rows=warmup_rows,
+            tail_rows=tail_rows,
             external_scaler_path=os.path.join(model_dir, 'scaler_params.json'),
             fit_aux_models=False,
         )
@@ -299,6 +306,8 @@ def run_walkforward(
             direction_threshold_ticks=float(ref_cfg.get('direction_threshold_ticks', 1.0)),
             tp_mult=float(ref_cfg.get('tp_mult', 1.2)),
             sl_mult=float(ref_cfg.get('sl_mult', 1.0)),
+            score_start_ts=str(window['test_start']),
+            score_end_ts=str(window['test_end']),
         )
 
         fold_report = {

@@ -39,6 +39,11 @@ def run_raw_backtest(
     config = load_v19_config(config_path)
     ref_cfg = config.get('refinery', {})
     bt_cfg = config.get('backtest', {})
+    label_horizon = int(ref_cfg.get('label_horizon', 150))
+    event_roll_window = int(ref_cfg.get('event_roll_window', 50))
+    regime_window = int(ref_cfg.get('regime_window', 50))
+    warmup_rows = max(500, event_roll_window * 6, regime_window * 4, 200)
+    tail_rows = max(label_horizon * 3, 50)
 
     scaler_path = os.path.join(models_dir, 'scaler_params.json')
     if not os.path.exists(scaler_path):
@@ -72,6 +77,8 @@ def run_raw_backtest(
         lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
         external_scaler_path=scaler_path,
         fit_aux_models=False,
+        warmup_rows=warmup_rows,
+        tail_rows=tail_rows,
     )
 
     df = _load_csv(replay_build['csv'])
@@ -108,14 +115,16 @@ def run_raw_backtest(
         max_size=int(max_size if max_size is not None else bt_cfg.get('max_size', 5)),
         starting_equity=float(starting_equity if starting_equity is not None else bt_cfg.get('starting_equity', 100000.0)),
         direction_threshold_ticks=float(
-            direction_threshold_ticks if direction_threshold_ticks is not None else bt_cfg.get('direction_threshold_ticks', 1.0)
+            direction_threshold_ticks if direction_threshold_ticks is not None else ref_cfg.get('direction_threshold_ticks', 1.0)
         ),
-        tp_mult=float(tp_mult if tp_mult is not None else bt_cfg.get('tp_mult', 1.2)),
-        sl_mult=float(sl_mult if sl_mult is not None else bt_cfg.get('sl_mult', 1.0)),
+        tp_mult=float(tp_mult if tp_mult is not None else ref_cfg.get('tp_mult', 1.2)),
+        sl_mult=float(sl_mult if sl_mult is not None else ref_cfg.get('sl_mult', 1.0)),
         max_horizon_steps=max_horizon_steps,
         allow_oracle_forward_return=allow_oracle_forward_return,
         single_position_only=single_position_only,
         cooldown_rows=int(max(cooldown_rows, 0)),
+        score_start_ts=start_ts,
+        score_end_ts=end_ts,
     )
 
     summary = {

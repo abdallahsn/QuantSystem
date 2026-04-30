@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from modules.config_v19 import load_v19_config
+from modules.feature_artifact_v19 import load_feature_artifact
 from modules.logging_v19 import EventLogWriter, log_event
 from modules.monitoring_v19 import MonitoringState, emit_alerts, load_baseline_from_artifacts, load_jsonl, write_monitoring_outputs
 from predict_v19 import V19PredictionEngine
@@ -46,7 +47,7 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
         manifest_path=os.path.join(models_dir, 'manifest.json'),
         failsafe_policy=failsafe_cfg,
     )
-    df = pd.read_csv(csv_path, low_memory=False)
+    df = load_feature_artifact(csv_path)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
     visual_embeddings = _load_visual_embeddings(visual_npy, len(canonical_df), len(engine.visual_features))
 

@@ -14,10 +14,10 @@ os.environ.setdefault("QUANTSYSTEM_SKIP_HEAVY_ML", "1")
 os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 
 from backtest_v19 import _load_meta_features, _simulate_trade_path
-from prepare_training_data import _fit_regime_surface, _require_causal_label_runtime
+from prepare_training_data import _fit_regime_surface, _frame_integrity_snapshot, _process_mbp10, _require_causal_label_runtime
 from modules.dynamic_labels import EventGate
 from modules.feature_factory_v19 import V19FeatureFactory
-from modules.labels_v22 import _compute_adaptive_horizons
+from modules.labels_v19 import _compute_adaptive_horizons
 from modules.meta_learner import _input_shape_matches
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
 from train_v19 import _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
@@ -40,6 +40,69 @@ class LeakageGuardTests(unittest.TestCase):
         spiked = _compute_adaptive_horizons(future_spike, base_horizon=100)
 
         np.testing.assert_array_equal(base[:40], spiked[:40])
+
+    def test_spoofing_baseline_does_not_backfill_future_depth(self):
+        n = 32
+        ts = pd.date_range("2026-01-01", periods=n, freq="s")
+        base = pd.DataFrame(
+            {
+                "ts_event": ts,
+                "action": ["A"] * n,
+                "bid_px_00": np.full(n, 100.0),
+                "ask_px_00": np.full(n, 100.25),
+                "bid_sz_00": np.full(n, 10.0),
+                "ask_sz_00": np.full(n, 10.0),
+            }
+        )
+        for level in range(1, 10):
+            base[f"bid_px_{level:02d}"] = 100.0 - 0.25 * level
+            base[f"ask_px_{level:02d}"] = 100.25 + 0.25 * level
+            base[f"bid_sz_{level:02d}"] = 10.0
+            base[f"ask_sz_{level:02d}"] = 10.0
+
+        future_depth = base.copy()
+        future_depth.loc[20:, "bid_sz_00"] = 10_000.0
+        future_depth.loc[20:, "ask_sz_00"] = 10_000.0
+
+        base_feat = _process_mbp10(base, tick_size=0.25)
+        spiked_feat = _process_mbp10(future_depth, tick_size=0.25)
+
+        np.testing.assert_allclose(
+            base_feat.loc[:19, "spoofing_ratio"].values,
+            spiked_feat.loc[:19, "spoofing_ratio"].values,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            base_feat.loc[:19, "spoofing_duration"].values,
+            spiked_feat.loc[:19, "spoofing_duration"].values,
+            atol=1e-8,
+        )
+
+    def test_integrity_snapshot_flags_timestamp_and_value_anomalies(self):
+        df = pd.DataFrame(
+            {
+                "ts_event": [
+                    "2026-01-01 00:00:01",
+                    "2026-01-01 00:00:01",
+                    "2025-12-31 23:59:59",
+                    None,
+                ],
+                "price": [100.0, 0.0, 101.0, -5.0],
+                "size": [1.0, -2.0, 0.0, np.nan],
+                "symbol": ["ES", "ES", "NQ", "ES"],
+            }
+        )
+
+        snap = _frame_integrity_snapshot(df)
+
+        self.assertEqual(snap["rows"], 4)
+        self.assertEqual(snap["missing_ts_rows"], 1)
+        self.assertEqual(snap["duplicate_ts_rows"], 1)
+        self.assertEqual(snap["non_monotonic_ts_steps"], 1)
+        self.assertEqual(snap["price_nonpositive_rows"], 2)
+        self.assertEqual(snap["size_negative_rows"], 1)
+        self.assertEqual(snap["size_zero_rows"], 1)
+        self.assertEqual(snap["symbol_unique_count"], 2)
 
     def test_raw_stat_frame_rejects_forward_return(self):
         df = pd.DataFrame(
@@ -253,9 +316,9 @@ class LeakageGuardTests(unittest.TestCase):
 
         self.assertEqual(len(labels), len(df))
         self.assertEqual(info['mode'], 'rules')
-        self.assertEqual(info['effective_stride'], 12)
-        self.assertLess(info['full_sample_rows'], len(df))
-        self.assertLess(info['train_sample_rows'], len(train_idx))
+        self.assertEqual(info['effective_stride'], 1)
+        self.assertEqual(info['full_sample_rows'], len(df))
+        self.assertEqual(info['train_sample_rows'], len(train_idx))
         self.assertTrue(np.isin(labels, [0, 1, 2, 3]).all())
 
     def test_regime_surface_can_be_disabled(self):

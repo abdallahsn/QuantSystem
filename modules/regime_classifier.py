@@ -37,13 +37,25 @@ REGIME_META_SCORE_COLS = (
     'regime_low_liq_score',
 )
 N_REGIME_SCORE_COLS = len(REGIME_META_SCORE_COLS)
+TREND_EFFICIENCY_WINDOW = 50
+CVD_PERSISTENCE_WINDOW = 50
 
 REGIME_TRADEABLE = {
     0: True,   
     1: False,  
-    2: True,   
+    2: False,  
     3: False,  
 }
+
+
+def _resolve_cvd_level(df: pd.DataFrame) -> pd.Series:
+    if 'cvd' in df.columns:
+        base = pd.to_numeric(df.get('cvd'), errors='coerce')
+    elif 'cvd_delta' in df.columns:
+        base = pd.to_numeric(df.get('cvd_delta'), errors='coerce').fillna(0.0).cumsum()
+    else:
+        base = pd.Series(np.zeros(len(df)), index=df.index, dtype=np.float64)
+    return base.ffill().bfill().fillna(0.0).astype(np.float64)
 
 def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     features = pd.DataFrame(index=df.index)
@@ -55,8 +67,10 @@ def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
 
     if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
         features['volatility'] = (df['high'] - df['low']) / df['close'].clip(lower=1e-8)
+    elif 'raw__micro_atr' in df.columns:
+        features['volatility'] = pd.to_numeric(df['raw__micro_atr'], errors='coerce').abs()
     elif 'micro_atr' in df.columns:
-        features['volatility'] = df['micro_atr'].abs()
+        features['volatility'] = pd.to_numeric(df['micro_atr'], errors='coerce').abs()
     else:
         features['volatility'] = df.get('volume_burst', pd.Series(np.zeros(len(df))))
 
@@ -68,9 +82,13 @@ def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     roll_mean = vol.shift(1).rolling(20, min_periods=1).mean().fillna(1.0)
     features['volume_ratio'] = (vol / roll_mean.clip(lower=1e-8)).clip(0, 5)
 
-    cvd = df.get('cvd_delta', df.get('cvd', pd.Series(np.zeros(len(df)))))
-    cvd_delta = pd.to_numeric(cvd, errors='coerce').diff().abs().fillna(0.0)
-    features['cvd_strength'] = cvd_delta.shift(1).rolling(10, min_periods=1).mean().fillna(0.0)
+    cvd_level = _resolve_cvd_level(df)
+    cvd_delta = cvd_level.diff().abs().fillna(0.0)
+    features['cvd_impulse'] = cvd_delta.shift(1).rolling(10, min_periods=1).mean().fillna(0.0)
+    features['cvd_persistence'] = (
+        cvd_level.shift(1).diff(CVD_PERSISTENCE_WINDOW).abs().rolling(5, min_periods=1).mean().fillna(0.0)
+    )
+    features['cvd_strength'] = features['cvd_impulse']
 
     if 'imbalance' in df.columns:
         features['imbalance'] = df['imbalance'].abs()
@@ -90,8 +108,8 @@ def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
         else:
             features['activity'] = features['volume_ratio']
 
-    gross_move = price.diff().abs().rolling(12, min_periods=2).sum()
-    net_move = price.diff(12).abs()
+    gross_move = price.diff().abs().rolling(TREND_EFFICIENCY_WINDOW, min_periods=2).sum()
+    net_move = price.diff(TREND_EFFICIENCY_WINDOW).abs()
     features['trend_efficiency'] = (net_move / gross_move.clip(lower=1e-8)).fillna(0.0).clip(0.0, 1.0)
 
     return features.fillna(0.0).astype(np.float64)
@@ -123,7 +141,7 @@ def _bounded_scale(series: pd.Series, low: float, high: float) -> pd.Series:
 
 def _fit_rule_feature_stats(X: pd.DataFrame) -> dict:
     stats: dict[str, dict[str, float]] = {}
-    for col in ('volatility', 'activity', 'volume_ratio', 'cvd_strength', 'trend_efficiency', 'imbalance'):
+    for col in ('volatility', 'activity', 'volume_ratio', 'cvd_impulse', 'cvd_persistence', 'trend_efficiency', 'imbalance'):
         s = pd.to_numeric(X.get(col, pd.Series(dtype=np.float64)), errors='coerce').fillna(0.0).astype(np.float64)
         stats[col] = {
             'q10': float(s.quantile(0.10)) if len(s) else 0.0,
@@ -155,34 +173,37 @@ def _build_rule_scores(X: pd.DataFrame, feature_stats: dict | None = None) -> pd
         vol_rank = _score_feature_from_stats(X, feature_stats, 'volatility')
         activity_rank = _score_feature_from_stats(X, feature_stats, 'activity')
         volume_rank = _score_feature_from_stats(X, feature_stats, 'volume_ratio')
-        cvd_rank = _score_feature_from_stats(X, feature_stats, 'cvd_strength')
+        cvd_impulse_rank = _score_feature_from_stats(X, feature_stats, 'cvd_impulse')
+        cvd_persistence_rank = _score_feature_from_stats(X, feature_stats, 'cvd_persistence')
         trend_rank = _score_feature_from_stats(X, feature_stats, 'trend_efficiency', low_key='q10', high_key='q75')
         imbalance_rank = _score_feature_from_stats(X, feature_stats, 'imbalance')
     else:
         vol_rank = _pct_rank(X['volatility'])
         activity_rank = _pct_rank(X['activity'])
         volume_rank = _pct_rank(X['volume_ratio'])
-        cvd_rank = _pct_rank(X['cvd_strength'])
+        cvd_impulse_rank = _pct_rank(X['cvd_impulse'])
+        cvd_persistence_rank = _pct_rank(X['cvd_persistence'])
         trend_rank = _pct_rank(X['trend_efficiency'])
         imbalance_rank = _pct_rank(X['imbalance'])
 
     scores = pd.DataFrame(index=X.index)
     scores[REGIME_META_SCORE_COLS[1]] = (
-        0.55 * vol_rank
+        0.50 * vol_rank
         + 0.20 * activity_rank
         + 0.15 * volume_rank
-        + 0.10 * imbalance_rank
+        + 0.10 * cvd_impulse_rank
+        + 0.05 * imbalance_rank
     )
     scores[REGIME_META_SCORE_COLS[0]] = (
         0.55 * trend_rank
-        + 0.25 * cvd_rank
+        + 0.25 * cvd_persistence_rank
         + 0.10 * activity_rank
         + 0.10 * imbalance_rank
     )
     scores[REGIME_META_SCORE_COLS[2]] = (
-        0.60 * (1.0 - activity_rank)
-        + 0.30 * (1.0 - volume_rank)
-        + 0.10 * (1.0 - cvd_rank)
+        0.55 * (1.0 - activity_rank)
+        + 0.25 * (1.0 - volume_rank)
+        + 0.20 * (1.0 - cvd_impulse_rank)
     )
     return scores.fillna(0.0).clip(0.0, 1.0).astype(np.float64)
 
@@ -198,6 +219,7 @@ class RegimeClassifier:
         self._labels        = None
         self._regime_map = {}   
         self.rule_stats = {}
+        self.last_rule_diagnostics = {}
 
     def fit(self, df: pd.DataFrame, output_dir: str = 'outputs') -> 'RegimeClassifier':
         X = _build_regime_features(df)
@@ -215,6 +237,7 @@ class RegimeClassifier:
             self._fitted = True
             print("  ✅ Regime rules fitted (semantic regime labels)")
             self._print_distribution(labels)
+            self._print_rule_diagnostics(len(labels))
             self._save(output_dir)
             return self
 
@@ -275,11 +298,12 @@ class RegimeClassifier:
             'high_vol_q': float(X['volatility'].quantile(0.75)),
             'extreme_vol_q': float(X['volatility'].quantile(0.90)),
             'trend_eff_q': float(X['trend_efficiency'].quantile(0.45)),
-            'cvd_q': float(X['cvd_strength'].quantile(0.45)),
+            'cvd_impulse_q': float(X['cvd_impulse'].quantile(0.45)),
+            'cvd_persistence_q': float(X['cvd_persistence'].quantile(0.45)),
             'activity_med': float(X['activity'].median()),
             'volume_med': float(X['volume_ratio'].median()),
             'volatile_score_q': float(scores[REGIME_META_SCORE_COLS[1]].quantile(0.82)),
-            'trend_score_q': float(scores[REGIME_META_SCORE_COLS[0]].quantile(0.58)),
+            'trend_score_q': float(scores[REGIME_META_SCORE_COLS[0]].quantile(0.55)),
             'low_liq_score_q': float(scores[REGIME_META_SCORE_COLS[2]].quantile(0.80)),
         }
 
@@ -334,38 +358,55 @@ class RegimeClassifier:
         high_vol_q = float(stats.get('high_vol_q', X['volatility'].quantile(0.75)))
         extreme_vol_q = float(stats.get('extreme_vol_q', X['volatility'].quantile(0.90)))
         trend_eff_q = float(stats.get('trend_eff_q', X['trend_efficiency'].quantile(0.45)))
-        cvd_q = float(stats.get('cvd_q', X['cvd_strength'].quantile(0.45)))
+        cvd_impulse_q = float(stats.get('cvd_impulse_q', X['cvd_impulse'].quantile(0.45)))
+        cvd_persistence_q = float(stats.get('cvd_persistence_q', X['cvd_persistence'].quantile(0.45)))
         activity_med = float(stats.get('activity_med', X['activity'].median()))
         volume_med = float(stats.get('volume_med', X['volume_ratio'].median()))
         volatile_score_q = float(stats.get('volatile_score_q', scores[REGIME_META_SCORE_COLS[1]].quantile(0.82)))
-        trend_score_q = float(stats.get('trend_score_q', scores[REGIME_META_SCORE_COLS[0]].quantile(0.58)))
+        trend_score_q = float(stats.get('trend_score_q', scores[REGIME_META_SCORE_COLS[0]].quantile(0.55)))
         low_liq_score_q = float(stats.get('low_liq_score_q', scores[REGIME_META_SCORE_COLS[2]].quantile(0.80)))
 
         volatile = (
             (scores[REGIME_META_SCORE_COLS[1]] >= volatile_score_q) &
             (
                 (X['activity'] >= max(activity_med, 1e-6)) |
-                (X['volume_ratio'] >= max(volume_med, 1e-6))
+                (X['volume_ratio'] >= max(volume_med, 1e-6)) |
+                (X['cvd_impulse'] >= max(cvd_impulse_q, 1e-6))
             )
         ) | (X['volatility'] >= max(extreme_vol_q, 1e-6))
+        trend_guard_1 = X['trend_efficiency'] >= max(trend_eff_q, 0.25)
+        trend_guard_2 = X['cvd_persistence'] >= max(cvd_persistence_q, 1e-6) * 0.95
+        trend_guard_3 = X['activity'] > max(low_activity_q, 1e-6)
+        trend_guard_4 = X['volume_ratio'] > max(low_volume_q, 1e-6)
+        trend_guard_count = (
+            trend_guard_1.astype(np.int8)
+            + trend_guard_2.astype(np.int8)
+            + trend_guard_3.astype(np.int8)
+            + trend_guard_4.astype(np.int8)
+        )
         trending = (
             (scores[REGIME_META_SCORE_COLS[0]] >= trend_score_q) &
-            (X['trend_efficiency'] >= max(trend_eff_q, 0.25)) &
-            (X['cvd_strength'] >= max(cvd_q, 1e-6) * 0.95) &
-            (X['activity'] > max(low_activity_q, 1e-6)) &
-            (X['volume_ratio'] > max(low_volume_q, 1e-6))
+            (trend_guard_count >= 2)
         )
         low_liq = (
             (scores[REGIME_META_SCORE_COLS[2]] >= low_liq_score_q) &
             (X['activity'] <= max(activity_med, 1e-6)) &
             (X['volume_ratio'] <= max(volume_med, 1e-6)) &
-            (X['volatility'] <= max(high_vol_q, 1e-6))
+            (X['volatility'] <= max(high_vol_q, 1e-6)) &
+            (X['cvd_impulse'] <= max(cvd_impulse_q, 1e-6))
         )
 
         labels = np.full(len(X), 1, dtype=np.int8)
-        labels[volatile.values] = 2
-        labels[(low_liq & ~volatile).values] = 3
-        labels[(trending & ~volatile & ~low_liq).values] = 0
+        labels[low_liq.values] = 3
+        labels[(trending & ~low_liq).values] = 0
+        labels[(volatile & ~low_liq & ~trending).values] = 2
+        self.last_rule_diagnostics = {
+            'trend_volatile_overlap_count': int((trending & volatile).sum()),
+            'trending_masked_by_priority_count': int((trending & low_liq).sum()),
+            'trending_share': float(np.mean(labels == 0)) if len(labels) else 0.0,
+            'volatile_share': float(np.mean(labels == 2)) if len(labels) else 0.0,
+            'low_liq_share': float(np.mean(labels == 3)) if len(labels) else 0.0,
+        }
         return labels
 
     def _print_distribution(self, labels: np.ndarray):
@@ -373,6 +414,17 @@ class RegimeClassifier:
             count = int(np.sum(labels == regime_id))
             pct = count / max(len(labels), 1)
             print(f"     {REGIME_NAMES.get(regime_id, regime_id)}: {count} ({pct:.0%})")
+
+    def _print_rule_diagnostics(self, n_rows: int):
+        if not self.last_rule_diagnostics:
+            return
+        print(
+            "     Diagnostics: "
+            f"trend∩volatile={int(self.last_rule_diagnostics.get('trend_volatile_overlap_count', 0)):,} | "
+            f"trending_share={float(self.last_rule_diagnostics.get('trending_share', 0.0)):.1%} | "
+            f"volatile_share={float(self.last_rule_diagnostics.get('volatile_share', 0.0)):.1%} | "
+            f"trend_masked={int(self.last_rule_diagnostics.get('trending_masked_by_priority_count', 0)):,}/{max(int(n_rows), 1):,}"
+        )
 
     def _map_clusters(self, labels: np.ndarray, means: np.ndarray):
         """

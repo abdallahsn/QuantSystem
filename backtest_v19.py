@@ -26,7 +26,7 @@ from modules.feature_artifact_v19 import (
     load_feature_artifact,
     resolve_artifact_root,
 )
-from modules.slippage_model import confidence_bet_size
+from modules.slippage_model import SlippageModel, confidence_bet_size
 from predict_v19 import V19PredictionEngine
 
 try:
@@ -62,6 +62,54 @@ def _series_or_default(df: pd.DataFrame, col: str, default, dtype=None) -> pd.Se
     if dtype is not None:
         series = pd.to_numeric(series, errors='coerce').fillna(default).astype(dtype)
     return series
+
+
+def _realized_fill_pricing(
+    *,
+    entry_row: dict,
+    exit_row: dict,
+    direction: str,
+    size: int,
+    raw_pnl_pips: float,
+    tick_size: float,
+    round_trip_cost_pips: float,
+) -> dict:
+    tick = max(float(tick_size), 1e-8)
+    raw_pnl_pips = float(raw_pnl_pips)
+    floor_cost = max(float(round_trip_cost_pips), 0.0)
+
+    fill_model = SlippageModel(tick_size=tick, tick_value=1.0, commission=0.0)
+    entry_fill = fill_model.compute_fill(entry_row or {}, size=max(int(size), 1), direction=str(direction).lower())
+    exit_direction = 'short' if str(direction).upper() == 'LONG' else 'long'
+    exit_fill = fill_model.compute_fill(exit_row or {}, size=max(int(size), 1), direction=exit_direction)
+
+    entry_price = _safe_float(entry_fill.get('fill_price', 0.0))
+    exit_price = _safe_float(exit_fill.get('fill_price', 0.0))
+    if entry_fill.get('filled', 0) <= 0 or exit_fill.get('filled', 0) <= 0 or entry_price <= 0 or exit_price <= 0:
+        return {
+            'used_dynamic_fill': False,
+            'entry_fill': entry_fill,
+            'exit_fill': exit_fill,
+            'fill_pnl_pips': raw_pnl_pips,
+            'dynamic_cost_pips': float(floor_cost),
+            'net_pnl_pips': float(raw_pnl_pips - floor_cost),
+        }
+
+    if str(direction).upper() == 'LONG':
+        fill_pnl_pips = float((exit_price - entry_price) / tick)
+    else:
+        fill_pnl_pips = float((entry_price - exit_price) / tick)
+
+    dynamic_cost_pips = max(float(raw_pnl_pips - fill_pnl_pips), 0.0)
+    total_cost_pips = max(dynamic_cost_pips, floor_cost)
+    return {
+        'used_dynamic_fill': True,
+        'entry_fill': entry_fill,
+        'exit_fill': exit_fill,
+        'fill_pnl_pips': float(fill_pnl_pips),
+        'dynamic_cost_pips': float(total_cost_pips),
+        'net_pnl_pips': float(raw_pnl_pips - total_cost_pips),
+    }
 
 
 def _simulate_trade_path(
@@ -663,6 +711,7 @@ def _build_visual_diagnostics(
     models_dir: str | None = None,
     results_df: pd.DataFrame | None = None,
     eval_visual_diagnostics: dict | None = None,
+    scoring_mask: np.ndarray | None = None,
 ) -> dict:
     n_rows = len(df)
     if n_rows == 0:
@@ -684,20 +733,41 @@ def _build_visual_diagnostics(
             vis = vis.reshape(-1, 1)
         covered_mask = np.linalg.norm(vis, axis=1) > 0
 
+    if scoring_mask is None:
+        scoring_mask = np.ones(n_rows, dtype=bool)
+    else:
+        scoring_mask = np.asarray(scoring_mask, dtype=bool)
+        if len(scoring_mask) != n_rows:
+            scoring_mask = np.ones(n_rows, dtype=bool)
+
     event_flag = pd.to_numeric(df.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
     train_event_flag = pd.to_numeric(df.get('train_event_flag', event_flag), errors='coerce').fillna(0).astype(np.int8)
     bias_label = pd.to_numeric(df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
     directional_mask = bias_label.isin([0, 1]).to_numpy(dtype=bool)
-    full_mask = np.ones(n_rows, dtype=bool)
-    event_mask = (event_flag == 1).to_numpy(dtype=bool)
-    train_event_mask = (train_event_flag == 1).to_numpy(dtype=bool)
+    full_mask = np.asarray(scoring_mask, dtype=bool)
+    event_mask = (event_flag == 1).to_numpy(dtype=bool) & full_mask
+    train_event_mask = (train_event_flag == 1).to_numpy(dtype=bool) & full_mask
     directional_train_event_mask = train_event_mask & directional_mask
+    directional_mask = directional_mask & full_mask
 
     tradeable_mask = np.zeros(n_rows, dtype=bool)
     executed_mask = np.zeros(n_rows, dtype=bool)
-    if results_df is not None and len(results_df) == n_rows:
-        tradeable_mask = pd.to_numeric(results_df.get('tradeable', 0), errors='coerce').fillna(0).astype(bool).to_numpy()
-        executed_mask = pd.to_numeric(results_df.get('executed', 0), errors='coerce').fillna(0).astype(bool).to_numpy()
+    active_idx = np.flatnonzero(full_mask)
+    if results_df is not None and len(results_df):
+        mapped_idx = None
+        if 'idx' in results_df.columns:
+            idx_values = pd.to_numeric(results_df['idx'], errors='coerce').dropna().astype(int).to_numpy()
+            if len(idx_values) == len(results_df):
+                mapped_idx = idx_values
+        if mapped_idx is None and len(results_df) == len(active_idx):
+            mapped_idx = active_idx
+        if mapped_idx is not None and len(mapped_idx):
+            valid = (mapped_idx >= 0) & (mapped_idx < n_rows)
+            mapped_idx = mapped_idx[valid]
+            tradeable_values = pd.to_numeric(results_df.get('tradeable', 0), errors='coerce').fillna(0).astype(bool).to_numpy()[valid]
+            executed_values = pd.to_numeric(results_df.get('executed', 0), errors='coerce').fillna(0).astype(bool).to_numpy()[valid]
+            tradeable_mask[mapped_idx] = tradeable_values
+            executed_mask[mapped_idx] = executed_values
 
     full_total, full_covered, full_ratio = _coverage_counts(full_mask, covered_mask)
     event_total, event_covered, event_ratio = _coverage_counts(event_mask, covered_mask)
@@ -735,6 +805,13 @@ def _build_visual_diagnostics(
         'executed_rows_with_visual': int(executed_covered),
         'executed_coverage_ratio': float(executed_ratio),
     }
+    if not np.all(full_mask):
+        context_total, context_covered, context_ratio = _coverage_counts(np.ones(n_rows, dtype=bool), covered_mask)
+        diagnostics.update({
+            'context_rows_total': int(context_total),
+            'context_rows_with_visual': int(context_covered),
+            'context_coverage_ratio': float(context_ratio),
+        })
 
     if eval_visual_diagnostics:
         for key in (
@@ -810,6 +887,8 @@ def run_causal_backtest(
     single_position_only: bool = True,
     cooldown_rows: int = 0,
     visual_diagnostics: dict | None = None,
+    score_start_ts: str | None = None,
+    score_end_ts: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     engine = V19PredictionEngine(models_dir, run_mode='backtest')
     engine.reset_state()
@@ -828,6 +907,13 @@ def run_causal_backtest(
         utc=True,
         errors='coerce',
     ).dt.tz_localize(None)
+    scoring_mask = _build_backtest_window_mask(
+        replay_df,
+        start_ts=score_start_ts,
+        end_ts=score_end_ts,
+    ).to_numpy(dtype=bool)
+    if not bool(scoring_mask.any()):
+        raise ValueError('❌ نافذة التقييم المطلوبة لا تحتوي أي صفوف داخل replay_df.')
 
     results = []
     trades = []
@@ -872,6 +958,10 @@ def run_causal_backtest(
         )
 
         if pred.get('reason', '').startswith('Warming up'):
+            continue
+
+        row_in_score = bool(scoring_mask[i])
+        if not row_in_score:
             continue
 
         pred['idx'] = i
@@ -942,20 +1032,34 @@ def run_causal_backtest(
                 continue
 
             raw_pnl_pips = float(trade_path['raw_pnl_pips'])
-            net_pnl_pips = raw_pnl_pips - round_trip_cost_pips
+            exit_idx = int(trade_path['exit_idx'])
+            exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
+            exit_row = replay_df.iloc[exit_idx].to_dict() if 0 <= exit_idx < len(replay_df) else {}
+            fill_pricing = _realized_fill_pricing(
+                entry_row=row.to_dict(),
+                exit_row=exit_row,
+                direction=direction,
+                size=size,
+                raw_pnl_pips=raw_pnl_pips,
+                tick_size=tick_size,
+                round_trip_cost_pips=round_trip_cost_pips,
+            )
+            net_pnl_pips = float(fill_pricing['net_pnl_pips'])
             net_pnl_dollars = net_pnl_pips * tick_value * size
 
             result = 'WIN' if net_pnl_pips > 0 else ('LOSE' if net_pnl_pips < 0 else 'FLAT')
-            exit_idx = int(trade_path['exit_idx'])
-            exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
+            entry_fill = fill_pricing.get('entry_fill', {}) or {}
+            exit_fill = fill_pricing.get('exit_fill', {}) or {}
+            entry_price = _safe_float(entry_fill.get('fill_price', row.get('price', 0.0)))
+            exit_price = _safe_float(exit_fill.get('fill_price', trade_path.get('exit_price', 0.0)))
             trade = {
                 'idx': i,
                 'ts_event': pred['ts_event'],
                 'dir': direction,
                 'confidence': round(_safe_float(pred.get('confidence', 0.0)), 4),
                 'size': size,
-                'ep': _safe_float(row.get('price', 0.0)),
-                'xp': round(float(trade_path['exit_price']), 6),
+                'ep': round(float(entry_price), 6),
+                'xp': round(float(exit_price), 6),
                 'exit_idx': exit_idx,
                 'exit_ts': '' if pd.isna(exit_ts) else str(exit_ts),
                 'exit_reason': str(trade_path['exit_reason']),
@@ -963,7 +1067,11 @@ def run_causal_backtest(
                 'dur_min': int(trade_path['hold_steps']),
                 'pips': round(net_pnl_pips, 4),
                 'raw_pnl_pips': round(raw_pnl_pips, 4),
-                'cost_pips': round(round_trip_cost_pips, 4),
+                'cost_pips': round(float(fill_pricing.get('dynamic_cost_pips', round_trip_cost_pips)), 4),
+                'fill_pnl_pips': round(float(fill_pricing.get('fill_pnl_pips', raw_pnl_pips)), 4),
+                'used_dynamic_fill_cost': bool(fill_pricing.get('used_dynamic_fill', False)),
+                'entry_slippage_pips': round(float(entry_fill.get('slippage_pips', 0.0) or 0.0), 4),
+                'exit_slippage_pips': round(float(exit_fill.get('slippage_pips', 0.0) or 0.0), 4),
                 'mfe_pips': round(float(trade_path.get('mfe_pips', 0.0)), 4),
                 'mae_pips': round(float(trade_path.get('mae_pips', 0.0)), 4),
                 'pnl_source': pnl_source,
@@ -978,6 +1086,8 @@ def run_causal_backtest(
             pred['pending_exit_ts'] = '' if pd.isna(exit_ts) else str(exit_ts)
             pred['exit_reason'] = str(trade_path['exit_reason'])
             pred['pnl_source'] = pnl_source
+            pred['cost_pips'] = round(float(fill_pricing.get('dynamic_cost_pips', round_trip_cost_pips)), 4)
+            pred['used_dynamic_fill_cost'] = bool(fill_pricing.get('used_dynamic_fill', False))
 
             if bool(single_position_only):
                 active_trade = trade
@@ -1006,6 +1116,7 @@ def run_causal_backtest(
         models_dir=models_dir,
         results_df=results_df,
         eval_visual_diagnostics=visual_diagnostics,
+        scoring_mask=scoring_mask,
     )
 
     mdd_abs, mdd_pct = _equity_metrics(equity_curve)
@@ -1038,6 +1149,10 @@ def run_causal_backtest(
         'skipped_trade_replays': int(skipped_trade_replays),
         'single_position_only': bool(single_position_only),
         'cooldown_rows': int(max(cooldown_rows, 0)),
+        'context_rows': int(len(replay_df)),
+        'scored_rows': int(scoring_mask.sum()),
+        'score_start_ts': None if score_start_ts is None else str(score_start_ts),
+        'score_end_ts': None if score_end_ts is None else str(score_end_ts),
         'visual_coverage': float(visual_diag.get('coverage_ratio', 0.0)),
         'visual_diagnostics': visual_diag,
     }
@@ -1120,12 +1235,12 @@ def main():
         start_ts=start_ts,
         end_ts=end_ts,
     )
-    df = df_aligned.loc[eval_mask].reset_index(drop=True)
-    if df.empty:
+    df_score = df_aligned.loc[eval_mask].reset_index(drop=True)
+    if df_score.empty:
         raise ValueError('❌ نافذة الباك تست المطلوبة فارغة. راجع start_ts/end_ts أو training_window في manifest.')
 
     oos_guard = _enforce_oos_backtest_guard(
-        df,
+        df_score,
         csv_path=args.data,
         models_dir=args.models,
         allow_in_sample_data_override=args.allow_in_sample_data_override,
@@ -1138,7 +1253,6 @@ def main():
         expected_dim=len(engine.visual_features),
         models_dir=args.models,
     )
-    visual_embeddings = visual_full[eval_mask.to_numpy()]
 
     meta_path = args.meta_npy
     if meta_path is None:
@@ -1152,14 +1266,13 @@ def main():
         expected_dim=len(engine.meta_features),
         allow_in_sample_live_override=args.allow_in_sample_live_meta_override,
     )
-    meta_features = meta_full[eval_mask.to_numpy()] if meta_full is not None else None
 
     _, _, summary = run_causal_backtest(
-        df=df,
+        df=df_aligned,
         models_dir=args.models,
         output_dir=args.output,
-        visual_embeddings=visual_embeddings,
-        meta_features=meta_features,
+        visual_embeddings=visual_full,
+        meta_features=meta_full,
         input_scaled=args.input_scaled,
         tick_size=args.tick_size,
         tick_value=args.tick_value,
@@ -1173,6 +1286,8 @@ def main():
         allow_oracle_forward_return=args.allow_oracle_forward_return,
         single_position_only=(not args.disable_single_position_only),
         cooldown_rows=args.cooldown_rows,
+        score_start_ts=start_ts,
+        score_end_ts=end_ts,
     )
     summary['oos_guard'] = oos_guard
     summary['backtest_window'] = {

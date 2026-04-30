@@ -30,7 +30,7 @@ def main():
     p.add_argument('--symbol', default='')
     p.add_argument('--output', default='outputs_v19')
     p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(defaults.get('chunk_rows', defaults.get('chunksize', 2_000_000))))
-    p.add_argument('--label_mode', choices=['v19', 'v22'], default=defaults.get('label_mode', 'v19'))
+    p.add_argument('--label_mode', choices=['v19'], default=defaults.get('label_mode', 'v19'))
     p.add_argument('--n_workers', type=int, default=defaults.get('n_workers'))
     p.add_argument('--mbo_workers', type=int, default=defaults.get('mbo_workers'))
     p.add_argument('--mbp_workers', type=int, default=defaults.get('mbp_workers'))

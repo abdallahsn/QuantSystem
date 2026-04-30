@@ -11,6 +11,7 @@ from backtest_v19 import (
     _load_visual_embeddings,
 )
 from modules.html_reporter import generate_backtest_report
+from modules.raw_replay_v19 import _slice_timerange_with_row_context
 
 
 def _sample_df() -> pd.DataFrame:
@@ -180,6 +181,29 @@ def test_filter_backtest_window_respects_bounds():
     assert len(out) == 2
     assert out["ts_event"].iloc[0] == pd.Timestamp("2025-01-15 09:00:01")
     assert out["ts_event"].iloc[-1] == pd.Timestamp("2025-01-15 09:00:02")
+
+
+def test_replay_timerange_slice_preserves_warmup_and_tail_context():
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.date_range("2025-01-15 09:00:00", periods=8, freq="s"),
+            "price": np.arange(8, dtype=np.float32) + 100.0,
+        }
+    )
+
+    out, meta = _slice_timerange_with_row_context(
+        df,
+        start_ts="2025-01-15 09:00:02",
+        end_ts="2025-01-15 09:00:05",
+        warmup_rows=2,
+        tail_rows=2,
+    )
+
+    assert list(out["ts_event"]) == list(pd.date_range("2025-01-15 09:00:00", periods=7, freq="s"))
+    assert meta["scoring_rows_est"] == 3
+    assert meta["warmup_rows_applied"] == 2
+    assert meta["tail_rows_applied"] == 2
+    assert meta["context_rows"] == 7
 
 
 def test_visual_diagnostics_explain_training_vs_backtest_denominator_gap(tmp_path):

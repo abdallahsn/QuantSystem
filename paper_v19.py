@@ -12,11 +12,12 @@ import numpy as np
 import pandas as pd
 
 from modules.config_v19 import load_v19_config
+from modules.feature_artifact_v19 import load_feature_artifact
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.logging_v19 import EventLogWriter, ExecutionLogger, RiskLogger, log_event
 from modules.monitoring_v19 import MonitoringState, emit_alerts, load_baseline_from_artifacts, load_jsonl, write_monitoring_outputs
 from modules.slippage_model import SlippageModel, confidence_bet_size
-from backtest_v19 import _simulate_trade_path
+from backtest_v19 import _realized_fill_pricing, _simulate_trade_path
 from predict_v19 import V19PredictionEngine
 
 
@@ -38,6 +39,9 @@ def _spread_pips(row: pd.Series, tick_size: float) -> float:
     ask = float(row.get('ask_px_00', 0.0) or 0.0)
     if bid > 0 and ask > 0:
         return max((ask - bid) / max(tick_size, 1e-8), 0.0)
+    spread = float(row.get('spread', 0.0) or 0.0)
+    if spread > 0:
+        return max(spread / max(tick_size, 1e-8), 0.0)
     return 0.0
 
 
@@ -65,6 +69,8 @@ def run_paper(
     rollout_cfg = cfg.get('rollout', {})
     failsafe_cfg = cfg.get('failsafe', {})
     log_cfg = cfg.get('logging', {})
+    ref_cfg = cfg.get('refinery', {})
+    bt_cfg = cfg.get('backtest', {})
 
     events_path = os.path.join(output_dir, log_cfg.get('events_file', 'paper_events.jsonl'))
     orders_path = os.path.join(output_dir, 'paper_orders.jsonl')
@@ -84,16 +90,20 @@ def run_paper(
         manifest_path=os.path.join(models_dir, 'manifest.json'),
         failsafe_policy={**failsafe_cfg, **rollout_cfg},
     )
-    df = pd.read_csv(csv_path, low_memory=False)
+    df = load_feature_artifact(csv_path)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
     visual_embeddings = _visual_embeddings(visual_npy, len(canonical_df), len(engine.visual_features))
     prices = pd.to_numeric(canonical_df.get('price', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
     horizons = pd.to_numeric(canonical_df.get('label_horizon_steps', 0), errors='coerce').fillna(0).astype(np.int32).to_numpy()
     micro_atr = pd.to_numeric(canonical_df.get('micro_atr', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
-    tick_size = float(cfg.get('backtest', {}).get('tick_size', 0.0001))
-    tick_value = float(cfg.get('backtest', {}).get('tick_value', 10.0))
+    tick_size = float(bt_cfg.get('tick_size', 0.0001))
+    tick_value = float(bt_cfg.get('tick_value', 10.0))
+    round_trip_cost_pips = float(bt_cfg.get('round_trip_cost_pips', 1.0))
+    direction_threshold_ticks = float(ref_cfg.get('direction_threshold_ticks', 1.0))
+    tp_mult = float(ref_cfg.get('tp_mult', 1.2))
+    sl_mult = float(ref_cfg.get('sl_mult', 1.0))
 
-    slippage = SlippageModel()
+    slippage = SlippageModel(tick_size=tick_size, tick_value=tick_value, commission=0.0)
     trades = []
     active = None
     cooldown_until = -1
@@ -102,7 +112,7 @@ def run_paper(
 
     for i, (_, row) in enumerate(canonical_df.iterrows()):
         ts = row.get('ts_event', None)
-        spread_pips = _spread_pips(row, float(cfg.get('backtest', {}).get('tick_size', 0.0001)))
+        spread_pips = _spread_pips(row, tick_size)
         pred = engine.predict_step(
             row.to_dict(),
             visual_embedding=visual_embeddings[i] if len(engine.visual_features) else None,
@@ -124,14 +134,28 @@ def run_paper(
         if active is not None:
             if i >= int(active.get('exit_idx', i + 1)):
                 raw_pnl_pips = float(active.get('raw_pnl_pips', 0.0) or 0.0)
-                adj = slippage.adjust_pnl(raw_pnl_pips, size=active['size'], direction=active['direction'].lower(), row=row.to_dict())
-                pnl = float(adj['real_pnl_pips']) * tick_value * active['size']
+                fill_pricing = _realized_fill_pricing(
+                    entry_row=active.get('entry_row', {}),
+                    exit_row=row.to_dict(),
+                    direction=str(active['direction']),
+                    size=int(active['size']),
+                    raw_pnl_pips=raw_pnl_pips,
+                    tick_size=tick_size,
+                    round_trip_cost_pips=round_trip_cost_pips,
+                )
+                pnl = float(fill_pricing['net_pnl_pips']) * tick_value * active['size']
                 equity += pnl
                 engine.loss_guard.update_equity(equity)
                 engine.loss_guard.record_trade(pnl, ts=ts)
                 active['exit_ts'] = str(ts)
                 active['pnl_dollars'] = round(pnl, 2)
-                active['real_pnl_pips'] = adj['real_pnl_pips']
+                active['real_pnl_pips'] = float(fill_pricing['net_pnl_pips'])
+                active['fill_pnl_pips'] = float(fill_pricing.get('fill_pnl_pips', raw_pnl_pips))
+                active['cost_pips'] = float(fill_pricing.get('dynamic_cost_pips', round_trip_cost_pips))
+                active['used_dynamic_fill_cost'] = bool(fill_pricing.get('used_dynamic_fill', False))
+                active['exit_price'] = float(
+                    fill_pricing.get('exit_fill', {}).get('fill_price', row.get('price', 0.0)) or row.get('price', 0.0)
+                )
                 active['exit_reason'] = active.get('exit_reason', 'path_replay')
                 trades.append(active)
                 exec_logger.log_order(
@@ -146,6 +170,9 @@ def run_paper(
                             'exit_ts': active['exit_ts'],
                             'pnl_dollars': active['pnl_dollars'],
                             'real_pnl_pips': active['real_pnl_pips'],
+                            'fill_pnl_pips': active['fill_pnl_pips'],
+                            'cost_pips': active['cost_pips'],
+                            'used_dynamic_fill_cost': active['used_dynamic_fill_cost'],
                             'exit_reason': active['exit_reason'],
                             'equity_after': equity,
                         },
@@ -166,6 +193,9 @@ def run_paper(
                             'exit_ts': active['exit_ts'],
                             'pnl_dollars': active['pnl_dollars'],
                             'real_pnl_pips': active['real_pnl_pips'],
+                            'fill_pnl_pips': active['fill_pnl_pips'],
+                            'cost_pips': active['cost_pips'],
+                            'used_dynamic_fill_cost': active['used_dynamic_fill_cost'],
                             'exit_reason': active['exit_reason'],
                             'equity_after': equity,
                         },
@@ -274,9 +304,9 @@ def run_paper(
                 horizons=horizons,
                 micro_atr=micro_atr,
                 tick_size=tick_size,
-                direction_threshold_ticks=1.0,
-                tp_mult=1.2,
-                sl_mult=1.0,
+                direction_threshold_ticks=direction_threshold_ticks,
+                tp_mult=tp_mult,
+                sl_mult=sl_mult,
                 row_data=row.to_dict(),
             )
             if trade_path is None:
@@ -287,6 +317,7 @@ def run_paper(
                 'size': size,
                 'entry_ts': str(ts),
                 'entry_price': float(fill.get('fill_price', row.get('price', 0.0)) or row.get('price', 0.0)),
+                'entry_row': row.to_dict(),
                 'exit_idx': int(trade_path['exit_idx']),
                 'raw_pnl_pips': float(trade_path['raw_pnl_pips']),
                 'exit_reason': str(trade_path['exit_reason']),
