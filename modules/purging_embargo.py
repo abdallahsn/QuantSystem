@@ -59,17 +59,17 @@ def walk_forward_expanding(
     min_train = min(min_train, max(test_n + 50, n_samples - test_n))
     tail_n = max(0, n_samples - min_train)
     effective_folds = max(int(n_folds), int(np.ceil(tail_n / max(test_n, 1))))
+    if tail_n <= 0:
+        return
 
-    step = max(1, (n_samples - min_train - test_n) // max(effective_folds - 1, 1))
+    tail_idx = np.arange(min_train, n_samples, dtype=np.int64)
+    effective_folds = min(max(effective_folds, 1), len(tail_idx))
+    test_blocks = [block for block in np.array_split(tail_idx, effective_folds) if len(block) > 0]
 
-    for f in range(effective_folds):
-        test_start = min_train + f * step
-        test_end = min(test_start + test_n, n_samples)
-        
-        if test_start >= n_samples: break
-            
-        all_before = np.arange(0, test_start)
-        test_idx = np.arange(test_start, test_end)
+    for test_idx in test_blocks:
+        test_idx = np.asarray(test_idx, dtype=np.int64)
+        test_start = int(test_idx[0])
+        all_before = np.arange(0, test_start, dtype=np.int64)
 
         if t0 is not None and t1 is not None:
             train_idx = purge_overlapping(all_before, test_idx, t1, t0)

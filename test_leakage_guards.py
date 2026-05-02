@@ -22,6 +22,7 @@ from modules.labels_v19 import _compute_adaptive_horizons, build_causal_event_la
 from modules.dynamic_labels import kalman_trend
 from modules.meta_learner import _input_shape_matches
 from modules.oof_stacking import run_sequential_oof
+from modules.purging_embargo import walk_forward_expanding
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
 from train_v19 import _assert_single_contract_df, _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, _time_series, build_inference_scaler_params
 from modules.failsafe_v19 import evaluate_system_health, decide_runtime_mode
@@ -499,6 +500,23 @@ class LeakageGuardTests(unittest.TestCase):
         self.assertEqual([spec['name'] for spec in layout['base_models']], ['catboost', 'xgboost'])
         self.assertEqual(layout['base_prob_dim'], 4)
         self.assertEqual(len(layout['regime_meta_cols']), 7)
+
+    def test_walk_forward_expanding_produces_disjoint_test_blocks(self):
+        splits = list(
+            walk_forward_expanding(
+                n_samples=3913,
+                n_folds=9,
+                test_size=0.10,
+                embargo_pct=0.02,
+                min_train_pct=0.20,
+                min_train_rows=200,
+            )
+        )
+        seen = np.array([], dtype=np.int64)
+        self.assertGreaterEqual(len(splits), 1)
+        for _, test_idx in splits:
+            self.assertEqual(len(np.intersect1d(seen, test_idx)), 0)
+            seen = np.r_[seen, np.asarray(test_idx, dtype=np.int64)]
 
     def test_feature_factory_accepts_legacy_catboost_only_schema(self):
         with tempfile.TemporaryDirectory() as tmpdir:
