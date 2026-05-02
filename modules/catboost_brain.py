@@ -21,19 +21,8 @@ import os
 import numpy as np
 import pandas as pd
 import json
-from typing import Optional
 import pickle
 from collections import deque
-
-try:
-    from modules.range_state_machine import RangeStateMachine
-    RSM_AVAILABLE = True
-except ImportError:
-    try:
-        from range_state_machine import RangeStateMachine
-        RSM_AVAILABLE = True
-    except ImportError:
-        RSM_AVAILABLE = False
 
 try:
     from catboost import CatBoostClassifier, Pool
@@ -91,19 +80,6 @@ class CatBoostQuantBrain:
         self.rolling_window      = rolling_window
         self._ctx_feature_cols   = list(self.feature_cols)  # يُحدَّث بعد fit
         self._predict_buffer     = deque(maxlen=rolling_window)  # بافر للـ predict اللحظي
-
-        # ── RangeStateMachine — يمنع التقلب في الرينج ─────────────────
-        # يراكم إشارات CatBoost ولا يُصدر قرار إلا بعد N تأكيدات
-        # من الحافة الصحيحة (قاع الرينج للشراء، قمته للبيع)
-        self._rsm: Optional[RangeStateMachine] = None
-        if RSM_AVAILABLE:
-            self._rsm = RangeStateMachine(
-                range_window        = rolling_window,
-                min_confirmations   = 3,
-                confirmation_window = 6,
-                min_confidence      = confidence_threshold * 0.85,
-                min_candles_between = 4,
-            )
 
         self.model       = None
         self._fitted     = False
@@ -342,13 +318,13 @@ class CatBoostQuantBrain:
 
                 bars = ax.barh(range(len(names_r)), vals_r,
                                color=color, alpha=0.8)
-
+                
                 ax.set_yticks(range(len(names_r)))
                 ax.set_yticklabels(names_r, color='white', fontsize=9)
                 ax.set_xlabel('Mean |SHAP|', color='gray')
                 ax.set_title(f'{cls_name}', color=color, fontweight='bold')
                 ax.tick_params(colors='gray')
-
+                
                 for spine in ax.spines.values():
                     spine.set_edgecolor('#333')
 
@@ -405,7 +381,7 @@ class CatBoostQuantBrain:
         x_ctx = self._rolling_from_buffer(x_combined)
 
         x2d   = x_ctx.reshape(1, -1)
-
+        
         # التحقق من عدد الميزات قبل التنبؤ
         expected_cols = len(self._ctx_feature_cols)
         if x2d.shape[1] != expected_cols:
@@ -429,69 +405,11 @@ class CatBoostQuantBrain:
                            for i, p in enumerate(probs)},
         }
 
-    def should_trade(
-        self,
-        x: np.ndarray,
-        embeddings: np.ndarray = None,
-        price: float = 0.0,
-        regime: str = 'Ranging',
-    ) -> tuple:
-        """
-        Interface متوافق مع TransformerBrain — مع RangeStateMachine.
-
-        Parameters
-        ----------
-        x          : features
-        embeddings : autoencoder embeddings
-        price      : السعر الحالي (للـ RSM)
-        regime     : حالة السوق من regime_classifier
-        """
+    def should_trade(self, x: np.ndarray, embeddings: np.ndarray = None) -> tuple:
+        """Interface متوافق مع TransformerBrain"""
         result    = self.predict(x, embeddings)
-        tradeable = result.pop('tradeable', False)
-
-        # ── تطبيق RangeStateMachine ────────────────────────────────────
-        # بدلاً من إصدار كل إشارة CatBoost مباشرة:
-        # نمررها للـ RSM يراكمها ويُصدر قرار مؤكد فقط
-        if self._rsm is not None and price > 0:
-            raw_bias   = result.get('bias', 'NEUTRAL')
-            confidence = result.get('confidence', 0.0)
-
-            decision = self._rsm.process(
-                price      = price,
-                raw_signal = raw_bias,
-                confidence = confidence,
-                regime     = regime,
-            )
-
-            if decision['action'] == 'ENTER':
-                # إشارة مؤكدة — أصدرها
-                result['bias']       = decision['direction']
-                result['rsm_reason'] = decision['reason']
-                result['rsm_state']  = decision['market_state']
-                result['rsm_confs']  = decision['confirmations']
-                tradeable = (decision['direction'] in ('LONG', 'SHORT'))
-            else:
-                # لا تزال في مرحلة التراكم — لا تدخل
-                result['bias']       = 'NEUTRAL'
-                result['rsm_reason'] = decision['reason']
-                result['rsm_state']  = decision['market_state']
-                result['rsm_confs']  = decision['confirmations']
-                tradeable = False
-
+        tradeable = result.pop('tradeable')
         return tradeable, result
-
-    def notify_trade_closed(self):
-        """
-        استدعِ هذا عند إغلاق الصفقة لفتح RSM للإشارة التالية.
-        """
-        if self._rsm is not None:
-            self._rsm.unlock()
-
-    def get_rsm_summary(self) -> dict:
-        """تقرير حالة الـ RangeStateMachine."""
-        if self._rsm is None:
-            return {'rsm': 'unavailable'}
-        return self._rsm.summary()
 
     def get_feature_report(self) -> str:
         """تقرير أهمية الـ features"""
