@@ -1,5 +1,5 @@
 """
-stage2_catboost.py - Standalone entrypoint for CatBoost/regime stage
+stage2_catboost.py - Standalone entrypoint for CatBoost/XGBoost/regime stage
 """
 
 from __future__ import annotations
@@ -15,6 +15,15 @@ except ImportError as e:
         "pip install -r requirements.txt"
     ) from e
 
+try:
+    import xgboost  # noqa: F401
+except ImportError as e:
+    raise SystemExit(
+        "❌ XGBoost غير مثبّت في هذه البيئة.\n"
+        "نفّذ أولًا:\n"
+        "pip install -r requirements.txt"
+    ) from e
+
 from modules.config_v19 import load_v19_config
 from modules.catboost_5m_report import generate_catboost_5m_report
 from train_v19 import run_training_pipeline
@@ -22,7 +31,7 @@ from train_v19 import run_training_pipeline
 
 def main():
     defaults = load_v19_config().get('training', {})
-    p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 2 CatBoost only')
+    p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 2 CatBoost + XGBoost')
     p.add_argument('--csv', required=True, help='training_features_ready.csv from stage 1')
     p.add_argument('--lob', default=None, help='optional lob_tensors.npy')
     p.add_argument('--lob_ts', default=None, help='optional lob_tensor_timestamps.npy')

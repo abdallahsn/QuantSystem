@@ -172,7 +172,7 @@ class V19PredictionEngine:
             print(f"  ✅ CatBoost V19: {cb_path}")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
-        if 'catboost' in required_base_models and self.cb_advisor is None:
+        if run_mode != 'backtest' and 'catboost' in required_base_models and self.cb_advisor is None:
             raise FileNotFoundError(
                 "❌ CatBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -202,7 +202,7 @@ class V19PredictionEngine:
             print(f"  ✅ XGBoost V19: {xgb_path}")
         else:
             print(f"  ⚠️ XGBoost V19 missing: {xgb_path}")
-        if 'xgboost' in required_base_models and self.xgb_advisor is None:
+        if run_mode != 'backtest' and 'xgboost' in required_base_models and self.xgb_advisor is None:
             raise FileNotFoundError(
                 "❌ XGBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -486,7 +486,7 @@ class V19PredictionEngine:
                 'confidence': float(probs[bias_idx]),
                 'uncertainty': 0.5,
                 'tradeable': float(probs[bias_idx]) >= 0.60,
-                'source': 'CatBoost_Fallback_V19',
+                'source': 'BaseModels_Fallback_V19',
             }
         result = self.meta.predict(seq)
         result['source'] = 'MetaLearner_V19'

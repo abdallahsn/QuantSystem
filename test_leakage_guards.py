@@ -17,7 +17,7 @@ os.environ.setdefault("QUANTSYSTEM_SKIP_GPU_DETECT", "1")
 from backtest_v19 import _load_meta_features, _realized_fill_pricing, _simulate_trade_path
 from prepare_training_data import _fit_regime_surface, _frame_integrity_snapshot, _process_mbp10, _require_causal_label_runtime
 from modules.dynamic_labels import EventGate, engineer_features
-from modules.feature_factory_v19 import V19FeatureFactory
+from modules.feature_factory_v19 import V19FeatureFactory, infer_meta_feature_layout, resolve_meta_feature_names
 from modules.labels_v19 import _compute_adaptive_horizons, build_causal_event_labels
 from modules.dynamic_labels import kalman_trend
 from modules.meta_learner import _input_shape_matches
@@ -492,6 +492,28 @@ class LeakageGuardTests(unittest.TestCase):
                     f.write(b'0')
             with self.assertRaises(ValueError):
                 _load_required_stage1_artifacts(tmpdir, n_rows=5)
+
+    def test_meta_feature_layout_supports_catboost_xgboost_surface(self):
+        names = resolve_meta_feature_names(include_xgboost=True)
+        layout = infer_meta_feature_layout(names)
+        self.assertEqual([spec['name'] for spec in layout['base_models']], ['catboost', 'xgboost'])
+        self.assertEqual(layout['base_prob_dim'], 4)
+        self.assertEqual(len(layout['regime_meta_cols']), 7)
+
+    def test_feature_factory_accepts_legacy_catboost_only_schema(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            schema = {
+                'version': 'v19-event-binary',
+                'seq_len': 50,
+                'stat_features': ['cvd'],
+                'meta_features': resolve_meta_feature_names(include_xgboost=False),
+                'visual_features': [],
+                'input_dim': 10,
+            }
+            with open(os.path.join(tmpdir, 'feature_schema_v19.json'), 'w') as f:
+                json.dump(schema, f)
+            factory = V19FeatureFactory(tmpdir)
+            self.assertEqual(factory.meta_features, resolve_meta_feature_names(include_xgboost=False))
 
     def test_feature_factory_rejects_old_schema_surface(self):
         with tempfile.TemporaryDirectory() as tmpdir:
