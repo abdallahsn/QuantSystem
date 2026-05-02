@@ -92,10 +92,76 @@ class CatBoostQuantBrain:
                 print(f"[CatBoost] 🧠 تحميل: {brain_filename}")
                 self.model   = CatBoostClassifier()
                 self.model.load_model(brain_filename)
+                self._restore_feature_metadata(brain_filename)
                 self._fitted = True
             except Exception as e:
                 print(f"[CatBoost] ⚠️ مكسور ({e}) — بنبني جديد")
                 self.model = None
+
+    def _resolved_model_path(self, output_dir: str) -> str:
+        if os.path.isabs(self.brain_file):
+            return self.brain_file
+        return os.path.join(output_dir, os.path.basename(self.brain_file))
+
+    @staticmethod
+    def _metadata_path(model_path: str) -> str:
+        root, _ = os.path.splitext(model_path)
+        return f"{root}.meta.json"
+
+    def _infer_ctx_feature_cols(self) -> list:
+        base_cols = list(self.feature_cols)
+        if not self.use_rolling_context:
+            return base_cols
+        w = int(self.rolling_window)
+        return (
+            base_cols
+            + [f'{c}__rm{w}' for c in base_cols]
+            + [f'{c}__rs{w}' for c in base_cols]
+        )
+
+    def _restore_feature_metadata(self, model_path: str) -> None:
+        feature_names = None
+        meta_path = self._metadata_path(model_path)
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r') as f:
+                    payload = json.load(f)
+                self.use_rolling_context = bool(payload.get('use_rolling_context', self.use_rolling_context))
+                self.rolling_window = max(int(payload.get('rolling_window', self.rolling_window)), 1)
+                self._predict_buffer = deque(maxlen=self.rolling_window)
+                feature_names = payload.get('ctx_feature_cols')
+            except Exception as e:
+                print(f"[CatBoost] ⚠️ تعذر قراءة metadata ({e}) — سيتم استخدام fallback")
+
+        if not feature_names and self.model is not None:
+            feature_names = getattr(self.model, 'feature_names_', None)
+
+        if isinstance(feature_names, (list, tuple)) and len(feature_names) > 0:
+            self._ctx_feature_cols = [str(col) for col in feature_names]
+            return
+
+        self._ctx_feature_cols = self._infer_ctx_feature_cols()
+
+    def _save_feature_metadata(self, model_path: str) -> None:
+        payload = {
+            'base_feature_cols': list(self.base_feature_cols),
+            'feature_cols': list(self.feature_cols),
+            'ctx_feature_cols': list(self._ctx_feature_cols),
+            'embeddings_dim': int(self.embeddings_dim),
+            'use_rolling_context': bool(self.use_rolling_context),
+            'rolling_window': int(self.rolling_window),
+            'confidence_threshold': float(self.confidence_threshold),
+        }
+        with open(self._metadata_path(model_path), 'w') as f:
+            json.dump(payload, f, indent=2)
+
+    def _effective_feature_names(self, n_features: int | None = None) -> list:
+        names = list(self._ctx_feature_cols) if self._ctx_feature_cols else self._infer_ctx_feature_cols()
+        if n_features is None or len(names) == int(n_features):
+            return names
+        if len(self.feature_cols) == int(n_features):
+            return list(self.feature_cols)
+        return [f'feature_{i}' for i in range(int(n_features))]
 
     # ── Rolling Context ────────────────────────────────────────────────────────
 
@@ -193,7 +259,12 @@ class CatBoostQuantBrain:
             return {}
 
         # تحضير الداتا
-        split    = int(len(X_clean) * 0.8)
+        if len(X_clean) <= 1:
+            print("  ⚠️ عدد العينات غير كافٍ لتقسيم train/val آمن.")
+            return {}
+
+        split = int(len(X_clean) * 0.8)
+        split = min(max(split, 1), len(X_clean) - 1)
         X_tr, X_val = X_clean[:split], X_clean[split:]
         y_tr, y_val = y_clean[:split], y_clean[split:]
 
@@ -239,8 +310,10 @@ class CatBoostQuantBrain:
         )
 
         # حفظ الموديل
-        model_path = os.path.join(output_dir, 'catboost_brain.cbm')
+        model_path = self._resolved_model_path(output_dir)
         self.model.save_model(model_path)
+        self.brain_file = model_path
+        self._save_feature_metadata(model_path)
         self._fitted = True
 
         # تقرير الدقة
@@ -271,7 +344,7 @@ class CatBoostQuantBrain:
         if not self._fitted:
             return {}
         imp = self.model.get_feature_importance()
-        names = self.feature_cols
+        names = self._effective_feature_names(len(imp))
         ranked = sorted(zip(names, imp), key=lambda x: -x[1])
         return {name: round(float(val), 4) for name, val in ranked}
 
@@ -291,9 +364,10 @@ class CatBoostQuantBrain:
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
 
+            feature_names = self._effective_feature_names(X_val.shape[1])
             explainer   = shap.TreeExplainer(self.model)
             shap_values = explainer.shap_values(
-                Pool(X_val, feature_names=self.feature_cols))
+                Pool(X_val, feature_names=feature_names))
 
             # ── Plot 1: Feature Importance (SHAP) ────────────────
             fig, axes = plt.subplots(1, 3, figsize=(20, 8),
@@ -310,7 +384,7 @@ class CatBoostQuantBrain:
 
                 sv  = shap_values[idx]  # (n, features)
                 imp = np.abs(sv).mean(axis=0)
-                ranked = sorted(zip(self.feature_cols, imp),
+                ranked = sorted(zip(feature_names, imp),
                                 key=lambda x: -x[1])[:15]
 
                 names_r = [r[0] for r in ranked]
@@ -340,7 +414,7 @@ class CatBoostQuantBrain:
             for idx, cls_name in enumerate(class_names):
                 sv   = shap_values[idx]
                 imp  = np.abs(sv).mean(axis=0)
-                top5 = sorted(zip(self.feature_cols, imp),
+                top5 = sorted(zip(feature_names, imp),
                               key=lambda x: -x[1])[:5]
                 shap_summary[cls_name] = [(n, round(float(v),4)) for n,v in top5]
                 print(f"  {cls_name} top features: {[n for n,_ in top5]}")
@@ -349,7 +423,7 @@ class CatBoostQuantBrain:
             shap_pkl = os.path.join(output_dir, 'shap_values.pkl')
             with open(shap_pkl, 'wb') as f:
                 pickle.dump({'shap_values': shap_values,
-                             'feature_names': self.feature_cols,
+                             'feature_names': feature_names,
                              'summary': shap_summary}, f)
 
             return {'shap_summary': shap_summary}

@@ -39,6 +39,14 @@ TREND_DOWN = -1
 TREND_NEUTRAL = 0
 EVENT_SHIFT_COLS = ("obi", "cvd", "micro_price", "liquidity_density")
 
+DEFAULT_EVENT_ROLL_WINDOW = 50
+DEFAULT_EVENT_VOL_MULT = 1.10
+DEFAULT_EVENT_OBI_THR = 0.08
+DEFAULT_EVENT_WALL_STR_THR = 0.70
+DEFAULT_EVENT_SHIFT_Z_THR = 0.75
+DEFAULT_EVENT_TARGET_RATE = 0.25
+DEFAULT_EVENT_SCORE_THRESHOLD = 0.0
+
 
 @dataclass
 class MarketFeatureVector:
@@ -388,8 +396,20 @@ def engineer_features(df: pd.DataFrame, roll_window: int = 20) -> pd.DataFrame:
         df[f"{col}_rmean"] = roll_mean.fillna(0.0)
 
     if "obi" in df.columns:
-        obi_std = pd.to_numeric(df["obi"], errors="coerce").fillna(0.0).rolling(roll_window, min_periods=1).std().fillna(0.0)
-        df["regime"] = (obi_std > float(obi_std.median())).astype(np.int8)
+        obi_std = (
+            pd.to_numeric(df["obi"], errors="coerce")
+            .fillna(0.0)
+            .rolling(roll_window, min_periods=1)
+            .std()
+            .fillna(0.0)
+        )
+        causal_median = (
+            obi_std.expanding(min_periods=1)
+            .median()
+            .ffill()
+            .fillna(0.0)
+        )
+        df["regime"] = (obi_std > causal_median).astype(np.int8)
     else:
         df["regime"] = REGIME_RANGING
 
@@ -412,11 +432,11 @@ def _rolling_zscore(series: pd.Series, roll_window: int) -> pd.Series:
 
 def build_event_filter(
     df: pd.DataFrame,
-    vol_mult: float = 1.5,
-    obi_thr: float = 0.3,
-    wall_str_thr: float = 1.0,
-    roll_window: int = 50,
-    shift_z_thr: float = 0.75,
+    vol_mult: float = DEFAULT_EVENT_VOL_MULT,
+    obi_thr: float = DEFAULT_EVENT_OBI_THR,
+    wall_str_thr: float = DEFAULT_EVENT_WALL_STR_THR,
+    roll_window: int = DEFAULT_EVENT_ROLL_WINDOW,
+    shift_z_thr: float = DEFAULT_EVENT_SHIFT_Z_THR,
     return_details: bool = False,
 ) -> pd.Series:
     """
@@ -480,17 +500,19 @@ class EventGate:
 
     def __init__(
         self,
-        roll_window: int = 50,
-        vol_mult: float = 1.45,
-        obi_thr: float = 0.40,
-        wall_str_thr: float = 1.025,
-        shift_z_thr: float = 0.75,
+        roll_window: int = DEFAULT_EVENT_ROLL_WINDOW,
+        vol_mult: float = DEFAULT_EVENT_VOL_MULT,
+        obi_thr: float = DEFAULT_EVENT_OBI_THR,
+        wall_str_thr: float = DEFAULT_EVENT_WALL_STR_THR,
+        shift_z_thr: float = DEFAULT_EVENT_SHIFT_Z_THR,
+        score_threshold: float = DEFAULT_EVENT_SCORE_THRESHOLD,
     ):
         self.roll_window = max(int(roll_window), 1)
         self.vol_mult = float(vol_mult)
         self.obi_thr = float(obi_thr)
         self.wall_str_thr = float(wall_str_thr)
         self.shift_z_thr = float(shift_z_thr)
+        self.score_threshold = max(float(score_threshold), 0.0)
         self._volume_hist = deque(maxlen=self.roll_window)
         self._shift_hist = {col: deque(maxlen=self.roll_window) for col in EVENT_SHIFT_COLS}
 
@@ -537,14 +559,21 @@ class EventGate:
         vol_values = list(self._volume_hist)
         vol_values.append(volume)
         vol_mean = float(np.mean(vol_values)) if vol_values else 0.0
-        cond_vol = bool(volume > (vol_mean * self.vol_mult)) if vol_mean > 0 else bool(volume > 0)
-        cond_obi = bool(abs(obi) > self.obi_thr)
-        cond_wall = bool((bid_wall > self.wall_str_thr) or (ask_wall > self.wall_str_thr))
+        vol_ratio = float(volume / max(vol_mean, 1e-9)) if vol_mean > 0 else float(volume > 0)
+        obi_abs = abs(obi)
+        wall_strength = max(bid_wall, ask_wall)
+
+        cond_vol = bool(vol_ratio > self.vol_mult)
+        cond_obi = bool(obi_abs > self.obi_thr)
+        cond_wall = bool(wall_strength > self.wall_str_thr)
 
         shift_hits = []
+        shift_peak = 0.0
         for col in EVENT_SHIFT_COLS:
             current = self._pick(row, f"raw__{col}", col, default=0.0)
-            if abs(self._current_zscore(col, current)) > self.shift_z_thr:
+            z_abs = abs(self._current_zscore(col, current))
+            shift_peak = max(shift_peak, z_abs)
+            if z_abs > self.shift_z_thr:
                 shift_hits.append(col)
         cond_shift = bool(shift_hits)
 
@@ -563,7 +592,23 @@ class EventGate:
         if cond_shift:
             reasons.append("shift")
 
-        passed = bool(cond_vol or cond_obi or cond_wall or cond_shift)
+        trigger_count = int(cond_vol) + int(cond_obi) + int(cond_wall) + int(cond_shift)
+        vol_excess = max((vol_ratio / max(self.vol_mult, 1e-6)) - 1.0, 0.0)
+        obi_excess = max((obi_abs / max(self.obi_thr, 1e-6)) - 1.0, 0.0)
+        wall_excess = max((wall_strength / max(self.wall_str_thr, 1e-6)) - 1.0, 0.0)
+        shift_excess = max((shift_peak / max(self.shift_z_thr, 1e-6)) - 1.0, 0.0)
+        event_score = float(
+            0.30 * vol_excess
+            + 0.30 * obi_excess
+            + 0.20 * wall_excess
+            + 0.20 * shift_excess
+            + 0.50 * max(trigger_count - 1.0, 0.0)
+        )
+        base_passed = bool(trigger_count > 0)
+        score_passed = bool(event_score >= self.score_threshold) if base_passed else False
+        passed = bool(base_passed and score_passed)
+        if base_passed and not score_passed:
+            reasons.append(f"score<{self.score_threshold:.3f}")
         return {
             "passed": passed,
             "reason": "|".join(reasons) if reasons else "quiet",
@@ -573,6 +618,13 @@ class EventGate:
                 "cond_wall": cond_wall,
                 "cond_shift": cond_shift,
                 "shift_hits": shift_hits,
+                "trigger_count": trigger_count,
+                "event_score": event_score,
+                "score_threshold": float(self.score_threshold),
+                "base_passed": base_passed,
+                "score_passed": score_passed,
+                "vol_ratio": vol_ratio,
+                "shift_peak": float(shift_peak),
             },
         }
 
@@ -922,7 +974,9 @@ def kalman_trend(
         kalman_price[i] = x[0]
         slopes[i] = x[1]
 
-    max_abs_slope = float(np.abs(slopes).max()) + 1e-10
+    abs_slopes = np.abs(slopes)
+    max_abs_slope = np.maximum.accumulate(abs_slopes)
+    max_abs_slope = np.where(max_abs_slope > 1e-10, max_abs_slope, 1e-10)
     norm_slope = slopes / max_abs_slope
 
     trend_label = np.where(
