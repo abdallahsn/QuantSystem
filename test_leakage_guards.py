@@ -518,6 +518,36 @@ class LeakageGuardTests(unittest.TestCase):
             self.assertEqual(len(np.intersect1d(seen, test_idx)), 0)
             seen = np.r_[seen, np.asarray(test_idx, dtype=np.int64)]
 
+    def test_walk_forward_expanding_coverage_comes_from_prefix_holdout_not_tiny_folds(self):
+        low_fold_splits = list(
+            walk_forward_expanding(
+                n_samples=3913,
+                n_folds=5,
+                test_size=0.10,
+                embargo_pct=0.02,
+                min_train_pct=0.20,
+                min_train_rows=200,
+            )
+        )
+        high_fold_splits = list(
+            walk_forward_expanding(
+                n_samples=3913,
+                n_folds=9,
+                test_size=0.10,
+                embargo_pct=0.02,
+                min_train_pct=0.20,
+                min_train_rows=200,
+            )
+        )
+
+        self.assertEqual(len(low_fold_splits), 9)
+        self.assertEqual(len(high_fold_splits), 9)
+        self.assertGreaterEqual(min(len(test_idx) for _, test_idx in low_fold_splits), 300)
+        self.assertEqual(
+            sum(len(test_idx) for _, test_idx in low_fold_splits),
+            sum(len(test_idx) for _, test_idx in high_fold_splits),
+        )
+
     def test_feature_factory_accepts_legacy_catboost_only_schema(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             schema = {

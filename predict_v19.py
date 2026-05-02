@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.dynamic_labels import EventGate
 from modules.feature_artifact_v19 import load_feature_artifact
-from modules.feature_factory_v19 import infer_meta_feature_layout
+from modules.feature_factory_v19 import apply_scaler_params_to_frame, infer_meta_feature_layout
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -113,6 +113,7 @@ class V19PredictionEngine:
 
         self.pre = V19FeaturePreprocessor(models_dir)
         self.factory = self.pre.factory
+        self.scaler_params = self.pre.scaler_params
         self.schema = self.factory.schema
         self.seq_len = self.factory.seq_len
         self.stat_features = self.factory.stat_features
@@ -373,6 +374,18 @@ class V19PredictionEngine:
                 raise ValueError(f'Unsupported base model in schema: {name}')
         return np.concatenate(blocks, axis=1).astype(np.float32)
 
+    def _build_base_model_stat_matrix(self, stat_df: pd.DataFrame) -> np.ndarray:
+        # Tree base models are trained on the same scaler params but without
+        # clipping, so we reconstruct that view from the preserved raw columns.
+        raw_data = {}
+        for col in self.stat_features:
+            raw_col = f"raw__{col}"
+            src = raw_col if raw_col in stat_df.columns else col
+            raw_data[col] = pd.to_numeric(stat_df[src], errors="coerce").fillna(0.0).astype(np.float32)
+        raw_df = pd.DataFrame(raw_data, index=stat_df.index)
+        scaled = apply_scaler_params_to_frame(raw_df, self.scaler_params, clip_range=None)
+        return scaled[self.stat_features].values.astype(np.float32)
+
     def _apply_long_calibrator(self, probs: np.ndarray) -> np.ndarray:
         arr = np.asarray(probs, dtype=np.float32)
         if self.cb_calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
@@ -450,6 +463,7 @@ class V19PredictionEngine:
         meta_override: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         X_stat = stat_df[self.stat_features].values.astype(np.float32)
+        base_model_X_stat = self._build_base_model_stat_matrix(stat_df)
         if meta_override is not None:
             meta_override = np.asarray(meta_override, dtype=np.float32)
             if meta_override.ndim == 1:
@@ -462,7 +476,7 @@ class V19PredictionEngine:
             cb_probs = meta_override[:, :self.base_prob_dim]
             regime_meta = meta_override[:, self.base_prob_dim:expected_dim]
         else:
-            cb_probs = self._get_base_model_prob_block(X_stat)
+            cb_probs = self._get_base_model_prob_block(base_model_X_stat)
             regime_meta = self._get_regime_meta_block(stat_df)
         if visual_emb is None:
             visual_emb = np.zeros((len(stat_df), len(self.visual_features)), dtype=np.float32)

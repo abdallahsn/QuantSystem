@@ -190,7 +190,21 @@ def normalize_timestamp_columns(
     return out
 
 
-def apply_scaler_params_to_frame(df: pd.DataFrame, scaler_params: dict) -> pd.DataFrame:
+def _clip_numeric_series(
+    series: pd.Series,
+    clip_range: tuple[float, float] | None,
+) -> pd.Series:
+    if clip_range is None:
+        return series
+    clip_low, clip_high = clip_range
+    return series.clip(float(clip_low), float(clip_high))
+
+
+def apply_scaler_params_to_frame(
+    df: pd.DataFrame,
+    scaler_params: dict,
+    clip_range: tuple[float, float] | None = (-10.0, 10.0),
+) -> pd.DataFrame:
     out = df.copy()
     for col, p in scaler_params.items():
         if col not in out.columns:
@@ -201,10 +215,16 @@ def apply_scaler_params_to_frame(df: pd.DataFrame, scaler_params: dict) -> pd.Da
         if typ == 'binary':
             out[col] = s
         elif typ == 'robust':
-            out[col] = ((s - p.get('median', 0.0)) / max(p.get('iqr', 0.0), 1e-8)).clip(-10, 10)
+            out[col] = _clip_numeric_series(
+                (s - p.get('median', 0.0)) / max(p.get('iqr', 0.0), 1e-8),
+                clip_range,
+            )
         elif typ == 'minmax':
             rng = max(float(p.get('max', 0.0)) - float(p.get('min', 0.0)), 1e-8)
-            out[col] = ((s - float(p.get('min', 0.0))) / rng * 2 - 1).clip(-10, 10)
+            out[col] = _clip_numeric_series(
+                (s - float(p.get('min', 0.0))) / rng * 2 - 1,
+                clip_range,
+            )
         else:
             out[col] = 0.0
     return out

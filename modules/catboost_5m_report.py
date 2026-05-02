@@ -105,7 +105,11 @@ def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
 
     scaler_params = _load_scaler_params(models_dir)
     raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
-    X_stat = _apply_scaler_to_stat_frame(raw_stat, scaler_params).values.astype(np.float32)
+    X_stat = _apply_scaler_to_stat_frame(
+        raw_stat,
+        scaler_params,
+        clip_range=None,
+    ).values.astype(np.float32)
 
     model = CatBoostClassifier()
     model.load_model(model_path)

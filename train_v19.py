@@ -102,6 +102,7 @@ META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=True)
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
 VISUAL_COVERAGE_FAIL_FAST = True
+TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
     'label_end_ts',
@@ -696,15 +697,35 @@ def _fit_scaler_params_from_frame(frame: pd.DataFrame) -> dict:
     return params
 
 
-def _apply_scaler_to_stat_frame(frame: pd.DataFrame, scaler_params: dict) -> pd.DataFrame:
-    scaled = apply_scaler_params_to_frame(frame, scaler_params or {})
+def _apply_scaler_to_stat_frame(
+    frame: pd.DataFrame,
+    scaler_params: dict,
+    clip_range: tuple[float, float] | None = (-10.0, 10.0),
+) -> pd.DataFrame:
+    scaled = apply_scaler_params_to_frame(frame, scaler_params or {}, clip_range=clip_range)
     return scaled[frame.columns].astype(np.float32)
 
 
-def _build_scaled_stat_matrix(df: pd.DataFrame, cols: list[str], scaler_params: dict) -> np.ndarray:
+def _build_scaled_stat_matrix(
+    df: pd.DataFrame,
+    cols: list[str],
+    scaler_params: dict,
+    clip_range: tuple[float, float] | None = (-10.0, 10.0),
+) -> np.ndarray:
     raw_frame = _raw_stat_frame(df, cols)
-    scaled = _apply_scaler_to_stat_frame(raw_frame, scaler_params)
+    scaled = _apply_scaler_to_stat_frame(raw_frame, scaler_params, clip_range=clip_range)
     return scaled[cols].values.astype(np.float32)
+
+
+def _adaptive_tree_early_stopping_rounds(train_rows: int, has_eval_set: bool) -> int | None:
+    if not has_eval_set:
+        return None
+    train_rows = max(int(train_rows), 0)
+    if train_rows < 1_000:
+        return 20
+    if train_rows < 3_000:
+        return 30
+    return 50
 
 
 def _project_sequence_aux_context(
@@ -1205,6 +1226,7 @@ def stage1_oof_meta(
     def _cb_predict(train_idx, test_idx, fold_no):
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
+        early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
@@ -1227,8 +1249,16 @@ def stage1_oof_meta(
                 'mode': 'priors_only_single_class_train',
             }
         fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
-        X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
-        X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
+        X_fit = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[fit_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
+        X_test = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[test_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
         print(
             f"      CatBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
             f"| scaler_fit_rows={len(fit_idx):,}"
@@ -1241,12 +1271,14 @@ def stage1_oof_meta(
         )
         model = CatBoostClassifier(
             iterations=1000,
-            depth=5,
+            depth=4,
             learning_rate=0.01,
             l2_leaf_reg=3.0,
+            bootstrap_type='Bernoulli',
+            subsample=0.80,
             loss_function='Logloss',
             eval_metric='Logloss',
-            early_stopping_rounds=50 if inner_val is not None else None,
+            early_stopping_rounds=early_stopping_rounds,
             use_best_model=inner_val is not None,
             verbose=50,
             random_seed=42 + fold_no,
@@ -1256,7 +1288,11 @@ def stage1_oof_meta(
         tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
         eval_set = None
         if inner_val is not None:
-            X_val = _apply_scaler_to_stat_frame(raw_stat.iloc[inner_val], fold_scaler).values.astype(np.float32)
+            X_val = _apply_scaler_to_stat_frame(
+                raw_stat.iloc[inner_val],
+                fold_scaler,
+                clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+            ).values.astype(np.float32)
             eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
         model.fit(tr_pool, eval_set=eval_set, plot=False)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
@@ -1273,11 +1309,17 @@ def stage1_oof_meta(
             average='macro',
             zero_division=0,
         )
+        cb_best_iteration = None
+        if inner_val is not None:
+            best_iter = getattr(model, 'get_best_iteration', lambda: None)()
+            cb_best_iteration = None if best_iter is None else int(best_iter)
         return preds, {
             'directional_precision': float(precision),
             'directional_recall': float(recall),
             'directional_f1': float(f1),
             'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
+            'best_iteration': cb_best_iteration,
+            'early_stopping_rounds': early_stopping_rounds,
         }
 
     oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
@@ -1288,6 +1330,7 @@ def stage1_oof_meta(
     def _xgb_predict(train_idx, test_idx, fold_no):
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
+        early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
@@ -1310,8 +1353,16 @@ def stage1_oof_meta(
                 'mode': 'priors_only_single_class_train',
             }
         fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
-        X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
-        X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
+        X_fit = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[fit_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
+        X_test = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[test_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
         print(
             f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
             f"| scaler_fit_rows={len(fit_idx):,}"
@@ -1325,23 +1376,27 @@ def stage1_oof_meta(
             'n_estimators': 800,
             'max_depth': 4,
             'learning_rate': 0.03,
-            'subsample': 0.90,
-            'colsample_bytree': 0.90,
+            'subsample': 0.80,
+            'colsample_bytree': 0.80,
             'reg_lambda': 3.0,
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
             'random_state': 84 + fold_no,
             'tree_method': 'hist',
         }
-        if inner_val is not None:
-            model_kwargs['early_stopping_rounds'] = 50
+        if early_stopping_rounds is not None:
+            model_kwargs['early_stopping_rounds'] = early_stopping_rounds
         model = XGBClassifier(**model_kwargs)
         fit_kwargs = {
             'sample_weight': sw,
             'verbose': False,
         }
         if inner_val is not None:
-            X_val = _apply_scaler_to_stat_frame(raw_stat.iloc[inner_val], fold_scaler).values.astype(np.float32)
+            X_val = _apply_scaler_to_stat_frame(
+                raw_stat.iloc[inner_val],
+                fold_scaler,
+                clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+            ).values.astype(np.float32)
             fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
         model.fit(X_fit, y[fit_idx], **fit_kwargs)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
@@ -1358,11 +1413,14 @@ def stage1_oof_meta(
             average='macro',
             zero_division=0,
         )
+        xgb_best_iteration = getattr(model, 'best_iteration', None) if early_stopping_rounds is not None else None
         return preds, {
             'directional_precision': float(precision),
             'directional_recall': float(recall),
             'directional_f1': float(f1),
             'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
+            'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
+            'early_stopping_rounds': early_stopping_rounds,
         }
 
     xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(
@@ -1414,7 +1472,11 @@ def stage1_oof_meta(
             'Refusing to fall back to a full-data scaler.'
         )
     final_scaler = inference_scaler_params
-    X_final = _apply_scaler_to_stat_frame(raw_stat, final_scaler).values.astype(np.float32)
+    X_final = _apply_scaler_to_stat_frame(
+        raw_stat,
+        final_scaler,
+        clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+    ).values.astype(np.float32)
     final_sw = _quality_sample_weights(
         df,
         strong_weight=quality_weight_strong,
@@ -1422,12 +1484,13 @@ def stage1_oof_meta(
     )
     final_model = CatBoostClassifier(
         iterations=1000,
-        depth=5,
+        depth=4,
         learning_rate=0.01,
         l2_leaf_reg=3.0,
+        bootstrap_type='Bernoulli',
+        subsample=0.80,
         loss_function='Logloss',
         eval_metric='Logloss',
-        early_stopping_rounds=50,
         use_best_model=False,
         verbose=50,
         random_seed=42,
@@ -1445,8 +1508,8 @@ def stage1_oof_meta(
         n_estimators=800,
         max_depth=4,
         learning_rate=0.03,
-        subsample=0.90,
-        colsample_bytree=0.90,
+        subsample=0.80,
+        colsample_bytree=0.80,
         reg_lambda=3.0,
         objective='binary:logistic',
         eval_metric='logloss',

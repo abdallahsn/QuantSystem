@@ -4,10 +4,12 @@ import numpy as np
 import pandas as pd
 
 from prepare_training_data import _build_refinery_split_context, _fit_regime_surface, _select_event_rich_lob_emit_positions
+from modules.feature_factory_v19 import apply_scaler_params_to_frame
 from modules.regime_classifier import RegimeClassifier, _build_regime_features
 from modules.meta_learner import MetaLearnerLSTM
 from train_v19 import (
     _align_lob_to_rows,
+    _adaptive_tree_early_stopping_rounds,
     _resolve_default_lob_paths,
     _resolve_meta_learner_profile,
     build_event_training_view,
@@ -196,6 +198,24 @@ def test_build_event_training_view_uses_continuous_conf_target():
     assert info["conf_target_std"] > 0.0
 
 
+def test_build_event_training_view_excludes_neutral_rows_from_stage1_surface():
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.date_range("2025-01-01", periods=5, freq="s"),
+            "event_flag": [1, 1, 1, 1, 1],
+            "train_event_flag": [1, 1, 1, 1, 1],
+            "bias_label": [0, 1, 2, 0, 2],
+            "signal_quality": [2, 1, 2, 1, 0],
+            "event_score": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+
+    event_df, info = build_event_training_view(df)
+
+    assert sorted(event_df["bias_label"].unique().tolist()) == [0, 1]
+    assert info["bias_counts"] == {"0": 2, "1": 1}
+
+
 def test_build_event_training_view_fits_score_normalization_on_train_prefix_only():
     base = pd.DataFrame(
         {
@@ -220,6 +240,24 @@ def test_build_event_training_view_fits_score_normalization_on_train_prefix_only
     )
     assert base_info["score_fit_rows"] == shifted_info["score_fit_rows"]
     assert base_info["score_fit_max"] == shifted_info["score_fit_max"]
+
+
+def test_apply_scaler_params_can_skip_clipping_for_tree_models():
+    frame = pd.DataFrame({"cvd": [0.0, 1000.0]})
+    scaler_params = {"cvd": {"type": "robust", "median": 0.0, "iqr": 1.0}}
+
+    clipped = apply_scaler_params_to_frame(frame, scaler_params)
+    unclipped = apply_scaler_params_to_frame(frame, scaler_params, clip_range=None)
+
+    assert float(clipped["cvd"].iloc[1]) == 10.0
+    assert float(unclipped["cvd"].iloc[1]) == 1000.0
+
+
+def test_adaptive_tree_early_stopping_rounds_shrinks_for_small_folds():
+    assert _adaptive_tree_early_stopping_rounds(300, True) == 20
+    assert _adaptive_tree_early_stopping_rounds(1500, True) == 30
+    assert _adaptive_tree_early_stopping_rounds(5000, True) == 50
+    assert _adaptive_tree_early_stopping_rounds(300, False) is None
 
 
 def test_regime_features_build_cvd_persistence_from_constant_cvd_delta():
