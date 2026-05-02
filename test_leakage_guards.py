@@ -21,8 +21,9 @@ from modules.feature_factory_v19 import V19FeatureFactory
 from modules.labels_v19 import _compute_adaptive_horizons, build_causal_event_labels
 from modules.dynamic_labels import kalman_trend
 from modules.meta_learner import _input_shape_matches
+from modules.oof_stacking import run_sequential_oof
 from modules.regime_classifier import RegimeClassifier, REGIME_META_SCORE_COLS, REGIME_ONE_HOT_COLS
-from train_v19 import _assert_single_contract_df, _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, build_inference_scaler_params
+from train_v19 import _assert_single_contract_df, _load_required_stage1_artifacts, _project_sequence_aux_context, _raw_stat_frame, _time_series, build_inference_scaler_params
 from modules.failsafe_v19 import evaluate_system_health, decide_runtime_mode
 
 
@@ -245,6 +246,24 @@ class LeakageGuardTests(unittest.TestCase):
         self.assertEqual(info['scaler_train_rows'], 60)
         self.assertEqual(params['cvd']['type'], 'robust')
         self.assertAlmostEqual(params['cvd']['median'], 30.5)
+
+    def test_time_series_rejects_missing_or_invalid_required_timestamps(self):
+        with self.assertRaises(ValueError):
+            _time_series(pd.DataFrame({'x': [1, 2, 3]}), 'ts_event')
+        with self.assertRaises(ValueError):
+            _time_series(pd.DataFrame({'ts_event': [None, '2025-01-01 00:00:02', None]}), 'ts_event')
+
+    def test_run_sequential_oof_rejects_overlapping_test_rows(self):
+        splits = [
+            (np.array([0, 1], dtype=np.int32), np.array([2, 3], dtype=np.int32)),
+            (np.array([0, 1, 2], dtype=np.int32), np.array([3, 4], dtype=np.int32)),
+        ]
+
+        def _predictor(train_idx, test_idx, fold_no):
+            return np.zeros((len(test_idx), 2), dtype=np.float32), {'fold_no': fold_no}
+
+        with self.assertRaises(ValueError):
+            run_sequential_oof(5, 2, splits, _predictor)
 
     def test_v19_label_runtime_requires_explicit_override_for_fallback(self):
         import prepare_training_data as prep

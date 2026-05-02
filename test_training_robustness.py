@@ -196,6 +196,32 @@ def test_build_event_training_view_uses_continuous_conf_target():
     assert info["conf_target_std"] > 0.0
 
 
+def test_build_event_training_view_fits_score_normalization_on_train_prefix_only():
+    base = pd.DataFrame(
+        {
+            "ts_event": pd.date_range("2025-01-01", periods=4, freq="s"),
+            "event_flag": [1, 1, 1, 1],
+            "train_event_flag": [1, 1, 1, 1],
+            "bias_label": [0, 1, 0, 1],
+            "signal_quality": [2, 2, 2, 2],
+            "event_score": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    shifted = base.copy()
+    shifted.loc[3, "event_score"] = 40.0
+
+    base_view, base_info = build_event_training_view(base)
+    shifted_view, shifted_info = build_event_training_view(shifted)
+
+    np.testing.assert_allclose(
+        base_view["conf_target"].iloc[:3].to_numpy(dtype=np.float32),
+        shifted_view["conf_target"].iloc[:3].to_numpy(dtype=np.float32),
+        atol=1e-7,
+    )
+    assert base_info["score_fit_rows"] == shifted_info["score_fit_rows"]
+    assert base_info["score_fit_max"] == shifted_info["score_fit_max"]
+
+
 def test_regime_features_build_cvd_persistence_from_constant_cvd_delta():
     df = pd.DataFrame(
         {

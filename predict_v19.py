@@ -4,7 +4,7 @@ predict_v19.py - QuantSystem V19 inference engine
 V19 inference uses the exact feature schema and scaler artifacts produced by
 the training pipeline, then reconstructs the same step vector used in training:
 
-  [25 scaled statistical features] + [2 CatBoost probs] +
+  [25 scaled statistical features] + [CatBoost/XGBoost directional probs] +
   [4 regime one-hot + 3 regime scores] + [8 visual embeddings if available]
 """
 
@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.dynamic_labels import EventGate
 from modules.feature_artifact_v19 import load_feature_artifact
+from modules.feature_factory_v19 import infer_meta_feature_layout
 from modules.logging_v19 import DataQualityLogger, EventLogWriter, PredictionLogger, RiskLogger, feature_hash_from_dict
 from modules.meta_learner import MetaLearnerLSTM
 from modules.oof_stacking import align_probability_columns
@@ -51,9 +52,16 @@ try:
 except ImportError:
     CB_AVAILABLE = False
 
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 2
+N_XGB_PROBS = 2
 
 
 def _directional_metrics_from_rows(rows: list[dict]) -> dict:
@@ -111,7 +119,17 @@ class V19PredictionEngine:
         self.meta_features = self.factory.meta_features
         self.visual_features = self.factory.visual_features
         self.input_dim = self.factory.input_dim
+        self.meta_layout = infer_meta_feature_layout(self.meta_features)
+        self.base_models = list(self.meta_layout.get('base_models', []))
+        self.base_prob_dim = int(self.meta_layout.get('base_prob_dim', 0))
+        self.regime_meta_features = list(self.meta_layout.get('regime_meta_cols', []))
         self.sequence_aux_mode = str(self.factory.schema.get('sequence_aux_mode', 'full_window')).strip() or 'full_window'
+        print(
+            "  Meta feature layout: "
+            f"base_models={[m['name'] for m in self.base_models]} "
+            f"| base_prob_dim={self.base_prob_dim} "
+            f"| regime_dim={len(self.regime_meta_features)}"
+        )
         gate_cfg = self.factory.schema.get('event_gate', {}) or {}
         self.event_gate = EventGate(
             roll_window=int(gate_cfg.get('roll_window', 50)),
@@ -141,6 +159,7 @@ class V19PredictionEngine:
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
         self.cb_classes = None
         cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
+        required_base_models = {str(spec.get('name')) for spec in self.base_models}
         if os.path.exists(cb_classes_path):
             try:
                 with open(cb_classes_path, 'r') as f:
@@ -153,6 +172,10 @@ class V19PredictionEngine:
             print(f"  ✅ CatBoost V19: {cb_path}")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
+        if 'catboost' in required_base_models and self.cb_advisor is None:
+            raise FileNotFoundError(
+                "❌ CatBoost artifact/runtime required by the feature schema but was not found."
+            )
         calibrator_path = os.path.join(models_dir, artifacts.get('catboost_calibrator', 'catboost_calibrator_v19.pkl'))
         if os.path.exists(calibrator_path):
             try:
@@ -163,6 +186,27 @@ class V19PredictionEngine:
                 self.cb_calibrator = None
                 print(f"  ⚠️ CatBoost calibrator unavailable: {exc}")
 
+        self.xgb_advisor = None
+        self.xgb_classes = None
+        xgb_path = os.path.join(models_dir, artifacts.get('xgboost_model', 'xgboost_advisor_v19.json'))
+        xgb_classes_path = os.path.join(models_dir, artifacts.get('xgboost_classes', 'xgboost_classes_v19.json'))
+        if os.path.exists(xgb_classes_path):
+            try:
+                with open(xgb_classes_path, 'r') as f:
+                    self.xgb_classes = json.load(f).get('classes')
+            except Exception:
+                self.xgb_classes = None
+        if XGB_AVAILABLE and os.path.exists(xgb_path):
+            self.xgb_advisor = XGBClassifier()
+            self.xgb_advisor.load_model(xgb_path)
+            print(f"  ✅ XGBoost V19: {xgb_path}")
+        else:
+            print(f"  ⚠️ XGBoost V19 missing: {xgb_path}")
+        if 'xgboost' in required_base_models and self.xgb_advisor is None:
+            raise FileNotFoundError(
+                "❌ XGBoost artifact/runtime required by the feature schema but was not found."
+            )
+
         self.regime_clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         regime_ok = self.regime_clf.load(models_dir)
         if regime_ok:
@@ -170,7 +214,7 @@ class V19PredictionEngine:
         else:
             print("  ⚠️ Regime classifier missing")
 
-        regime_meta_required = max(len(self.meta_features) - N_CB_PROBS, 0) > 0
+        regime_meta_required = len(self.regime_meta_features) > 0
         if regime_meta_required and not regime_ok:
             raise FileNotFoundError(
                 "❌ Regime classifier artifact is required by the feature schema but was not found."
@@ -300,6 +344,35 @@ class V19PredictionEngine:
         except Exception:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
 
+    def _get_xgb_probs(self, X_stat: np.ndarray) -> np.ndarray:
+        n = X_stat.shape[0]
+        if self.xgb_advisor is None:
+            return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
+        try:
+            probs = self.xgb_advisor.predict_proba(X_stat)
+            return align_probability_columns(
+                probs,
+                N_XGB_PROBS,
+                classes=getattr(self.xgb_advisor, 'classes_', None) or self.xgb_classes,
+            )
+        except Exception:
+            return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
+
+    def _get_base_model_prob_block(self, X_stat: np.ndarray) -> np.ndarray:
+        n = X_stat.shape[0]
+        if not self.base_models:
+            return np.zeros((n, 0), dtype=np.float32)
+        blocks = []
+        for spec in self.base_models:
+            name = str(spec.get('name', '')).strip().lower()
+            if name == 'catboost':
+                blocks.append(self._get_cb_probs(X_stat))
+            elif name == 'xgboost':
+                blocks.append(self._get_xgb_probs(X_stat))
+            else:
+                raise ValueError(f'Unsupported base model in schema: {name}')
+        return np.concatenate(blocks, axis=1).astype(np.float32)
+
     def _apply_long_calibrator(self, probs: np.ndarray) -> np.ndarray:
         arr = np.asarray(probs, dtype=np.float32)
         if self.cb_calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
@@ -331,7 +404,7 @@ class V19PredictionEngine:
 
     def _get_regime_meta_block(self, stat_df: pd.DataFrame) -> np.ndarray:
         n = len(stat_df)
-        expected_dim = max(len(self.meta_features) - N_CB_PROBS, 0)
+        expected_dim = len(self.regime_meta_features)
         out = np.zeros((n, expected_dim), dtype=np.float32)
         if expected_dim == 0:
             return out
@@ -342,7 +415,7 @@ class V19PredictionEngine:
             meta_df = self.regime_clf.predict_regime_meta(recent_df).iloc[-1:]
         else:
             meta_df = self.regime_clf.predict_regime_meta(stat_df)
-        meta_cols = list(self.meta_features[N_CB_PROBS:])
+        meta_cols = list(self.regime_meta_features)
         missing = [col for col in meta_cols if col not in meta_df.columns]
         if missing:
             raise ValueError(
@@ -386,10 +459,10 @@ class V19PredictionEngine:
                 raise ValueError(
                     f'❌ meta override columns ({meta_override.shape[1]}) do not match schema ({expected_dim})'
                 )
-            cb_probs = meta_override[:, :N_CB_PROBS]
-            regime_meta = meta_override[:, N_CB_PROBS:expected_dim]
+            cb_probs = meta_override[:, :self.base_prob_dim]
+            regime_meta = meta_override[:, self.base_prob_dim:expected_dim]
         else:
-            cb_probs = self._get_cb_probs(X_stat)
+            cb_probs = self._get_base_model_prob_block(X_stat)
             regime_meta = self._get_regime_meta_block(stat_df)
         if visual_emb is None:
             visual_emb = np.zeros((len(stat_df), len(self.visual_features)), dtype=np.float32)
@@ -400,7 +473,11 @@ class V19PredictionEngine:
         if self.meta is None:
             last_step = seq[-1]
             offset = len(self.stat_features)
-            probs = last_step[offset:offset + N_CB_PROBS]
+            base_block = last_step[offset:offset + self.base_prob_dim]
+            if base_block.size >= N_CB_PROBS:
+                probs = base_block.reshape(-1, N_CB_PROBS).mean(axis=0).astype(np.float32)
+            else:
+                probs = np.ones(N_CB_PROBS, dtype=np.float32) / N_CB_PROBS
             bias_idx = int(np.argmax(probs))
             return {
                 'bias': BIAS_LABELS[bias_idx],

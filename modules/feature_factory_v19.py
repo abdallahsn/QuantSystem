@@ -12,7 +12,28 @@ import numpy as np
 import pandas as pd
 
 EXPECTED_SCHEMA_VERSION = 'v19-event-binary'
-EXPECTED_META_FEATURES = 9
+BASE_MODEL_META_GROUPS = (
+    ('catboost', ('cb_prob_long', 'cb_prob_short')),
+    ('xgboost', ('xgb_prob_long', 'xgb_prob_short')),
+)
+REGIME_META_FEATURES = (
+    'cluster_0',
+    'cluster_1',
+    'cluster_2',
+    'cluster_3',
+    'regime_lowliq_score',
+    'regime_trend_score',
+    'regime_volatile_score',
+)
+LEGACY_META_FEATURES = tuple(BASE_MODEL_META_GROUPS[0][1]) + REGIME_META_FEATURES
+FULL_META_FEATURES = tuple(
+    [*BASE_MODEL_META_GROUPS[0][1], *BASE_MODEL_META_GROUPS[1][1], *REGIME_META_FEATURES]
+)
+SUPPORTED_META_FEATURES = {
+    LEGACY_META_FEATURES: 'legacy_catboost_only',
+    FULL_META_FEATURES: 'catboost_xgboost',
+}
+EXPECTED_META_FEATURES = len(FULL_META_FEATURES)
 
 
 DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')
@@ -63,6 +84,89 @@ FORBIDDEN_STAT_FEATURES = {
     'is_expansion',
     'label_horizon_steps',
 }
+
+
+def resolve_meta_feature_names(
+    *,
+    include_xgboost: bool = True,
+    meta_dim: int | None = None,
+) -> list[str]:
+    if meta_dim is not None:
+        if int(meta_dim) == len(LEGACY_META_FEATURES):
+            return list(LEGACY_META_FEATURES)
+        if int(meta_dim) == len(FULL_META_FEATURES):
+            return list(FULL_META_FEATURES)
+        raise ValueError(f'Unsupported meta feature dimension: {meta_dim}')
+    return list(FULL_META_FEATURES if include_xgboost else LEGACY_META_FEATURES)
+
+
+def infer_meta_feature_layout(meta_features: Iterable[str]) -> dict:
+    names = [str(col) for col in meta_features]
+    if tuple(names) in SUPPORTED_META_FEATURES:
+        base_models = []
+        offset = 0
+        for model_name, cols in BASE_MODEL_META_GROUPS:
+            cols = list(cols)
+            if names[offset:offset + len(cols)] != cols:
+                continue
+            base_models.append(
+                {
+                    'name': model_name,
+                    'prob_cols': cols,
+                    'start': int(offset),
+                    'end': int(offset + len(cols)),
+                }
+            )
+            offset += len(cols)
+        return {
+            'surface': SUPPORTED_META_FEATURES[tuple(names)],
+            'base_models': base_models,
+            'base_prob_dim': int(offset),
+            'regime_meta_cols': list(REGIME_META_FEATURES),
+        }
+
+    if len(names) < len(REGIME_META_FEATURES):
+        raise ValueError(
+            f'Unsupported meta feature surface: expected at least {len(REGIME_META_FEATURES)} columns, got {len(names)}'
+        )
+
+    regime_cols = names[-len(REGIME_META_FEATURES):]
+    if regime_cols != list(REGIME_META_FEATURES):
+        raise ValueError(
+            'Unsupported meta feature surface: invalid regime meta suffix '
+            f'{regime_cols}, expected {list(REGIME_META_FEATURES)}'
+        )
+
+    base_block = names[:-len(REGIME_META_FEATURES)]
+    offset = 0
+    base_models = []
+    for model_name, cols in BASE_MODEL_META_GROUPS:
+        cols = list(cols)
+        if base_block[offset:offset + len(cols)] != cols:
+            break
+        base_models.append(
+            {
+                'name': model_name,
+                'prob_cols': cols,
+                'start': int(offset),
+                'end': int(offset + len(cols)),
+            }
+        )
+        offset += len(cols)
+
+    if offset != len(base_block) or not base_models:
+        supported = [list(surface) for surface in SUPPORTED_META_FEATURES]
+        raise ValueError(
+            'Unsupported meta feature surface. '
+            f'Got {names}. Supported surfaces: {supported}'
+        )
+
+    return {
+        'surface': 'custom_supported_order',
+        'base_models': base_models,
+        'base_prob_dim': int(offset),
+        'regime_meta_cols': list(REGIME_META_FEATURES),
+    }
 
 
 def _load_json(path: str, required: bool = True):
@@ -197,10 +301,7 @@ class V19FeatureFactory:
                 f'Unsupported feature schema version: {version or "<missing>"}. '
                 f'Expected {EXPECTED_SCHEMA_VERSION}.'
             )
-        if len(self.meta_features) != EXPECTED_META_FEATURES:
-            raise ValueError(
-                f'Unsupported meta feature surface: expected {EXPECTED_META_FEATURES} dims, got {len(self.meta_features)}'
-            )
+        infer_meta_feature_layout(self.meta_features)
         leaked = sorted(set(self.stat_features) & FORBIDDEN_STAT_FEATURES)
         if leaked:
             raise ValueError(

@@ -17,7 +17,6 @@ import argparse
 import datetime
 import json
 import os
-import pickle
 import shutil
 import sys
 import tempfile
@@ -49,7 +48,9 @@ from modules.dynamic_labels import (
 from modules.feature_factory_v19 import (
     DEFAULT_PASSTHROUGH_COLS,
     apply_scaler_params_to_frame,
+    infer_meta_feature_layout,
     prepare_feature_frame,
+    resolve_meta_feature_names,
 )
 from modules.feature_artifact_v19 import load_artifact_manifest, load_feature_artifact, resolve_artifact_root
 from modules.gpu_config import detect_gpu
@@ -73,9 +74,16 @@ try:
 except ImportError:
     CB_AVAILABLE = False
 
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 2
+N_XGB_PROBS = 2
 SEQ_LEN = 50
 SCHEMA_VERSION = 'v19-event-binary'
 TRAIN_MODE_EVENT_BINARY = 'event_binary'
@@ -89,11 +97,8 @@ STAGE_TO_PHASE = {
     2: PHASE_VISUAL,
     3: PHASE_TRAIN,
 }
-META_FEATURE_NAMES = [
-    'cb_prob_long', 'cb_prob_short',
-    *REGIME_ONE_HOT_COLS,
-    *REGIME_META_SCORE_COLS,
-]
+LEGACY_META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=False)
+META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=True)
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
 VISUAL_COVERAGE_FAIL_FAST = True
@@ -294,6 +299,8 @@ def _fit_long_isotonic_calibrator(
         }
     calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
     calibrated = calibrator.fit_transform(p_long[mask], y_long)
+    raw_probs = np.c_[1.0 - p_long[mask], p_long[mask]]
+    cal_probs = np.c_[1.0 - calibrated, calibrated]
     report = {
         'enabled': True,
         'rows': int(mask.sum()),
@@ -301,8 +308,8 @@ def _fit_long_isotonic_calibrator(
         'calibrated_brier': float(np.mean((calibrated - y_long) ** 2)),
         'raw_ece': _binary_ece(y_bias[mask], p_long[mask]),
         'calibrated_ece': _binary_ece(y_bias[mask], calibrated),
-        'raw_nll': float(log_loss(y_long, np.c_[p_long[mask], 1.0 - p_long[mask]], labels=[1, 0])),
-        'calibrated_nll': float(log_loss(y_long, np.c_[calibrated, 1.0 - calibrated], labels=[1, 0])),
+        'raw_nll': float(log_loss(y_long, raw_probs, labels=[0, 1])),
+        'calibrated_nll': float(log_loss(y_long, cal_probs, labels=[0, 1])),
     }
     return calibrator, report
 
@@ -328,6 +335,7 @@ def _fit_temperature_from_probs(y_bias: np.ndarray, probs: np.ndarray) -> tuple[
         return None, {'enabled': False, 'reason': 'insufficient_validation_probs', 'rows': int(mask.sum())}
     y_dir = y_bias[mask]
     probs = np.clip(probs[mask], 1e-6, 1.0 - 1e-6)
+    probs = probs / np.clip(probs.sum(axis=1, keepdims=True), 1e-9, None)
     logits = np.log(probs)
     temperatures = np.linspace(0.5, 3.0, 51)
     best_t = None
@@ -359,6 +367,21 @@ def _fit_temperature_from_probs(y_bias: np.ndarray, probs: np.ndarray) -> tuple[
         'raw_ece': _binary_ece(y_dir, probs[:, 0]),
         'calibrated_ece': _binary_ece(y_dir, cal_probs[:, 0]),
     }
+
+
+def _load_stage1_meta_feature_names(output_dir: str, meta_dim: int) -> list[str]:
+    names_path = os.path.join(output_dir, 'meta_feature_names_v19.json')
+    if os.path.exists(names_path):
+        with open(names_path) as f:
+            payload = json.load(f)
+        names = payload.get('meta_features')
+        if not isinstance(names, list) or len(names) != int(meta_dim):
+            raise ValueError(
+                f'❌ Stage1 meta feature names mismatch: expected {meta_dim} columns, got {names}'
+            )
+        infer_meta_feature_layout(names)
+        return [str(col) for col in names]
+    return resolve_meta_feature_names(meta_dim=int(meta_dim))
 
 
 def _write_feature_coverage_drift_report(
@@ -457,6 +480,11 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         raise ValueError("❌ 'bias_label' غير موجود — شغّل prepare_training_data.py --label_mode v19 أولاً")
     if 'ts_event' not in df.columns:
         raise ValueError("❌ 'ts_event' غير موجود — V19 يحتاج timestamps محفوظة في CSV")
+    if 'label_end_ts' not in df.columns:
+        raise ValueError(
+            "❌ 'label_end_ts' غير موجود — V19 hardened training requires label end timestamps "
+            "for chronological purging and leakage-safe validation."
+        )
 
     df = _sanitize_df(df)
     raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' in df.columns]
@@ -474,6 +502,26 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         passthrough_cols=TRAINING_PASSTHROUGH_COLS,
         timestamp_cols=('ts_event', 'label_end_ts'),
     )
+    ts_event = _time_series(df, 'ts_event')
+    label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
+    if not ts_event.is_monotonic_increasing:
+        print("  ⚠️ Input rows were not monotonic by ts_event — sorting chronologically before training")
+        df = df.assign(ts_event=ts_event, label_end_ts=label_end).sort_values('ts_event').reset_index(drop=True)
+        ts_event = _time_series(df, 'ts_event')
+        label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
+    invalid_horizon = (label_end < ts_event).to_numpy(dtype=bool)
+    if np.any(invalid_horizon):
+        bad_rows = np.flatnonzero(invalid_horizon)[:5].tolist()
+        raise ValueError(
+            "❌ Found label_end_ts earlier than ts_event. "
+            f"rows={int(np.sum(invalid_horizon))} sample_indices={bad_rows}"
+        )
+    print(
+        "  🕒 Timestamp Range: "
+        f"ts_event=[{ts_event.iloc[0]} → {ts_event.iloc[-1]}] | "
+        f"label_end_ts=[{label_end.iloc[0]} → {label_end.iloc[-1]}] | "
+        f"rows={len(df):,}"
+    )
     print(f"  Shape: {df.shape}")
     print(f"  Labels: {df['bias_label'].value_counts().to_dict()}")
     return df
@@ -484,6 +532,8 @@ def build_event_training_view(
     mode: str = TRAIN_MODE_EVENT_BINARY,
     quality_weight_strong: float = 2.0,
     quality_weight_weak: float = 1.0,
+    train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     if mode != TRAIN_MODE_EVENT_BINARY:
         raise ValueError(f'Unsupported training mode: {mode}')
@@ -531,12 +581,30 @@ def build_event_training_view(
         1.0,
         np.where(event_df['signal_quality'].values.astype(np.int8) == 1, 0.5, 0.0),
     ).astype(np.float32)
+    score_split_ctx = _sequence_split_context(
+        event_df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=_parse_optional_timestamp(split_time),
+    )
+    score_train_mask = np.asarray(score_split_ctx['train_row_ok'], dtype=bool)
+    if not np.any(score_train_mask):
+        fallback_rows = int(min(max(score_split_ctx['split_idx'], 1), len(event_df)))
+        if fallback_rows >= len(event_df) and len(event_df) > 1:
+            fallback_rows = len(event_df) - 1
+        score_train_mask = np.zeros(len(event_df), dtype=bool)
+        score_train_mask[:max(fallback_rows, 1)] = True
+        print(
+            "  ⚠️ Event score normalization fallback: "
+            f"no strict train rows via split guard; using prefix rows={int(np.sum(score_train_mask)):,}"
+        )
     event_score_values = event_df.get('event_score')
     if event_score_values is None:
         event_score_values = pd.Series(0.0, index=event_df.index, dtype=np.float32)
     event_scores = pd.to_numeric(event_score_values, errors='coerce').fillna(0.0).astype(np.float32)
-    score_min = float(event_scores.min()) if len(event_scores) else 0.0
-    score_max = float(event_scores.max()) if len(event_scores) else score_min
+    score_fit_values = event_scores.loc[score_train_mask]
+    score_min = float(score_fit_values.min()) if len(score_fit_values) else 0.0
+    score_max = float(score_fit_values.max()) if len(score_fit_values) else score_min
     score_rng = score_max - score_min
     if score_rng > 1e-8:
         normalized_event_score = ((event_scores - score_min) / score_rng).clip(0.0, 1.0).astype(np.float32)
@@ -562,6 +630,10 @@ def build_event_training_view(
         'quality_weight_weak': float(quality_weight_weak),
         'bias_counts': {str(k): int(v) for k, v in event_df['bias_label'].value_counts().to_dict().items()},
         'quality_counts': {str(k): int(v) for k, v in event_df['signal_quality'].value_counts().to_dict().items()},
+        'score_fit_rows': int(np.sum(score_train_mask)),
+        'score_fit_min': float(score_min),
+        'score_fit_max': float(score_max),
+        'score_fit_split_time': str(score_split_ctx['split_time']),
         'conf_target_mean': float(event_df['conf_target'].mean()) if len(event_df) else 0.0,
         'conf_target_std': float(event_df['conf_target'].std(ddof=0)) if len(event_df) else 0.0,
     }
@@ -570,7 +642,10 @@ def build_event_training_view(
         f"{info['rows_event_directional']:,}/{info['rows_full']:,} rows "
         f"({info['event_rate_full']:.1%}) via {event_col} "
         f"| raw_event={info['raw_event_rate_full']:.1%} "
-        f"| bias={info['bias_counts']} | quality={info['quality_counts']}"
+        f"| bias={info['bias_counts']} | quality={info['quality_counts']} "
+        f"| score_fit_rows={info['score_fit_rows']:,} "
+        f"| score_fit_range=[{info['score_fit_min']:.4f}, {info['score_fit_max']:.4f}] "
+        f"| split={info['score_fit_split_time']}"
     )
     return event_df, info
 
@@ -654,25 +729,35 @@ def _quality_sample_weights(df: pd.DataFrame, strong_weight: float = 2.0, weak_w
 
 
 def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
+    primary = None
     if col in df.columns:
-        s = pd.to_datetime(df[col], utc=True, errors='coerce').dt.tz_localize(None)
-    elif fallback and fallback in df.columns:
-        s = pd.to_datetime(df[fallback], utc=True, errors='coerce').dt.tz_localize(None)
-    else:
-        s = pd.Series(pd.date_range('2026-01-01', periods=len(df), freq='s'))
+        primary = pd.to_datetime(df[col], utc=True, errors='coerce').dt.tz_localize(None)
+    fallback_series = None
+    if fallback and fallback in df.columns:
+        fallback_series = pd.to_datetime(df[fallback], utc=True, errors='coerce').dt.tz_localize(None)
 
-    s = s.ffill()
-    if s.isna().any():
-        first_valid = s.first_valid_index()
-        if first_valid is not None:
-            first_pos = s.index.get_loc(first_valid)
-            first_ts = s.iloc[first_pos]
-            for pos in range(first_pos - 1, -1, -1):
-                s.iloc[pos] = first_ts - pd.Timedelta(seconds=(first_pos - pos))
-    if s.isna().any():
-        base = pd.Timestamp('2026-01-01')
-        s = pd.Series([base + pd.Timedelta(seconds=i) for i in range(len(df))])
-    return s
+    if primary is None and fallback_series is None:
+        raise ValueError(
+            f"❌ Missing required timestamp column '{col}'"
+            + (f" (fallback '{fallback}' also missing)." if fallback else ".")
+        )
+
+    if primary is None:
+        s = fallback_series.copy()
+    elif fallback_series is None:
+        s = primary.copy()
+    else:
+        s = primary.where(primary.notna(), fallback_series)
+
+    invalid = s.isna()
+    if invalid.any():
+        sample = np.flatnonzero(invalid.to_numpy(dtype=bool))[:5].tolist()
+        raise ValueError(
+            f"❌ Invalid timestamps in '{col}'"
+            + (f" after fallback='{fallback}'" if fallback else "")
+            + f": rows={int(invalid.sum())} sample_indices={sample}"
+        )
+    return s.reset_index(drop=True)
 
 
 def _parse_optional_timestamp(value) -> pd.Timestamp | None:
@@ -1057,7 +1142,7 @@ def stage1_oof_meta(
     quality_weight_weak: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
-    print("🐱 STAGE 1 — V19 OOF CatBoost + Regime Meta-Features")
+    print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
     print("═" * 65)
     if not inference_scaler_params:
         raise RuntimeError(
@@ -1088,13 +1173,21 @@ def stage1_oof_meta(
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
     cb_task_type, cb_devices = _resolve_catboost_device(catboost_device)
     print(f"  CatBoost device: {cb_task_type}")
+    print(f"  Class distribution: {pd.Series(y).value_counts().sort_index().to_dict()}")
 
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
+    meta_feature_names = resolve_meta_feature_names(include_xgboost=True)
 
     if not CB_AVAILABLE:
         raise RuntimeError(
             "❌ CatBoost غير مثبّت. هذه المرحلة لم تتدرب فعليًا.\n"
+            "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
+            "pip install -r requirements.txt"
+        )
+    if not XGB_AVAILABLE:
+        raise RuntimeError(
+            "❌ XGBoost غير مثبّت. مرحلة stacked base models تتطلبه الآن.\n"
             "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
             "pip install -r requirements.txt"
         )
@@ -1105,9 +1198,34 @@ def stage1_oof_meta(
     def _cb_predict(train_idx, test_idx, fold_no):
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
+        fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
+        test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
+        fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
+        test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
+        print(
+            f"    Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
+            f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
+            f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
+            f"| y_fit={fit_counts} | y_test={test_counts}"
+        )
+        if len(np.unique(y[fit_idx])) < 2:
+            print(
+                f"      CatBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
+                "| using class priors"
+            )
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_single_class_train',
+            }
         fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
         X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
         X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
+        print(
+            f"      CatBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
+            f"| scaler_fit_rows={len(fit_idx):,}"
+        )
 
         sw = _quality_sample_weights(
             df.iloc[fit_idx],
@@ -1152,12 +1270,98 @@ def stage1_oof_meta(
             'directional_precision': float(precision),
             'directional_recall': float(recall),
             'directional_f1': float(f1),
+            'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
         }
 
     oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
         n, N_CB_PROBS, splits, _cb_predict
     )
     oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
+
+    def _xgb_predict(train_idx, test_idx, fold_no):
+        inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
+        fit_idx = inner_train if inner_train is not None else train_idx
+        fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
+        test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
+        fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
+        test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
+        print(
+            f"    XGB Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
+            f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
+            f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
+            f"| y_fit={fit_counts} | y_test={test_counts}"
+        )
+        if len(np.unique(y[fit_idx])) < 2:
+            print(
+                f"      XGBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
+                "| using class priors"
+            )
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_single_class_train',
+            }
+        fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        X_fit = _apply_scaler_to_stat_frame(raw_stat.iloc[fit_idx], fold_scaler).values.astype(np.float32)
+        X_test = _apply_scaler_to_stat_frame(raw_stat.iloc[test_idx], fold_scaler).values.astype(np.float32)
+        print(
+            f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
+            f"| scaler_fit_rows={len(fit_idx):,}"
+        )
+        sw = _quality_sample_weights(
+            df.iloc[fit_idx],
+            strong_weight=quality_weight_strong,
+            weak_weight=quality_weight_weak,
+        )
+        model_kwargs = {
+            'n_estimators': 800,
+            'max_depth': 4,
+            'learning_rate': 0.03,
+            'subsample': 0.90,
+            'colsample_bytree': 0.90,
+            'reg_lambda': 3.0,
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'random_state': 84 + fold_no,
+            'tree_method': 'hist',
+        }
+        if inner_val is not None:
+            model_kwargs['early_stopping_rounds'] = 50
+        model = XGBClassifier(**model_kwargs)
+        fit_kwargs = {
+            'sample_weight': sw,
+            'verbose': False,
+        }
+        if inner_val is not None:
+            X_val = _apply_scaler_to_stat_frame(raw_stat.iloc[inner_val], fold_scaler).values.astype(np.float32)
+            fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
+        model.fit(X_fit, y[fit_idx], **fit_kwargs)
+        present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
+        preds = align_probability_columns(
+            model.predict_proba(X_test),
+            N_XGB_PROBS,
+            classes=present_classes,
+        )
+        pred_labels = np.argmax(preds, axis=1)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y[test_idx],
+            pred_labels,
+            labels=[0, 1],
+            average='macro',
+            zero_division=0,
+        )
+        return preds, {
+            'directional_precision': float(precision),
+            'directional_recall': float(recall),
+            'directional_f1': float(f1),
+            'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
+        }
+
+    xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(
+        n, N_XGB_PROBS, splits, _xgb_predict
+    )
+    xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
 
     regime_meta_dim = len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)
 
@@ -1176,24 +1380,26 @@ def stage1_oof_meta(
     regime_meta = np.zeros((n, regime_meta_dim), dtype=np.float32)
     regime_meta[:, 0] = 1.0
     regime_meta[regime_covered] = regime_raw[regime_covered]
-    coverage = prob_covered & regime_covered
+    coverage = prob_covered & xgb_covered & regime_covered
 
     fold_metrics = {
         'catboost_folds': prob_reports,
+        'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
+        'catboost_coverage_ratio': float(prob_covered.mean()),
+        'xgboost_coverage_ratio': float(xgb_covered.mean()),
+        'regime_coverage_ratio': float(regime_covered.mean()),
         'coverage_ratio': float(coverage.mean()),
     }
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
         json.dump(fold_metrics, f, indent=2)
 
-    calibrator, calibrator_report = _fit_long_isotonic_calibrator(y, oof_probs[:, 0])
-    calibrated_oof_probs = _apply_long_calibrator(calibrator, oof_probs)
     calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
-    if calibrator is not None:
-        with open(calibrator_path, 'wb') as f:
-            pickle.dump(calibrator, f)
-    else:
-        calibrator_path = ''
+    if os.path.exists(calibrator_path):
+        try:
+            os.remove(calibrator_path)
+        except OSError:
+            pass
 
     if not inference_scaler_params:
         raise RuntimeError(
@@ -1226,6 +1432,26 @@ def stage1_oof_meta(
     final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y)), dtype=np.int32).tolist()
     with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
         json.dump({'classes': final_cb_classes}, f, indent=2)
+    print(f"  ✅ CatBoost final classes: {final_cb_classes}")
+
+    final_xgb = XGBClassifier(
+        n_estimators=800,
+        max_depth=4,
+        learning_rate=0.03,
+        subsample=0.90,
+        colsample_bytree=0.90,
+        reg_lambda=3.0,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        random_state=84,
+        tree_method='hist',
+    )
+    final_xgb.fit(X_final, y, sample_weight=final_sw, verbose=False)
+    final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
+    final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y)), dtype=np.int32).tolist()
+    with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
+        json.dump({'classes': final_xgb_classes}, f, indent=2)
+    print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
 
     final_regime = RegimeClassifier(n_regimes=N_CLUSTERS)
     final_regime.fit(df.copy(), output_dir=output_dir)
@@ -1234,25 +1460,45 @@ def stage1_oof_meta(
         N_CB_PROBS,
         classes=final_cb_classes,
     )
-    live_probs = _apply_long_calibrator(calibrator, live_probs)
+    live_xgb_probs = align_probability_columns(
+        final_xgb.predict_proba(X_final),
+        N_XGB_PROBS,
+        classes=final_xgb_classes,
+    )
     live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
+    with open(os.path.join(output_dir, 'meta_feature_names_v19.json'), 'w') as f:
+        json.dump({'meta_features': meta_feature_names}, f, indent=2)
     np.save(
         os.path.join(output_dir, 'meta_features_live_v19.npy'),
-        np.concatenate([live_probs, live_regime_meta], axis=1).astype(np.float32),
+        np.concatenate([live_probs, live_xgb_probs, live_regime_meta], axis=1).astype(np.float32),
     )
 
-    meta = np.concatenate([calibrated_oof_probs, regime_meta], axis=1).astype(np.float32)
+    meta = np.concatenate([oof_probs, xgb_probs, regime_meta], axis=1).astype(np.float32)
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
     calibration_report = {
-        'stage1_catboost_isotonic': calibrator_report,
-        'catboost_calibrator_artifact': calibrator_path or None,
-        'long_threshold': 0.5,
-        'short_threshold': 0.5,
+        'stage1_catboost_isotonic': {
+            'enabled': False,
+            'reason': 'disabled_to_preserve_strict_oof_meta_features',
+            'covered_rows': int(np.sum(prob_covered)),
+            'total_rows': int(len(prob_covered)),
+        },
+        'stage1_xgboost_probability_block': {
+            'enabled': True,
+            'covered_rows': int(np.sum(xgb_covered)),
+            'total_rows': int(len(xgb_covered)),
+        },
+        'catboost_calibrator_artifact': None,
+        'long_threshold': None,
+        'short_threshold': None,
     }
     with open(os.path.join(output_dir, 'calibration_report.json'), 'w') as f:
         json.dump(calibration_report, f, indent=2)
-    print(f"  ✅ OOF Meta Features: {meta.shape}")
+    if meta.shape[1] != len(meta_feature_names):
+        raise ValueError(
+            f"❌ Stage1 meta feature width mismatch: meta={meta.shape} vs names={len(meta_feature_names)}"
+        )
+    print(f"  ✅ OOF Meta Features: {meta.shape} | names={meta_feature_names}")
     print(f"  ✅ Coverage: {coverage.sum():,}/{len(coverage):,} ({coverage.mean():.1%})")
     return meta, coverage
 
@@ -1662,6 +1908,7 @@ def stage3_meta_learner_v19(
     coverage_mask: np.ndarray,
     inference_scaler_params: dict,
     output_dir: str,
+    meta_feature_names: list[str] | None = None,
     event_gate_cfg: dict | None = None,
     epochs: int = 100,
     batch: int = 64,
@@ -1673,6 +1920,13 @@ def stage3_meta_learner_v19(
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
     MetaLearnerLSTM = _load_meta_learner_class()
+    meta_feature_names = list(meta_feature_names or resolve_meta_feature_names(meta_dim=int(meta_features.shape[1])))
+    meta_layout = infer_meta_feature_layout(meta_feature_names)
+    if int(meta_features.shape[1]) != len(meta_feature_names):
+        raise ValueError(
+            f'❌ MetaLearner stage received meta shape {meta_features.shape} '
+            f'but {len(meta_feature_names)} feature names'
+        )
 
     # OOF CatBoost probabilities / visual embeddings are intentionally exposed
     # only on the last step of each sequence. Historical timesteps stay pure
@@ -1680,6 +1934,16 @@ def stage3_meta_learner_v19(
     sequence_aux_mode = SEQUENCE_AUX_LAST_STEP_ONLY
     X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
+    print(
+        "  Meta Surface Layout: "
+        f"base_models={[m['name'] for m in meta_layout['base_models']]} "
+        f"| base_prob_dim={meta_layout['base_prob_dim']} "
+        f"| regime_dim={len(meta_layout['regime_meta_cols'])}"
+    )
+    print(
+        "  Input Shapes: "
+        f"X_stat={X_stat.shape} | meta={meta_features.shape} | visual={visual_embeddings.shape} | rows={X_rows.shape}"
+    )
 
     X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, split_stats = build_safe_sequences(
         df,
@@ -1788,17 +2052,42 @@ def stage3_meta_learner_v19(
                 f,
                 indent=2,
             )
+        artifacts = {
+            'catboost_model': 'catboost_advisor_v19.cbm',
+            'catboost_classes': 'catboost_classes_v19.json',
+            'catboost_calibrator': 'catboost_calibrator_v19.pkl',
+            'meta_model': 'meta_learner_v19.keras',
+            'meta_temperature': 'meta_temperature_v19.json',
+            'regime_model': 'regime_classifier.pkl',
+            'scaler_params': 'scaler_params.json',
+            'deeplob_model': 'deeplob_cnn_v19.keras',
+            'visual_embeddings': 'visual_embeddings_live_v19.npy',
+            'visual_embeddings_oof': 'visual_embeddings_v19.npy',
+            'visual_embeddings_live': 'visual_embeddings_live_v19.npy',
+            'meta_features_oof': 'meta_features_oof_v19.npy',
+            'meta_features_live': 'meta_features_live_v19.npy',
+            'meta_feature_names': 'meta_feature_names_v19.json',
+        }
+        if any(spec.get('name') == 'xgboost' for spec in meta_layout.get('base_models', [])):
+            artifacts.update(
+                {
+                    'xgboost_model': 'xgboost_advisor_v19.json',
+                    'xgboost_classes': 'xgboost_classes_v19.json',
+                }
+            )
+
         schema = {
             'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
             'stat_features': CATBOOST_ADVISOR_FEATURES,
-            'meta_features': META_FEATURE_NAMES,
+            'meta_features': meta_feature_names,
             'visual_features': VISUAL_FEATURE_NAMES,
             'sequence_aux_mode': sequence_aux_mode,
             'passthrough_cols': TRAINING_PASSTHROUGH_COLS,
             'timestamp_cols': ['ts_event', 'label_end_ts'],
             'input_dim': int(X_rows.shape[1]),
             'regime_meta_features': [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
+            'base_models': meta_layout['base_models'],
             'deeplob': {
                 'enabled': bool(len(VISUAL_FEATURE_NAMES)),
                 'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
@@ -1812,21 +2101,7 @@ def stage3_meta_learner_v19(
                 'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
                 'temperature_scaling': temperature_report,
             },
-            'artifacts': {
-                'catboost_model': 'catboost_advisor_v19.cbm',
-                'catboost_classes': 'catboost_classes_v19.json',
-                'catboost_calibrator': 'catboost_calibrator_v19.pkl',
-                'meta_model': 'meta_learner_v19.keras',
-                'meta_temperature': 'meta_temperature_v19.json',
-                'regime_model': 'regime_classifier.pkl',
-                'scaler_params': 'scaler_params.json',
-                'deeplob_model': 'deeplob_cnn_v19.keras',
-                'visual_embeddings': 'visual_embeddings_live_v19.npy',
-                'visual_embeddings_oof': 'visual_embeddings_v19.npy',
-                'visual_embeddings_live': 'visual_embeddings_live_v19.npy',
-                'meta_features_oof': 'meta_features_oof_v19.npy',
-                'meta_features_live': 'meta_features_live_v19.npy',
-            },
+            'artifacts': artifacts,
             'event_gate': event_gate_cfg,
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
@@ -1834,9 +2109,19 @@ def stage3_meta_learner_v19(
         print("  ✅ MetaLearner V19 history + schema محفوظان")
 
 
-def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+def _load_required_stage1_artifacts(
+    output_dir: str,
+    n_rows: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
     coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
+    meta_features = np.load(meta_path)
+    coverage = np.load(coverage_path).astype(bool)
+    meta_arr = np.asarray(meta_features)
+    if meta_arr.ndim != 2:
+        raise ValueError(f'❌ Stage1 cached meta surface must be 2D, got {meta_arr.shape}')
+    meta_feature_names = _load_stage1_meta_feature_names(output_dir, meta_dim=int(meta_arr.shape[1]))
+    layout = infer_meta_feature_layout(meta_feature_names)
     required_files = [
         meta_path,
         coverage_path,
@@ -1844,20 +2129,24 @@ def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) 
         os.path.join(output_dir, 'catboost_classes_v19.json'),
         os.path.join(output_dir, 'regime_classifier.pkl'),
     ]
+    if any(spec.get('name') == 'xgboost' for spec in layout.get('base_models', [])):
+        required_files.extend(
+            [
+                os.path.join(output_dir, 'xgboost_advisor_v19.json'),
+                os.path.join(output_dir, 'xgboost_classes_v19.json'),
+            ]
+        )
     missing = [path for path in required_files if not os.path.exists(path)]
     if missing:
         raise FileNotFoundError(
-            '❌ CatBoost stage artifacts missing. '
+            '❌ CatBoost/XGBoost stage artifacts missing. '
             'شغّل المرحلة الثانية أولاً:\n'
             'python train_v19.py --data <stage1_artifact_dir> --output <dir> --phase catboost\n'
             f'Missing: {missing}'
         )
-
-    meta_features = np.load(meta_path)
-    coverage = np.load(coverage_path).astype(bool)
-    expected_meta_dim = len(META_FEATURE_NAMES)
+    expected_meta_dim = len(meta_feature_names)
     meta_arr = np.asarray(meta_features)
-    if meta_arr.ndim != 2 or int(meta_arr.shape[1]) != expected_meta_dim:
+    if int(meta_arr.shape[1]) != expected_meta_dim:
         raise ValueError(
             f'❌ Stage1 cached meta surface mismatch: expected {expected_meta_dim} columns, got {meta_arr.shape}'
         )
@@ -1865,7 +2154,11 @@ def _load_required_stage1_artifacts(output_dir: str, n_rows: int | None = None) 
         raise ValueError(
             f'❌ Stage1 cached artifacts shape mismatch: meta={len(meta_features)}, coverage={len(coverage)}, expected={int(n_rows)}'
         )
-    return meta_features, coverage
+    print(
+        "  ✅ Stage1 cache layout: "
+        f"meta={meta_arr.shape} | base_models={[m['name'] for m in layout['base_models']]}"
+    )
+    return meta_features, coverage, meta_feature_names
 
 
 def _load_or_init_visual_artifacts(output_dir: str, n_rows: int) -> tuple[np.ndarray, np.ndarray, str]:
@@ -1955,6 +2248,8 @@ def run_training_pipeline(
         mode=training_mode,
         quality_weight_strong=quality_weight_strong,
         quality_weight_weak=quality_weight_weak,
+        train_frac=train_frac,
+        split_time=training_window.get('split_time'),
     )
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
@@ -2059,9 +2354,10 @@ def run_training_pipeline(
             quality_weight_strong=quality_weight_strong,
             quality_weight_weak=quality_weight_weak,
         )
+        meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:
-        meta_features, coverage = _load_required_stage1_artifacts(output_dir, n_rows=len(event_df))
-        print(f'✅ CatBoost artifacts loaded from cache: {meta_features.shape}')
+        meta_features, coverage, meta_feature_names = _load_required_stage1_artifacts(output_dir, n_rows=len(event_df))
+        print(f'✅ CatBoost/XGBoost artifacts loaded from cache: {meta_features.shape}')
 
     if resolved_phase == PHASE_CATBOOST:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
@@ -2110,7 +2406,7 @@ def run_training_pipeline(
             extra={
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
-                'meta_feature_dim': len(META_FEATURE_NAMES),
+                'meta_feature_dim': int(meta_features.shape[1]),
             },
         )
         print('\n' + '=' * 65)
@@ -2187,7 +2483,7 @@ def run_training_pipeline(
             extra={
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
-                'meta_feature_dim': len(META_FEATURE_NAMES),
+                'meta_feature_dim': int(meta_features.shape[1]),
             },
         )
         print('\n' + '=' * 65)
@@ -2219,6 +2515,7 @@ def run_training_pipeline(
             coverage_mask=coverage,
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
+            meta_feature_names=meta_feature_names,
             event_gate_cfg=_infer_event_gate_schema(df_full),
             epochs=epochs,
             batch=batch,
@@ -2275,7 +2572,7 @@ def run_training_pipeline(
         extra={
             'source_contract': effective_source_contract,
             'training_window': training_window,
-            'meta_feature_dim': len(META_FEATURE_NAMES),
+            'meta_feature_dim': int(meta_features.shape[1]),
         },
     )
     print('\n' + '=' * 65)

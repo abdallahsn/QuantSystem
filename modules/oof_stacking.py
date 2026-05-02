@@ -78,6 +78,18 @@ def run_sequential_oof(
     reports = []
 
     for fold_no, (train_idx, test_idx) in enumerate(splits, start=1):
+        test_idx = np.asarray(test_idx, dtype=np.int64)
+        if test_idx.ndim != 1:
+            raise ValueError(f"OOF test_idx must be 1D, got shape {test_idx.shape}")
+        if len(np.unique(test_idx)) != len(test_idx):
+            raise ValueError(f"OOF split {fold_no} contains duplicate test rows")
+        if np.any(test_idx < 0) or np.any(test_idx >= n_samples):
+            raise ValueError(f"OOF split {fold_no} has out-of-range test rows")
+        if np.any(covered[test_idx]):
+            overlap_rows = test_idx[covered[test_idx]].tolist()[:10]
+            raise ValueError(
+                f"OOF split {fold_no} overlaps previously covered rows: sample={overlap_rows}"
+            )
         preds, info = predictor_fn(train_idx, test_idx, fold_no)
         preds = np.asarray(preds, dtype=np.float32)
         if preds.shape != (len(test_idx), n_outputs):
