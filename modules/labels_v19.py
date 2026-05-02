@@ -97,6 +97,8 @@ NEUTRAL_REASON_SHORT_SL = 3
 
 DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
 DEFAULT_V19_TP_MULT = 1.5
+DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
+DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
 
 
 _FORWARD_SCAN_SHARED: dict[str, object] = {}
@@ -1034,7 +1036,8 @@ def build_causal_event_labels(
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
     trend_strength_min: float = 0.05,
     causal_threshold_mode: str = "expanding",
-    raw_event_target_rate: float = 0.70,
+    raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
+    training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     training_event_score_threshold: float | None = None,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
@@ -1079,6 +1082,8 @@ def build_causal_event_labels(
                             directional label.
     causal_threshold_mode : `expanding` (default) أو `fixed` للـ training-event gate.
     raw_event_target_rate : Target keep-rate for the broader `event_flag` mask.
+    training_event_target_rate : Target keep-rate for the narrower
+                                 `train_event_flag` mask داخل `event_flag`.
     """
 
     out = df.copy()
@@ -1194,6 +1199,7 @@ def build_causal_event_labels(
         vol_mult=vol_mult,
         obi_thr=obi_thr,
         wall_thr=wall_thr,
+        target_rate=training_event_target_rate,
         causal_threshold_mode=causal_threshold_mode,
         fixed_score_threshold=training_event_score_threshold,
     )
@@ -1521,6 +1527,8 @@ def build_causal_event_labels(
     print(
         f"[v19] Gate   → raw_score_thr={raw_event_score_threshold:.3f}  "
         f"train_score_thr={event_score_threshold:.3f}  "
+        f"raw_target={float(raw_event_target_rate):.2f}  "
+        f"train_target={float(training_event_target_rate):.2f}  "
         f"avg_train_score={float(np.nanmean(event_score)):.3f}  "
         f"max_triggers={int(event_trigger_count.max()) if len(event_trigger_count) else 0}"
     )

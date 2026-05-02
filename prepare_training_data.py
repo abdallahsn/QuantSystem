@@ -85,6 +85,8 @@ LOB_EVENT_SAMPLE_DEFAULT = 100_000
 
 try:
     from modules.labels_v19 import (
+        DEFAULT_RAW_EVENT_TARGET_RATE,
+        DEFAULT_TRAINING_EVENT_TARGET_RATE,
         DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
         DEFAULT_V19_TP_MULT,
         build_causal_event_labels,
@@ -93,6 +95,8 @@ try:
     V19_LABELS_IMPORT_ERROR = None
     V19_LABELS_SOURCE = 'modules.labels_v19'
 except ImportError as exc:
+    DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
+    DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
     DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
     DEFAULT_V19_TP_MULT = 1.5
     V19_LABELS_AVAILABLE = False
@@ -2914,6 +2918,8 @@ def run_refinery(
     event_roll_window: int = 50,
     direction_threshold_ticks: float = DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
     causal_threshold_mode: str = 'expanding',
+    raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
+    training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
@@ -3243,6 +3249,8 @@ def run_refinery(
             event_roll_window=event_roll_window,
             direction_threshold_ticks=direction_threshold_ticks,
             causal_threshold_mode=causal_threshold_mode,
+            raw_event_target_rate=raw_event_target_rate,
+            training_event_target_rate=training_event_target_rate,
             tp_mult=tp_mult,
             sl_mult=sl_mult,
             neutral_mult=0.45,
@@ -3540,6 +3548,8 @@ def run_refinery(
             'event_roll_window': int(event_roll_window),
             'direction_threshold_ticks': float(direction_threshold_ticks),
             'causal_threshold_mode': str(causal_threshold_mode),
+            'raw_event_target_rate': float(raw_event_target_rate),
+            'training_event_target_rate': float(training_event_target_rate),
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
             'regime_mode': str(_resolve_regime_mode(regime_mode)),
@@ -3639,6 +3649,10 @@ if __name__=='__main__':
                    help=f'Directional threshold floor in ticks (default: {DEFAULT_V19_DIRECTION_THRESHOLD_TICKS:.1f})')
     p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='expanding',
                    help='threshold mode for train_event_flag selection (default: expanding)')
+    p.add_argument('--raw_event_target_rate', type=float, default=DEFAULT_RAW_EVENT_TARGET_RATE,
+                   help=f'target keep-rate for broad event_flag (default: {DEFAULT_RAW_EVENT_TARGET_RATE:.2f})')
+    p.add_argument('--training_event_target_rate', type=float, default=DEFAULT_TRAINING_EVENT_TARGET_RATE,
+                   help=f'target keep-rate for narrower train_event_flag (default: {DEFAULT_TRAINING_EVENT_TARGET_RATE:.2f})')
     p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
                    help='Max event-rich emit positions for LOB tensors')
     p.add_argument('--tp_mult', type=float, default=DEFAULT_V19_TP_MULT,
@@ -3672,6 +3686,8 @@ if __name__=='__main__':
                  event_roll_window=a.event_roll_window,
                  direction_threshold_ticks=a.direction_threshold_ticks,
                  causal_threshold_mode=a.causal_threshold_mode,
+                 raw_event_target_rate=a.raw_event_target_rate,
+                 training_event_target_rate=a.training_event_target_rate,
                  lob_event_sample=a.lob_event_sample,
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,

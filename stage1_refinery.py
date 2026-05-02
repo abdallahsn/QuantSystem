@@ -49,6 +49,8 @@ def main():
     # 5 tick floor كان يرفع TP/SL بشكل مبالغ فيه على بيانات منخفضة التذبذب
     p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 1.0)))
     p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default=str(defaults.get('causal_threshold_mode', 'expanding')))
+    p.add_argument('--raw_event_target_rate', type=float, default=float(defaults.get('raw_event_target_rate', 0.70)))
+    p.add_argument('--training_event_target_rate', type=float, default=float(defaults.get('training_event_target_rate', 0.25)))
 
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
     p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
@@ -91,6 +93,8 @@ def main():
         event_roll_window=args.event_roll_window,
         direction_threshold_ticks=args.direction_threshold_ticks,
         causal_threshold_mode=args.causal_threshold_mode,
+        raw_event_target_rate=args.raw_event_target_rate,
+        training_event_target_rate=args.training_event_target_rate,
         lob_event_sample=args.lob_event_sample,
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,

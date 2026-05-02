@@ -6,11 +6,20 @@ import prepare_training_data as ptd
 def test_label_builder_compat_keeps_supported_kwargs(monkeypatch):
     received = {}
 
-    def fake_builder(df, horizon=0, event_roll_window=0, kalman_slope_threshold=0.0):
+    def fake_builder(
+        df,
+        horizon=0,
+        event_roll_window=0,
+        kalman_slope_threshold=0.0,
+        raw_event_target_rate=0.0,
+        training_event_target_rate=0.0,
+    ):
         received["df"] = df
         received["horizon"] = horizon
         received["event_roll_window"] = event_roll_window
         received["kalman_slope_threshold"] = kalman_slope_threshold
+        received["raw_event_target_rate"] = raw_event_target_rate
+        received["training_event_target_rate"] = training_event_target_rate
         return df.assign(ok=1)
 
     monkeypatch.setattr(ptd, "build_causal_event_labels", fake_builder)
@@ -21,12 +30,16 @@ def test_label_builder_compat_keeps_supported_kwargs(monkeypatch):
         horizon=64,
         event_roll_window=50,
         kalman_slope_threshold=0.05,
+        raw_event_target_rate=0.70,
+        training_event_target_rate=0.35,
     )
 
     assert received["df"] is df
     assert received["horizon"] == 64
     assert received["event_roll_window"] == 50
     assert received["kalman_slope_threshold"] == 0.05
+    assert received["raw_event_target_rate"] == 0.70
+    assert received["training_event_target_rate"] == 0.35
     assert "ok" in out.columns
 
 
@@ -48,10 +61,11 @@ def test_label_builder_compat_drops_unsupported_kwargs(monkeypatch):
         event_roll_window=25,
         kalman_slope_threshold=0.05,
         trend_strength_min=0.10,
+        raw_event_target_rate=0.70,
+        training_event_target_rate=0.35,
     )
 
     assert received["df"] is df
     assert received["horizon"] == 32
     assert received["event_roll_window"] == 25
     assert "ok" in out.columns
-
