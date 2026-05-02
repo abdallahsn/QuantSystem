@@ -1178,6 +1178,13 @@ def stage1_oof_meta(
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
     meta_feature_names = resolve_meta_feature_names(include_xgboost=True)
+    meta_layout = infer_meta_feature_layout(meta_feature_names)
+    print(
+        "  Meta Layout Guard: "
+        f"base_models={[spec['name'] for spec in meta_layout['base_models']]} "
+        f"| base_prob_dim={meta_layout['base_prob_dim']} "
+        f"| regime_dim={len(meta_layout['regime_meta_cols'])}"
+    )
 
     if not CB_AVAILABLE:
         raise RuntimeError(
