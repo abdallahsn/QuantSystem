@@ -47,7 +47,9 @@ from modules.dynamic_labels import (
 )
 from modules.feature_factory_v19 import (
     DEFAULT_PASSTHROUGH_COLS,
+    ROBUST_IQR_MIN,
     apply_scaler_params_to_frame,
+    fit_numeric_scaler_param,
     infer_meta_feature_layout,
     prepare_feature_frame,
     resolve_meta_feature_names,
@@ -678,22 +680,7 @@ def _fit_scaler_params_from_frame(frame: pd.DataFrame) -> dict:
         if col in BINARY_FEATURES:
             params[col] = {'type': 'binary'}
             continue
-
-        median_ = float(s.median())
-        q1 = float(s.quantile(0.25))
-        q3 = float(s.quantile(0.75))
-        iqr = q3 - q1
-        if iqr > 1e-8:
-            params[col] = {'type': 'robust', 'median': median_, 'iqr': iqr}
-            continue
-
-        smin = float(s.min())
-        smax = float(s.max())
-        rng = smax - smin
-        if rng > 1e-8:
-            params[col] = {'type': 'minmax', 'min': smin, 'max': smax}
-        else:
-            params[col] = {'type': 'zero'}
+        params[col] = fit_numeric_scaler_param(s, robust_iqr_min=ROBUST_IQR_MIN)
     return params
 
 

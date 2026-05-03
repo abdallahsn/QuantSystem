@@ -709,6 +709,13 @@ def generate_catboost_5m_report(
     pred_df = predict_catboost_frame(csv_path, models_dir)
     bars = _resample_catboost_bars(pred_df, freq=freq)
     bars_before_limit = int(len(bars))
+    raw_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
+    raw_confidence_stats = {
+        "mean": float(bars["cb_confidence"].mean()) if not bars.empty else 0.0,
+        "median": float(bars["cb_confidence"].median()) if not bars.empty else 0.0,
+        "min": float(bars["cb_confidence"].min()) if not bars.empty else 0.0,
+        "max": float(bars["cb_confidence"].max()) if not bars.empty else 0.0,
+    }
     if RSM_AVAILABLE and len(bars):
         bars["cb_direction_raw"] = bars["cb_direction"].astype(str)
         bars = apply_range_filter_to_dataframe(bars, regime_col="regime_label")
@@ -719,6 +726,8 @@ def generate_catboost_5m_report(
                 "NEUTRAL",
             )
             bars["cb_direction_idx"] = bars["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+    filtered_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
+    rsm_action_counts = bars["rsm_action"].value_counts().to_dict() if "rsm_action" in bars.columns else {}
     bars_limit_applied = 0
     if max_bars and len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
@@ -782,7 +791,14 @@ def generate_catboost_5m_report(
         "bars_before_limit": int(bars_before_limit),
         "bars_limit_applied": int(bars_limit_applied),
         "transitions": int(len(turns)),
-        "direction_counts": bars["cb_direction"].value_counts().to_dict() if not bars.empty else {},
+        "direction_counts": filtered_direction_counts,
+        "raw_direction_counts": raw_direction_counts,
+        "rsm_action_counts": rsm_action_counts,
+        "raw_confidence_stats": raw_confidence_stats,
+        "all_neutral_after_rsm": bool(
+            filtered_direction_counts.get("NEUTRAL", 0) == int(len(bars))
+            and any(raw_direction_counts.get(side, 0) > 0 for side in ("LONG", "SHORT"))
+        ),
         "files": {
             "html": html_path,
             "signals_csv": signals_csv,

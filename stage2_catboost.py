@@ -88,7 +88,16 @@ def main():
         print("\n📊 5m CatBoost dashboard generated")
         for key, path in summary.get('files', {}).items():
             print(f"  {key}: {path}")
+        if summary.get("raw_direction_counts"):
+            print(f"  raw_direction_counts: {summary.get('raw_direction_counts', {})}")
+        if summary.get("rsm_action_counts"):
+            print(f"  rsm_action_counts: {summary.get('rsm_action_counts', {})}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
+        if summary.get("all_neutral_after_rsm"):
+            print(
+                "  ℹ️ All plotted bars became NEUTRAL after RSM filtering. "
+                "Check raw_direction_counts vs rsm_action_counts before judging the base model."
+            )
         print(f"  transitions: {summary.get('transitions', 0)}")
     except Exception as e:
         print(f"\n⚠️ تعذر توليد Dashboard الـ 5m: {e}")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+pytest.importorskip("plotly")
+
 from modules.catboost_5m_report import _build_price_hover_trace
 from modules.range_state_machine import SignalState, apply_range_filter_to_dataframe, RangeStateMachine
 
@@ -99,6 +101,73 @@ def test_generate_report_prefers_regime_label(monkeypatch, tmp_path):
 
     assert captured["regime_col"] == "regime_label"
     assert summary["direction_counts"] == {"SHORT": 1}
+    assert summary["raw_direction_counts"] == {"SHORT": 1}
+    assert summary["rsm_action_counts"] == {"ENTER": 1}
+    assert summary["all_neutral_after_rsm"] is False
+
+
+def test_generate_report_exposes_when_rsm_masks_all_signals(monkeypatch, tmp_path):
+    plotly = pytest.importorskip("plotly")
+    assert plotly is not None
+    from modules import catboost_5m_report
+
+    bars = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(["2025-01-15 00:00:00", "2025-01-15 00:05:00"]),
+            "signal_time": pd.to_datetime(["2025-01-15 00:05:00", "2025-01-15 00:10:00"]),
+            "open": [1.0, 1.1],
+            "high": [1.1, 1.2],
+            "low": [0.9, 1.0],
+            "close": [1.05, 1.15],
+            "volume": [1.0, 1.0],
+            "event_count": [1, 1],
+            "cvd": [0.0, 0.0],
+            "cvd_delta": [0.0, 0.0],
+            "obi": [0.0, 0.0],
+            "absorption_intensity": [0.0, 0.0],
+            "kyle_lambda": [0.0, 0.0],
+            "hawkes_intensity": [0.0, 0.0],
+            "regime_label": ["Trending", "Trending"],
+            "cb_prob_long": [0.8, 0.2],
+            "cb_prob_short": [0.2, 0.8],
+            "cb_direction_idx": [0, 1],
+            "cb_direction": ["LONG", "SHORT"],
+            "cb_confidence": [0.8, 0.8],
+            "cb_change_flag": [1, 1],
+        }
+    )
+
+    monkeypatch.setattr(catboost_5m_report, "RSM_AVAILABLE", True)
+    monkeypatch.setattr(catboost_5m_report, "predict_catboost_frame", lambda *args, **kwargs: pd.DataFrame({"x": [1, 2]}))
+    monkeypatch.setattr(catboost_5m_report, "_resample_catboost_bars", lambda *args, **kwargs: bars.copy())
+    monkeypatch.setattr(catboost_5m_report, "_load_optional_market_csv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(catboost_5m_report, "_compute_signal_stats", lambda *args, **kwargs: {"total": len(bars)})
+    monkeypatch.setattr(catboost_5m_report, "_build_turns_table", lambda frame: pd.DataFrame())
+    monkeypatch.setattr(catboost_5m_report, "_build_dashboard", lambda *args, **kwargs: type("Fig", (), {"write_html": lambda self, *a, **k: None, "to_html": lambda self, *a, **k: "<div></div>"})())
+    monkeypatch.setattr(catboost_5m_report, "_build_confusion_chart", lambda *args, **kwargs: type("Fig", (), {"to_html": lambda self, *a, **k: "<div></div>"})())
+
+    def fake_apply(df, **kwargs):
+        out = df.copy()
+        out["rsm_action"] = ["HOLD", "HOLD"]
+        out["rsm_direction"] = ["LONG", "SHORT"]
+        out["rsm_reason"] = ["test", "test"]
+        out["rsm_state"] = ["TRENDING", "TRENDING"]
+        out["rsm_confs"] = [0, 0]
+        return out
+
+    monkeypatch.setattr(catboost_5m_report, "apply_range_filter_to_dataframe", fake_apply)
+
+    summary = catboost_5m_report.generate_catboost_5m_report(
+        csv_path="unused.csv",
+        models_dir=str(tmp_path),
+        output_dir=str(tmp_path),
+        report_name="report",
+    )
+
+    assert summary["raw_direction_counts"] == {"LONG": 1, "SHORT": 1}
+    assert summary["rsm_action_counts"] == {"HOLD": 2}
+    assert summary["direction_counts"] == {"NEUTRAL": 2}
+    assert summary["all_neutral_after_rsm"] is True
 
 
 def test_generate_report_keeps_all_bars_when_max_bars_zero(monkeypatch, tmp_path):

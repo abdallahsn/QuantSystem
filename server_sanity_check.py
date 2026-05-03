@@ -374,7 +374,7 @@ def evaluate(env_info: dict, conda_info: dict, nvidia_info: dict, tf_info: dict,
     elif tf_info["error"]:
         fails.append("TensorFlow import/runtime check failed: " + tf_info["error"])
 
-    if tf_info["installed"] and conda_prefix and tf_info["module_path"]:
+    if tf_info["installed"] and conda_prefix and not venv_prefix and tf_info["module_path"]:
         if not tf_info["module_path"].startswith(conda_prefix):
             fails.append("TensorFlow is imported from outside the active Conda environment.")
 

@@ -59,6 +59,7 @@ from modules.context_features        import GARCHVolatilityProxy                
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
 from modules.manifest_v19            import write_manifest
+from modules.feature_factory_v19     import ROBUST_IQR_MIN, fit_numeric_scaler_param
 from modules.feature_artifact_v19    import (
     FINAL_FEATURE_DIR,
     load_feature_artifact,
@@ -2631,7 +2632,8 @@ def _normalize_and_save(
             if typ == 'binary':
                 df[col] = s
             elif typ == 'robust':
-                df[col] = ((s - float(p.get('median', 0.0))) / max(float(p.get('iqr', 0.0)), 1e-8)).clip(-10, 10)
+                denom = max(float(p.get('iqr', 0.0)), float(p.get('min_robust_iqr', ROBUST_IQR_MIN)))
+                df[col] = ((s - float(p.get('median', 0.0))) / denom).clip(-10, 10)
             elif typ == 'minmax':
                 smin = float(p.get('min', 0.0)); smax = float(p.get('max', 0.0)); rng = max(smax - smin, 1e-8)
                 df[col] = ((s - smin) / rng * 2 - 1).clip(-10, 10)
@@ -2646,51 +2648,22 @@ def _normalize_and_save(
 
             # FIT على train فقط
             s_train = s.iloc[train_idx]
-            median_  = float(s_train.median())
-            q1, q3   = float(s_train.quantile(0.25)), float(s_train.quantile(0.75))
-            iqr      = q3 - q1
-
-            if iqr > 1e-8:
-                robust_train = ((s_train - median_) / iqr).astype(np.float32)
-                clip_rate = float((np.abs(robust_train) >= 9.5).mean()) if len(robust_train) else 0.0
-                if clip_rate > 0.80:
-                    smin = float(s_train.min()); smax = float(s_train.max()); rng = smax - smin
-                    if rng > 1e-8:
-                        df[col] = ((s - smin) / rng * 2 - 1).clip(-10, 10)
-                        scaler_params[col] = {
-                            'type': 'minmax',
-                            'min': smin,
-                            'max': smax,
-                            'fallback_from': 'robust',
-                            'robust_clip_rate': clip_rate,
-                        }
-                    else:
-                        df[col] = ((s - median_) / iqr).clip(-10, 10)
-                        scaler_params[col] = {
-                            'type': 'robust',
-                            'median': median_,
-                            'iqr': iqr,
-                            'robust_clip_rate': clip_rate,
-                        }
-                else:
-                    df[col] = ((s - median_) / iqr).clip(-10, 10)
-                    scaler_params[col] = {
-                        'type': 'robust',
-                        'median': median_,
-                        'iqr': iqr,
-                        'robust_clip_rate': clip_rate,
-                    }
-            elif s_train.abs().max() > 1e-8:
-                smin = float(s_train.min()); smax = float(s_train.max()); rng = smax - smin
-                if rng > 1e-8:
-                    df[col] = ((s - smin) / rng * 2 - 1).clip(-10, 10)
-                    scaler_params[col] = {'type': 'minmax', 'min': smin, 'max': smax}
-                else:
-                    df[col] = 0.0
-                    scaler_params[col] = {'type': 'zero'}
+            scaler_params[col] = fit_numeric_scaler_param(
+                s_train,
+                robust_iqr_min=ROBUST_IQR_MIN,
+                clip_rate_threshold=0.80,
+            )
+            param = scaler_params[col]
+            if param.get('type') == 'robust':
+                denom = max(float(param.get('iqr', 0.0)), float(param.get('min_robust_iqr', ROBUST_IQR_MIN)))
+                df[col] = ((s - float(param.get('median', 0.0))) / denom).clip(-10, 10)
+            elif param.get('type') == 'minmax':
+                smin = float(param.get('min', 0.0))
+                smax = float(param.get('max', 0.0))
+                rng = max(smax - smin, 1e-8)
+                df[col] = ((s - smin) / rng * 2 - 1).clip(-10, 10)
             else:
                 df[col] = 0.0
-                scaler_params[col] = {'type': 'zero'}
 
     # حفظ params للـ live trading
     scaler_path = os.path.join(output_dir, 'scaler_params.json')
@@ -2892,7 +2865,8 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
         if t == 'binary':
             df[col] = s
         elif t == 'robust':
-            df[col] = ((s - p['median']) / max(p['iqr'], 1e-8)).clip(-10, 10)
+            denom = max(float(p.get('iqr', 0.0)), float(p.get('min_robust_iqr', ROBUST_IQR_MIN)))
+            df[col] = ((s - float(p.get('median', 0.0))) / denom).clip(-10, 10)
         elif t == 'minmax':
             rng = max(p['max'] - p['min'], 1e-8)
             df[col] = ((s - p['min']) / rng * 2 - 1).clip(-10, 10)

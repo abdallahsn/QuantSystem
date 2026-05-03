@@ -34,6 +34,7 @@ SUPPORTED_META_FEATURES = {
     FULL_META_FEATURES: 'catboost_xgboost',
 }
 EXPECTED_META_FEATURES = len(FULL_META_FEATURES)
+ROBUST_IQR_MIN = 1e-4
 
 
 DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')
@@ -200,6 +201,58 @@ def _clip_numeric_series(
     return series.clip(float(clip_low), float(clip_high))
 
 
+def fit_numeric_scaler_param(
+    series: pd.Series,
+    *,
+    robust_iqr_min: float = ROBUST_IQR_MIN,
+    clip_rate_threshold: float | None = None,
+) -> dict:
+    s = pd.to_numeric(series, errors='coerce').fillna(0.0).astype(np.float32)
+    median_ = float(s.median())
+    q1 = float(s.quantile(0.25))
+    q3 = float(s.quantile(0.75))
+    iqr = q3 - q1
+    smin = float(s.min())
+    smax = float(s.max())
+    rng = smax - smin
+
+    if np.isfinite(iqr) and iqr >= float(robust_iqr_min):
+        payload = {
+            'type': 'robust',
+            'median': median_,
+            'iqr': float(iqr),
+            'min_robust_iqr': float(robust_iqr_min),
+        }
+        if clip_rate_threshold is not None:
+            denom = max(float(iqr), float(robust_iqr_min))
+            robust_scaled = ((s - median_) / denom).astype(np.float32)
+            clip_rate = float((np.abs(robust_scaled) >= 9.5).mean()) if len(robust_scaled) else 0.0
+            if clip_rate > float(clip_rate_threshold) and rng > 1e-8:
+                return {
+                    'type': 'minmax',
+                    'min': smin,
+                    'max': smax,
+                    'fallback_from': 'robust',
+                    'observed_iqr': float(iqr),
+                    'min_robust_iqr': float(robust_iqr_min),
+                    'robust_clip_rate': clip_rate,
+                }
+            payload['robust_clip_rate'] = clip_rate
+        return payload
+
+    if rng > 1e-8:
+        return {
+            'type': 'minmax',
+            'min': smin,
+            'max': smax,
+            'fallback_from': 'low_iqr',
+            'observed_iqr': float(iqr),
+            'min_robust_iqr': float(robust_iqr_min),
+        }
+
+    return {'type': 'zero'}
+
+
 def apply_scaler_params_to_frame(
     df: pd.DataFrame,
     scaler_params: dict,
@@ -215,8 +268,12 @@ def apply_scaler_params_to_frame(
         if typ == 'binary':
             out[col] = s
         elif typ == 'robust':
+            denom = max(
+                float(p.get('iqr', 0.0)),
+                float(p.get('min_robust_iqr', ROBUST_IQR_MIN)),
+            )
             out[col] = _clip_numeric_series(
-                (s - p.get('median', 0.0)) / max(p.get('iqr', 0.0), 1e-8),
+                (s - p.get('median', 0.0)) / denom,
                 clip_range,
             )
         elif typ == 'minmax':

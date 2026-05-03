@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  echo "Activate your .venv first."
-  exit 1
+PYTHON_BIN=""
+ENV_KIND="system"
+
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
 fi
 
-PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  ENV_KIND="venv"
+elif [[ -n "${CONDA_PREFIX:-}" ]]; then
+  ENV_KIND="conda"
+fi
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "No active python interpreter was found. Activate your .venv or Conda env first."
+  exit 1
+fi
 
 TF_DIR="$("$PYTHON_BIN" - <<'PY'
 import os
@@ -24,6 +37,9 @@ PY
 )"
 
 echo "Python: $PYTHON_BIN"
+echo "Environment: $ENV_KIND"
+echo "VIRTUAL_ENV: ${VIRTUAL_ENV:-<unset>}"
+echo "CONDA_PREFIX: ${CONDA_PREFIX:-<unset>}"
 echo "TensorFlow dir: $TF_DIR"
 echo "TensorFlow core .so: $TF_SO"
 

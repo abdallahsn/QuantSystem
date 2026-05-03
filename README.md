@@ -337,7 +337,7 @@ cd /path/to/QS_FINAL
 ### 3. أنشئ بيئة افتراضية
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
@@ -557,7 +557,7 @@ TensorFlow غير مثبّت — MetaLearner غير متاح
 الحل:
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 bash install_tf_gpu_cu12.sh
 ```
