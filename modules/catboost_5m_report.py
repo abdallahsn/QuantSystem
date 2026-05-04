@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from modules.oof_stacking import align_probability_columns
+from modules.decision_policy_v19 import evaluate_decision_policy, structure_bucket_from_row
+from modules.regime_classifier import REGIME_ONE_HOT_COLS, RegimeClassifier
 from prepare_training_data import CATBOOST_ADVISOR_FEATURES
-from train_v19 import _apply_scaler_to_stat_frame, _raw_stat_frame, load_training_csv
+from train_v19 import _apply_long_calibrator, _apply_scaler_to_stat_frame, _raw_stat_frame, load_training_csv
 try:
     from modules.range_state_machine import apply_range_filter_to_dataframe
     RSM_AVAILABLE = True
@@ -77,6 +80,100 @@ def _load_catboost_classes(models_dir: str) -> list[int] | None:
     return [int(x) for x in classes]
 
 
+def _load_optional_pickle(path: str) -> Any | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _load_optional_json(path: str) -> dict[str, Any] | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _load_regime_meta_frame(df: pd.DataFrame, models_dir: str) -> pd.DataFrame | None:
+    clf = RegimeClassifier(n_regimes=4)
+    if not clf.load(models_dir):
+        return None
+    try:
+        meta = clf.predict_regime_meta(df.copy())
+    except Exception:
+        return None
+    required = list(REGIME_ONE_HOT_COLS)
+    if any(col not in meta.columns for col in required):
+        return None
+    return meta
+
+
+def _apply_decision_policy_to_bars(
+    bars: pd.DataFrame,
+    policy: dict[str, Any] | None,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    out = bars.copy()
+    if not isinstance(policy, dict) or not policy or out.empty:
+        out["policy_available"] = False
+        return out, {}
+
+    regime_cols = [col for col in REGIME_ONE_HOT_COLS if col in out.columns]
+    decisions: list[dict[str, Any] | None] = []
+    for row in out.to_dict("records"):
+        regime_probs = [float(row.get(col, 0.0) or 0.0) for col in regime_cols] if regime_cols else None
+        direction_probs = {
+            "LONG": float(row.get("cb_prob_long", 0.0) or 0.0),
+            "SHORT": float(row.get("cb_prob_short", 0.0) or 0.0),
+        }
+        decision = evaluate_decision_policy(
+            policy,
+            direction_probs=direction_probs,
+            regime_probs=regime_probs,
+            structure_bucket=structure_bucket_from_row(row),
+            uncertainty=float(max(0.0, 1.0 - float(row.get("cb_confidence", 0.0) or 0.0))),
+            runtime_penalty=1.0,
+        )
+        decisions.append(decision)
+
+    out["policy_available"] = True
+    out["structure_bucket"] = [structure_bucket_from_row(row) for row in out.to_dict("records")]
+    out["cb_direction_policy"] = [
+        (decision or {}).get("bias", "NEUTRAL")
+        for decision in decisions
+    ]
+    out["policy_tradeable"] = [
+        bool((decision or {}).get("tradeable", False))
+        for decision in decisions
+    ]
+    out["expected_value_pips"] = [
+        float((decision or {}).get("expected_value_pips", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["policy_reason"] = [
+        str((decision or {}).get("reason", "policy_unavailable"))
+        for decision in decisions
+    ]
+    out["chosen_threshold"] = [
+        float((decision or {}).get("chosen_threshold", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["policy_edge_prob"] = [
+        float((decision or {}).get("edge_prob", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["cb_direction"] = out["cb_direction_policy"].astype(str)
+    out["cb_direction_idx"] = out["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+    counts = out["cb_direction"].value_counts().to_dict()
+    return out, counts
+
+
 def _load_optional_market_csv(path: str, t_min: pd.Timestamp, t_max: pd.Timestamp) -> pd.DataFrame | None:
     if not path or not Path(path).exists():
         return None
@@ -114,18 +211,26 @@ def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
     model = CatBoostClassifier()
     model.load_model(model_path)
     classes = _load_catboost_classes(models_dir)
-    probs = align_probability_columns(
+    raw_probs = align_probability_columns(
         model.predict_proba(X_stat),
         2,
         classes=classes or getattr(model, "classes_", None),
     )
+    calibrator = _load_optional_pickle(os.path.join(models_dir, "catboost_calibrator_v19.pkl"))
+    probs = _apply_long_calibrator(calibrator, raw_probs)
 
     out = df.copy()
+    out["cb_prob_long_raw"] = raw_probs[:, 0]
+    out["cb_prob_short_raw"] = raw_probs[:, 1]
     out["cb_prob_long"] = probs[:, 0]
     out["cb_prob_short"] = probs[:, 1]
     out["cb_direction_idx"] = np.argmax(probs, axis=1).astype(np.int8)
     out["cb_direction"] = pd.Series(out["cb_direction_idx"]).map(BIAS_LABELS).fillna("UNKNOWN").values
     out["cb_confidence"] = probs.max(axis=1).astype(np.float32)
+    regime_meta = _load_regime_meta_frame(out, models_dir)
+    if regime_meta is not None:
+        for col in regime_meta.columns:
+            out[col] = regime_meta[col].astype(np.float32).values
     return out
 
 
@@ -172,11 +277,41 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     kyle = pd.to_numeric(frame.get("kyle_lambda", 0.0), errors="coerce").resample(freq).mean().rename("kyle_lambda")
     hawkes = pd.to_numeric(frame.get("hawkes_intensity", 0.0), errors="coerce").resample(freq).mean().rename("hawkes_intensity")
     regime = frame.get("regime_label", pd.Series(1, index=frame.index)).resample(freq).apply(lambda s: _mode_or_default(s, 1)).rename("regime_label")
+    trend_strength = pd.to_numeric(frame.get("trend_strength", 0.0), errors="coerce").resample(freq).mean().rename("trend_strength")
+    correction_depth = pd.to_numeric(frame.get("correction_depth", 0.0), errors="coerce").resample(freq).mean().rename("correction_depth")
+    liquidity_sweep = pd.to_numeric(frame.get("liquidity_sweep", 0.0), errors="coerce").resample(freq).mean().rename("liquidity_sweep")
+    kalman_trend_strength = pd.to_numeric(frame.get("kalman_trend_strength", 0.0), errors="coerce").resample(freq).mean().rename("kalman_trend_strength")
+    event_score = pd.to_numeric(frame.get("event_score", 0.0), errors="coerce").resample(freq).mean().rename("event_score")
+    price_position = pd.to_numeric(frame.get("price_position", 0.5), errors="coerce").resample(freq).mean().rename("price_position")
 
     cb_probs = frame[DIRECTION_PROB_COLS].resample(freq).mean()
+    regime_probs = (
+        frame.loc[:, [col for col in REGIME_ONE_HOT_COLS if col in frame.columns]].resample(freq).mean()
+        if any(col in frame.columns for col in REGIME_ONE_HOT_COLS)
+        else pd.DataFrame(index=ohlc.index)
+    )
 
     bars = pd.concat(
-        [ohlc, volume, event_count, cvd_last, cvd_delta, obi, absorption, kyle, hawkes, regime, cb_probs],
+        [
+            ohlc,
+            volume,
+            event_count,
+            cvd_last,
+            cvd_delta,
+            obi,
+            absorption,
+            kyle,
+            hawkes,
+            regime,
+            cb_probs,
+            regime_probs,
+            trend_strength,
+            correction_depth,
+            liquidity_sweep,
+            kalman_trend_strength,
+            event_score,
+            price_position,
+        ],
         axis=1,
     ).dropna(subset=["open", "high", "low", "close"])
 
@@ -220,7 +355,7 @@ def _compute_signal_stats(bars: pd.DataFrame, future_bars: int = 4) -> dict:
         "pct_short": n_short / max(total, 1) * 100,
         "long_hit_rate": correct_long / max(total_long, 1) * 100,
         "short_hit_rate": correct_short / max(total_short, 1) * 100,
-        "note": "5m CatBoost predictions, not Step 4 raw causal labels",
+        "note": "5m calibrated CatBoost overlay; if policy artifacts exist, signals are EV-filtered before RSM",
         "regime_dist": bars["regime_label"].value_counts().to_dict() if "regime_label" in bars.columns else {},
     }
 
@@ -716,6 +851,10 @@ def generate_catboost_5m_report(
         "min": float(bars["cb_confidence"].min()) if not bars.empty else 0.0,
         "max": float(bars["cb_confidence"].max()) if not bars.empty else 0.0,
     }
+    decision_policy = _load_optional_json(os.path.join(models_dir, "decision_policy_v19.json"))
+    bars, policy_direction_counts = _apply_decision_policy_to_bars(bars, decision_policy)
+    policy_available = bool(decision_policy)
+    pre_rsm_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
     if RSM_AVAILABLE and len(bars):
         bars["cb_direction_raw"] = bars["cb_direction"].astype(str)
         bars = apply_range_filter_to_dataframe(bars, regime_col="regime_label")
@@ -793,8 +932,11 @@ def generate_catboost_5m_report(
         "transitions": int(len(turns)),
         "direction_counts": filtered_direction_counts,
         "raw_direction_counts": raw_direction_counts,
+        "policy_direction_counts": policy_direction_counts,
+        "pre_rsm_direction_counts": pre_rsm_direction_counts,
         "rsm_action_counts": rsm_action_counts,
         "raw_confidence_stats": raw_confidence_stats,
+        "policy_available": bool(policy_available),
         "all_neutral_after_rsm": bool(
             filtered_direction_counts.get("NEUTRAL", 0) == int(len(bars))
             and any(raw_direction_counts.get(side, 0) > 0 for side in ("LONG", "SHORT"))

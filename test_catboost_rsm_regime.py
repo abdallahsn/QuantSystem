@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("plotly")
 
-from modules.catboost_5m_report import _build_price_hover_trace
+from modules.catboost_5m_report import _apply_decision_policy_to_bars, _build_price_hover_trace
 from modules.range_state_machine import SignalState, apply_range_filter_to_dataframe, RangeStateMachine
 
 
@@ -310,6 +310,56 @@ def test_price_hover_trace_exposes_raw_signal_when_rsm_masks_it():
     assert trace.customdata[0][6] == "NEUTRAL"
     assert trace.customdata[0][16] == "SHORT"
     assert trace.customdata[0][18] == "trend_accumulating_1/2"
+
+
+def test_report_policy_overlay_can_abstain_before_rsm():
+    bars = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(["2025-01-15 07:55:00"]),
+            "signal_time": pd.to_datetime(["2025-01-15 08:00:00"]),
+            "open": [1.2224],
+            "high": [1.2234],
+            "low": [1.2219],
+            "close": [1.2233],
+            "cb_prob_long": [0.58],
+            "cb_prob_short": [0.42],
+            "cb_direction": ["LONG"],
+            "cb_direction_idx": [0],
+            "cb_confidence": [0.58],
+            "cluster_0": [1.0],
+            "cluster_1": [0.0],
+            "cluster_2": [0.0],
+            "cluster_3": [0.0],
+            "trend_strength": [0.10],
+            "correction_depth": [0.10],
+            "liquidity_sweep": [0.0],
+            "kalman_trend_strength": [0.0],
+            "event_score": [0.0],
+            "price_position": [0.50],
+        }
+    )
+    policy = {
+        "policy_version": "test",
+        "coverage_ratio": 1.0,
+        "minimum_support": 1,
+        "minimum_coverage_ratio": 0.50,
+        "cost_model": {"effective_cost_pips": 3.0},
+        "regime_priors": [1.0, 0.0, 0.0, 0.0],
+        "global": {
+            "LONG": {"support": 10, "avg_win_pips": 2.0, "avg_loss_pips": 2.0, "threshold_from_cost": 0.80, "coverage_ratio": 1.0},
+            "SHORT": {"support": 10, "avg_win_pips": 2.0, "avg_loss_pips": 2.0, "threshold_from_cost": 0.80, "coverage_ratio": 1.0},
+        },
+        "structures": {},
+        "structure_buckets": [],
+    }
+
+    out, counts = _apply_decision_policy_to_bars(bars, policy)
+
+    assert bool(out.loc[0, "policy_available"]) is True
+    assert out.loc[0, "cb_direction"] == "NEUTRAL"
+    assert bool(out.loc[0, "policy_tradeable"]) is False
+    assert out.loc[0, "policy_reason"] == "cost_aware_abstain"
+    assert counts == {"NEUTRAL": 1}
 
 
 def test_locked_state_times_out_and_reprocesses_current_bar():

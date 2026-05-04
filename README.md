@@ -157,14 +157,7 @@ pip install jupyterlab ipykernel hmmlearn
 ### 1. تجهيز البيانات
 
 ```bash
-python3 stage1_refinery.py \
-  --mbo /path/to/mbo.csv \
-  --mbp /path/to/mbp.csv \
-  --output outputs_v19 \
-  --label_mode v19 \
-  --chunk_rows 2000000 \
-  --mbo_workers 32 \
-  --mbp_workers 32
+python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --label_mode v19 --chunk_rows 2000000 --mbo_workers 32 --mbp_workers 32
 ```
 
 السلوك الافتراضي المهم في النسخة الحالية:
@@ -217,9 +210,7 @@ python3 stage1_refinery.py \
 ### 2. CatBoost Stage
 
 ```bash
-python stage2_catboost.py \
-  --data outputs_v19 \
-  --output outputs_v19
+python stage2_catboost.py --data outputs_v19 --output outputs_v19
 ```
 
 النواتج المهمة:
