@@ -26,7 +26,7 @@ from modules.feature_artifact_v19 import (
     load_feature_artifact,
     resolve_artifact_root,
 )
-from modules.slippage_model import SlippageModel, confidence_bet_size
+from modules.slippage_model import SlippageModel, position_size_from_prediction
 from predict_v19 import V19PredictionEngine
 
 try:
@@ -1070,11 +1070,17 @@ def run_causal_backtest(
             continue
 
         if tradeable and direction in ('LONG', 'SHORT'):
-            size = int(pred.get('position_size') or confidence_bet_size(
-                float(pred.get('confidence', 0.0)),
+            size = int(position_size_from_prediction(
+                pred,
                 base_size=1,
                 max_size=max_size,
+                fraction=0.25,
             ))
+            if size <= 0:
+                pred['trade_skip_reason'] = 'position_size_zero'
+                pred['position_size'] = 0
+                results.append(pred)
+                continue
             entry_idx = min(i + max(int(latency_rows), 0), len(replay_df) - 1)
             entry_row_data = replay_df.iloc[entry_idx].to_dict() if 0 <= entry_idx < len(replay_df) else row.to_dict()
             trade_path = _simulate_trade_path(

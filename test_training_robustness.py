@@ -4,9 +4,11 @@ import numpy as np
 import pandas as pd
 
 from prepare_training_data import _build_refinery_split_context, _fit_regime_surface, _select_event_rich_lob_emit_positions
+from modules.decision_policy_v19 import build_decision_policy, evaluate_decision_policy
 from modules.feature_factory_v19 import apply_scaler_params_to_frame
 from modules.regime_classifier import RegimeClassifier, _build_regime_features
 from modules.meta_learner import MetaLearnerLSTM
+from modules.slippage_model import fractional_kelly_bet_size
 from train_v19 import (
     _align_lob_to_rows,
     _adaptive_tree_early_stopping_rounds,
@@ -254,10 +256,80 @@ def test_apply_scaler_params_can_skip_clipping_for_tree_models():
 
 
 def test_adaptive_tree_early_stopping_rounds_shrinks_for_small_folds():
-    assert _adaptive_tree_early_stopping_rounds(300, True) == 20
-    assert _adaptive_tree_early_stopping_rounds(1500, True) == 30
-    assert _adaptive_tree_early_stopping_rounds(5000, True) == 50
+    assert _adaptive_tree_early_stopping_rounds(300, True) == 30
+    assert _adaptive_tree_early_stopping_rounds(1500, True) == 50
+    assert _adaptive_tree_early_stopping_rounds(5000, True) == 75
+    assert _adaptive_tree_early_stopping_rounds(15000, True) == 100
     assert _adaptive_tree_early_stopping_rounds(300, False) is None
+
+
+def test_decision_policy_abstains_when_expected_value_is_negative():
+    df = pd.DataFrame(
+        {
+            'bias_label': [0, 1, 0, 1],
+            'forward_return': [0.0001, -0.0001, 0.0001, -0.0001],
+            'trend_strength': [0.6, 0.6, 0.6, 0.6],
+            'correction_depth': [0.7, 0.7, 0.7, 0.7],
+        }
+    )
+    probs = np.array(
+        [
+            [0.90, 0.10],
+            [0.10, 0.90],
+            [0.85, 0.15],
+            [0.15, 0.85],
+        ],
+        dtype=np.float32,
+    )
+    regime_meta = np.tile(np.array([[0.7, 0.2, 0.05, 0.05]], dtype=np.float32), (len(df), 1))
+    coverage = np.ones(len(df), dtype=bool)
+
+    policy = build_decision_policy(
+        df,
+        probs,
+        regime_meta,
+        coverage,
+        cost_config={'tick_size': 0.0001, 'round_trip_cost_pips': 5.0},
+        min_support=1,
+    )
+    decision = evaluate_decision_policy(
+        policy,
+        direction_probs={'LONG': 0.90, 'SHORT': 0.10},
+        regime_probs=regime_meta[0],
+        structure_bucket='deep_pullback',
+        uncertainty=0.05,
+        runtime_penalty=1.0,
+    )
+
+    assert decision is not None
+    assert decision['bias'] == 'NEUTRAL'
+    assert decision['tradeable'] is False
+    assert decision['expected_value_long_pips'] <= 0.0
+
+
+def test_fractional_kelly_size_shrinks_with_uncertainty():
+    low_uncertainty = fractional_kelly_bet_size(
+        0.65,
+        4.0,
+        2.0,
+        uncertainty=0.05,
+        coverage_ratio=1.0,
+        regime_entropy=0.05,
+        runtime_penalty=1.0,
+        max_size=5,
+    )
+    high_uncertainty = fractional_kelly_bet_size(
+        0.65,
+        4.0,
+        2.0,
+        uncertainty=0.85,
+        coverage_ratio=1.0,
+        regime_entropy=0.05,
+        runtime_penalty=1.0,
+        max_size=5,
+    )
+
+    assert low_uncertainty >= high_uncertainty
 
 
 def test_regime_features_build_cvd_persistence_from_constant_cvd_delta():

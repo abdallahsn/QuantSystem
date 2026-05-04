@@ -25,6 +25,11 @@ from sklearn.metrics import precision_recall_fscore_support
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
+from modules.decision_policy_v19 import (
+    DEFAULT_DECISION_POLICY_ARTIFACT,
+    evaluate_decision_policy,
+    structure_bucket_from_row,
+)
 from modules.dynamic_labels import EventGate
 from modules.feature_artifact_v19 import load_feature_artifact
 from modules.feature_factory_v19 import apply_scaler_params_to_frame, infer_meta_feature_layout
@@ -38,7 +43,7 @@ from modules.regime_classifier import (
     REGIME_ONE_HOT_COLS,
     RegimeClassifier,
 )
-from modules.slippage_model import DailyLossGuard
+from modules.slippage_model import DailyLossGuard, position_size_from_prediction
 try:
     from modules.deeplob_cnn import DeepLOBCNN
     DEEPLOB_AVAILABLE = True
@@ -188,6 +193,7 @@ class V19PredictionEngine:
                 print(f"  ⚠️ CatBoost calibrator unavailable: {exc}")
 
         self.xgb_advisor = None
+        self.xgb_calibrator = None
         self.xgb_classes = None
         xgb_path = os.path.join(models_dir, artifacts.get('xgboost_model', 'xgboost_advisor_v19.json'))
         xgb_classes_path = os.path.join(models_dir, artifacts.get('xgboost_classes', 'xgboost_classes_v19.json'))
@@ -207,6 +213,31 @@ class V19PredictionEngine:
             raise FileNotFoundError(
                 "❌ XGBoost artifact/runtime required by the feature schema but was not found."
             )
+        xgb_calibrator_path = os.path.join(models_dir, artifacts.get('xgboost_calibrator', 'xgboost_calibrator_v19.pkl'))
+        if os.path.exists(xgb_calibrator_path):
+            try:
+                with open(xgb_calibrator_path, 'rb') as f:
+                    self.xgb_calibrator = pickle.load(f)
+                print("  ✅ XGBoost calibrator loaded")
+            except Exception as exc:
+                self.xgb_calibrator = None
+                print(f"  ⚠️ XGBoost calibrator unavailable: {exc}")
+
+        self.decision_policy = None
+        decision_policy_name = (
+            artifacts.get('decision_policy')
+            or self.schema.get('decision_policy_artifact')
+            or DEFAULT_DECISION_POLICY_ARTIFACT
+        )
+        decision_policy_path = os.path.join(models_dir, decision_policy_name)
+        if os.path.exists(decision_policy_path):
+            try:
+                with open(decision_policy_path, 'r') as f:
+                    self.decision_policy = json.load(f)
+                print(f"  ✅ Decision policy loaded: {decision_policy_name}")
+            except Exception as exc:
+                self.decision_policy = None
+                print(f"  ⚠️ Decision policy unavailable: {exc}")
 
         self.regime_clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         regime_ok = self.regime_clf.load(models_dir)
@@ -298,9 +329,11 @@ class V19PredictionEngine:
     def get_runtime_status(self) -> dict:
         return {
             'catboost_available': self.cb_advisor is not None,
+            'xgboost_available': self.xgb_advisor is not None,
             'regime_available': bool(self.regime_clf._fitted),
             'visual_available': self.cnn is not None,
             'meta_available': self.meta is not None,
+            'decision_policy_available': isinstance(self.decision_policy, dict),
             'event_gate_available': self.event_gate is not None,
             'manifest_exists': os.path.exists(self.manifest_path),
             'schema_exists': os.path.exists(os.path.join(self.models_dir, 'feature_schema_v19.json')),
@@ -351,11 +384,12 @@ class V19PredictionEngine:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
         try:
             probs = self.xgb_advisor.predict_proba(X_stat)
-            return align_probability_columns(
+            aligned = align_probability_columns(
                 probs,
                 N_XGB_PROBS,
                 classes=getattr(self.xgb_advisor, 'classes_', None) or self.xgb_classes,
             )
+            return self._apply_long_calibrator(aligned, calibrator=self.xgb_calibrator)
         except Exception:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
 
@@ -386,12 +420,17 @@ class V19PredictionEngine:
         scaled = apply_scaler_params_to_frame(raw_df, self.scaler_params, clip_range=None)
         return scaled[self.stat_features].values.astype(np.float32)
 
-    def _apply_long_calibrator(self, probs: np.ndarray) -> np.ndarray:
+    def _apply_long_calibrator(
+        self,
+        probs: np.ndarray,
+        calibrator=None,
+    ) -> np.ndarray:
         arr = np.asarray(probs, dtype=np.float32)
-        if self.cb_calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
+        calibrator = self.cb_calibrator if calibrator is None else calibrator
+        if calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
             return arr
         p_long = np.clip(arr[:, 0].astype(np.float64), 1e-6, 1.0 - 1e-6)
-        cal_long = np.asarray(self.cb_calibrator.transform(p_long), dtype=np.float64)
+        cal_long = np.asarray(calibrator.transform(p_long), dtype=np.float64)
         cal_long = np.clip(cal_long, 1e-6, 1.0 - 1e-6)
         out = np.zeros_like(arr, dtype=np.float32)
         out[:, 0] = cal_long.astype(np.float32)
@@ -517,6 +556,22 @@ class V19PredictionEngine:
         out[:-1, n_stat:] = 0.0
         return out
 
+    def _runtime_penalty(self, runtime_mode: dict | None) -> float:
+        runtime_mode = runtime_mode or {}
+        if not runtime_mode.get('allow_shadow', True):
+            return 0.0
+        penalty = 1.0
+        degraded_components = list(runtime_mode.get('degraded_components', []))
+        if degraded_components:
+            penalty *= max(0.5, 1.0 - 0.10 * len(degraded_components))
+        if runtime_mode.get('blocking_issues'):
+            penalty *= 0.75
+        if self.run_mode == 'rollout' and not runtime_mode.get('allow_rollout', False):
+            return 0.0
+        if self.run_mode == 'paper' and not runtime_mode.get('allow_paper', False):
+            return 0.0
+        return float(np.clip(penalty, 0.0, 1.0))
+
     def predict_step(self,
                      stat_features: dict,
                      visual_embedding: np.ndarray | None = None,
@@ -631,14 +686,13 @@ class V19PredictionEngine:
             result['bias_idx'] = bias_idx
             result['bias'] = BIAS_LABELS.get(bias_idx, 'NEUTRAL')
             result['chosen_threshold'] = float(getattr(self.meta, 'bias_long_threshold', 0.5)) if self.meta is not None else 0.5
+        runtime_block_reason = None
+        runtime_block_event = 'risk_blocked'
         if self.run_mode == 'rollout' and not runtime_mode.get('allow_rollout', False):
-            result['tradeable'] = False
-            result['reason'] = runtime_mode.get('reason', 'Rollout blocked')
-            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode, event_type='rollout_guard_triggered')
+            runtime_block_reason = runtime_mode.get('reason', 'Rollout blocked')
+            runtime_block_event = 'rollout_guard_triggered'
         elif self.run_mode == 'paper' and not runtime_mode.get('allow_paper', False):
-            result['tradeable'] = False
-            result['reason'] = runtime_mode.get('reason', 'Paper blocked')
-            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode)
+            runtime_block_reason = runtime_mode.get('reason', 'Paper blocked')
         cluster = int(np.argmax(regime_meta[0, :N_CLUSTERS])) if regime_meta.shape[1] >= N_CLUSTERS else 0
         bias_probs = np.asarray(result.get('bias_probs', cb_probs[0]), dtype=np.float32).reshape(-1)
         direction_probs = {
@@ -666,10 +720,46 @@ class V19PredictionEngine:
             'trend': round(float(regime_meta[0, score_offset + 1]), 4) if regime_meta.shape[1] > score_offset + 1 else 0.0,
             'low_liq': round(float(regime_meta[0, score_offset + 2]), 4) if regime_meta.shape[1] > score_offset + 2 else 0.0,
         }
+        if self.base_prob_dim >= 4 and cb_probs.shape[1] >= 4:
+            result['xgb_probs'] = {
+                'LONG': round(float(cb_probs[0, 2]), 4),
+                'SHORT': round(float(cb_probs[0, 3]), 4),
+            }
+        structure_context = stat_df.iloc[-1].to_dict() if len(stat_df) else {}
+        structure_context.update(stat_features or {})
+        structure_bucket = structure_bucket_from_row(structure_context)
+        result['structure_bucket'] = structure_bucket
+        decision = evaluate_decision_policy(
+            self.decision_policy,
+            direction_probs=direction_probs,
+            regime_probs=regime_meta[0, :N_CLUSTERS] if regime_meta.shape[1] >= N_CLUSTERS else None,
+            structure_bucket=structure_bucket,
+            uncertainty=float(result.get('uncertainty', 0.0) or 0.0),
+            runtime_penalty=self._runtime_penalty(runtime_mode),
+        )
+        if decision is not None:
+            for key, value in decision.items():
+                if key in {'long_policy', 'short_policy'}:
+                    continue
+                result[key] = value
+            result['policy_available'] = True
+        else:
+            result['policy_available'] = False
+        if runtime_block_reason:
+            result['tradeable'] = False
+            result['reason'] = runtime_block_reason
+            self.risk_logger.log_block(result['reason'], ts=ts, extra=runtime_mode, event_type=runtime_block_event)
         result['sequence_ready'] = True
         result['feature_hash'] = feature_hash
         result['event_gate_passed'] = True
         result['event_gate_reason'] = gate_result.get('reason', 'event')
+        max_contracts = int(self.failsafe_policy.get('max_contracts', 5) or 5)
+        result['position_size'] = position_size_from_prediction(
+            result,
+            base_size=1,
+            max_size=max_contracts,
+            fraction=float(self.failsafe_policy.get('fractional_kelly', 0.25) or 0.25),
+        ) if result.get('tradeable', False) else 0
         result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
 
         # FIX: تمرير remaining_fuel و adr_pips الحقيقيين من DailyContextEngine

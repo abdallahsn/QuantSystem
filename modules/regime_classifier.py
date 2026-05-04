@@ -208,6 +208,19 @@ def _build_rule_scores(X: pd.DataFrame, feature_stats: dict | None = None) -> pd
     return scores.fillna(0.0).clip(0.0, 1.0).astype(np.float64)
 
 
+def _normalize_prob_rows(arr: np.ndarray) -> np.ndarray:
+    out = np.asarray(arr, dtype=np.float64)
+    if out.ndim != 2:
+        raise ValueError(f"Expected 2D regime probabilities, got {out.shape}")
+    out = np.clip(out, 0.0, None)
+    row_sums = out.sum(axis=1, keepdims=True)
+    invalid = row_sums[:, 0] <= 0
+    if np.any(invalid):
+        out[invalid] = 1.0
+        row_sums = out.sum(axis=1, keepdims=True)
+    return (out / np.clip(row_sums, 1e-12, None)).astype(np.float64, copy=False)
+
+
 class RegimeClassifier:
     def __init__(self, n_regimes: int = 4, model_type: str = 'auto'):
         self.n_regimes  = n_regimes
@@ -484,28 +497,80 @@ class RegimeClassifier:
         if not self._fitted:
             return np.zeros(len(df), dtype=np.int8)
 
+        probs = self.predict_regime_posteriors(df)
+        if probs.empty:
+            return np.zeros(len(df), dtype=np.int8)
+        return np.argmax(probs.values, axis=1).astype(np.int8)
+
+    def predict_regime_posteriors(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self._fitted or len(df) == 0:
+            return pd.DataFrame(
+                np.zeros((len(df), len(REGIME_ONE_HOT_COLS)), dtype=np.float32),
+                index=df.index,
+                columns=list(REGIME_ONE_HOT_COLS),
+            )
+
         X = _build_regime_features(df)
         if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
-            return self._predict_rules(X)
-        X_scaled = self.scaler.transform(X)
-        clusters = self.model.predict(X_scaled)
-        
-        return np.array([self._regime_map.get(int(c), 1) for c in clusters], dtype=np.int8)
+            labels = self._predict_rules(X)
+            scores = _build_rule_scores(X, feature_stats=(self.rule_stats or {}).get('feature_stats', {}))
+            ranging_score = (
+                1.0
+                - np.maximum.reduce(
+                    [
+                        scores[REGIME_META_SCORE_COLS[0]].to_numpy(dtype=np.float64),
+                        scores[REGIME_META_SCORE_COLS[1]].to_numpy(dtype=np.float64),
+                        scores[REGIME_META_SCORE_COLS[2]].to_numpy(dtype=np.float64),
+                    ]
+                )
+            )
+            base = np.full((len(X), len(REGIME_ONE_HOT_COLS)), 1e-3, dtype=np.float64)
+            base[:, 0] += scores[REGIME_META_SCORE_COLS[0]].to_numpy(dtype=np.float64) * 0.55
+            base[:, 2] += scores[REGIME_META_SCORE_COLS[1]].to_numpy(dtype=np.float64) * 0.55
+            base[:, 3] += scores[REGIME_META_SCORE_COLS[2]].to_numpy(dtype=np.float64) * 0.55
+            base[:, 1] += np.clip(ranging_score, 0.0, 1.0) * 0.55
+            base[np.arange(len(labels), dtype=np.int32), np.clip(labels, 0, len(REGIME_ONE_HOT_COLS) - 1)] += 0.45
+            probs = _normalize_prob_rows(base)
+        else:
+            X_scaled = self.scaler.transform(X)
+            raw_probs = None
+            if hasattr(self.model, 'predict_proba'):
+                try:
+                    raw_probs = np.asarray(self.model.predict_proba(X_scaled), dtype=np.float64)
+                except Exception:
+                    raw_probs = None
+            if raw_probs is None:
+                raw_labels = np.asarray(self.model.predict(X_scaled), dtype=np.int32)
+                raw_probs = np.zeros((len(raw_labels), self.n_regimes), dtype=np.float64)
+                raw_probs[np.arange(len(raw_labels), dtype=np.int32), np.clip(raw_labels, 0, self.n_regimes - 1)] = 1.0
+
+            probs = np.zeros((len(raw_probs), len(REGIME_ONE_HOT_COLS)), dtype=np.float64)
+            for cluster_idx in range(raw_probs.shape[1]):
+                regime_idx = int(self._regime_map.get(int(cluster_idx), 1))
+                probs[:, regime_idx] += raw_probs[:, cluster_idx]
+            probs = _normalize_prob_rows(probs)
+
+        probs = _normalize_prob_rows(probs)
+        probs32 = probs.astype(np.float32)
+        if probs32.shape[1] > 1:
+            probs32[:, -1] = np.float32(1.0) - np.sum(probs32[:, :-1], axis=1, dtype=np.float32)
+        return pd.DataFrame(
+            probs32,
+            index=df.index,
+            columns=list(REGIME_ONE_HOT_COLS),
+        )
 
     def predict_regime_meta(self, df: pd.DataFrame) -> pd.DataFrame:
-        labels = self.predict(df)
+        posteriors = self.predict_regime_posteriors(df)
         scores = self.predict_scores(df)
-        one_hot = np.zeros((len(df), len(REGIME_ONE_HOT_COLS)), dtype=np.float32)
-        if len(labels):
-            safe_labels = np.asarray(labels, dtype=np.int32)
-            safe_labels = np.where(
-                (safe_labels >= 0) & (safe_labels < len(REGIME_ONE_HOT_COLS)),
-                safe_labels,
-                0,
-            )
-            one_hot[np.arange(len(safe_labels), dtype=np.int32), safe_labels] = 1.0
         out = pd.DataFrame(
-            np.concatenate([one_hot, np.zeros((len(df), len(REGIME_META_SCORE_COLS)), dtype=np.float32)], axis=1),
+            np.concatenate(
+                [
+                    posteriors.reindex(columns=list(REGIME_ONE_HOT_COLS), fill_value=0.0).values.astype(np.float32),
+                    np.zeros((len(df), len(REGIME_META_SCORE_COLS)), dtype=np.float32),
+                ],
+                axis=1,
+            ),
             index=df.index,
             columns=[*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
         )
@@ -516,28 +581,12 @@ class RegimeClassifier:
     def predict_current(self, recent_bars: pd.DataFrame) -> dict:
         if not self._fitted or len(recent_bars) == 0:
             return {'regime_id': 0, 'regime_name': 'Trending', 'tradeable': True, 'confidence': 0.5}
-
-        if self.model is None or (self.model_type or '').strip().lower() in ('auto', 'rules'):
-            recent_regimes = self.predict(recent_bars)
-            regime_id = Counter(recent_regimes[-min(10, len(recent_regimes)):]).most_common(1)[0][0]
-            conf = 0.7 if recent_regimes[-1] == regime_id else 0.55
-        else:
-            X = _build_regime_features(recent_bars)
-            X_scaled = self.scaler.transform(X)
-            clusters = self.model.predict(X_scaled)
-
-            if isinstance(self.model, GaussianMixture):
-                probs = self.model.predict_proba(X_scaled)
-                conf = float(probs[-1].max())
-            else:
-                try:
-                    probs = self.model.predict_proba(X_scaled)
-                    conf = float(probs[-1].max())
-                except Exception:
-                    conf = 0.6
-
-            recent_regimes = [self._regime_map.get(int(c), 1) for c in clusters[-min(10, len(clusters)):]]
-            regime_id = Counter(recent_regimes).most_common(1)[0][0]
+        recent_posteriors = self.predict_regime_posteriors(recent_bars)
+        if recent_posteriors.empty:
+            return {'regime_id': 0, 'regime_name': 'Trending', 'tradeable': True, 'confidence': 0.5}
+        smoothed = recent_posteriors.tail(min(10, len(recent_posteriors))).mean(axis=0)
+        regime_id = int(np.argmax(smoothed.values))
+        conf = float(smoothed.iloc[regime_id]) if len(smoothed) else 0.5
 
         return {
             'regime_id':   int(regime_id),

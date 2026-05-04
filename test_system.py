@@ -8,6 +8,13 @@ test_system.py — اختبار شامل لكل مكونات النظام
   5. المخرجات منطقية
 """
 
+if __name__ != "__main__":
+    import pytest
+    pytest.skip(
+        "test_system.py is an integration script; run `python test_system.py` instead.",
+        allow_module_level=True,
+    )
+
 import sys, traceback, time
 import numpy as np
 import pandas as pd

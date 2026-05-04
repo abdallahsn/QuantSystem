@@ -16,7 +16,7 @@ from modules.feature_artifact_v19 import load_feature_artifact
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.logging_v19 import EventLogWriter, ExecutionLogger, RiskLogger, log_event
 from modules.monitoring_v19 import MonitoringState, emit_alerts, load_baseline_from_artifacts, load_jsonl, write_monitoring_outputs
-from modules.slippage_model import SlippageModel, confidence_bet_size
+from modules.slippage_model import SlippageModel, position_size_from_prediction
 from backtest_v19 import _realized_fill_pricing, _simulate_trade_path
 from predict_v19 import V19PredictionEngine
 
@@ -208,7 +208,12 @@ def run_paper(
         allowed = runtime.get('allow_paper', True) if run_mode == 'paper' else runtime.get('allow_rollout', False)
         min_conf_by_regime = rollout_cfg.get('min_confidence_by_regime', {})
         min_conf = float(min_conf_by_regime.get(pred.get('cluster_name', ''), rollout_cfg.get('min_confidence_default', 0.65)))
-        size = int(confidence_bet_size(float(pred.get('confidence', 0.0) or 0.0), base_size=int(paper_cfg.get('base_size', 1)), max_size=int(paper_cfg.get('max_size', rollout_cfg.get('max_contracts', 5)))))
+        size = int(position_size_from_prediction(
+            pred,
+            base_size=int(paper_cfg.get('base_size', 1)),
+            max_size=int(paper_cfg.get('max_size', rollout_cfg.get('max_contracts', 5))),
+            fraction=float(paper_cfg.get('fractional_kelly', 0.25) or 0.25),
+        ))
 
         block_reason = ''
         if active is not None and bool(paper_cfg.get('single_position_only', True)):
@@ -223,6 +228,8 @@ def run_paper(
             block_reason = 'latency_too_high'
         elif float(pred.get('confidence', 0.0) or 0.0) < min_conf:
             block_reason = 'confidence_below_regime_min'
+        elif size <= 0:
+            block_reason = 'position_size_zero'
         elif size > int(rollout_cfg.get('max_contracts', 5)):
             block_reason = 'size_above_max_contracts'
         elif not allowed:

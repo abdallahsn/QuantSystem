@@ -188,22 +188,33 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
             'total_pnl_dollars': 0.0,
         }
 
+    def _backtest_block(report: dict) -> dict:
+        block = report.get('backtest_base')
+        if isinstance(block, dict):
+            return block
+        block = report.get('backtest')
+        if isinstance(block, dict):
+            return block
+        return {}
+
+    blocks = [_backtest_block(report) for report in fold_reports]
+
     return {
         'n_folds': int(len(fold_reports)),
-        'mean_directional_precision': float(np.mean([r['backtest_base'].get('directional_precision_macro', 0.0) for r in fold_reports])),
-        'mean_directional_recall': float(np.mean([r['backtest_base'].get('directional_recall_macro', 0.0) for r in fold_reports])),
-        'mean_directional_f1': float(np.mean([r['backtest_base'].get('directional_f1_macro', 0.0) for r in fold_reports])),
-        'mean_event_gate_rate': float(np.mean([r['backtest_base'].get('event_gate_rate', 0.0) for r in fold_reports])),
-        'mean_brier_score': float(np.mean([r['backtest_base'].get('brier_score', 0.0) for r in fold_reports])),
-        'mean_ece': float(np.mean([r['backtest_base'].get('ece', 0.0) for r in fold_reports])),
-        'mean_win_rate': float(np.mean([r['backtest_base'].get('win_rate', 0.0) for r in fold_reports])),
-        'mean_profit_factor': float(np.mean([r['backtest_base'].get('profit_factor', 0.0) for r in fold_reports])),
-        'mean_trade_sharpe': float(np.mean([r['backtest_base'].get('trade_sharpe', 0.0) for r in fold_reports])),
-        'mean_trade_pnl_dollars': float(np.mean([r['backtest_base'].get('avg_trade_pnl_dollars', 0.0) for r in fold_reports])),
-        'mean_expectancy_dollars': float(np.mean([r['backtest_base'].get('avg_trade_expectancy_dollars', 0.0) for r in fold_reports])),
-        'max_drawdown_pct': float(np.max([r['backtest_base'].get('max_drawdown_pct', 0.0) for r in fold_reports])),
-        'total_trades': int(np.sum([r['backtest_base'].get('trades', 0) for r in fold_reports])),
-        'total_pnl_dollars': float(np.sum([r['backtest_base'].get('total_pnl_dollars', 0.0) for r in fold_reports])),
+        'mean_directional_precision': float(np.mean([block.get('directional_precision_macro', 0.0) for block in blocks])),
+        'mean_directional_recall': float(np.mean([block.get('directional_recall_macro', 0.0) for block in blocks])),
+        'mean_directional_f1': float(np.mean([block.get('directional_f1_macro', 0.0) for block in blocks])),
+        'mean_event_gate_rate': float(np.mean([block.get('event_gate_rate', 0.0) for block in blocks])),
+        'mean_brier_score': float(np.mean([block.get('brier_score', 0.0) for block in blocks])),
+        'mean_ece': float(np.mean([block.get('ece', 0.0) for block in blocks])),
+        'mean_win_rate': float(np.mean([block.get('win_rate', 0.0) for block in blocks])),
+        'mean_profit_factor': float(np.mean([block.get('profit_factor', 0.0) for block in blocks])),
+        'mean_trade_sharpe': float(np.mean([block.get('trade_sharpe', 0.0) for block in blocks])),
+        'mean_trade_pnl_dollars': float(np.mean([block.get('avg_trade_pnl_dollars', 0.0) for block in blocks])),
+        'mean_expectancy_dollars': float(np.mean([block.get('avg_trade_expectancy_dollars', 0.0) for block in blocks])),
+        'max_drawdown_pct': float(np.max([block.get('max_drawdown_pct', 0.0) for block in blocks])),
+        'total_trades': int(np.sum([block.get('trades', 0) for block in blocks])),
+        'total_pnl_dollars': float(np.sum([block.get('total_pnl_dollars', 0.0) for block in blocks])),
     }
 
 

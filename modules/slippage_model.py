@@ -157,6 +157,87 @@ def confidence_bet_size(confidence: float, base_size: int = 1, max_size: int = 5
     elif confidence >= 0.60: return max(base_size, max_size // 2)
     else: return base_size
 
+
+def fractional_kelly_bet_size(
+    probability: float,
+    avg_win_pips: float,
+    avg_loss_pips: float,
+    *,
+    uncertainty: float = 0.0,
+    coverage_ratio: float = 1.0,
+    regime_entropy: float = 0.0,
+    runtime_penalty: float = 1.0,
+    fraction: float = 0.25,
+    max_size: int = 5,
+    min_size: int = 1,
+    allow_zero: bool = True,
+) -> int:
+    p = float(np.clip(probability, 0.0, 1.0))
+    win = max(float(avg_win_pips), 1e-8)
+    loss = max(float(avg_loss_pips), 1e-8)
+    q = 1.0 - p
+    b = win / loss
+    kelly_fraction = p - (q / max(b, 1e-8))
+    if kelly_fraction <= 0.0:
+        return 0 if allow_zero else max(int(min_size), 1)
+
+    penalty = float(
+        np.clip(1.0 - float(uncertainty), 0.0, 1.0)
+        * np.clip(float(coverage_ratio), 0.0, 1.0)
+        * np.clip(1.0 - float(regime_entropy), 0.0, 1.0)
+        * np.clip(float(runtime_penalty), 0.0, 1.0)
+    )
+    adjusted_fraction = max(float(kelly_fraction), 0.0) * max(float(fraction), 0.0) * penalty
+    size = int(round(adjusted_fraction * max(int(max_size), 1)))
+    if size <= 0:
+        return 0 if allow_zero else max(int(min_size), 1)
+    if allow_zero:
+        return min(size, max(int(max_size), 1))
+    return min(max(size, max(int(min_size), 1)), max(int(max_size), 1))
+
+
+def position_size_from_prediction(
+    prediction: dict,
+    *,
+    base_size: int = 1,
+    max_size: int = 5,
+    fraction: float = 0.25,
+) -> int:
+    explicit_size = prediction.get('position_size', None)
+    if explicit_size is not None:
+        try:
+            return max(0, min(int(explicit_size), max(int(max_size), 1)))
+        except Exception:
+            pass
+
+    if prediction.get('tradeable', False) and prediction.get('bias') in ('LONG', 'SHORT'):
+        edge_prob = prediction.get('edge_prob')
+        avg_win_pips = prediction.get('selected_avg_win_pips')
+        avg_loss_pips = prediction.get('selected_avg_loss_pips')
+        if edge_prob is not None and avg_win_pips is not None and avg_loss_pips is not None:
+            size = fractional_kelly_bet_size(
+                float(edge_prob),
+                float(avg_win_pips),
+                float(avg_loss_pips),
+                uncertainty=float(prediction.get('uncertainty', 0.0) or 0.0),
+                coverage_ratio=float(prediction.get('policy_coverage_ratio', 1.0) or 0.0),
+                regime_entropy=float(prediction.get('regime_entropy', 0.0) or 0.0),
+                runtime_penalty=float(prediction.get('sizing_penalty', 1.0) or 0.0),
+                fraction=fraction,
+                max_size=max_size,
+                min_size=base_size,
+                allow_zero=True,
+            )
+            if size > 0:
+                return size
+            return 0
+
+    return confidence_bet_size(
+        float(prediction.get('confidence', 0.0) or 0.0),
+        base_size=int(base_size),
+        max_size=int(max_size),
+    )
+
 # ══════════════════════════════════════════════════════════════════
 # DailyLossGuard — وقف التداول عند تجاوز الخسارة اليومية
 # ══════════════════════════════════════════════════════════════════

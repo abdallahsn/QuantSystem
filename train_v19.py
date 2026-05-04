@@ -17,6 +17,7 @@ import argparse
 import datetime
 import json
 import os
+import pickle
 import shutil
 import sys
 import tempfile
@@ -37,6 +38,10 @@ from prepare_training_data import (
 )
 VISUAL_EMB_DIM = 8
 from modules.config_v19 import load_v19_config
+from modules.decision_policy_v19 import (
+    DEFAULT_DECISION_POLICY_ARTIFACT,
+    build_decision_policy,
+)
 from modules.dynamic_labels import (
     DEFAULT_EVENT_OBI_THR,
     DEFAULT_EVENT_ROLL_WINDOW,
@@ -65,6 +70,7 @@ from modules.oof_stacking import (
 )
 from modules.purging_embargo import embargo_observations, purge_overlapping, walk_forward_expanding
 from modules.regime_classifier import (
+    HMM_AVAILABLE,
     REGIME_META_SCORE_COLS,
     REGIME_ONE_HOT_COLS,
     RegimeClassifier,
@@ -103,8 +109,11 @@ LEGACY_META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=False)
 META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=True)
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
 SEQUENCE_AUX_LAST_STEP_ONLY = 'last_step_only'
+SEQUENCE_AUX_ALL_STEPS = 'all_steps'
 VISUAL_COVERAGE_FAIL_FAST = True
 TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
+DEFAULT_LOB_MAX_AGE = '500ms'
+TREE_CLASS_WEIGHT_MAX = 2.5
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
     'label_end_ts',
@@ -328,6 +337,42 @@ def _apply_long_calibrator(calibrator: IsotonicRegression | None, probs: np.ndar
     out[:, 0] = cal_long.astype(np.float32)
     out[:, 1] = (1.0 - cal_long).astype(np.float32)
     return out
+
+
+def _calibration_metrics(
+    y_bias: np.ndarray,
+    raw_probs: np.ndarray,
+    calibrated_probs: np.ndarray,
+) -> dict:
+    y_bias = np.asarray(y_bias, dtype=np.int32)
+    raw_probs = np.asarray(raw_probs, dtype=np.float64)
+    calibrated_probs = np.asarray(calibrated_probs, dtype=np.float64)
+    mask = np.isin(y_bias, [0, 1])
+    if int(mask.sum()) == 0:
+        return {
+            'rows': 0,
+            'raw_brier': None,
+            'calibrated_brier': None,
+            'raw_ece': None,
+            'calibrated_ece': None,
+            'raw_nll': None,
+            'calibrated_nll': None,
+        }
+    y_dir = y_bias[mask]
+    raw = np.clip(raw_probs[mask], 1e-6, 1.0 - 1e-6)
+    raw = raw / np.clip(raw.sum(axis=1, keepdims=True), 1e-9, None)
+    cal = np.clip(calibrated_probs[mask], 1e-6, 1.0 - 1e-6)
+    cal = cal / np.clip(cal.sum(axis=1, keepdims=True), 1e-9, None)
+    y_long = (y_dir == 0).astype(np.float64)
+    return {
+        'rows': int(mask.sum()),
+        'raw_brier': float(np.mean((raw[:, 0] - y_long) ** 2)),
+        'calibrated_brier': float(np.mean((cal[:, 0] - y_long) ** 2)),
+        'raw_ece': _binary_ece(y_dir, raw[:, 0]),
+        'calibrated_ece': _binary_ece(y_dir, cal[:, 0]),
+        'raw_nll': float(log_loss(y_dir, raw, labels=[0, 1])),
+        'calibrated_nll': float(log_loss(y_dir, cal, labels=[0, 1])),
+    }
 
 
 def _fit_temperature_from_probs(y_bias: np.ndarray, probs: np.ndarray) -> tuple[float | None, dict]:
@@ -704,15 +749,73 @@ def _build_scaled_stat_matrix(
     return scaled[cols].values.astype(np.float32)
 
 
+def _adaptive_tree_depth(n_features: int) -> int:
+    n_features = max(int(n_features), 0)
+    if n_features < 50:
+        return 4
+    if n_features < 100:
+        return 6
+    return 7
+
+
+def _compute_binary_class_weights(y_bias: np.ndarray, max_weight: float = TREE_CLASS_WEIGHT_MAX) -> list[float] | None:
+    y_bias = np.asarray(y_bias, dtype=np.int32)
+    counts = np.bincount(y_bias[(y_bias >= 0) & (y_bias < 2)], minlength=2)[:2]
+    if counts.size < 2 or np.any(counts <= 0):
+        return None
+    total = float(np.sum(counts))
+    raw_weights = [total / (2.0 * float(count)) for count in counts]
+    weights = [float(np.clip(w, 1.0, max_weight)) for w in raw_weights]
+    return weights
+
+
+def _fold_scaler_diagnostics(scaler_params: dict | None) -> dict:
+    scaler_params = scaler_params or {}
+    type_counts: dict[str, int] = {}
+    for params in scaler_params.values():
+        scaler_type = str((params or {}).get('type', 'missing'))
+        type_counts[scaler_type] = int(type_counts.get(scaler_type, 0) + 1)
+    total = int(sum(type_counts.values()))
+    zero_count = int(type_counts.get('zero', 0))
+    return {
+        'feature_count': total,
+        'type_counts': type_counts,
+        'zero_count': zero_count,
+        'zero_pct': float(zero_count / max(total, 1)),
+    }
+
+
+def _stabilize_fold_scaler(
+    fold_scaler: dict | None,
+    inference_scaler_params: dict | None,
+) -> tuple[dict, dict]:
+    stabilized = {str(col): dict(params or {}) for col, params in (fold_scaler or {}).items()}
+    inference_scaler_params = inference_scaler_params or {}
+    fallback_used: list[str] = []
+    for col, params in list(stabilized.items()):
+        if str((params or {}).get('type', '')) != 'zero':
+            continue
+        fallback = inference_scaler_params.get(col)
+        if isinstance(fallback, dict) and str(fallback.get('type', '')) != 'zero':
+            stabilized[col] = dict(fallback)
+            fallback_used.append(str(col))
+    diagnostics = _fold_scaler_diagnostics(stabilized)
+    diagnostics['zero_fallback_features'] = fallback_used
+    diagnostics['zero_fallback_count'] = int(len(fallback_used))
+    return stabilized, diagnostics
+
+
 def _adaptive_tree_early_stopping_rounds(train_rows: int, has_eval_set: bool) -> int | None:
     if not has_eval_set:
         return None
     train_rows = max(int(train_rows), 0)
-    if train_rows < 1_000:
-        return 20
-    if train_rows < 3_000:
+    if train_rows < 500:
         return 30
-    return 50
+    if train_rows < 2_000:
+        return 50
+    if train_rows < 10_000:
+        return 75
+    return 100
 
 
 def _project_sequence_aux_context(
@@ -775,6 +878,39 @@ def _parse_optional_timestamp(value) -> pd.Timestamp | None:
     if pd.isna(ts):
         return None
     return ts.tz_localize(None)
+
+
+def _chronological_holdout_indices(n_rows: int, holdout_frac: float = 0.10) -> tuple[np.ndarray, np.ndarray]:
+    n_rows = max(int(n_rows), 0)
+    if n_rows <= 1:
+        idx = np.arange(n_rows, dtype=np.int32)
+        return idx, np.array([], dtype=np.int32)
+    holdout_rows = int(max(1, round(n_rows * float(holdout_frac))))
+    holdout_rows = min(holdout_rows, n_rows - 1)
+    split_idx = n_rows - holdout_rows
+    train_idx = np.arange(split_idx, dtype=np.int32)
+    holdout_idx = np.arange(split_idx, n_rows, dtype=np.int32)
+    return train_idx, holdout_idx
+
+
+def _regime_priors_from_meta(regime_meta: np.ndarray, covered_mask: np.ndarray) -> np.ndarray:
+    regime_meta = np.asarray(regime_meta, dtype=np.float32)
+    covered_mask = np.asarray(covered_mask, dtype=bool).reshape(-1)
+    out = np.zeros((regime_meta.shape[0], regime_meta.shape[1]), dtype=np.float32)
+    if regime_meta.ndim != 2 or regime_meta.shape[1] == 0:
+        return out
+    if np.any(covered_mask):
+        priors = regime_meta[covered_mask].mean(axis=0)
+    else:
+        priors = np.zeros(regime_meta.shape[1], dtype=np.float32)
+    if regime_meta.shape[1] >= N_CLUSTERS:
+        one_hot_block = np.clip(priors[:N_CLUSTERS], 0.0, None)
+        if float(one_hot_block.sum()) <= 0.0:
+            one_hot_block = np.ones(N_CLUSTERS, dtype=np.float32) / float(N_CLUSTERS)
+        else:
+            one_hot_block = one_hot_block / float(one_hot_block.sum())
+        priors[:N_CLUSTERS] = one_hot_block.astype(np.float32)
+    return np.repeat(priors.reshape(1, -1), regime_meta.shape[0], axis=0).astype(np.float32)
 
 
 def _build_row_time_mask(
@@ -1148,6 +1284,7 @@ def stage1_oof_meta(
     catboost_device: str = 'auto',
     quality_weight_strong: float = 2.0,
     quality_weight_weak: float = 1.0,
+    cost_config: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
@@ -1207,8 +1344,21 @@ def stage1_oof_meta(
             "pip install -r requirements.txt"
         )
 
+    regime_model_type = 'hmm' if HMM_AVAILABLE else 'rules'
     regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
     os.makedirs(regime_tmp_dir, exist_ok=True)
+    tree_depth = _adaptive_tree_depth(len(CATBOOST_ADVISOR_FEATURES))
+
+    def _weighted_quality_weights(indices: np.ndarray, class_weights: list[float] | None) -> np.ndarray:
+        weights = _quality_sample_weights(
+            df.iloc[indices],
+            strong_weight=quality_weight_strong,
+            weak_weight=quality_weight_weak,
+        ).astype(np.float32)
+        if class_weights is not None:
+            class_mult = np.asarray(class_weights, dtype=np.float32)
+            weights = weights * class_mult[np.clip(y[indices], 0, len(class_mult) - 1)]
+        return weights.astype(np.float32)
 
     def _cb_predict(train_idx, test_idx, fold_no):
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
@@ -1235,7 +1385,21 @@ def stage1_oof_meta(
                 'directional_f1': None,
                 'mode': 'priors_only_single_class_train',
             }
-        fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
+        if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
+            print(
+                f"      CatBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
+                "| using priors"
+            )
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_degraded_scaler',
+                'fold_scaler_diagnostics': scaler_diag,
+            }
+
         X_fit = _apply_scaler_to_stat_frame(
             raw_stat.iloc[fit_idx],
             fold_scaler,
@@ -1251,18 +1415,16 @@ def stage1_oof_meta(
             f"| scaler_fit_rows={len(fit_idx):,}"
         )
 
-        sw = _quality_sample_weights(
-            df.iloc[fit_idx],
-            strong_weight=quality_weight_strong,
-            weak_weight=quality_weight_weak,
-        )
+        class_weights = _compute_binary_class_weights(y[fit_idx])
+        sw = _weighted_quality_weights(fit_idx, class_weights)
         model = CatBoostClassifier(
             iterations=1000,
-            depth=4,
+            depth=tree_depth,
             learning_rate=0.01,
             l2_leaf_reg=3.0,
             bootstrap_type='Bernoulli',
             subsample=0.80,
+            rsm=0.70,
             loss_function='Logloss',
             eval_metric='Logloss',
             early_stopping_rounds=early_stopping_rounds,
@@ -1274,6 +1436,7 @@ def stage1_oof_meta(
         )
         tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
         eval_set = None
+        X_val = None
         if inner_val is not None:
             X_val = _apply_scaler_to_stat_frame(
                 raw_stat.iloc[inner_val],
@@ -1283,11 +1446,22 @@ def stage1_oof_meta(
             eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
         model.fit(tr_pool, eval_set=eval_set, plot=False)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
-        preds = align_probability_columns(
+        raw_preds = align_probability_columns(
             model.predict_proba(X_test),
             N_CB_PROBS,
             classes=present_classes,
         )
+        calibrator = None
+        calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
+        if X_val is not None:
+            val_raw = align_probability_columns(
+                model.predict_proba(X_val),
+                N_CB_PROBS,
+                classes=present_classes,
+            )
+            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+        preds = _apply_long_calibrator(calibrator, raw_preds)
+        test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
         pred_labels = np.argmax(preds, axis=1)
         precision, recall, f1, _ = precision_recall_fscore_support(
             y[test_idx],
@@ -1307,11 +1481,15 @@ def stage1_oof_meta(
             'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
             'best_iteration': cb_best_iteration,
             'early_stopping_rounds': early_stopping_rounds,
+            'class_weights': class_weights,
+            'fold_scaler_diagnostics': scaler_diag,
+            'calibration': {
+                'inner_validation': calibrator_report,
+                'outer_test': test_metrics,
+            },
         }
 
-    oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(
-        n, N_CB_PROBS, splits, _cb_predict
-    )
+    oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(n, N_CB_PROBS, splits, _cb_predict)
     oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
 
     def _xgb_predict(train_idx, test_idx, fold_no):
@@ -1339,7 +1517,20 @@ def stage1_oof_meta(
                 'directional_f1': None,
                 'mode': 'priors_only_single_class_train',
             }
-        fold_scaler = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
+        if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
+            print(
+                f"      XGBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
+                "| using priors"
+            )
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_degraded_scaler',
+                'fold_scaler_diagnostics': scaler_diag,
+            }
         X_fit = _apply_scaler_to_stat_frame(
             raw_stat.iloc[fit_idx],
             fold_scaler,
@@ -1354,17 +1545,14 @@ def stage1_oof_meta(
             f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
             f"| scaler_fit_rows={len(fit_idx):,}"
         )
-        sw = _quality_sample_weights(
-            df.iloc[fit_idx],
-            strong_weight=quality_weight_strong,
-            weak_weight=quality_weight_weak,
-        )
+        class_weights = _compute_binary_class_weights(y[fit_idx])
+        sw = _weighted_quality_weights(fit_idx, class_weights)
         model_kwargs = {
             'n_estimators': 800,
-            'max_depth': 4,
+            'max_depth': tree_depth,
             'learning_rate': 0.03,
             'subsample': 0.80,
-            'colsample_bytree': 0.80,
+            'colsample_bytree': 0.70,
             'reg_lambda': 3.0,
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
@@ -1378,6 +1566,7 @@ def stage1_oof_meta(
             'sample_weight': sw,
             'verbose': False,
         }
+        X_val = None
         if inner_val is not None:
             X_val = _apply_scaler_to_stat_frame(
                 raw_stat.iloc[inner_val],
@@ -1387,11 +1576,22 @@ def stage1_oof_meta(
             fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
         model.fit(X_fit, y[fit_idx], **fit_kwargs)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
-        preds = align_probability_columns(
+        raw_preds = align_probability_columns(
             model.predict_proba(X_test),
             N_XGB_PROBS,
             classes=present_classes,
         )
+        calibrator = None
+        calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
+        if X_val is not None:
+            val_raw = align_probability_columns(
+                model.predict_proba(X_val),
+                N_XGB_PROBS,
+                classes=present_classes,
+            )
+            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+        preds = _apply_long_calibrator(calibrator, raw_preds)
+        test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
         pred_labels = np.argmax(preds, axis=1)
         precision, recall, f1, _ = precision_recall_fscore_support(
             y[test_idx],
@@ -1408,31 +1608,184 @@ def stage1_oof_meta(
             'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
             'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
             'early_stopping_rounds': early_stopping_rounds,
+            'class_weights': class_weights,
+            'fold_scaler_diagnostics': scaler_diag,
+            'calibration': {
+                'inner_validation': calibrator_report,
+                'outer_test': test_metrics,
+            },
         }
 
-    xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(
-        n, N_XGB_PROBS, splits, _xgb_predict
-    )
+    xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(n, N_XGB_PROBS, splits, _xgb_predict)
     xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
 
     regime_meta_dim = len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)
 
     def _regime_predict(train_idx, test_idx, fold_no):
-        clf = RegimeClassifier(n_regimes=N_CLUSTERS)
+        clf = RegimeClassifier(n_regimes=N_CLUSTERS, model_type=regime_model_type)
         clf.fit(df.iloc[train_idx].copy(), output_dir=regime_tmp_dir)
         meta = clf.predict_regime_meta(df.iloc[test_idx].copy())
         labels = np.argmax(meta.loc[:, list(REGIME_ONE_HOT_COLS)].values, axis=1).astype(np.int32)
         return meta.values.astype(np.float32), {
             'cluster_counts': np.bincount(labels, minlength=N_CLUSTERS).tolist(),
+            'model_type': str(getattr(clf, 'model_type', regime_model_type)),
         }
 
-    regime_raw, regime_covered, regime_reports = run_sequential_oof(
-        n, regime_meta_dim, splits, _regime_predict
-    )
-    regime_meta = np.zeros((n, regime_meta_dim), dtype=np.float32)
-    regime_meta[:, 0] = 1.0
+    regime_raw, regime_covered, regime_reports = run_sequential_oof(n, regime_meta_dim, splits, _regime_predict)
+    regime_meta = _regime_priors_from_meta(regime_raw, regime_covered)
     regime_meta[regime_covered] = regime_raw[regime_covered]
     coverage = prob_covered & xgb_covered & regime_covered
+
+    coverage_warnings = {
+        'catboost': float(prob_covered.mean()) < 0.50,
+        'xgboost': float(xgb_covered.mean()) < 0.50,
+        'regime': float(regime_covered.mean()) < 0.50,
+        'combined': float(coverage.mean()) < 0.50,
+    }
+    if coverage_warnings['catboost'] or coverage_warnings['xgboost']:
+        print(
+            "  ⚠️ Low OOF coverage detected: "
+            f"catboost={float(prob_covered.mean()):.1%} | xgboost={float(xgb_covered.mean()):.1%}"
+        )
+
+    cb_calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
+    xgb_calibrator_path = os.path.join(output_dir, 'xgboost_calibrator_v19.pkl')
+    decision_policy_path = os.path.join(output_dir, DEFAULT_DECISION_POLICY_ARTIFACT)
+    for path in (cb_calibrator_path, xgb_calibrator_path, decision_policy_path):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    final_scaler = inference_scaler_params
+    X_final = _apply_scaler_to_stat_frame(
+        raw_stat,
+        final_scaler,
+        clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+    ).values.astype(np.float32)
+    final_train_idx, final_holdout_idx = _chronological_holdout_indices(len(df), holdout_frac=0.10)
+    final_train_sw = _weighted_quality_weights(final_train_idx, _compute_binary_class_weights(y[final_train_idx]))
+    X_train_final = X_final[final_train_idx]
+    y_train_final = y[final_train_idx]
+    X_holdout_final = X_final[final_holdout_idx] if len(final_holdout_idx) else np.zeros((0, X_final.shape[1]), dtype=np.float32)
+    y_holdout_final = y[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.int32)
+
+    final_model = CatBoostClassifier(
+        iterations=1000,
+        depth=tree_depth,
+        learning_rate=0.01,
+        l2_leaf_reg=3.0,
+        bootstrap_type='Bernoulli',
+        subsample=0.80,
+        rsm=0.70,
+        loss_function='Logloss',
+        eval_metric='Logloss',
+        use_best_model=len(final_holdout_idx) > 0,
+        early_stopping_rounds=50 if len(final_holdout_idx) > 0 else None,
+        verbose=50,
+        random_seed=42,
+        task_type=cb_task_type,
+        devices=cb_devices,
+    )
+    final_pool = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+    final_eval_pool = Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES) if len(final_holdout_idx) else None
+    final_model.fit(final_pool, eval_set=final_eval_pool, plot=False)
+    final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
+    final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
+    with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
+        json.dump({'classes': final_cb_classes}, f, indent=2)
+    print(f"  ✅ CatBoost final classes: {final_cb_classes}")
+
+    final_cb_calibrator = None
+    final_cb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
+    if len(final_holdout_idx):
+        holdout_raw = align_probability_columns(
+            final_model.predict_proba(X_holdout_final),
+            N_CB_PROBS,
+            classes=final_cb_classes,
+        )
+        final_cb_calibrator, final_cb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_raw[:, 0])
+        if final_cb_calibrator is not None:
+            with open(cb_calibrator_path, 'wb') as f:
+                pickle.dump(final_cb_calibrator, f)
+    live_probs_raw = align_probability_columns(
+        final_model.predict_proba(X_final),
+        N_CB_PROBS,
+        classes=final_cb_classes,
+    )
+    live_probs = _apply_long_calibrator(final_cb_calibrator, live_probs_raw)
+
+    final_xgb = XGBClassifier(
+        n_estimators=800,
+        max_depth=tree_depth,
+        learning_rate=0.03,
+        subsample=0.80,
+        colsample_bytree=0.70,
+        reg_lambda=3.0,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        early_stopping_rounds=50 if len(final_holdout_idx) else None,
+        random_state=84,
+        tree_method='hist',
+    )
+    xgb_fit_kwargs = {
+        'sample_weight': final_train_sw,
+        'verbose': False,
+    }
+    if len(final_holdout_idx):
+        xgb_fit_kwargs['eval_set'] = [(X_holdout_final, y_holdout_final)]
+    final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kwargs)
+    final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
+    final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
+    with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
+        json.dump({'classes': final_xgb_classes}, f, indent=2)
+    print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
+
+    final_xgb_calibrator = None
+    final_xgb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
+    if len(final_holdout_idx):
+        holdout_xgb_raw = align_probability_columns(
+            final_xgb.predict_proba(X_holdout_final),
+            N_XGB_PROBS,
+            classes=final_xgb_classes,
+        )
+        final_xgb_calibrator, final_xgb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_xgb_raw[:, 0])
+        if final_xgb_calibrator is not None:
+            with open(xgb_calibrator_path, 'wb') as f:
+                pickle.dump(final_xgb_calibrator, f)
+    live_xgb_raw = align_probability_columns(
+        final_xgb.predict_proba(X_final),
+        N_XGB_PROBS,
+        classes=final_xgb_classes,
+    )
+    live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
+
+    final_regime = RegimeClassifier(n_regimes=N_CLUSTERS, model_type=regime_model_type)
+    final_regime.fit(df.copy(), output_dir=output_dir)
+    live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
+
+    with open(os.path.join(output_dir, 'meta_feature_names_v19.json'), 'w') as f:
+        json.dump({'meta_features': meta_feature_names}, f, indent=2)
+
+    live_meta = np.concatenate([live_probs, live_xgb_probs, live_regime_meta], axis=1).astype(np.float32)
+    np.save(os.path.join(output_dir, 'meta_features_live_v19.npy'), live_meta)
+
+    meta = np.concatenate([oof_probs, xgb_probs, regime_meta], axis=1).astype(np.float32)
+    np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
+    np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
+
+    ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
+    decision_policy = build_decision_policy(
+        df,
+        ensemble_oof_probs,
+        regime_meta,
+        coverage,
+        cost_config=cost_config,
+        source='stage1_oof_base_models',
+    )
+    with open(decision_policy_path, 'w') as f:
+        json.dump(decision_policy, f, indent=2)
 
     fold_metrics = {
         'catboost_folds': prob_reports,
@@ -1442,115 +1795,40 @@ def stage1_oof_meta(
         'xgboost_coverage_ratio': float(xgb_covered.mean()),
         'regime_coverage_ratio': float(regime_covered.mean()),
         'coverage_ratio': float(coverage.mean()),
+        'coverage_warning': coverage_warnings,
+        'fold_scaler_diagnostics': {
+            'catboost': [report.get('fold_scaler_diagnostics', {}) for report in prob_reports],
+            'xgboost': [report.get('fold_scaler_diagnostics', {}) for report in xgb_reports],
+        },
+        'decision_policy_artifact': os.path.basename(decision_policy_path),
+        'decision_policy_coverage_ratio': float(decision_policy.get('coverage_ratio', 0.0)),
     }
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
         json.dump(fold_metrics, f, indent=2)
 
-    calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
-    if os.path.exists(calibrator_path):
-        try:
-            os.remove(calibrator_path)
-        except OSError:
-            pass
-
-    if not inference_scaler_params:
-        raise RuntimeError(
-            '❌ inference_scaler_params is required for the final CatBoost fit. '
-            'Refusing to fall back to a full-data scaler.'
-        )
-    final_scaler = inference_scaler_params
-    X_final = _apply_scaler_to_stat_frame(
-        raw_stat,
-        final_scaler,
-        clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
-    ).values.astype(np.float32)
-    final_sw = _quality_sample_weights(
-        df,
-        strong_weight=quality_weight_strong,
-        weak_weight=quality_weight_weak,
-    )
-    final_model = CatBoostClassifier(
-        iterations=1000,
-        depth=4,
-        learning_rate=0.01,
-        l2_leaf_reg=3.0,
-        bootstrap_type='Bernoulli',
-        subsample=0.80,
-        loss_function='Logloss',
-        eval_metric='Logloss',
-        use_best_model=False,
-        verbose=50,
-        random_seed=42,
-        task_type=cb_task_type,
-        devices=cb_devices,
-    )
-    final_model.fit(Pool(X_final, y, weight=final_sw, feature_names=CATBOOST_ADVISOR_FEATURES), plot=False)
-    final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
-    final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y)), dtype=np.int32).tolist()
-    with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
-        json.dump({'classes': final_cb_classes}, f, indent=2)
-    print(f"  ✅ CatBoost final classes: {final_cb_classes}")
-
-    final_xgb = XGBClassifier(
-        n_estimators=800,
-        max_depth=4,
-        learning_rate=0.03,
-        subsample=0.80,
-        colsample_bytree=0.80,
-        reg_lambda=3.0,
-        objective='binary:logistic',
-        eval_metric='logloss',
-        random_state=84,
-        tree_method='hist',
-    )
-    final_xgb.fit(X_final, y, sample_weight=final_sw, verbose=False)
-    final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
-    final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y)), dtype=np.int32).tolist()
-    with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
-        json.dump({'classes': final_xgb_classes}, f, indent=2)
-    print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
-
-    final_regime = RegimeClassifier(n_regimes=N_CLUSTERS)
-    final_regime.fit(df.copy(), output_dir=output_dir)
-    live_probs = align_probability_columns(
-        final_model.predict_proba(X_final),
-        N_CB_PROBS,
-        classes=final_cb_classes,
-    )
-    live_xgb_probs = align_probability_columns(
-        final_xgb.predict_proba(X_final),
-        N_XGB_PROBS,
-        classes=final_xgb_classes,
-    )
-    live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
-    with open(os.path.join(output_dir, 'meta_feature_names_v19.json'), 'w') as f:
-        json.dump({'meta_features': meta_feature_names}, f, indent=2)
-    np.save(
-        os.path.join(output_dir, 'meta_features_live_v19.npy'),
-        np.concatenate([live_probs, live_xgb_probs, live_regime_meta], axis=1).astype(np.float32),
-    )
-
-    meta = np.concatenate([oof_probs, xgb_probs, regime_meta], axis=1).astype(np.float32)
-    np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
-    np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
     calibration_report = {
         'stage1_catboost_isotonic': {
-            'enabled': False,
-            'reason': 'disabled_to_preserve_strict_oof_meta_features',
+            'enabled': any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in prob_reports),
             'covered_rows': int(np.sum(prob_covered)),
             'total_rows': int(len(prob_covered)),
+            'folds': prob_reports,
         },
-        'stage1_xgboost_probability_block': {
-            'enabled': True,
+        'stage1_xgboost_isotonic': {
+            'enabled': any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in xgb_reports),
             'covered_rows': int(np.sum(xgb_covered)),
             'total_rows': int(len(xgb_covered)),
+            'folds': xgb_reports,
         },
-        'catboost_calibrator_artifact': None,
-        'long_threshold': None,
-        'short_threshold': None,
+        'final_catboost_holdout_calibration': final_cb_cal_report,
+        'final_xgboost_holdout_calibration': final_xgb_cal_report,
+        'catboost_calibrator_artifact': os.path.basename(cb_calibrator_path) if os.path.exists(cb_calibrator_path) else None,
+        'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if os.path.exists(xgb_calibrator_path) else None,
+        'decision_policy_artifact': os.path.basename(decision_policy_path),
+        'coverage_warning': coverage_warnings,
     }
     with open(os.path.join(output_dir, 'calibration_report.json'), 'w') as f:
         json.dump(calibration_report, f, indent=2)
+
     if meta.shape[1] != len(meta_feature_names):
         raise ValueError(
             f"❌ Stage1 meta feature width mismatch: meta={meta.shape} vs names={len(meta_feature_names)}"
@@ -1581,7 +1859,7 @@ def _load_lob_inputs(lob_path: str | None, lob_ts_path: str | None):
 def _align_lob_to_rows(
     df: pd.DataFrame,
     lob_timestamps: pd.Series,
-    max_age: str = '5s',
+    max_age: str = DEFAULT_LOB_MAX_AGE,
     max_tensors: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n_lob = len(lob_timestamps) if max_tensors is None else min(len(lob_timestamps), int(max_tensors))
@@ -1985,10 +2263,7 @@ def stage3_meta_learner_v19(
             f'but {len(meta_feature_names)} feature names'
         )
 
-    # OOF CatBoost probabilities / visual embeddings are intentionally exposed
-    # only on the last step of each sequence. Historical timesteps stay pure
-    # market-structure features to avoid fold-boundary artifacts in the LSTM.
-    sequence_aux_mode = SEQUENCE_AUX_LAST_STEP_ONLY
+    sequence_aux_mode = SEQUENCE_AUX_ALL_STEPS
     X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
     print(
@@ -2113,6 +2388,7 @@ def stage3_meta_learner_v19(
             'catboost_model': 'catboost_advisor_v19.cbm',
             'catboost_classes': 'catboost_classes_v19.json',
             'catboost_calibrator': 'catboost_calibrator_v19.pkl',
+            'decision_policy': DEFAULT_DECISION_POLICY_ARTIFACT,
             'meta_model': 'meta_learner_v19.keras',
             'meta_temperature': 'meta_temperature_v19.json',
             'regime_model': 'regime_classifier.pkl',
@@ -2130,6 +2406,7 @@ def stage3_meta_learner_v19(
                 {
                     'xgboost_model': 'xgboost_advisor_v19.json',
                     'xgboost_classes': 'xgboost_classes_v19.json',
+                    'xgboost_calibrator': 'xgboost_calibrator_v19.pkl',
                 }
             )
 
@@ -2144,7 +2421,10 @@ def stage3_meta_learner_v19(
             'timestamp_cols': ['ts_event', 'label_end_ts'],
             'input_dim': int(X_rows.shape[1]),
             'regime_meta_features': [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
+            'regime_meta_semantics': 'posterior_probabilities',
+            'regime_source': 'hmm' if HMM_AVAILABLE else 'fallback_rules',
             'base_models': meta_layout['base_models'],
+            'decision_policy_artifact': DEFAULT_DECISION_POLICY_ARTIFACT,
             'deeplob': {
                 'enabled': bool(len(VISUAL_FEATURE_NAMES)),
                 'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
@@ -2410,6 +2690,7 @@ def run_training_pipeline(
             catboost_device=catboost_device,
             quality_weight_strong=quality_weight_strong,
             quality_weight_weak=quality_weight_weak,
+            cost_config=(config_snapshot or {}).get('backtest', {}),
         )
         meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:

@@ -59,7 +59,7 @@ from modules.context_features        import GARCHVolatilityProxy                
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
 from modules.manifest_v19            import write_manifest
-from modules.feature_factory_v19     import ROBUST_IQR_MIN, fit_numeric_scaler_param
+from modules.feature_factory_v19     import ROBUST_IQR_MIN, fit_numeric_scaler_param, resolve_meta_feature_names
 from modules.feature_artifact_v19    import (
     FINAL_FEATURE_DIR,
     load_feature_artifact,
@@ -464,10 +464,7 @@ RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]
 
 # V19 Meta-Features — مخرجات CatBoost تُضاف للـ LSTM
-META_FEATURE_COLS = [
-    'cb_prob_long', 'cb_prob_short',                       # 2 احتمالات CatBoost
-    'cluster_0', 'cluster_1', 'cluster_2', 'cluster_3',   # 4 One-Hot Cluster
-]  # N = 6
+META_FEATURE_COLS = resolve_meta_feature_names(include_xgboost=True)  # N = 11
 
 # V19 Visual Features — مخرجات CNN
 VISUAL_EMB_COLS = [f'vis_emb_{i}' for i in range(8)]  # N = 8

@@ -431,7 +431,7 @@ class LeakageGuardTests(unittest.TestCase):
         expected_cols = [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS]
         self.assertEqual(list(meta.columns), expected_cols)
         self.assertEqual(meta.shape, (n, len(expected_cols)))
-        np.testing.assert_allclose(meta.loc[:, list(REGIME_ONE_HOT_COLS)].sum(axis=1).values, 1.0)
+        np.testing.assert_allclose(meta.loc[:, list(REGIME_ONE_HOT_COLS)].sum(axis=1).values, 1.0, atol=1e-6)
         self.assertTrue(((meta.loc[:, list(REGIME_META_SCORE_COLS)].values >= 0.0) & (meta.loc[:, list(REGIME_META_SCORE_COLS)].values <= 1.0)).all())
 
     def test_regime_surface_rules_expand_from_coarse_stride(self):
