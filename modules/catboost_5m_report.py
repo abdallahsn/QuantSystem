@@ -252,6 +252,18 @@ def _regime_to_name(value) -> str:
         return str(value)
 
 
+def _resample_source_series(
+    frame: pd.DataFrame,
+    col: str,
+    default_value: float | int = 0.0,
+) -> pd.Series:
+    if col in frame.columns:
+        values = frame[col]
+    else:
+        values = pd.Series(default_value, index=frame.index, dtype=np.float64)
+    return pd.to_numeric(values, errors="coerce").fillna(float(default_value))
+
+
 def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
     freq = _normalize_freq(freq)
     offset = pd.tseries.frequencies.to_offset(freq)
@@ -269,20 +281,20 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     ohlc = frame["price"].resample(freq).ohlc()
     volume = frame["size"].resample(freq).sum().rename("volume")
     event_count = frame["price"].resample(freq).size().rename("event_count")
-    cvd_last = pd.to_numeric(frame.get("cvd", 0.0), errors="coerce").resample(freq).last().rename("cvd")
-    cvd_first = pd.to_numeric(frame.get("cvd", 0.0), errors="coerce").resample(freq).first().rename("cvd_first")
+    cvd_last = _resample_source_series(frame, "cvd", 0.0).resample(freq).last().rename("cvd")
+    cvd_first = _resample_source_series(frame, "cvd", 0.0).resample(freq).first().rename("cvd_first")
     cvd_delta = (cvd_last - cvd_first).rename("cvd_delta")
-    obi = pd.to_numeric(frame.get("obi", 0.0), errors="coerce").resample(freq).mean().rename("obi")
-    absorption = pd.to_numeric(frame.get("absorption_intensity", 0.0), errors="coerce").resample(freq).mean().rename("absorption_intensity")
-    kyle = pd.to_numeric(frame.get("kyle_lambda", 0.0), errors="coerce").resample(freq).mean().rename("kyle_lambda")
-    hawkes = pd.to_numeric(frame.get("hawkes_intensity", 0.0), errors="coerce").resample(freq).mean().rename("hawkes_intensity")
+    obi = _resample_source_series(frame, "obi", 0.0).resample(freq).mean().rename("obi")
+    absorption = _resample_source_series(frame, "absorption_intensity", 0.0).resample(freq).mean().rename("absorption_intensity")
+    kyle = _resample_source_series(frame, "kyle_lambda", 0.0).resample(freq).mean().rename("kyle_lambda")
+    hawkes = _resample_source_series(frame, "hawkes_intensity", 0.0).resample(freq).mean().rename("hawkes_intensity")
     regime = frame.get("regime_label", pd.Series(1, index=frame.index)).resample(freq).apply(lambda s: _mode_or_default(s, 1)).rename("regime_label")
-    trend_strength = pd.to_numeric(frame.get("trend_strength", 0.0), errors="coerce").resample(freq).mean().rename("trend_strength")
-    correction_depth = pd.to_numeric(frame.get("correction_depth", 0.0), errors="coerce").resample(freq).mean().rename("correction_depth")
-    liquidity_sweep = pd.to_numeric(frame.get("liquidity_sweep", 0.0), errors="coerce").resample(freq).mean().rename("liquidity_sweep")
-    kalman_trend_strength = pd.to_numeric(frame.get("kalman_trend_strength", 0.0), errors="coerce").resample(freq).mean().rename("kalman_trend_strength")
-    event_score = pd.to_numeric(frame.get("event_score", 0.0), errors="coerce").resample(freq).mean().rename("event_score")
-    price_position = pd.to_numeric(frame.get("price_position", 0.5), errors="coerce").resample(freq).mean().rename("price_position")
+    trend_strength = _resample_source_series(frame, "trend_strength", 0.0).resample(freq).mean().rename("trend_strength")
+    correction_depth = _resample_source_series(frame, "correction_depth", 0.0).resample(freq).mean().rename("correction_depth")
+    liquidity_sweep = _resample_source_series(frame, "liquidity_sweep", 0.0).resample(freq).mean().rename("liquidity_sweep")
+    kalman_trend_strength = _resample_source_series(frame, "kalman_trend_strength", 0.0).resample(freq).mean().rename("kalman_trend_strength")
+    event_score = _resample_source_series(frame, "event_score", 0.0).resample(freq).mean().rename("event_score")
+    price_position = _resample_source_series(frame, "price_position", 0.5).resample(freq).mean().rename("price_position")
 
     cb_probs = frame[DIRECTION_PROB_COLS].resample(freq).mean()
     regime_probs = (

@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("plotly")
 
-from modules.catboost_5m_report import _apply_decision_policy_to_bars, _build_price_hover_trace
+from modules.catboost_5m_report import _apply_decision_policy_to_bars, _build_price_hover_trace, _resample_catboost_bars
 from modules.range_state_machine import SignalState, apply_range_filter_to_dataframe, RangeStateMachine
 
 
@@ -360,6 +360,32 @@ def test_report_policy_overlay_can_abstain_before_rsm():
     assert bool(out.loc[0, "policy_tradeable"]) is False
     assert out.loc[0, "policy_reason"] == "cost_aware_abstain"
     assert counts == {"NEUTRAL": 1}
+
+
+def test_resample_catboost_bars_handles_missing_optional_series():
+    pred_df = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-15 07:55:00",
+                    "2025-01-15 07:56:00",
+                    "2025-01-15 07:57:00",
+                ]
+            ),
+            "price": [1.2224, 1.2226, 1.2225],
+            "size": [1.0, 2.0, 1.5],
+            "cb_prob_long": [0.6, 0.55, 0.52],
+            "cb_prob_short": [0.4, 0.45, 0.48],
+        }
+    )
+
+    bars = _resample_catboost_bars(pred_df, freq="5min")
+
+    assert len(bars) == 1
+    assert "cvd_delta" in bars.columns
+    assert "obi" in bars.columns
+    assert "event_score" in bars.columns
+    assert float(bars.loc[0, "cvd_delta"]) == 0.0
 
 
 def test_locked_state_times_out_and_reprocesses_current_bar():
