@@ -362,6 +362,44 @@ def test_decision_policy_abstains_when_expected_value_is_negative():
     assert decision['expected_value_long_pips'] <= 0.0
 
 
+def test_decision_policy_build_uses_model_probabilities_to_weight_side_stats():
+    df = pd.DataFrame(
+        {
+            'bias_label': [0, 0, 1, 1],
+            'forward_return': [0.0001, 0.0006, -0.0001, -0.0001],
+            'trend_strength': [0.6, 0.6, 0.6, 0.6],
+            'correction_depth': [0.7, 0.7, 0.7, 0.7],
+        }
+    )
+    probs = np.array(
+        [
+            [0.10, 0.90],
+            [0.95, 0.05],
+            [0.20, 0.80],
+            [0.20, 0.80],
+        ],
+        dtype=np.float32,
+    )
+    regime_meta = np.tile(np.array([[0.7, 0.2, 0.05, 0.05]], dtype=np.float32), (len(df), 1))
+    coverage = np.ones(len(df), dtype=bool)
+
+    policy = build_decision_policy(
+        df,
+        probs,
+        regime_meta,
+        coverage,
+        cost_config={'tick_size': 0.0001, 'round_trip_cost_pips': 1.0},
+        min_support=1,
+    )
+
+    long_stats = policy['global']['LONG']
+    short_stats = policy['global']['SHORT']
+
+    assert long_stats['avg_win_pips'] > 3.0
+    assert long_stats['avg_win_pips'] > short_stats['avg_win_pips']
+    assert long_stats['weighted_support'] > 0.0
+
+
 def test_fractional_kelly_size_shrinks_with_uncertainty():
     low_uncertainty = fractional_kelly_bet_size(
         0.65,

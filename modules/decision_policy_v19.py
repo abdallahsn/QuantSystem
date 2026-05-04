@@ -114,7 +114,20 @@ def structure_bucket_series(df: pd.DataFrame) -> pd.Series:
     return df.apply(structure_bucket_from_row, axis=1).astype(str)
 
 
-def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float) -> dict:
+def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if values.size != weights.size:
+        raise ValueError(f"weighted mean size mismatch: {values.size} vs {weights.size}")
+    weight_sum = float(np.sum(np.clip(weights, 0.0, None)))
+    if weight_sum <= 1e-12:
+        return float(np.mean(values))
+    return float(np.sum(values * np.clip(weights, 0.0, None)) / weight_sum)
+
+
+def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_probs: np.ndarray | None = None) -> dict:
     if frame.empty:
         baseline = max(float(cost_pips), 1.0)
         threshold = (baseline + float(cost_pips)) / max(2.0 * baseline + float(cost_pips), 1e-8)
@@ -138,25 +151,34 @@ def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float) -> dict:
         forward_pips = forward_pips / tick_size
     labels = pd.to_numeric(frame.get("bias_label", 1), errors="coerce").fillna(1).astype(np.int32).to_numpy()
     covered = pd.to_numeric(frame.get("policy_covered", 0), errors="coerce").fillna(0).astype(np.int8).to_numpy()
+    weights = (
+        np.clip(np.asarray(side_probs, dtype=np.float64).reshape(-1), 0.0, 1.0)
+        if side_probs is not None
+        else np.ones(len(frame), dtype=np.float64)
+    )
+    if len(weights) != len(frame):
+        raise ValueError(f"side_probs length mismatch: {len(weights)} vs {len(frame)}")
 
     win_mask = labels == int(side_label)
     loss_mask = labels == int(1 - side_label)
-    avg_win = float(np.mean(forward_pips[win_mask])) if np.any(win_mask) else 0.0
-    avg_loss = float(np.mean(forward_pips[loss_mask])) if np.any(loss_mask) else 0.0
+    avg_win = _weighted_mean(forward_pips[win_mask], weights[win_mask]) if np.any(win_mask) else 0.0
+    avg_loss = _weighted_mean(forward_pips[loss_mask], weights[loss_mask]) if np.any(loss_mask) else 0.0
     baseline = max(float(cost_pips), 1.0)
     avg_win = max(avg_win, baseline)
     avg_loss = max(avg_loss, baseline)
     threshold = (avg_loss + float(cost_pips)) / max(avg_win + avg_loss + float(cost_pips), 1e-8)
+    weighted_support = float(np.sum(weights))
     return {
         "support": int(len(frame)),
+        "weighted_support": float(weighted_support),
         "win_support": int(np.sum(win_mask)),
         "loss_support": int(np.sum(loss_mask)),
         "coverage_ratio": float(np.mean(covered.astype(np.float32))) if len(covered) else 0.0,
         "avg_win_pips": float(avg_win),
         "avg_loss_pips": float(avg_loss),
         "threshold_from_cost": float(np.clip(threshold, 0.0, 1.0)),
-        "realized_prior": float(np.mean(win_mask.astype(np.float32))) if len(win_mask) else 0.5,
-        "avg_abs_return_pips": float(np.mean(forward_pips)) if len(forward_pips) else float(baseline),
+        "realized_prior": _weighted_mean(win_mask.astype(np.float32), weights) if len(win_mask) else 0.5,
+        "avg_abs_return_pips": _weighted_mean(forward_pips, weights) if len(forward_pips) else float(baseline),
     }
 
 
@@ -204,6 +226,8 @@ def build_decision_policy(
     frame["policy_covered"] = coverage.astype(np.int8)
     frame["structure_bucket"] = structure_bucket_series(frame)
     frame["dominant_regime"] = np.argmax(regime_arr[:, :4], axis=1).astype(np.int32)
+    frame["prob_long"] = np.clip(probs[:, 0], 0.0, 1.0)
+    frame["prob_short"] = np.clip(probs[:, 1], 0.0, 1.0)
     tick_size = max(_safe_float((cost_config or {}).get("tick_size", 1.0), 1.0), 1e-8)
     frame["_abs_forward_pips"] = (
         np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
@@ -211,8 +235,8 @@ def build_decision_policy(
     )
 
     global_block = {
-        "LONG": _side_stats(frame, 0, cost_model["effective_cost_pips"]),
-        "SHORT": _side_stats(frame, 1, cost_model["effective_cost_pips"]),
+        "LONG": _side_stats(frame, 0, cost_model["effective_cost_pips"], frame["prob_long"].to_numpy(dtype=np.float64)),
+        "SHORT": _side_stats(frame, 1, cost_model["effective_cost_pips"], frame["prob_short"].to_numpy(dtype=np.float64)),
     }
 
     structures: dict[str, dict[str, Any]] = {}
@@ -221,8 +245,8 @@ def build_decision_policy(
             "support": int(len(bucket_df)),
             "coverage_ratio": float(bucket_df["policy_covered"].mean()) if len(bucket_df) else 0.0,
             "global": {
-                "LONG": _side_stats(bucket_df, 0, cost_model["effective_cost_pips"]),
-                "SHORT": _side_stats(bucket_df, 1, cost_model["effective_cost_pips"]),
+                "LONG": _side_stats(bucket_df, 0, cost_model["effective_cost_pips"], bucket_df["prob_long"].to_numpy(dtype=np.float64)),
+                "SHORT": _side_stats(bucket_df, 1, cost_model["effective_cost_pips"], bucket_df["prob_short"].to_numpy(dtype=np.float64)),
             },
             "by_regime": {},
         }
@@ -230,8 +254,8 @@ def build_decision_policy(
             regime_df = bucket_df[bucket_df["dominant_regime"] == regime_id]
             bucket_payload["by_regime"][str(regime_id)] = {
                 "support": int(len(regime_df)),
-                "LONG": _side_stats(regime_df, 0, cost_model["effective_cost_pips"]),
-                "SHORT": _side_stats(regime_df, 1, cost_model["effective_cost_pips"]),
+                "LONG": _side_stats(regime_df, 0, cost_model["effective_cost_pips"], regime_df["prob_long"].to_numpy(dtype=np.float64)),
+                "SHORT": _side_stats(regime_df, 1, cost_model["effective_cost_pips"], regime_df["prob_short"].to_numpy(dtype=np.float64)),
             }
         structures[str(bucket)] = bucket_payload
 
