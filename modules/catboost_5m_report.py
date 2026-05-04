@@ -988,6 +988,8 @@ def generate_catboost_5m_report(
     mbp_path: str = "",
     max_bars: int = 400,
     future_bars: int = 4,
+    apply_decision_policy: bool = True,
+    apply_rsm: bool = True,
 ) -> dict[str, Any]:
     output_dir = output_dir or models_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -1003,11 +1005,11 @@ def generate_catboost_5m_report(
         "min": float(bars["cb_confidence"].min()) if not bars.empty else 0.0,
         "max": float(bars["cb_confidence"].max()) if not bars.empty else 0.0,
     }
-    decision_policy = _load_optional_json(os.path.join(models_dir, "decision_policy_v19.json"))
+    decision_policy = _load_optional_json(os.path.join(models_dir, "decision_policy_v19.json")) if apply_decision_policy else None
     bars, policy_direction_counts = _apply_decision_policy_to_bars(bars, decision_policy)
-    policy_available = bool(decision_policy)
+    policy_available = bool(decision_policy) and bool(apply_decision_policy)
     pre_rsm_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
-    if RSM_AVAILABLE and len(bars):
+    if apply_rsm and RSM_AVAILABLE and len(bars):
         bars["cb_direction_raw"] = bars["cb_direction"].astype(str)
         bars = apply_range_filter_to_dataframe(bars, regime_col="regime_label")
         if "rsm_direction" in bars.columns:
@@ -1079,6 +1081,9 @@ def generate_catboost_5m_report(
     summary = {
         "rows": int(len(pred_df)),
         "bars": int(len(bars)),
+        "report_mode": "filtered" if apply_decision_policy or apply_rsm else "raw_direct",
+        "apply_decision_policy": bool(apply_decision_policy),
+        "apply_rsm": bool(apply_rsm),
         "bars_before_limit": int(bars_before_limit),
         "bars_limit_applied": int(bars_limit_applied),
         "transitions": int(len(turns)),

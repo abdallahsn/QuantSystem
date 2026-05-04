@@ -172,6 +172,7 @@ def main():
             report_name='catboost_5m',
         )
         print("\n📊 5m CatBoost dashboard generated")
+        print(f"  report_mode: {summary.get('report_mode')}")
         for key, path in summary.get('files', {}).items():
             print(f"  {key}: {path}")
         if summary.get("raw_direction_counts"):
@@ -189,7 +190,26 @@ def main():
             )
         print(f"  transitions: {summary.get('transitions', 0)}")
     except Exception as e:
-        print(f"\n⚠️ تعذر توليد Dashboard الـ 5m: {e}")
+        print(f"\n⚠️ تعذر توليد Dashboard الـ 5m (filtered mode): {e}")
+        try:
+            raw_summary = generate_catboost_5m_report(
+                csv_path=args.csv,
+                models_dir=args.output,
+                output_dir=args.output,
+                freq='5min',
+                report_name='catboost_5m_raw_direct',
+                apply_decision_policy=False,
+                apply_rsm=False,
+            )
+            print("\n📊 5m CatBoost raw-direct dashboard generated")
+            print(f"  report_mode: {raw_summary.get('report_mode')}")
+            for key, path in raw_summary.get('files', {}).items():
+                print(f"  {key}: {path}")
+            print(f"  raw_direction_counts: {raw_summary.get('raw_direction_counts', {})}")
+            print(f"  direction_counts: {raw_summary.get('direction_counts', {})}")
+            print(f"  transitions: {raw_summary.get('transitions', 0)}")
+        except Exception as raw_exc:
+            print(f"⚠️ تعذر أيضًا توليد Dashboard الـ 5m raw-direct: {raw_exc}")
 
 
 if __name__ == '__main__':
