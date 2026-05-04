@@ -188,6 +188,8 @@ def _load_optional_market_csv(path: str, t_min: pd.Timestamp, t_max: pd.Timestam
 
 def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
     df = load_training_csv(csv_path).copy()
+    if df.empty:
+        raise ValueError("CatBoost 5m report received an empty artifact frame")
     if "price" not in df.columns:
         raise ValueError("Column 'price' is required for CatBoost visualization")
     if "ts_event" not in df.columns:
@@ -218,6 +220,12 @@ def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
     )
     calibrator = _load_optional_pickle(os.path.join(models_dir, "catboost_calibrator_v19.pkl"))
     probs = _apply_long_calibrator(calibrator, raw_probs)
+    probs = np.asarray(probs, dtype=np.float32)
+    if probs.ndim != 2 or probs.shape[0] != len(df) or probs.shape[1] < 2:
+        raise ValueError(
+            "CatBoost probability block is invalid for 5m report: "
+            f"shape={getattr(probs, 'shape', None)} rows={len(df)} classes={classes}"
+        )
 
     out = df.copy()
     out["cb_prob_long_raw"] = raw_probs[:, 0]

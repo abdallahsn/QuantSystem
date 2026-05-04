@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -386,6 +387,39 @@ def test_resample_catboost_bars_handles_missing_optional_series():
     assert "obi" in bars.columns
     assert "event_score" in bars.columns
     assert float(bars.loc[0, "cvd_delta"]) == 0.0
+
+
+def test_predict_catboost_frame_rejects_invalid_probability_block(monkeypatch, tmp_path):
+    from modules import catboost_5m_report
+
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(["2025-01-15 00:00:00"]),
+            "price": [1.2345],
+        }
+    )
+
+    class DummyModel:
+        def load_model(self, path):
+            return None
+
+        def predict_proba(self, X):
+            return np.zeros((len(X), 0), dtype=np.float32)
+
+    monkeypatch.setattr(catboost_5m_report, "CB_AVAILABLE", True)
+    monkeypatch.setattr(catboost_5m_report, "load_training_csv", lambda path: df.copy())
+    monkeypatch.setattr(catboost_5m_report, "_load_scaler_params", lambda path: {})
+    monkeypatch.setattr(catboost_5m_report, "_raw_stat_frame", lambda frame, cols: pd.DataFrame(index=frame.index))
+    monkeypatch.setattr(catboost_5m_report, "_apply_scaler_to_stat_frame", lambda frame, params, clip_range=None: pd.DataFrame(index=frame.index))
+    monkeypatch.setattr(catboost_5m_report, "CatBoostClassifier", DummyModel, raising=False)
+    monkeypatch.setattr(catboost_5m_report, "_load_catboost_classes", lambda path: [0, 1])
+    monkeypatch.setattr(catboost_5m_report, "_load_optional_pickle", lambda path: None)
+    monkeypatch.setattr(catboost_5m_report, "align_probability_columns", lambda probs, n_outputs, classes=None: np.zeros((len(df), 0), dtype=np.float32))
+    model_path = tmp_path / "catboost_advisor_v19.cbm"
+    model_path.write_text("dummy", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="probability block is invalid"):
+        catboost_5m_report.predict_catboost_frame("unused.csv", str(tmp_path))
 
 
 def test_locked_state_times_out_and_reprocesses_current_bar():
