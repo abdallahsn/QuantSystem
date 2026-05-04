@@ -265,6 +265,66 @@ python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase train
 ```
 
 
+### 4b. Diagnostic Verification Commands
+
+هذه الأوامر مفيدة بعد أي تعديل في `train_v19.py` أو `predict_v19.py` أو طبقات
+الـ backtest / paper / regime / schema contracts:
+
+```bash
+python -m py_compile \
+  train_v19.py \
+  predict_v19.py \
+  backtest_v19.py \
+  paper_v19.py \
+  modules/decision_policy_v19.py \
+  modules/regime_classifier.py \
+  modules/slippage_model.py
+```
+
+```bash
+pytest -q test_training_robustness.py test_leakage_guards.py
+```
+
+```bash
+pytest -q \
+  test_backtest_alignment.py \
+  test_catboost_rsm_regime.py \
+  test_feature_scaler_v19.py \
+  test_prepare_training_data_label_compat.py \
+  test_v19_labels.py
+```
+
+```bash
+python test_system.py
+```
+
+للتحقق التشغيلي النهائي على artifact حقيقي:
+
+```bash
+python train_v19.py \
+  --data /path/to/artifact_dir \
+  --output /path/to/output_dir \
+  --phase catboost \
+  --catboost_device cpu
+```
+
+```bash
+python backtest_v19.py \
+  --data /path/to/artifact_dir \
+  --models /path/to/output_dir \
+  --output /path/to/backtest_output \
+  --input_scaled \
+  --visual_npy /path/to/output_dir/visual_embeddings_v19.npy
+```
+
+إذا كان هدفك التحقق من إصلاحات التقرير الأخيرة بالتحديد، راقب هذه الملفات بعد التشغيل:
+- `stage1_v19_metrics.json`
+- `calibration_report.json`
+- `feature_schema_v19.json`
+- `meta_learner_v19_history.json`
+- `manifest.json`
+
+
 ### 5. Backtest
 
 ```bash

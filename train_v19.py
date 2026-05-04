@@ -429,7 +429,26 @@ def _load_stage1_meta_feature_names(output_dir: str, meta_dim: int) -> list[str]
             )
         infer_meta_feature_layout(names)
         return [str(col) for col in names]
-    return resolve_meta_feature_names(meta_dim=int(meta_dim))
+    try:
+        return resolve_meta_feature_names(meta_dim=int(meta_dim))
+    except Exception as exc:
+        raise ValueError(
+            '❌ Unsupported stage1 meta feature surface: '
+            f'actual_dim={int(meta_dim)} | supported_dims='
+            f'[{len(META_FEATURE_NAMES)} => catboost+xgboost+regime, '
+            f'{len(LEGACY_META_FEATURE_NAMES)} => legacy catboost-only]'
+        ) from exc
+
+
+def _meta_layout_label(meta_feature_names: list[str]) -> str:
+    layout = infer_meta_feature_layout(list(meta_feature_names))
+    base_models = [str(spec.get('name', 'unknown')) for spec in layout.get('base_models', [])]
+    regime_dim = len(layout.get('regime_meta_cols', []))
+    if base_models == ['catboost', 'xgboost'] and regime_dim == 7:
+        return 'catboost+xgboost+regime'
+    if base_models == ['catboost'] and regime_dim == 7:
+        return 'legacy catboost-only'
+    return '+'.join(base_models) + f'+regime({regime_dim})'
 
 
 def _write_feature_coverage_drift_report(
@@ -1796,12 +1815,27 @@ def stage1_oof_meta(
         'regime_coverage_ratio': float(regime_covered.mean()),
         'coverage_ratio': float(coverage.mean()),
         'coverage_warning': coverage_warnings,
+        'catboost_low_coverage_warning': bool(coverage_warnings['catboost']),
+        'xgboost_low_coverage_warning': bool(coverage_warnings['xgboost']),
+        'regime_low_coverage_warning': bool(coverage_warnings['regime']),
         'fold_scaler_diagnostics': {
             'catboost': [report.get('fold_scaler_diagnostics', {}) for report in prob_reports],
             'xgboost': [report.get('fold_scaler_diagnostics', {}) for report in xgb_reports],
         },
+        'fold_zero_pct_summary': {
+            'catboost': [
+                float((report.get('fold_scaler_diagnostics', {}) or {}).get('zero_pct', 0.0))
+                for report in prob_reports
+            ],
+            'xgboost': [
+                float((report.get('fold_scaler_diagnostics', {}) or {}).get('zero_pct', 0.0))
+                for report in xgb_reports
+            ],
+        },
+        'regime_source': str(regime_model_type),
         'decision_policy_artifact': os.path.basename(decision_policy_path),
         'decision_policy_coverage_ratio': float(decision_policy.get('coverage_ratio', 0.0)),
+        'scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
     }
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
         json.dump(fold_metrics, f, indent=2)
@@ -1825,6 +1859,12 @@ def stage1_oof_meta(
         'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if os.path.exists(xgb_calibrator_path) else None,
         'decision_policy_artifact': os.path.basename(decision_policy_path),
         'coverage_warning': coverage_warnings,
+        'catboost_low_coverage_warning': bool(coverage_warnings['catboost']),
+        'xgboost_low_coverage_warning': bool(coverage_warnings['xgboost']),
+        'regime_low_coverage_warning': bool(coverage_warnings['regime']),
+        'fold_zero_pct_summary': fold_metrics['fold_zero_pct_summary'],
+        'regime_source': str(regime_model_type),
+        'scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
     }
     with open(os.path.join(output_dir, 'calibration_report.json'), 'w') as f:
         json.dump(calibration_report, f, indent=2)
@@ -1854,6 +1894,72 @@ def _load_lob_inputs(lob_path: str | None, lob_ts_path: str | None):
             f"Visual stage will use the first {min(len(tensors), len(ts)):,} aligned items only."
         )
     return tensors, pd.Series(ts)
+
+
+def _lob_event_timestamp_overlap_stats(
+    df: pd.DataFrame,
+    lob_timestamps: pd.Series,
+    *,
+    tolerance: str = '1s',
+    max_tensors: int | None = None,
+) -> dict:
+    n_lob = len(lob_timestamps) if max_tensors is None else min(len(lob_timestamps), int(max_tensors))
+    row_ts = _time_series(df, 'ts_event')
+    row_df = pd.DataFrame({
+        'ts_event': row_ts,
+        'row_idx': np.arange(len(df), dtype=np.int32),
+    }).sort_values('ts_event')
+    lob_df = pd.DataFrame({
+        'ts_event': pd.to_datetime(pd.Series(lob_timestamps).iloc[:n_lob], utc=True, errors='coerce').dt.tz_localize(None),
+        'tensor_idx': np.arange(n_lob, dtype=np.int32),
+    }).dropna(subset=['ts_event']).sort_values('ts_event')
+    if len(row_df) == 0 or len(lob_df) == 0:
+        return {
+            'tolerance': str(tolerance),
+            'rows_total': int(len(row_df)),
+            'lob_tensors_total': int(len(lob_df)),
+            'matched_rows': 0,
+            'matched_ratio': 0.0,
+        }
+    merged = pd.merge_asof(
+        row_df,
+        lob_df,
+        on='ts_event',
+        direction='backward',
+        tolerance=pd.Timedelta(tolerance),
+    )
+    matched_rows = int(merged['tensor_idx'].notna().sum())
+    return {
+        'tolerance': str(tolerance),
+        'rows_total': int(len(row_df)),
+        'lob_tensors_total': int(len(lob_df)),
+        'matched_rows': matched_rows,
+        'matched_ratio': float(matched_rows / max(len(row_df), 1)),
+    }
+
+
+def _assert_lob_event_alignment(
+    df: pd.DataFrame,
+    lob_timestamps: pd.Series,
+    *,
+    tolerance: str = '1s',
+    min_overlap_ratio: float = 0.90,
+    max_tensors: int | None = None,
+) -> dict:
+    stats = _lob_event_timestamp_overlap_stats(
+        df,
+        lob_timestamps,
+        tolerance=tolerance,
+        max_tensors=max_tensors,
+    )
+    if float(stats['matched_ratio']) < float(min_overlap_ratio):
+        raise RuntimeError(
+            '❌ LOB/event timestamp alignment too low before Stage 2. '
+            f"matched_rows={stats['matched_rows']:,}/{stats['rows_total']:,} "
+            f"({float(stats['matched_ratio']):.1%}) with tolerance={stats['tolerance']}. "
+            'Rebuild lob_tensors.npy/lob_tensor_timestamps.npy from the same refinery run as event_df.'
+        )
+    return stats
 
 
 def _align_lob_to_rows(
@@ -2182,6 +2288,30 @@ def _compute_bias_class_weights(y_bias: np.ndarray, max_weight: float = 2.5) -> 
     return weights
 
 
+def _event_gate_train_prefix(
+    df: pd.DataFrame,
+    *,
+    train_frac: float = 0.80,
+    split_time: pd.Timestamp | str | None = None,
+) -> pd.DataFrame:
+    if len(df) == 0:
+        return df.copy()
+    split_ctx = _sequence_split_context(
+        df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=_parse_optional_timestamp(split_time),
+    )
+    train_mask = np.asarray(split_ctx.get('train_row_ok', []), dtype=bool)
+    if train_mask.size != len(df) or not np.any(train_mask):
+        fallback_rows = int(min(max(split_ctx.get('split_idx', 1), 1), len(df)))
+        if fallback_rows >= len(df) and len(df) > 1:
+            fallback_rows = len(df) - 1
+        train_mask = np.zeros(len(df), dtype=bool)
+        train_mask[:max(fallback_rows, 1)] = True
+    return df.loc[train_mask].copy().reset_index(drop=True)
+
+
 def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
     event_cfg = {
         'roll_window': DEFAULT_EVENT_ROLL_WINDOW,
@@ -2190,11 +2320,14 @@ def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
         'wall_str_thr': DEFAULT_EVENT_WALL_STR_THR,
         'shift_z_thr': DEFAULT_EVENT_SHIFT_Z_THR,
         'score_threshold': DEFAULT_EVENT_SCORE_THRESHOLD,
+        'rows_used': int(len(df)),
+        'event_col': 'train_event_flag' if 'train_event_flag' in df.columns else 'event_flag',
+        'score_threshold_source': 'train_only',
     }
     if len(df) == 0 or 'event_score' not in df.columns:
         return event_cfg
 
-    event_col = 'train_event_flag' if 'train_event_flag' in df.columns else 'event_flag'
+    event_col = str(event_cfg['event_col'])
     event_mask = (
         pd.to_numeric(df.get(event_col, 0), errors='coerce')
         .fillna(0)
@@ -2217,7 +2350,14 @@ def _resolve_meta_learner_profile(
 ) -> dict:
     train_sequences = int(max(train_sequences, 0))
     visual_seq_coverage = float(np.clip(visual_seq_coverage, 0.0, 1.0))
+    compact_due_to_small_data = bool(train_sequences < 2500)
+    compact_due_to_visual_coverage = bool(visual_seq_coverage < 0.85)
     if train_sequences < 2500 or visual_seq_coverage < 0.85:
+        reasons = []
+        if compact_due_to_small_data:
+            reasons.append('small_training_set')
+        if compact_due_to_visual_coverage:
+            reasons.append('low_visual_coverage')
         return {
             'name': 'compact',
             'lstm_units_1': 48,
@@ -2225,6 +2365,11 @@ def _resolve_meta_learner_profile(
             'visual_dropout_rate': 0.35,
             'confidence_threshold': 0.62,
             'force_rebuild': True,
+            'profile_reason': '+'.join(reasons) if reasons else 'compact_default',
+            'compact_due_to_small_data': compact_due_to_small_data,
+            'compact_due_to_visual_coverage': compact_due_to_visual_coverage,
+            'visual_seq_coverage': float(visual_seq_coverage),
+            'train_sequences': int(train_sequences),
         }
     return {
         'name': 'standard',
@@ -2233,6 +2378,11 @@ def _resolve_meta_learner_profile(
         'visual_dropout_rate': 0.25,
         'confidence_threshold': 0.65,
         'force_rebuild': False,
+        'profile_reason': 'standard_capacity',
+        'compact_due_to_small_data': False,
+        'compact_due_to_visual_coverage': False,
+        'visual_seq_coverage': float(visual_seq_coverage),
+        'train_sequences': int(train_sequences),
     }
 
 
@@ -2250,7 +2400,7 @@ def stage3_meta_learner_v19(
     train_frac: float = 0.80,
     split_time: pd.Timestamp | str | None = None,
     min_seq_coverage: float = 0.80,
-) -> None:
+) -> dict:
     print("\n" + "═" * 65)
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
@@ -2258,9 +2408,16 @@ def stage3_meta_learner_v19(
     meta_feature_names = list(meta_feature_names or resolve_meta_feature_names(meta_dim=int(meta_features.shape[1])))
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     if int(meta_features.shape[1]) != len(meta_feature_names):
+        expected_dim = int(len(meta_feature_names))
+        actual_dim = int(meta_features.shape[1])
+        expected_layout = _meta_layout_label(meta_feature_names)
+        actual_names = resolve_meta_feature_names(meta_dim=actual_dim)
+        actual_layout = _meta_layout_label(actual_names)
         raise ValueError(
-            f'❌ MetaLearner stage received meta shape {meta_features.shape} '
-            f'but {len(meta_feature_names)} feature names'
+            '❌ MetaLearner stage meta feature contract mismatch: '
+            f'expected_dim={expected_dim} layout={expected_layout}, '
+            f'actual_dim={actual_dim} layout={actual_layout}. '
+            f'expected_features={meta_feature_names}'
         )
 
     sequence_aux_mode = SEQUENCE_AUX_ALL_STEPS
@@ -2318,6 +2475,21 @@ def stage3_meta_learner_v19(
         train_sequences=len(X_tr),
         visual_seq_coverage=visual_seq_coverage,
     )
+    stage3_summary = {
+        'profile_name': str(profile.get('name', 'unknown')),
+        'profile_reason': str(profile.get('profile_reason', 'unknown')),
+        'visual_seq_coverage': float(profile.get('visual_seq_coverage', visual_seq_coverage)),
+        'train_sequences': int(profile.get('train_sequences', len(X_tr))),
+        'compact_due_to_visual_coverage': bool(profile.get('compact_due_to_visual_coverage', False)),
+        'compact_due_to_small_data': bool(profile.get('compact_due_to_small_data', False)),
+    }
+    if profile.get('name') == 'compact':
+        print(
+            "  ⚠️ MetaLearner compact profile selected: "
+            f"reason={profile.get('profile_reason')} | "
+            f"visual_seq_coverage={float(profile.get('visual_seq_coverage', visual_seq_coverage)):.1%} | "
+            f"train_sequences={int(profile.get('train_sequences', len(X_tr))):,}"
+        )
     meta_brain_path = os.path.join(output_dir, 'meta_learner_v19.keras')
     if profile.get('force_rebuild') and os.path.exists(meta_brain_path):
         try:
@@ -2423,6 +2595,7 @@ def stage3_meta_learner_v19(
             'regime_meta_features': [*REGIME_ONE_HOT_COLS, *REGIME_META_SCORE_COLS],
             'regime_meta_semantics': 'posterior_probabilities',
             'regime_source': 'hmm' if HMM_AVAILABLE else 'fallback_rules',
+            'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
             'base_models': meta_layout['base_models'],
             'decision_policy_artifact': DEFAULT_DECISION_POLICY_ARTIFACT,
             'deeplob': {
@@ -2444,6 +2617,7 @@ def stage3_meta_learner_v19(
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
         print("  ✅ MetaLearner V19 history + schema محفوظان")
+    return stage3_summary
 
 
 def _load_required_stage1_artifacts(
@@ -2484,8 +2658,15 @@ def _load_required_stage1_artifacts(
     expected_meta_dim = len(meta_feature_names)
     meta_arr = np.asarray(meta_features)
     if int(meta_arr.shape[1]) != expected_meta_dim:
+        actual_dim = int(meta_arr.shape[1])
+        expected_layout = _meta_layout_label(meta_feature_names)
+        actual_names = resolve_meta_feature_names(meta_dim=actual_dim)
+        actual_layout = _meta_layout_label(actual_names)
         raise ValueError(
-            f'❌ Stage1 cached meta surface mismatch: expected {expected_meta_dim} columns, got {meta_arr.shape}'
+            '❌ Stage1 cached meta surface mismatch: '
+            f'expected_dim={expected_meta_dim} layout={expected_layout}, '
+            f'actual_dim={actual_dim} layout={actual_layout}. '
+            f'expected_features={meta_feature_names}'
         )
     if n_rows is not None and (len(meta_features) != int(n_rows) or len(coverage) != int(n_rows)):
         raise ValueError(
@@ -2667,6 +2848,12 @@ def run_training_pipeline(
             f,
             indent=2,
         )
+    event_gate_train_df = _event_gate_train_prefix(
+        event_df,
+        train_frac=train_frac,
+        split_time=training_window.get('split_time'),
+    )
+    event_gate_cfg = _infer_event_gate_schema(event_gate_train_df)
 
     meta_path = os.path.join(output_dir, 'meta_features_oof_v19.npy')
     coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
@@ -2763,6 +2950,19 @@ def run_training_pipeline(
 
     lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
     if resolved_phase in (PHASE_FULL, PHASE_VISUAL):
+        if lob_timestamps is not None:
+            lob_alignment_stats = _assert_lob_event_alignment(
+                event_df,
+                lob_timestamps,
+                tolerance='1s',
+                min_overlap_ratio=0.90,
+                max_tensors=None if lob_tensors is None else len(lob_tensors),
+            )
+            print(
+                "  ✅ LOB/event timestamp overlap: "
+                f"{lob_alignment_stats['matched_rows']:,}/{lob_alignment_stats['rows_total']:,} "
+                f"({lob_alignment_stats['matched_ratio']:.1%}) | tolerance={lob_alignment_stats['tolerance']}"
+            )
         visual_embeddings, visual_coverage = stage2_oof_visual_embeddings(
             event_df,
             output_dir,
@@ -2774,6 +2974,14 @@ def run_training_pipeline(
         visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(event_df))
         print(f'✅ Visual embeddings ready: {visual_embeddings.shape} | source={visual_source}')
 
+    stage3_summary = {
+        'profile_name': None,
+        'profile_reason': None,
+        'visual_seq_coverage': float(np.mean(visual_coverage)) if len(visual_coverage) else 0.0,
+        'train_sequences': None,
+        'compact_due_to_visual_coverage': False,
+        'compact_due_to_small_data': False,
+    }
     if resolved_phase == PHASE_VISUAL:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
         summary = {
@@ -2846,7 +3054,7 @@ def run_training_pipeline(
                 "❌ TensorFlow/MetaLearner غير متاح. المرحلة الثالثة لا يمكن تشغيلها الآن.\n"
                 "شغّل bash install_tf_gpu_cu12.sh داخل .venv، أو ثبّت TensorFlow للـ CPU فقط إذا كنت لا تحتاج DeepLOB GPU."
             ) from e
-        stage3_meta_learner_v19(
+        stage3_summary = stage3_meta_learner_v19(
             event_df,
             meta_features,
             visual_embeddings,
@@ -2854,7 +3062,7 @@ def run_training_pipeline(
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
             meta_feature_names=meta_feature_names,
-            event_gate_cfg=_infer_event_gate_schema(df_full),
+            event_gate_cfg=event_gate_cfg,
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,
@@ -2874,6 +3082,8 @@ def run_training_pipeline(
         'scaler_train_rows': int(scaler_info['scaler_train_rows']),
         'training_window': training_window,
         'split_meta': split_meta,
+        'event_gate_schema': event_gate_cfg,
+        'meta_learner_profile': stage3_summary,
         'elapsed_seconds': float(elapsed),
         'stage': int(stage),
         'phase': resolved_phase,
@@ -2911,6 +3121,9 @@ def run_training_pipeline(
             'source_contract': effective_source_contract,
             'training_window': training_window,
             'meta_feature_dim': int(meta_features.shape[1]),
+            'event_gate_schema': event_gate_cfg,
+            'meta_learner_profile': stage3_summary,
+            'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
         },
     )
     print('\n' + '=' * 65)

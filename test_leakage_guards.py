@@ -491,8 +491,11 @@ class LeakageGuardTests(unittest.TestCase):
             for name in ('catboost_advisor_v19.cbm', 'catboost_classes_v19.json', 'regime_classifier.pkl'):
                 with open(os.path.join(tmpdir, name), 'wb') as f:
                     f.write(b'0')
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as ctx:
                 _load_required_stage1_artifacts(tmpdir, n_rows=5)
+            msg = str(ctx.exception)
+            self.assertIn('actual_dim=6', msg)
+            self.assertIn('supported_dims', msg)
 
     def test_meta_feature_layout_supports_catboost_xgboost_surface(self):
         names = resolve_meta_feature_names(include_xgboost=True)

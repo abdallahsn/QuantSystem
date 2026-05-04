@@ -10,8 +10,11 @@ from modules.regime_classifier import RegimeClassifier, _build_regime_features
 from modules.meta_learner import MetaLearnerLSTM
 from modules.slippage_model import fractional_kelly_bet_size
 from train_v19 import (
+    _assert_lob_event_alignment,
     _align_lob_to_rows,
     _adaptive_tree_early_stopping_rounds,
+    _event_gate_train_prefix,
+    _infer_event_gate_schema,
     _resolve_default_lob_paths,
     _resolve_meta_learner_profile,
     build_event_training_view,
@@ -27,6 +30,9 @@ def test_meta_learner_profile_compacts_on_small_data():
     assert profile["lstm_units_2"] == 24
     assert profile["force_rebuild"] is True
     assert profile["visual_dropout_rate"] >= 0.35
+    assert profile["compact_due_to_small_data"] is True
+    assert profile["compact_due_to_visual_coverage"] is True
+    assert profile["profile_reason"] == "small_training_set+low_visual_coverage"
 
 
 def test_emit_positions_expand_neighbors_when_events_collapse_to_few_snapshots():
@@ -161,6 +167,32 @@ def test_align_lob_to_rows_prefers_directional_targets_over_raw_obi():
     assert np.isclose(tensor_targets[2], 0.5)
 
 
+def test_lob_event_alignment_guard_passes_and_fails_with_clear_diagnostics():
+    df = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-01 00:00:01",
+                    "2025-01-01 00:00:02",
+                    "2025-01-01 00:00:03",
+                ]
+            )
+        }
+    )
+    good_ts = pd.Series(df["ts_event"].copy())
+    stats = _assert_lob_event_alignment(df, good_ts, tolerance="1s", min_overlap_ratio=0.90)
+    assert stats["matched_ratio"] == 1.0
+
+    bad_ts = pd.Series(pd.to_datetime(["2025-01-01 01:00:00", "2025-01-01 01:00:01"]))
+    try:
+        _assert_lob_event_alignment(df, bad_ts, tolerance="1s", min_overlap_ratio=0.90)
+    except RuntimeError as exc:
+        assert "LOB/event timestamp alignment too low" in str(exc)
+        assert "matched_rows=0/3" in str(exc)
+    else:
+        raise AssertionError("Expected low-overlap LOB alignment to fail")
+
+
 def test_meta_threshold_calibration_can_shift_off_argmax_default():
     long_probs = np.array([0.70, 0.60, 0.55, 0.52, 0.48, 0.45], dtype=np.float32)
     y_true = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
@@ -242,6 +274,29 @@ def test_build_event_training_view_fits_score_normalization_on_train_prefix_only
     )
     assert base_info["score_fit_rows"] == shifted_info["score_fit_rows"]
     assert base_info["score_fit_max"] == shifted_info["score_fit_max"]
+
+
+def test_infer_event_gate_schema_uses_train_only_prefix_rows():
+    base = pd.DataFrame(
+        {
+            "ts_event": pd.date_range("2025-01-01", periods=10, freq="s"),
+            "train_event_flag": [1] * 10,
+            "event_flag": [1] * 10,
+            "event_score": [0.5] * 8 + [4.0, 5.0],
+        }
+    )
+    shifted = base.copy()
+    shifted.loc[8:, "event_score"] = [40.0, 50.0]
+
+    base_train = _event_gate_train_prefix(base, train_frac=0.80, split_time=None)
+    shifted_train = _event_gate_train_prefix(shifted, train_frac=0.80, split_time=None)
+    base_cfg = _infer_event_gate_schema(base_train)
+    shifted_cfg = _infer_event_gate_schema(shifted_train)
+
+    assert len(base_train) == len(shifted_train)
+    assert base_cfg["score_threshold"] == shifted_cfg["score_threshold"] == 0.5
+    assert base_cfg["score_threshold_source"] == "train_only"
+    assert base_cfg["rows_used"] == len(base_train)
 
 
 def test_apply_scaler_params_can_skip_clipping_for_tree_models():
