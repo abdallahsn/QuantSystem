@@ -285,26 +285,21 @@ def _representative_bar_rows(frame: pd.DataFrame, freq: str) -> pd.DataFrame:
     rows["cb_margin_tick"] = (rows["cb_prob_long"] - rows["cb_prob_short"]).abs().astype(float)
     rows["signal_strength"] = (rows["cb_confidence_tick"] + 0.35 * rows["cb_margin_tick"]).astype(float)
     rows["signal_strength"] = pd.to_numeric(rows["signal_strength"], errors="coerce").fillna(0.0)
-
-    def _pick(group: pd.DataFrame) -> pd.Series:
-        if group.empty:
-            return pd.Series(dtype=object)
-        ranked = group.sort_values(
-            by=["signal_strength", "cb_confidence_tick"],
-            ascending=[False, False],
-            kind="mergesort",
-        )
-        return ranked.iloc[0]
-
-    rep = rows.groupby(pd.Grouper(key="ts_event", freq=freq), sort=True, group_keys=False).apply(_pick)
-    if isinstance(rep, pd.Series):
-        rep = rep.to_frame().T
+    rows["bar_bucket"] = pd.to_datetime(rows["ts_event"], errors="coerce").dt.floor(freq)
+    rows = rows.dropna(subset=["bar_bucket"]).copy()
+    if rows.empty:
+        return pd.DataFrame()
+    ranked = rows.sort_values(
+        by=["bar_bucket", "signal_strength", "cb_confidence_tick"],
+        ascending=[True, False, False],
+        kind="mergesort",
+    )
+    rep = ranked.drop_duplicates(subset=["bar_bucket"], keep="first").copy()
     if rep.empty:
         return pd.DataFrame()
-    rep = rep.dropna(subset=["ts_event"], how="any")
-    if rep.empty:
-        return pd.DataFrame()
-    rep = rep.set_index("ts_event").sort_index()
+    rep = rep.drop(columns=["bar_bucket"], errors="ignore")
+    rep = rep.set_index(pd.Index(ranked.drop_duplicates(subset=["bar_bucket"], keep="first")["bar_bucket"], name="ts_event"))
+    rep = rep.loc[~rep.index.duplicated(keep="first")].sort_index()
     return rep
 
 
