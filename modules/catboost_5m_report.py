@@ -331,6 +331,11 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     bars["cb_direction_idx"] = np.argmax(prob_matrix, axis=1).astype(int)
     bars["cb_direction"] = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("UNKNOWN")
     bars["cb_confidence"] = prob_matrix.max(axis=1).astype(float)
+    bars["cb_direction_model_raw"] = bars["cb_direction"].astype(str)
+    bars["cb_direction_model_idx"] = bars["cb_direction_idx"].astype(int)
+    bars["cb_confidence_model_raw"] = bars["cb_confidence"].astype(float)
+    bars["cb_prob_long_model_raw"] = bars["cb_prob_long"].astype(float)
+    bars["cb_prob_short_model_raw"] = bars["cb_prob_short"].astype(float)
     bars["cb_change_flag"] = (bars["cb_direction"] != bars["cb_direction"].shift(1)).astype(int)
     bars["signal_time"] = pd.to_datetime(bars.index) + offset
     bars["regime_label"] = bars["regime_label"].apply(_regime_to_name)
@@ -473,6 +478,68 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
             line_dash="dash",
             line_color="rgba(148,163,184,0.28)",
             line_width=1,
+            row=1,
+            col=1,
+        )
+
+    for label, idx, y_col, symbol, color, edge in (
+        ("LONG Raw %", 0, "low", "circle-open", "rgba(0,232,150,0.35)", "#00e896"),
+        ("SHORT Raw %", 1, "high", "circle-open", "rgba(255,77,109,0.35)", "#ff4d6d"),
+    ):
+        raw_idx_col = "cb_direction_model_idx" if "cb_direction_model_idx" in bars.columns else "cb_direction_idx"
+        raw_conf_col = "cb_confidence_model_raw" if "cb_confidence_model_raw" in bars.columns else "cb_confidence"
+        raw_long_col = "cb_prob_long_model_raw" if "cb_prob_long_model_raw" in bars.columns else "cb_prob_long"
+        raw_short_col = "cb_prob_short_model_raw" if "cb_prob_short_model_raw" in bars.columns else "cb_prob_short"
+        raw_label_col = "cb_direction_model_raw" if "cb_direction_model_raw" in bars.columns else "cb_direction"
+        mask = bars[raw_idx_col] == idx
+        if not bool(mask.any()):
+            continue
+        y_values = bars.loc[mask, y_col].astype(float)
+        if y_col == "low":
+            y_values = y_values * 0.9991
+            text_position = "bottom center"
+        else:
+            y_values = y_values * 1.0009
+            text_position = "top center"
+        conf_pct = (bars.loc[mask, raw_conf_col].fillna(0.0).astype(float) * 100.0).round().astype(int)
+        fig.add_trace(
+            go.Scatter(
+                x=bars.loc[mask, "signal_time"],
+                y=y_values,
+                mode="markers+text",
+                text=[f"{int(v)}%" for v in conf_pct.values],
+                textposition=text_position,
+                textfont=dict(size=9, color=edge, family="IBM Plex Mono"),
+                marker=dict(symbol=symbol, size=7, color=color, line=dict(color=edge, width=1)),
+                name=f"{label} ({int(mask.sum())})",
+                opacity=0.85,
+                customdata=np.stack(
+                    [
+                        bars.loc[mask, "open"].values,
+                        bars.loc[mask, "high"].values,
+                        bars.loc[mask, "low"].values,
+                        bars.loc[mask, "close"].values,
+                        bars.loc[mask, raw_conf_col].fillna(0.0).values,
+                        bars.loc[mask, raw_long_col].fillna(0.0).values,
+                        bars.loc[mask, raw_short_col].fillna(0.0).values,
+                        bars.loc[mask, "regime_label"].fillna("Ranging").astype(str).values,
+                        bars.loc[mask, raw_label_col].fillna("UNKNOWN").astype(str).values,
+                    ],
+                    axis=1,
+                ),
+                hovertemplate=(
+                    f"{label}<br>%{{x}}<br>"
+                    "Open=%{customdata[0]:,.5f}<br>"
+                    "High=%{customdata[1]:,.5f}<br>"
+                    "Low=%{customdata[2]:,.5f}<br>"
+                    "Close=%{customdata[3]:,.5f}<br>"
+                    "Confidence=%{customdata[4]:.3f}<br>"
+                    "P(LONG)=%{customdata[5]:.3f}<br>"
+                    "P(SHORT)=%{customdata[6]:.3f}<br>"
+                    "Regime=%{customdata[7]}<br>"
+                    "Raw Signal=%{customdata[8]}<extra></extra>"
+                ),
+            ),
             row=1,
             col=1,
         )
