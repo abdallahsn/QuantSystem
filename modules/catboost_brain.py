@@ -1,6 +1,13 @@
 """
 catboost_brain.py — CatBoost Quantitative Brain
 ═══════════════════════════════════════════════════════════════════════
+LEGACY NOTE:
+  This module is currently NOT the training path used by stage2_catboost.py.
+  The active V19 Stage 2 pipeline trains CatBoost/XGBoost via train_v19.py
+  on directional event rows only. This file remains as a legacy/experimental
+  3-class CatBoost brain and should not be assumed to affect current Stage 2
+  results unless it is explicitly wired into the pipeline.
+
 البديل السريع والقوي للـ Transformer
 
 المزايا:
@@ -62,6 +69,10 @@ class CatBoostQuantBrain:
                  # CatBoost يرى الآن mean/std آخر 12 شمعة لكل feature
                  # بدلاً من لقطة واحدة فقط → يعرف أين هو في الترند
                  ):
+        print(
+            "[CatBoostQuantBrain] ⚠️ Legacy module loaded. "
+            "stage2_catboost.py currently trains via train_v19.py, not via modules/catboost_brain.py."
+        )
 
         # ندمج أسماء الميزات الأصلية مع أسماء الـ Embeddings
         self.base_feature_cols = feature_cols

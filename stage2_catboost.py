@@ -5,6 +5,8 @@ stage2_catboost.py - Standalone entrypoint for CatBoost/XGBoost/regime stage
 from __future__ import annotations
 
 import argparse
+import json
+import os
 
 try:
     import catboost  # noqa: F401
@@ -27,6 +29,89 @@ except ImportError as e:
 from modules.config_v19 import load_v19_config
 from modules.catboost_5m_report import generate_catboost_5m_report
 from train_v19 import run_training_pipeline
+
+
+def _load_optional_json(path: str) -> dict | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _print_directional_event_diagnostics(output_dir: str) -> None:
+    event_view = _load_optional_json(os.path.join(output_dir, 'event_training_view.json')) or {}
+    stage1_metrics = _load_optional_json(os.path.join(output_dir, 'stage1_v19_metrics.json')) or {}
+    calibration = _load_optional_json(os.path.join(output_dir, 'calibration_report.json')) or {}
+
+    if not event_view and not stage1_metrics and not calibration:
+        return
+
+    print("\n🔎 Stage 2 Diagnostics")
+    print(
+        "  ℹ️ Current Stage 2 CatBoost does NOT use modules/catboost_brain.py. "
+        "It trains via train_v19.py on directional event rows only."
+    )
+
+    rows_full = int(event_view.get('rows_full', 0) or 0)
+    rows_event = int(event_view.get('rows_event_directional', 0) or 0)
+    event_rate = float(event_view.get('event_rate_full', 0.0) or 0.0)
+    raw_event_rate = float(event_view.get('raw_event_rate_full', 0.0) or 0.0)
+    bias_counts = event_view.get('bias_counts', {}) or {}
+    fallback_reason = event_view.get('fallback_reason')
+    score_fit_rows = int(event_view.get('score_fit_rows', 0) or 0)
+
+    if rows_full > 0:
+        print(
+            "  Directional Event View: "
+            f"{rows_event:,}/{rows_full:,} rows ({event_rate:.1%}) "
+            f"| raw_event={raw_event_rate:.1%} "
+            f"| bias={bias_counts} "
+            f"| score_fit_rows={score_fit_rows:,}"
+        )
+        if fallback_reason:
+            print(f"  ⚠️ Event view fallback: {fallback_reason}")
+        if event_rate < 0.05:
+            print(
+                "  ⚠️ Very low directional event rate. "
+                "Few training rows can make CatBoost look weak even if labels are causal."
+            )
+        long_n = int(bias_counts.get('0', bias_counts.get(0, 0)) or 0)
+        short_n = int(bias_counts.get('1', bias_counts.get(1, 0)) or 0)
+        directional_total = max(long_n + short_n, 1)
+        imbalance = abs(long_n - short_n) / directional_total
+        if imbalance > 0.35:
+            print(
+                "  ⚠️ Directional class imbalance is high: "
+                f"LONG={long_n:,} SHORT={short_n:,} | imbalance={imbalance:.1%}"
+            )
+
+    cb_cov = float(stage1_metrics.get('catboost_coverage_ratio', 0.0) or 0.0)
+    xgb_cov = float(stage1_metrics.get('xgboost_coverage_ratio', 0.0) or 0.0)
+    regime_cov = float(stage1_metrics.get('regime_coverage_ratio', 0.0) or 0.0)
+    policy_cov = float(stage1_metrics.get('decision_policy_coverage_ratio', 0.0) or 0.0)
+    regime_source = stage1_metrics.get('regime_source')
+    if stage1_metrics:
+        print(
+            "  Stage1 Coverage: "
+            f"catboost={cb_cov:.1%} | xgboost={xgb_cov:.1%} | regime={regime_cov:.1%} | policy={policy_cov:.1%}"
+        )
+        if regime_source:
+            print(f"  Regime Source: {regime_source}")
+        if bool((stage1_metrics.get('coverage_warning', {}) or {}).get('catboost', False)):
+            print("  ⚠️ CatBoost OOF coverage is low; priors/backfills may dominate parts of the meta surface.")
+
+    cb_cal = (calibration.get('final_catboost_holdout_calibration', {}) or {})
+    xgb_cal = (calibration.get('final_xgboost_holdout_calibration', {}) or {})
+    if calibration:
+        print(
+            "  Holdout Calibration: "
+            f"catboost_enabled={bool(cb_cal.get('enabled', False))} | "
+            f"xgboost_enabled={bool(xgb_cal.get('enabled', False))}"
+        )
 
 
 def main():
@@ -76,6 +161,7 @@ def main():
         phase='catboost',
         config_snapshot=cfg,
     )
+    _print_directional_event_diagnostics(args.output)
 
     try:
         summary = generate_catboost_5m_report(
@@ -90,6 +176,9 @@ def main():
             print(f"  {key}: {path}")
         if summary.get("raw_direction_counts"):
             print(f"  raw_direction_counts: {summary.get('raw_direction_counts', {})}")
+        if summary.get("policy_available"):
+            print(f"  policy_direction_counts: {summary.get('policy_direction_counts', {})}")
+            print(f"  pre_rsm_direction_counts: {summary.get('pre_rsm_direction_counts', {})}")
         if summary.get("rsm_action_counts"):
             print(f"  rsm_action_counts: {summary.get('rsm_action_counts', {})}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
