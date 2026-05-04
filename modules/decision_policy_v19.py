@@ -337,6 +337,8 @@ def evaluate_decision_policy(
         "policy_version": str(policy.get("policy_version", POLICY_VERSION)),
         "structure_bucket": str(structure_bucket),
         "policy_coverage_ratio": float(effective_coverage),
+        "coverage_ok": bool(coverage_ok),
+        "runtime_ok": bool(runtime_penalty >= 0.5),
         "regime_entropy": float(regime_entropy),
         "regime_entropy_blend": float(entropy_blend),
         "cost_pips": float(cost_pips),
@@ -350,6 +352,14 @@ def evaluate_decision_policy(
 
     passes_long = coverage_ok and runtime_penalty >= 0.5 and p_long >= decision["long_threshold"] and ev_long > 0.0
     passes_short = coverage_ok and runtime_penalty >= 0.5 and p_short >= decision["short_threshold"] and ev_short > 0.0
+    long_threshold_ok = bool(p_long >= decision["long_threshold"])
+    short_threshold_ok = bool(p_short >= decision["short_threshold"])
+    long_ev_positive = bool(ev_long > 0.0)
+    short_ev_positive = bool(ev_short > 0.0)
+    decision["long_threshold_ok"] = long_threshold_ok
+    decision["short_threshold_ok"] = short_threshold_ok
+    decision["long_ev_positive"] = long_ev_positive
+    decision["short_ev_positive"] = short_ev_positive
 
     if passes_long and (not passes_short or ev_long >= ev_short):
         decision.update(
@@ -380,6 +390,21 @@ def evaluate_decision_policy(
             }
         )
     else:
+        if not coverage_ok:
+            reject_reason = "policy_coverage_too_low"
+            reject_bucket = "coverage"
+        elif runtime_penalty < 0.5:
+            reject_reason = "runtime_penalty_too_low"
+            reject_bucket = "runtime"
+        elif not long_threshold_ok and not short_threshold_ok:
+            reject_reason = "probability_below_threshold"
+            reject_bucket = "threshold"
+        elif not long_ev_positive and not short_ev_positive:
+            reject_reason = "expected_value_non_positive"
+            reject_bucket = "ev"
+        else:
+            reject_reason = "mixed_policy_constraints"
+            reject_bucket = "mixed"
         decision.update(
             {
                 "bias": "NEUTRAL",
@@ -390,7 +415,8 @@ def evaluate_decision_policy(
                 "chosen_threshold": float(max(decision["long_threshold"], decision["short_threshold"])),
                 "selected_avg_win_pips": float(max(_safe_float(long_side.get("avg_win_pips", 0.0), 0.0), _safe_float(short_side.get("avg_win_pips", 0.0), 0.0))),
                 "selected_avg_loss_pips": float(max(_safe_float(long_side.get("avg_loss_pips", 0.0), 0.0), _safe_float(short_side.get("avg_loss_pips", 0.0), 0.0))),
-                "reason": "cost_aware_abstain" if coverage_ok else "policy_coverage_too_low",
+                "reason": str(reject_reason),
+                "reject_bucket": str(reject_bucket),
             }
         )
 

@@ -354,13 +354,76 @@ def test_report_policy_overlay_can_abstain_before_rsm():
         "structure_buckets": [],
     }
 
-    out, counts = _apply_decision_policy_to_bars(bars, policy)
+    out, diagnostics = _apply_decision_policy_to_bars(bars, policy)
 
     assert bool(out.loc[0, "policy_available"]) is True
     assert out.loc[0, "cb_direction"] == "NEUTRAL"
     assert bool(out.loc[0, "policy_tradeable"]) is False
-    assert out.loc[0, "policy_reason"] == "cost_aware_abstain"
-    assert counts == {"NEUTRAL": 1}
+    assert out.loc[0, "policy_reason"] == "probability_below_threshold"
+    assert out.loc[0, "policy_reject_bucket"] == "threshold"
+    assert diagnostics["direction_counts"] == {"NEUTRAL": 1}
+
+
+def test_report_policy_overlay_exposes_rejection_breakdown():
+    bars = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-15 07:55:00",
+                    "2025-01-15 08:00:00",
+                    "2025-01-15 08:05:00",
+                ]
+            ),
+            "signal_time": pd.to_datetime(
+                [
+                    "2025-01-15 08:00:00",
+                    "2025-01-15 08:05:00",
+                    "2025-01-15 08:10:00",
+                ]
+            ),
+            "open": [1.22, 1.22, 1.22],
+            "high": [1.23, 1.23, 1.23],
+            "low": [1.21, 1.21, 1.21],
+            "close": [1.22, 1.22, 1.22],
+            "cb_prob_long": [0.58, 0.90, 0.90],
+            "cb_prob_short": [0.42, 0.10, 0.10],
+            "cb_direction": ["LONG", "LONG", "LONG"],
+            "cb_direction_idx": [0, 0, 0],
+            "cb_confidence": [0.58, 0.90, 0.90],
+            "cluster_0": [1.0, 1.0, 1.0],
+            "cluster_1": [0.0, 0.0, 0.0],
+            "cluster_2": [0.0, 0.0, 0.0],
+            "cluster_3": [0.0, 0.0, 0.0],
+            "trend_strength": [0.10, 0.10, 0.10],
+            "correction_depth": [0.10, 0.10, 0.10],
+            "liquidity_sweep": [0.0, 0.0, 0.0],
+            "kalman_trend_strength": [0.0, 0.0, 0.0],
+            "event_score": [0.0, 0.0, 0.0],
+            "price_position": [0.50, 0.50, 0.50],
+        }
+    )
+    policy = {
+        "policy_version": "test",
+        "coverage_ratio": 1.0,
+        "minimum_support": 1,
+        "minimum_coverage_ratio": 0.50,
+        "cost_model": {"effective_cost_pips": 5.0},
+        "regime_priors": [1.0, 0.0, 0.0, 0.0],
+        "global": {
+            "LONG": {"support": 10, "avg_win_pips": 4.0, "avg_loss_pips": 4.0, "threshold_from_cost": 0.80, "coverage_ratio": 1.0},
+            "SHORT": {"support": 10, "avg_win_pips": 4.0, "avg_loss_pips": 4.0, "threshold_from_cost": 0.80, "coverage_ratio": 1.0},
+        },
+        "structures": {},
+        "structure_buckets": [],
+    }
+
+    out, diagnostics = _apply_decision_policy_to_bars(bars, policy)
+
+    assert out.loc[0, "policy_reject_bucket"] == "threshold"
+    assert out.loc[1, "policy_reject_bucket"] == "ev"
+    assert diagnostics["blocked_by_threshold_count"] == 1
+    assert diagnostics["blocked_by_ev_count"] == 2
+    assert diagnostics["avg_long_threshold"] >= 0.80
 
 
 def test_resample_catboost_bars_handles_missing_optional_series():

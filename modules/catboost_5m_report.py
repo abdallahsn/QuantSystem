@@ -118,7 +118,7 @@ def _load_regime_meta_frame(df: pd.DataFrame, models_dir: str) -> pd.DataFrame |
 def _apply_decision_policy_to_bars(
     bars: pd.DataFrame,
     policy: dict[str, Any] | None,
-) -> tuple[pd.DataFrame, dict[str, int]]:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = bars.copy()
     if not isinstance(policy, dict) or not policy or out.empty:
         out["policy_available"] = False
@@ -168,10 +168,50 @@ def _apply_decision_policy_to_bars(
         float((decision or {}).get("edge_prob", 0.0) or 0.0)
         for decision in decisions
     ]
+    out["policy_reject_bucket"] = [
+        str((decision or {}).get("reject_bucket", "passed"))
+        for decision in decisions
+    ]
+    out["policy_coverage_ratio"] = [
+        float((decision or {}).get("policy_coverage_ratio", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["expected_value_long_pips"] = [
+        float((decision or {}).get("expected_value_long_pips", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["expected_value_short_pips"] = [
+        float((decision or {}).get("expected_value_short_pips", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["long_threshold"] = [
+        float((decision or {}).get("long_threshold", 0.0) or 0.0)
+        for decision in decisions
+    ]
+    out["short_threshold"] = [
+        float((decision or {}).get("short_threshold", 0.0) or 0.0)
+        for decision in decisions
+    ]
     out["cb_direction"] = out["cb_direction_policy"].astype(str)
     out["cb_direction_idx"] = out["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
     counts = out["cb_direction"].value_counts().to_dict()
-    return out, counts
+    neutral_mask = out["cb_direction"].eq("NEUTRAL")
+    rejection_breakdown = out.loc[neutral_mask, "policy_reject_bucket"].value_counts().to_dict()
+    diagnostics = {
+        "direction_counts": counts,
+        "rejection_breakdown": rejection_breakdown,
+        "blocked_by_coverage_count": int(rejection_breakdown.get("coverage", 0)),
+        "blocked_by_runtime_count": int(rejection_breakdown.get("runtime", 0)),
+        "blocked_by_threshold_count": int(rejection_breakdown.get("threshold", 0)),
+        "blocked_by_ev_count": int(rejection_breakdown.get("ev", 0)),
+        "blocked_by_mixed_count": int(rejection_breakdown.get("mixed", 0)),
+        "avg_ev_long": float(out["expected_value_long_pips"].mean()) if len(out) else 0.0,
+        "avg_ev_short": float(out["expected_value_short_pips"].mean()) if len(out) else 0.0,
+        "avg_long_threshold": float(out["long_threshold"].mean()) if len(out) else 0.0,
+        "avg_short_threshold": float(out["short_threshold"].mean()) if len(out) else 0.0,
+        "avg_policy_coverage_ratio": float(out["policy_coverage_ratio"].mean()) if len(out) else 0.0,
+    }
+    return out, diagnostics
 
 
 def _load_optional_market_csv(path: str, t_min: pd.Timestamp, t_max: pd.Timestamp) -> pd.DataFrame | None:
@@ -1006,7 +1046,12 @@ def generate_catboost_5m_report(
         "max": float(bars["cb_confidence"].max()) if not bars.empty else 0.0,
     }
     decision_policy = _load_optional_json(os.path.join(models_dir, "decision_policy_v19.json")) if apply_decision_policy else None
-    bars, policy_direction_counts = _apply_decision_policy_to_bars(bars, decision_policy)
+    bars, policy_diagnostics = _apply_decision_policy_to_bars(bars, decision_policy)
+    policy_direction_counts = (
+        policy_diagnostics.get("direction_counts", {})
+        if isinstance(policy_diagnostics, dict)
+        else {}
+    )
     policy_available = bool(decision_policy) and bool(apply_decision_policy)
     pre_rsm_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
     if apply_rsm and RSM_AVAILABLE and len(bars):
@@ -1094,6 +1139,17 @@ def generate_catboost_5m_report(
         "rsm_action_counts": rsm_action_counts,
         "raw_confidence_stats": raw_confidence_stats,
         "policy_available": bool(policy_available),
+        "policy_rejection_breakdown": (policy_diagnostics.get("rejection_breakdown", {}) if isinstance(policy_diagnostics, dict) else {}),
+        "blocked_by_coverage_count": int((policy_diagnostics.get("blocked_by_coverage_count", 0) if isinstance(policy_diagnostics, dict) else 0) or 0),
+        "blocked_by_runtime_count": int((policy_diagnostics.get("blocked_by_runtime_count", 0) if isinstance(policy_diagnostics, dict) else 0) or 0),
+        "blocked_by_threshold_count": int((policy_diagnostics.get("blocked_by_threshold_count", 0) if isinstance(policy_diagnostics, dict) else 0) or 0),
+        "blocked_by_ev_count": int((policy_diagnostics.get("blocked_by_ev_count", 0) if isinstance(policy_diagnostics, dict) else 0) or 0),
+        "blocked_by_mixed_count": int((policy_diagnostics.get("blocked_by_mixed_count", 0) if isinstance(policy_diagnostics, dict) else 0) or 0),
+        "avg_ev_long": float((policy_diagnostics.get("avg_ev_long", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
+        "avg_ev_short": float((policy_diagnostics.get("avg_ev_short", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
+        "avg_long_threshold": float((policy_diagnostics.get("avg_long_threshold", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
+        "avg_short_threshold": float((policy_diagnostics.get("avg_short_threshold", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
+        "avg_policy_coverage_ratio": float((policy_diagnostics.get("avg_policy_coverage_ratio", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
         "all_neutral_after_rsm": bool(
             filtered_direction_counts.get("NEUTRAL", 0) == int(len(bars))
             and any(raw_direction_counts.get(side, 0) > 0 for side in ("LONG", "SHORT"))

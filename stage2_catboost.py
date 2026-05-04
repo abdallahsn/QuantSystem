@@ -180,6 +180,21 @@ def main():
         if summary.get("policy_available"):
             print(f"  policy_direction_counts: {summary.get('policy_direction_counts', {})}")
             print(f"  pre_rsm_direction_counts: {summary.get('pre_rsm_direction_counts', {})}")
+            print(f"  policy_rejection_breakdown: {summary.get('policy_rejection_breakdown', {})}")
+            print(
+                "  policy_blockers: "
+                f"coverage={summary.get('blocked_by_coverage_count', 0)} | "
+                f"threshold={summary.get('blocked_by_threshold_count', 0)} | "
+                f"ev={summary.get('blocked_by_ev_count', 0)} | "
+                f"mixed={summary.get('blocked_by_mixed_count', 0)}"
+            )
+            print(
+                "  policy_averages: "
+                f"avg_ev_long={float(summary.get('avg_ev_long', 0.0) or 0.0):.3f} | "
+                f"avg_ev_short={float(summary.get('avg_ev_short', 0.0) or 0.0):.3f} | "
+                f"avg_long_threshold={float(summary.get('avg_long_threshold', 0.0) or 0.0):.3f} | "
+                f"avg_short_threshold={float(summary.get('avg_short_threshold', 0.0) or 0.0):.3f}"
+            )
         if summary.get("rsm_action_counts"):
             print(f"  rsm_action_counts: {summary.get('rsm_action_counts', {})}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
