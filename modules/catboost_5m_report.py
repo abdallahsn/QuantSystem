@@ -294,6 +294,8 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
     frame = frame.dropna(subset=["ts_event", "price"]).sort_values("ts_event")
     frame = frame.set_index("ts_event")
+    if frame.empty:
+        return pd.DataFrame()
 
     if "size" not in frame.columns:
         frame["size"] = 0.0
@@ -357,6 +359,8 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
         ],
         axis=1,
     ).dropna(subset=["open", "high", "low", "close"])
+    if bars.empty:
+        return bars.reset_index()
 
     if "cb_prob_long" not in bars.columns:
         bars["cb_prob_long"] = cb_probs_mean.get("cb_prob_long_mean", pd.Series(0.5, index=bars.index))
@@ -367,7 +371,18 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     if "cb_prob_short_mean" not in bars.columns:
         bars["cb_prob_short_mean"] = bars["cb_prob_short"]
 
-    prob_matrix = bars[DIRECTION_PROB_COLS].fillna(0.0).values
+    for col in DIRECTION_PROB_COLS:
+        if col not in bars.columns:
+            bars[col] = 0.5
+    prob_block = bars.reindex(columns=DIRECTION_PROB_COLS, fill_value=0.5).fillna(0.5)
+    if len(prob_block) == 0 or prob_block.shape[1] != len(DIRECTION_PROB_COLS):
+        bars["cb_direction_idx"] = pd.Series(dtype=np.int64)
+        bars["cb_direction"] = pd.Series(dtype="object")
+        bars["cb_confidence"] = pd.Series(dtype=np.float64)
+        bars["cb_change_flag"] = pd.Series(dtype=np.int64)
+        bars["signal_time"] = pd.to_datetime(bars.index) + offset
+        return bars.reset_index()
+    prob_matrix = prob_block.values
     bars["cb_direction_idx"] = np.argmax(prob_matrix, axis=1).astype(int)
     bars["cb_direction"] = bars["cb_direction_idx"].map(BIAS_LABELS).fillna("UNKNOWN")
     bars["cb_confidence"] = prob_matrix.max(axis=1).astype(float)
