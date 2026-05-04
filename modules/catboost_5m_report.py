@@ -276,17 +276,32 @@ def _representative_bar_rows(frame: pd.DataFrame, freq: str) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
     rows = frame.reset_index().copy()
-    rows["cb_confidence_tick"] = rows[DIRECTION_PROB_COLS].max(axis=1).astype(float)
+    for col in DIRECTION_PROB_COLS:
+        if col not in rows.columns:
+            rows[col] = 0.5
+    rows["cb_prob_long"] = pd.to_numeric(rows["cb_prob_long"], errors="coerce").fillna(0.5)
+    rows["cb_prob_short"] = pd.to_numeric(rows["cb_prob_short"], errors="coerce").fillna(0.5)
+    rows["cb_confidence_tick"] = rows.loc[:, DIRECTION_PROB_COLS].fillna(0.5).max(axis=1).astype(float)
     rows["cb_margin_tick"] = (rows["cb_prob_long"] - rows["cb_prob_short"]).abs().astype(float)
     rows["signal_strength"] = (rows["cb_confidence_tick"] + 0.35 * rows["cb_margin_tick"]).astype(float)
+    rows["signal_strength"] = pd.to_numeric(rows["signal_strength"], errors="coerce").fillna(0.0)
 
     def _pick(group: pd.DataFrame) -> pd.Series:
-        idx = group["signal_strength"].astype(float).idxmax()
-        return group.loc[idx]
+        if group.empty:
+            return pd.Series(dtype=object)
+        ranked = group.sort_values(
+            by=["signal_strength", "cb_confidence_tick"],
+            ascending=[False, False],
+            kind="mergesort",
+        )
+        return ranked.iloc[0]
 
     rep = rows.groupby(pd.Grouper(key="ts_event", freq=freq), sort=True, group_keys=False).apply(_pick)
     if isinstance(rep, pd.Series):
         rep = rep.to_frame().T
+    if rep.empty:
+        return pd.DataFrame()
+    rep = rep.dropna(subset=["ts_event"], how="any")
     if rep.empty:
         return pd.DataFrame()
     rep = rep.set_index("ts_event").sort_index()

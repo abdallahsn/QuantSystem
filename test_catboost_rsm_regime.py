@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("plotly")
 
-from modules.catboost_5m_report import _apply_decision_policy_to_bars, _build_price_hover_trace, _resample_catboost_bars
+from modules.catboost_5m_report import _apply_decision_policy_to_bars, _build_price_hover_trace, _representative_bar_rows, _resample_catboost_bars
 from modules.range_state_machine import SignalState, apply_range_filter_to_dataframe, RangeStateMachine
 
 
@@ -420,6 +420,27 @@ def test_predict_catboost_frame_rejects_invalid_probability_block(monkeypatch, t
 
     with pytest.raises(ValueError, match="probability block is invalid"):
         catboost_5m_report.predict_catboost_frame("unused.csv", str(tmp_path))
+
+
+def test_representative_bar_rows_handles_nan_probabilities():
+    frame = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(
+                [
+                    "2025-01-15 07:55:00",
+                    "2025-01-15 07:56:00",
+                    "2025-01-15 08:01:00",
+                ]
+            ),
+            "cb_prob_long": [np.nan, 0.61, np.nan],
+            "cb_prob_short": [np.nan, 0.39, np.nan],
+        }
+    ).set_index("ts_event")
+
+    rep = _representative_bar_rows(frame, freq="5min")
+
+    assert len(rep) >= 1
+    assert "cb_prob_long" in rep.columns
 
 
 def test_locked_state_times_out_and_reprocesses_current_bar():
