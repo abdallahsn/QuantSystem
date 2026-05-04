@@ -264,6 +264,27 @@ def _resample_source_series(
     return pd.to_numeric(values, errors="coerce").fillna(float(default_value))
 
 
+def _representative_bar_rows(frame: pd.DataFrame, freq: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    rows = frame.reset_index().copy()
+    rows["cb_confidence_tick"] = rows[DIRECTION_PROB_COLS].max(axis=1).astype(float)
+    rows["cb_margin_tick"] = (rows["cb_prob_long"] - rows["cb_prob_short"]).abs().astype(float)
+    rows["signal_strength"] = (rows["cb_confidence_tick"] + 0.35 * rows["cb_margin_tick"]).astype(float)
+
+    def _pick(group: pd.DataFrame) -> pd.Series:
+        idx = group["signal_strength"].astype(float).idxmax()
+        return group.loc[idx]
+
+    rep = rows.groupby(pd.Grouper(key="ts_event", freq=freq), sort=True, group_keys=False).apply(_pick)
+    if isinstance(rep, pd.Series):
+        rep = rep.to_frame().T
+    if rep.empty:
+        return pd.DataFrame()
+    rep = rep.set_index("ts_event").sort_index()
+    return rep
+
+
 def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
     freq = _normalize_freq(freq)
     offset = pd.tseries.frequencies.to_offset(freq)
@@ -296,12 +317,23 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
     event_score = _resample_source_series(frame, "event_score", 0.0).resample(freq).mean().rename("event_score")
     price_position = _resample_source_series(frame, "price_position", 0.5).resample(freq).mean().rename("price_position")
 
-    cb_probs = frame[DIRECTION_PROB_COLS].resample(freq).mean()
+    cb_probs_mean = frame[DIRECTION_PROB_COLS].resample(freq).mean().rename(
+        columns={"cb_prob_long": "cb_prob_long_mean", "cb_prob_short": "cb_prob_short_mean"}
+    )
+    rep_rows = _representative_bar_rows(frame, freq=freq)
+    rep_probs = rep_rows.loc[:, DIRECTION_PROB_COLS].rename(
+        columns={"cb_prob_long": "cb_prob_long", "cb_prob_short": "cb_prob_short"}
+    ) if len(rep_rows) else pd.DataFrame(index=ohlc.index)
     regime_probs = (
-        frame.loc[:, [col for col in REGIME_ONE_HOT_COLS if col in frame.columns]].resample(freq).mean()
-        if any(col in frame.columns for col in REGIME_ONE_HOT_COLS)
+        rep_rows.loc[:, [col for col in REGIME_ONE_HOT_COLS if col in rep_rows.columns]]
+        if any(col in rep_rows.columns for col in REGIME_ONE_HOT_COLS)
         else pd.DataFrame(index=ohlc.index)
     )
+    rep_structure_cols = [
+        col for col in ("trend_strength", "correction_depth", "liquidity_sweep", "kalman_trend_strength", "event_score", "price_position")
+        if col in rep_rows.columns
+    ]
+    rep_structure = rep_rows.loc[:, rep_structure_cols] if rep_structure_cols else pd.DataFrame(index=ohlc.index)
 
     bars = pd.concat(
         [
@@ -315,17 +347,25 @@ def _resample_catboost_bars(pred_df: pd.DataFrame, freq: str = "5min") -> pd.Dat
             kyle,
             hawkes,
             regime,
-            cb_probs,
+            cb_probs_mean,
+            rep_probs,
             regime_probs,
-            trend_strength,
-            correction_depth,
-            liquidity_sweep,
-            kalman_trend_strength,
-            event_score,
-            price_position,
+            rep_structure if len(rep_structure.columns) else pd.concat(
+                [trend_strength, correction_depth, liquidity_sweep, kalman_trend_strength, event_score, price_position],
+                axis=1,
+            ),
         ],
         axis=1,
     ).dropna(subset=["open", "high", "low", "close"])
+
+    if "cb_prob_long" not in bars.columns:
+        bars["cb_prob_long"] = cb_probs_mean.get("cb_prob_long_mean", pd.Series(0.5, index=bars.index))
+    if "cb_prob_short" not in bars.columns:
+        bars["cb_prob_short"] = cb_probs_mean.get("cb_prob_short_mean", pd.Series(0.5, index=bars.index))
+    if "cb_prob_long_mean" not in bars.columns:
+        bars["cb_prob_long_mean"] = bars["cb_prob_long"]
+    if "cb_prob_short_mean" not in bars.columns:
+        bars["cb_prob_short_mean"] = bars["cb_prob_short"]
 
     prob_matrix = bars[DIRECTION_PROB_COLS].fillna(0.0).values
     bars["cb_direction_idx"] = np.argmax(prob_matrix, axis=1).astype(int)

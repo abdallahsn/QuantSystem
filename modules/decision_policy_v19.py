@@ -315,13 +315,18 @@ def evaluate_decision_policy(
 
     p_long = _clip01((direction_probs or {}).get("LONG", 0.0))
     p_short = _clip01((direction_probs or {}).get("SHORT", 0.0))
-    regime_arr = normalize_regime_probs(regime_probs if regime_probs is not None else policy.get("regime_priors"))
+    regime_arr_raw = normalize_regime_probs(regime_probs if regime_probs is not None else policy.get("regime_priors"))
+    regime_prior = normalize_regime_probs(policy.get("regime_priors"))
+    regime_entropy = normalized_entropy(regime_arr_raw)
+    entropy_blend = float(np.clip((regime_entropy - 0.70) / 0.25, 0.0, 1.0))
+    regime_arr = normalize_regime_probs(
+        (1.0 - entropy_blend) * regime_arr_raw + entropy_blend * regime_prior
+    )
     long_side = _resolve_side_policy(policy, "LONG", structure_bucket, regime_arr)
     short_side = _resolve_side_policy(policy, "SHORT", structure_bucket, regime_arr)
     cost_pips = _safe_float(((policy.get("cost_model") or {}).get("effective_cost_pips")), 0.0)
     ev_long = p_long * _safe_float(long_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_long) * _safe_float(long_side.get("avg_loss_pips", 0.0), 0.0) - cost_pips
     ev_short = p_short * _safe_float(short_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_short) * _safe_float(short_side.get("avg_loss_pips", 0.0), 0.0) - cost_pips
-    regime_entropy = normalized_entropy(regime_arr)
     effective_coverage = float(policy.get("coverage_ratio", 0.0)) if coverage_ratio is None else float(coverage_ratio)
     coverage_ok = effective_coverage >= _safe_float(policy.get("minimum_coverage_ratio", MIN_POLICY_COVERAGE_RATIO), MIN_POLICY_COVERAGE_RATIO)
     runtime_penalty = _clip01(runtime_penalty)
@@ -333,6 +338,7 @@ def evaluate_decision_policy(
         "structure_bucket": str(structure_bucket),
         "policy_coverage_ratio": float(effective_coverage),
         "regime_entropy": float(regime_entropy),
+        "regime_entropy_blend": float(entropy_blend),
         "cost_pips": float(cost_pips),
         "expected_value_long_pips": float(ev_long),
         "expected_value_short_pips": float(ev_short),

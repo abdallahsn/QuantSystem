@@ -1228,6 +1228,7 @@ def build_time_splits(
     embargo_horizon_quantile: float = 0.95,
 ):
     n = len(df)
+    requested_n_folds = int(max(n_folds, 1))
     t0 = _time_series(df, 'ts_event')
     t1 = _time_series(df, 'label_end_ts', fallback='ts_event')
     directional_h = pd.to_numeric(
@@ -1241,10 +1242,26 @@ def build_time_splits(
         int(np.ceil(np.percentile(directional_h, float(embargo_horizon_quantile) * 100.0))) if len(directional_h) else 0,
     )
     effective_embargo_pct = float(dynamic_embargo_rows / max(n, 1))
+    # Small directional-event datasets become unstable when split into too many tiny
+    # walk-forward test blocks. Cap the requested fold count so each test block
+    # stays meaningfully sized before walk_forward_expanding applies its own logic.
+    test_n = max(1, int(n * test_size))
+    min_train = max(int(n * min_train_pct), 200)
+    min_train = min(min_train, max(test_n + 50, n - test_n))
+    tail_n = max(0, n - min_train)
+    min_desired_test_rows = 500 if n >= 3000 else 350
+    adaptive_fold_cap = max(1, int(tail_n // max(min_desired_test_rows, 1))) if tail_n > 0 else 1
+    effective_requested_folds = max(3, min(requested_n_folds, adaptive_fold_cap)) if tail_n > 0 else 1
+    if effective_requested_folds < requested_n_folds:
+        print(
+            "  ⚠️ Adaptive fold reduction: "
+            f"requested={requested_n_folds} → effective={effective_requested_folds} "
+            f"for rows={n:,} to avoid tiny test folds."
+        )
     splits = list(
         walk_forward_expanding(
             n,
-            n_folds=n_folds,
+            n_folds=effective_requested_folds,
             test_size=test_size,
             embargo_pct=effective_embargo_pct,
             t0=t0,
@@ -1258,6 +1275,8 @@ def build_time_splits(
         'dynamic_embargo_rows': int(dynamic_embargo_rows),
         'effective_embargo_pct': float(effective_embargo_pct),
         'embargo_horizon_quantile': float(embargo_horizon_quantile),
+        'requested_n_folds': int(requested_n_folds),
+        'effective_requested_n_folds': int(effective_requested_folds),
     }
 
 
