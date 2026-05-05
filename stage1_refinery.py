@@ -61,11 +61,9 @@ def main():
                    help='TP = tp_mult × ATR (default: 1.2)')
     p.add_argument('--sl_mult', type=float, default=float(defaults.get('sl_mult', 1.0)),
                    help='SL = sl_mult × ATR (default: 1.0)')
-    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'anchor_atr', 'atr'],
+    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'],
                    default=str(defaults.get('tp_sl_threshold_mode', 'fixed')),
-                   help="label TP/SL threshold mode: 'fixed', 'anchor_atr', or 'atr' (default: fixed)")
-    p.add_argument('--tp_sl_anchor_window', type=int, default=int(defaults.get('tp_sl_anchor_window', 1000)),
-                   help='anchor rows used when tp_sl_threshold_mode=anchor_atr')
+                   help="label TP/SL threshold mode: 'fixed' or 'atr' (default: fixed)")
     p.set_defaults(
         adaptive_horizon=bool(defaults.get('adaptive_horizon', False)),
         trend_filter=bool(defaults.get('trend_filter', False)),
@@ -123,7 +121,6 @@ def main():
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
         tp_sl_threshold_mode=args.tp_sl_threshold_mode,
-        tp_sl_anchor_window=args.tp_sl_anchor_window,
         adaptive_horizon=args.adaptive_horizon,
         trend_filter=args.trend_filter,
         trend_filter_strict=args.trend_filter_strict,
