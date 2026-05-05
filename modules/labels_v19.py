@@ -96,7 +96,7 @@ NEUTRAL_REASON_LONG_SL = 2
 NEUTRAL_REASON_SHORT_SL = 3
 
 DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
-DEFAULT_V19_TP_MULT = 4.0
+DEFAULT_V19_TP_MULT = 1.5
 DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
 DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
 
@@ -1087,7 +1087,7 @@ def build_causal_event_labels(
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     training_event_score_threshold: float | None = None,
     execution_cost_pips: float = 0.0,
-    enforce_economic_tp_floor: bool = True,
+    enforce_economic_tp_floor: bool = False,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
@@ -1285,7 +1285,7 @@ def build_causal_event_labels(
         enforce_economic_tp_floor=enforce_economic_tp_floor,
     )
     economic_tp_floor_ticks = float(label_economics["economic_tp_floor_ticks"])
-    if bool(label_economics["economic_floor_applied"]):
+    if bool(enforce_economic_tp_floor) and bool(label_economics["economic_floor_applied"]):
         _log_step4(
             "economic TP floor uplift "
             f"cost_ticks={float(label_economics['effective_cost_ticks']):.2f} | "
@@ -1295,9 +1295,11 @@ def build_causal_event_labels(
         )
     else:
         _log_step4(
-            "economic TP floor "
+            "economic TP guard "
             f"cost_ticks={float(label_economics['effective_cost_ticks']):.2f} | "
-            f"tp_floor_ticks={economic_tp_floor_ticks:.2f}"
+            f"base_tp_floor_ticks={float(label_economics['base_tp_floor_ticks']):.2f} | "
+            f"economic_tp_floor_ticks={economic_tp_floor_ticks:.2f} | "
+            f"enforced={bool(enforce_economic_tp_floor)}"
         )
 
     # ── 5. FIX-9: adaptive horizon ∝ ATR ─────────────────────────────────────

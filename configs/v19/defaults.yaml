@@ -33,7 +33,7 @@
     "causal_threshold_mode": "expanding",
     "raw_event_target_rate": 0.70,
     "training_event_target_rate": 0.25,
-    "tp_mult": 4.0,
+    "tp_mult": 1.5,
     "sl_mult": 1.0,
     "kalman_slope_threshold": 0.05,
     "trend_strength_min": 0.05,

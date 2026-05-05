@@ -101,7 +101,7 @@ except ImportError as exc:
     DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
     DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
     DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
-    DEFAULT_V19_TP_MULT = 4.0
+    DEFAULT_V19_TP_MULT = 1.5
     V19_LABELS_AVAILABLE = False
     V19_LABELS_IMPORT_ERROR = exc
     V19_LABELS_SOURCE = None
@@ -3192,9 +3192,10 @@ def run_refinery(
     )
     if float(label_economics['tp_floor_uplift_ticks']) > 1e-9:
         print(
-            "  ⚠️ Economic TP floor uplift applied: "
-            f"+{float(label_economics['tp_floor_uplift_ticks']):.2f} ticks "
-            "to keep labels above execution-cost + stop floor."
+            "  ⚠️ Economic mismatch warning: "
+            f"base_tp_floor={float(label_economics['base_tp_floor_ticks']):.2f} ticks "
+            f"< stop+cost floor {float(label_economics['economic_tp_floor_ticks']):.2f} ticks. "
+            "Keeping labels causal/light and leaving strict cost filtering to decision policy."
         )
 
     print("\n⚙️  Phase B — MBP Vectorized Shards...")
@@ -3412,7 +3413,7 @@ def run_refinery(
             neutral_mult=0.45,
             tick_size=_tick,
             execution_cost_pips=float(label_economics['effective_cost_ticks']),
-            enforce_economic_tp_floor=True,
+            enforce_economic_tp_floor=False,
             kalman_slope_threshold=kalman_slope_threshold,
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
