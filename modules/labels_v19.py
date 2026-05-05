@@ -28,10 +28,10 @@ All earlier fixes (FIX-1 … FIX-8) are preserved unchanged.
 External API is 100% backwards-compatible: build_causal_event_labels(df, ...).
 
 New optional parameters:
-  adaptive_horizon     : bool  = True   — enable FIX-9 (disable for ablation)
+  adaptive_horizon     : bool  = False  — enable FIX-9 only when explicitly requested
   horizon_min_mult     : float = 0.5    — floor: horizon never < base × 0.5
   horizon_max_mult     : float = 3.0    — ceiling: horizon never > base × 3.0
-  trend_filter         : bool  = True   — enable FIX-11 (disable for ablation)
+  trend_filter         : bool  = False  — enable FIX-11 only when explicitly requested
   trend_filter_strict  : bool  = False  — if True, neutral rows also filtered by trend
 """
 
@@ -1070,22 +1070,23 @@ def build_causal_event_labels(
     sl_mult: float = 1.0,
     neutral_mult: float = 0.45,
     tick_size: float = 1e-4,
+    tp_sl_threshold_mode: str = "fixed",
     # ── FIX-9 ────────────────────────────────────────────────────────────
-    adaptive_horizon: bool = True,
+    adaptive_horizon: bool = False,
     horizon_min_mult: float = 0.5,
     horizon_max_mult: float = 3.0,
     # ── FIX-11 ───────────────────────────────────────────────────────────
-    trend_filter: bool = True,
+    trend_filter: bool = False,
     trend_filter_strict: bool = False,
     # ── FIX-Kalman ───────────────────────────────────────────────────────
     kalman_slope_threshold: float = 0.05,
     # رُفع من 1e-5 (≈ صفر بعد التطبيع) → 0.05 = 5% من أقوى ميل مرصود
     # يجعل الكالمان يُصنّف فقط الترندات الواضحة كـ UP/DOWN بدلاً من 97%
     trend_strength_min: float = 0.05,
-    causal_threshold_mode: str = "expanding",
+    causal_threshold_mode: str = "fixed",
     raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
-    training_event_score_threshold: float | None = None,
+    training_event_score_threshold: float | None = 0.0,
     execution_cost_pips: float = 0.0,
     enforce_economic_tp_floor: bool = False,
     n_workers: int | None = None,
@@ -1122,14 +1123,14 @@ def build_causal_event_labels(
     sl_mult               : SL multiplier × ATR threshold.
     neutral_mult          : Unused post-FIX-1 but kept for API compat.
     tick_size             : Minimum price increment.
-    adaptive_horizon      : Enable FIX-9 (default True).
+    adaptive_horizon      : Enable FIX-9 (default False).
     horizon_min_mult      : Floor multiplier for adaptive horizon.
     horizon_max_mult      : Ceiling multiplier for adaptive horizon.
-    trend_filter          : Enable FIX-11 Kalman trend gate (default True).
+    trend_filter          : Enable FIX-11 Kalman trend gate (default False).
     trend_filter_strict   : If True, also filter NEUTRAL rows by trend.
     trend_strength_min    : Minimum opposite-trend strength required to veto a
                             directional label.
-    causal_threshold_mode : `expanding` (default) أو `fixed` للـ training-event gate.
+    causal_threshold_mode : `fixed` (default) أو `expanding` للـ training-event gate.
     raw_event_target_rate : Target keep-rate for the broader `event_flag` mask.
     training_event_target_rate : Target keep-rate for the narrower
                                  `train_event_flag` mask داخل `event_flag`.
@@ -1274,9 +1275,20 @@ def build_causal_event_labels(
     if np.isnan(micro_atr).all():
         micro_atr = _compute_micro_atr(prices_arr, window=feat_window)
 
-    # FIX-4: per-row dynamic threshold (floor = fixed ticks, adaptive = 0.5×ATR)
+    # FIX-10 ablation/stability mode:
+    #   - fixed: use one stationary TP/SL threshold floor across rows
+    #   - atr:   keep the older per-row ATR-adaptive threshold
     fixed_floor       = direction_threshold_ticks * tick_size
-    dynamic_threshold = np.maximum(fixed_floor, 0.5 * micro_atr)   # shape (n,)
+    tp_sl_mode = str(tp_sl_threshold_mode or "fixed").strip().lower()
+    if tp_sl_mode == "atr":
+        dynamic_threshold = np.maximum(fixed_floor, 0.5 * micro_atr)
+    elif tp_sl_mode == "fixed":
+        dynamic_threshold = np.full(n, max(fixed_floor, tick_size), dtype=np.float64)
+    else:
+        raise ValueError(
+            f"Unsupported tp_sl_threshold_mode={tp_sl_threshold_mode!r}. "
+            "Use 'fixed' or 'atr'."
+        )
     label_economics = _resolve_economic_tp_floor_ticks(
         direction_threshold_ticks=direction_threshold_ticks,
         tp_mult=tp_mult,
@@ -1572,6 +1584,7 @@ def build_causal_event_labels(
     print(
         f"[v19] Config → thr_ticks={direction_threshold_ticks:.2f}  "
         f"tp_mult={tp_mult:.2f}  sl_mult={sl_mult:.2f}  "
+        f"tp_sl_mode={tp_sl_mode}  "
         f"kalman_thr={kalman_slope_threshold:.2f}  trend_min={trend_strength_min:.2f}"
     )
     print(

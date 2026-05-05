@@ -3083,14 +3083,19 @@ def run_refinery(
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
     direction_threshold_ticks: float = DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
-    causal_threshold_mode: str = 'expanding',
+    causal_threshold_mode: str = 'fixed',
     raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
+    training_event_score_threshold: float | None = 0.0,
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
     tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
+    tp_sl_threshold_mode: str = 'fixed',
+    adaptive_horizon: bool = False,
+    trend_filter: bool = False,
+    trend_filter_strict: bool = False,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
     regime_mode: str = 'rules',
@@ -3440,8 +3445,13 @@ def run_refinery(
             causal_threshold_mode=causal_threshold_mode,
             raw_event_target_rate=raw_event_target_rate,
             training_event_target_rate=training_event_target_rate,
+            training_event_score_threshold=training_event_score_threshold,
             tp_mult=tp_mult,
             sl_mult=sl_mult,
+            tp_sl_threshold_mode=tp_sl_threshold_mode,
+            adaptive_horizon=adaptive_horizon,
+            trend_filter=trend_filter,
+            trend_filter_strict=trend_filter_strict,
             neutral_mult=0.45,
             tick_size=_tick,
             execution_cost_pips=float(label_economics['effective_cost_ticks']),
@@ -3741,8 +3751,13 @@ def run_refinery(
             'causal_threshold_mode': str(causal_threshold_mode),
             'raw_event_target_rate': float(raw_event_target_rate),
             'training_event_target_rate': float(training_event_target_rate),
+            'training_event_score_threshold': None if training_event_score_threshold is None else float(training_event_score_threshold),
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
+            'tp_sl_threshold_mode': str(tp_sl_threshold_mode),
+            'adaptive_horizon': bool(adaptive_horizon),
+            'trend_filter': bool(trend_filter),
+            'trend_filter_strict': bool(trend_filter_strict),
             'label_execution_cost_ticks': float(label_economics['effective_cost_ticks']),
             'label_stop_floor_ticks': float(label_economics['stop_floor_ticks']),
             'label_base_tp_floor_ticks': float(label_economics['base_tp_floor_ticks']),
@@ -3843,18 +3858,35 @@ if __name__=='__main__':
                    help='Rolling window for event filter (default: 50)')
     p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
                    help=f'Directional threshold floor in ticks (default: {DEFAULT_V19_DIRECTION_THRESHOLD_TICKS:.1f})')
-    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='expanding',
-                   help='threshold mode for train_event_flag selection (default: expanding)')
+    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='fixed',
+                   help='threshold mode for train_event_flag selection (default: fixed)')
     p.add_argument('--raw_event_target_rate', type=float, default=DEFAULT_RAW_EVENT_TARGET_RATE,
                    help=f'target keep-rate for broad event_flag (default: {DEFAULT_RAW_EVENT_TARGET_RATE:.2f})')
     p.add_argument('--training_event_target_rate', type=float, default=DEFAULT_TRAINING_EVENT_TARGET_RATE,
                    help=f'target keep-rate for narrower train_event_flag (default: {DEFAULT_TRAINING_EVENT_TARGET_RATE:.2f})')
+    p.add_argument('--training_event_score_threshold', type=float, default=0.0,
+                   help='fixed threshold for train_event_flag score when causal_threshold_mode=fixed (default: 0.0)')
     p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
                    help='Max event-rich emit positions for LOB tensors')
     p.add_argument('--tp_mult', type=float, default=DEFAULT_V19_TP_MULT,
                    help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V19_TP_MULT:.1f})')
     p.add_argument('--sl_mult', type=float, default=1.0,
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
+    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'], default='fixed',
+                   help="TP/SL threshold mode for label scan: 'fixed' or 'atr' (default: fixed)")
+    p.set_defaults(adaptive_horizon=False, trend_filter=False, trend_filter_strict=False)
+    p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
+                   help='enable ATR-adaptive forward horizon (default: off)')
+    p.add_argument('--no_adaptive_horizon', dest='adaptive_horizon', action='store_false',
+                   help='disable ATR-adaptive forward horizon')
+    p.add_argument('--trend_filter', dest='trend_filter', action='store_true',
+                   help='enable Kalman trend filter on labels (default: off)')
+    p.add_argument('--no_trend_filter', dest='trend_filter', action='store_false',
+                   help='disable Kalman trend filter on labels')
+    p.add_argument('--trend_filter_strict', dest='trend_filter_strict', action='store_true',
+                   help='if trend filter is enabled, also apply stricter neutral filtering')
+    p.add_argument('--no_trend_filter_strict', dest='trend_filter_strict', action='store_false',
+                   help='disable strict trend filtering')
     p.add_argument('--kalman_slope_threshold', type=float, default=0.05,
                    help='Kalman slope threshold for trend direction (default: 0.05)')
     p.add_argument('--trend_strength_min', type=float, default=0.05,
@@ -3884,9 +3916,14 @@ if __name__=='__main__':
                  causal_threshold_mode=a.causal_threshold_mode,
                  raw_event_target_rate=a.raw_event_target_rate,
                  training_event_target_rate=a.training_event_target_rate,
+                 training_event_score_threshold=a.training_event_score_threshold,
                  lob_event_sample=a.lob_event_sample,
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,
+                 tp_sl_threshold_mode=a.tp_sl_threshold_mode,
+                 adaptive_horizon=a.adaptive_horizon,
+                 trend_filter=a.trend_filter,
+                 trend_filter_strict=a.trend_filter_strict,
                  kalman_slope_threshold=a.kalman_slope_threshold,
                  trend_strength_min=a.trend_strength_min,
                  regime_mode=a.regime_mode,

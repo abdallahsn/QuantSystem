@@ -48,9 +48,10 @@ def main():
     # FIX: خُفّض من 5.0 → 2.0 tick
     # 5 tick floor كان يرفع TP/SL بشكل مبالغ فيه على بيانات منخفضة التذبذب
     p.add_argument('--direction_threshold_ticks', type=float, default=float(defaults.get('direction_threshold_ticks', 1.0)))
-    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default=str(defaults.get('causal_threshold_mode', 'expanding')))
+    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default=str(defaults.get('causal_threshold_mode', 'fixed')))
     p.add_argument('--raw_event_target_rate', type=float, default=float(defaults.get('raw_event_target_rate', 0.70)))
     p.add_argument('--training_event_target_rate', type=float, default=float(defaults.get('training_event_target_rate', 0.25)))
+    p.add_argument('--training_event_score_threshold', type=float, default=defaults.get('training_event_score_threshold', 0.0))
 
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
     p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
@@ -60,6 +61,26 @@ def main():
                    help='TP = tp_mult × ATR (default: 1.2)')
     p.add_argument('--sl_mult', type=float, default=float(defaults.get('sl_mult', 1.0)),
                    help='SL = sl_mult × ATR (default: 1.0)')
+    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'],
+                   default=str(defaults.get('tp_sl_threshold_mode', 'fixed')),
+                   help="label TP/SL threshold mode: 'fixed' or 'atr' (default: fixed)")
+    p.set_defaults(
+        adaptive_horizon=bool(defaults.get('adaptive_horizon', False)),
+        trend_filter=bool(defaults.get('trend_filter', False)),
+        trend_filter_strict=bool(defaults.get('trend_filter_strict', False)),
+    )
+    p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
+                   help='enable ATR-adaptive label horizon')
+    p.add_argument('--no_adaptive_horizon', dest='adaptive_horizon', action='store_false',
+                   help='disable ATR-adaptive label horizon')
+    p.add_argument('--trend_filter', dest='trend_filter', action='store_true',
+                   help='enable Kalman trend filter for labels')
+    p.add_argument('--no_trend_filter', dest='trend_filter', action='store_false',
+                   help='disable Kalman trend filter for labels')
+    p.add_argument('--trend_filter_strict', dest='trend_filter_strict', action='store_true',
+                   help='enable stricter Kalman trend filter behaviour')
+    p.add_argument('--no_trend_filter_strict', dest='trend_filter_strict', action='store_false',
+                   help='disable stricter Kalman trend filter behaviour')
     p.add_argument('--kalman_slope_threshold', type=float,
                    default=float(defaults.get('kalman_slope_threshold', 0.05)),
                    help='حد قوة الميل في Kalman (default: 0.05, القديم: 1e-5)')
@@ -95,9 +116,14 @@ def main():
         causal_threshold_mode=args.causal_threshold_mode,
         raw_event_target_rate=args.raw_event_target_rate,
         training_event_target_rate=args.training_event_target_rate,
+        training_event_score_threshold=args.training_event_score_threshold,
         lob_event_sample=args.lob_event_sample,
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
+        tp_sl_threshold_mode=args.tp_sl_threshold_mode,
+        adaptive_horizon=args.adaptive_horizon,
+        trend_filter=args.trend_filter,
+        trend_filter_strict=args.trend_filter_strict,
         kalman_slope_threshold=args.kalman_slope_threshold,
         trend_strength_min=args.trend_strength_min,
         regime_mode=args.regime_mode,

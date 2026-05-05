@@ -113,6 +113,15 @@ SEQUENCE_AUX_ALL_STEPS = 'all_steps'
 VISUAL_COVERAGE_FAIL_FAST = True
 TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 DEFAULT_LOB_MAX_AGE = '500ms'
+DEFAULT_STAT_FEATURE_LIMIT = 20
+EXTRA_STAT_FEATURE_CANDIDATES = [
+    'rel_vol',
+    'hour_sin',
+    'hour_cos',
+    'london_active',
+    'ny_active',
+    'overlap_active',
+]
 TREE_CLASS_WEIGHT_MAX = 2.5
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
@@ -169,6 +178,76 @@ def _assert_no_forbidden_model_inputs(cols: list[str]) -> None:
             "❌ Forbidden leakage-prone columns requested for model inputs: "
             f"{leaked}"
         )
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        key = str(value).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
+
+
+def _stat_feature_candidates() -> list[str]:
+    return _ordered_unique(list(CATBOOST_ADVISOR_FEATURES) + list(EXTRA_STAT_FEATURE_CANDIDATES))
+
+
+def _feature_available(df: pd.DataFrame, feature: str) -> bool:
+    feature = str(feature)
+    return feature in df.columns or f'{RAW_STAT_PREFIX}{feature}' in df.columns
+
+
+def _load_ranked_selected_features(path: str) -> list[str]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path) as f:
+        lines = [str(line).strip() for line in f.read().splitlines()]
+    return [line for line in lines if line]
+
+
+def _resolve_active_stat_features(
+    df: pd.DataFrame,
+    *,
+    artifacts_dir: str,
+    feature_limit: int = DEFAULT_STAT_FEATURE_LIMIT,
+) -> tuple[list[str], dict]:
+    limit = max(int(feature_limit), 1)
+    candidate_pool = _stat_feature_candidates()
+    available_candidates = [feat for feat in candidate_pool if _feature_available(df, feat)]
+    selected_path = os.path.join(artifacts_dir, 'selected_features.txt')
+    ranked_selected = _load_ranked_selected_features(selected_path)
+    ranked_candidates = [
+        feat for feat in ranked_selected
+        if feat in candidate_pool and feat in available_candidates
+    ]
+    active = ranked_candidates[:limit] if ranked_candidates else available_candidates[:limit]
+    if len(active) < limit:
+        for feat in available_candidates:
+            if feat not in active:
+                active.append(feat)
+            if len(active) >= limit:
+                break
+    active = _ordered_unique(active)[:limit]
+    if not active:
+        raise RuntimeError(
+            '❌ No active statistical features available after resolving selected_features.txt '
+            f'under {artifacts_dir}.'
+        )
+    info = {
+        'feature_limit': int(limit),
+        'selected_features_path': selected_path if os.path.exists(selected_path) else None,
+        'selected_features_count': int(len(ranked_selected)),
+        'selected_candidates_count': int(len(ranked_candidates)),
+        'available_candidate_count': int(len(available_candidates)),
+        'active_feature_count': int(len(active)),
+        'selected_features_used': bool(len(ranked_candidates) > 0),
+        'active_features': list(active),
+    }
+    return active, info
 
 
 def _resolve_phase(stage: int = 0, phase: str | None = None) -> str:
@@ -454,14 +533,16 @@ def _meta_layout_label(meta_feature_names: list[str]) -> str:
 def _write_feature_coverage_drift_report(
     df: pd.DataFrame,
     *,
+    stat_features: list[str] | None = None,
     split_time: pd.Timestamp | str | None,
     output_dir: str,
     protected_features: set[str] | None = None,
 ) -> str:
     protected_features = protected_features or set()
+    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
     ts = _time_series(df, 'ts_event')
     months = ts.dt.to_period('M').astype(str)
-    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
+    raw_stat = _raw_stat_frame(df, stat_features)
     split_ts = _parse_optional_timestamp(split_time)
     train_mask = np.ones(len(df), dtype=bool) if split_ts is None else (ts < split_ts).to_numpy(dtype=bool)
     train_ref = raw_stat.loc[train_mask] if np.any(train_mask) else raw_stat
@@ -471,13 +552,14 @@ def _write_feature_coverage_drift_report(
         'split_time': None if split_ts is None else str(split_ts),
         'months': [],
         'dead_features_3m': [],
+        'stat_features': stat_features,
     }
-    dead_streak = {feat: 0 for feat in CATBOOST_ADVISOR_FEATURES}
+    dead_streak = {feat: 0 for feat in stat_features}
     for month in sorted(months.unique()):
         month_mask = (months == month).to_numpy(dtype=bool)
         month_frame = raw_stat.loc[month_mask]
         feature_stats = {}
-        for feat in CATBOOST_ADVISOR_FEATURES:
+        for feat in stat_features:
             vals = pd.to_numeric(month_frame[feat], errors='coerce')
             ref_vals = pd.to_numeric(train_ref[feat], errors='coerce')
             non_zero_rate = float((vals.fillna(0.0) != 0.0).mean()) if len(vals) else 0.0
@@ -554,16 +636,22 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         )
 
     df = _sanitize_df(df)
-    raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' in df.columns]
-    if len(raw_cols) < len(CATBOOST_ADVISOR_FEATURES):
-        missing = [col for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' not in df.columns]
-        print(
-            "  ⚠️ Missing raw stat columns for fold-clean scaling: "
-            f"{missing}. Re-run prepare_training_data.py to unlock the strict anti-leakage path."
-        )
+    stat_candidates = _stat_feature_candidates()
+    raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in stat_candidates if f'{RAW_STAT_PREFIX}{col}' in df.columns]
+    safe_nonraw_features = {'hour_sin', 'hour_cos', 'london_active', 'ny_active', 'overlap_active'}
+    if len(raw_cols) < len(stat_candidates):
+        missing = [
+            col for col in stat_candidates
+            if f'{RAW_STAT_PREFIX}{col}' not in df.columns and col not in safe_nonraw_features
+        ]
+        if missing:
+            print(
+                "  ⚠️ Missing raw stat columns for fold-clean scaling: "
+                f"{missing}. Re-run prepare_training_data.py to unlock the strict anti-leakage path."
+            )
     df = prepare_feature_frame(
         df,
-        stat_features=CATBOOST_ADVISOR_FEATURES + raw_cols,
+        stat_features=stat_candidates + raw_cols,
         scaler_params=None,
         already_scaled=True,
         passthrough_cols=TRAINING_PASSTHROUGH_COLS,
@@ -725,12 +813,24 @@ def _raw_stat_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     # Hard guard: passthrough/meta columns such as forward_return may exist in
     # the CSV for analysis/backtesting, but they must never enter model inputs.
     _assert_no_forbidden_model_inputs(list(cols))
+    ts_event = _time_series(df, 'ts_event') if 'ts_event' in df.columns else None
+    hour_values = None if ts_event is None else ts_event.dt.hour.to_numpy(dtype=np.float32)
     data = {}
     for col in cols:
         raw_col = _raw_feature_name(col)
         src = raw_col if raw_col in df.columns else col
         if src in df.columns:
             series = pd.to_numeric(df[src], errors='coerce').fillna(0.0).astype(np.float32)
+        elif hour_values is not None and col == 'hour_sin':
+            series = pd.Series(np.sin(2.0 * np.pi * hour_values / 24.0).astype(np.float32), index=df.index)
+        elif hour_values is not None and col == 'hour_cos':
+            series = pd.Series(np.cos(2.0 * np.pi * hour_values / 24.0).astype(np.float32), index=df.index)
+        elif hour_values is not None and col == 'london_active':
+            series = pd.Series(((hour_values >= 7.0) & (hour_values < 16.0)).astype(np.float32), index=df.index)
+        elif hour_values is not None and col == 'ny_active':
+            series = pd.Series(((hour_values >= 13.0) & (hour_values < 22.0)).astype(np.float32), index=df.index)
+        elif hour_values is not None and col == 'overlap_active':
+            series = pd.Series(((hour_values >= 13.0) & (hour_values < 16.0)).astype(np.float32), index=df.index)
         else:
             series = pd.Series(np.zeros(len(df), dtype=np.float32), index=df.index)
         data[col] = series
@@ -1311,6 +1411,7 @@ def _build_inner_time_split(
 def stage1_oof_meta(
     df: pd.DataFrame,
     output_dir: str,
+    stat_features: list[str] | None = None,
     splits=None,
     n_folds: int = 6,
     test_size: float = 0.10,
@@ -1334,7 +1435,8 @@ def stage1_oof_meta(
         )
 
     n = len(df)
-    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
+    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
+    raw_stat = _raw_stat_frame(df, stat_features)
     y = df['bias_label'].fillna(1).astype(np.int32).values
     if splits is None:
         splits, t0, t1, _ = build_time_splits(
@@ -1385,7 +1487,7 @@ def stage1_oof_meta(
     regime_model_type = 'hmm' if HMM_AVAILABLE else 'rules'
     regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
     os.makedirs(regime_tmp_dir, exist_ok=True)
-    tree_depth = _adaptive_tree_depth(len(CATBOOST_ADVISOR_FEATURES))
+    tree_depth = _adaptive_tree_depth(len(stat_features))
 
     def _weighted_quality_weights(indices: np.ndarray, class_weights: list[float] | None) -> np.ndarray:
         weights = _quality_sample_weights(
@@ -1472,7 +1574,7 @@ def stage1_oof_meta(
             task_type=cb_task_type,
             devices=cb_devices,
         )
-        tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+        tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=stat_features)
         eval_set = None
         X_val = None
         if inner_val is not None:
@@ -1481,7 +1583,7 @@ def stage1_oof_meta(
                 fold_scaler,
                 clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
             ).values.astype(np.float32)
-            eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
+            eval_set = Pool(X_val, y[inner_val], feature_names=stat_features)
         model.fit(tr_pool, eval_set=eval_set, plot=False)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
         raw_preds = align_probability_columns(
@@ -1726,8 +1828,8 @@ def stage1_oof_meta(
         task_type=cb_task_type,
         devices=cb_devices,
     )
-    final_pool = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
-    final_eval_pool = Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES) if len(final_holdout_idx) else None
+    final_pool = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=stat_features)
+    final_eval_pool = Pool(X_holdout_final, y_holdout_final, feature_names=stat_features) if len(final_holdout_idx) else None
     final_model.fit(final_pool, eval_set=final_eval_pool, plot=False)
     final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
     final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
@@ -1826,6 +1928,7 @@ def stage1_oof_meta(
         json.dump(decision_policy, f, indent=2)
 
     fold_metrics = {
+        'stat_features': stat_features,
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
@@ -2681,6 +2784,7 @@ def stage3_meta_learner_v19(
     coverage_mask: np.ndarray,
     inference_scaler_params: dict,
     output_dir: str,
+    stat_features: list[str] | None = None,
     meta_feature_names: list[str] | None = None,
     event_gate_cfg: dict | None = None,
     full_df: pd.DataFrame | None = None,
@@ -2696,6 +2800,7 @@ def stage3_meta_learner_v19(
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
     MetaLearnerLSTM = _load_meta_learner_class()
+    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
     meta_feature_names = list(meta_feature_names or resolve_meta_feature_names(meta_dim=int(meta_features.shape[1])))
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     if int(meta_features.shape[1]) != len(meta_feature_names):
@@ -2712,7 +2817,7 @@ def stage3_meta_learner_v19(
         )
 
     sequence_aux_mode = SEQUENCE_AUX_ALL_STEPS
-    X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
+    X_stat = _build_scaled_stat_matrix(df, stat_features, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
     print(
         "  Meta Surface Layout: "
@@ -2733,7 +2838,7 @@ def stage3_meta_learner_v19(
         train_frac=train_frac,
         split_time=split_time,
         min_seq_coverage=min_seq_coverage,
-        n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
+        n_stat_feat=len(stat_features),
         sequence_aux_mode=sequence_aux_mode,
     )
     if len(X_tr) == 0 or len(X_val) == 0:
@@ -2791,7 +2896,7 @@ def stage3_meta_learner_v19(
 
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
-        n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
+        n_stat_feat=len(stat_features),
         n_meta_feat=int(meta_features.shape[1]),
         n_visual_emb=VISUAL_EMB_DIM,
         brain_file=meta_brain_path,
@@ -2888,7 +2993,7 @@ def stage3_meta_learner_v19(
         schema = {
             'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
-            'stat_features': CATBOOST_ADVISOR_FEATURES,
+            'stat_features': stat_features,
             'meta_features': meta_feature_names,
             'visual_features': VISUAL_FEATURE_NAMES,
             'sequence_aux_mode': sequence_aux_mode,
@@ -3037,6 +3142,7 @@ def run_training_pipeline(
     train_days: float | None = None,
     backtest_days: float | None = None,
     window_end: str | None = None,
+    stat_feature_limit: int = DEFAULT_STAT_FEATURE_LIMIT,
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
@@ -3091,6 +3197,17 @@ def run_training_pipeline(
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
+    active_stat_features, active_stat_info = _resolve_active_stat_features(
+        event_df,
+        artifacts_dir=output_dir,
+        feature_limit=stat_feature_limit,
+    )
+    print(
+        "  ✅ Active stat features: "
+        f"{len(active_stat_features)}/{max(int(stat_feature_limit), 1)} "
+        f"| selected_file_used={active_stat_info['selected_features_used']} "
+        f"| features={active_stat_features}"
+    )
 
     effective_source_contract = dict(source_contract)
     effective_source_contract.update({
@@ -3105,7 +3222,7 @@ def run_training_pipeline(
 
     inference_scaler_params, scaler_info = build_inference_scaler_params(
         event_df,
-        CATBOOST_ADVISOR_FEATURES,
+        active_stat_features,
         train_frac=train_frac,
         split_time=training_window.get('split_time'),
     )
@@ -3116,9 +3233,10 @@ def run_training_pipeline(
     )
     feature_drift_report_path = _write_feature_coverage_drift_report(
         event_df,
+        stat_features=active_stat_features,
         split_time=training_window.get('split_time'),
         output_dir=output_dir,
-        protected_features={'cvd', 'obi', 'micro_atr', 'kyle_lambda', 'hawkes_intensity', 'vwap_z_score'},
+        protected_features=set(active_stat_features) & {'cvd', 'obi', 'micro_atr', 'kyle_lambda', 'hawkes_intensity', 'vwap_z_score'},
     )
     print(f"  ✅ Feature coverage/drift report: {feature_drift_report_path}")
 
@@ -3183,6 +3301,7 @@ def run_training_pipeline(
         meta_features, coverage = stage1_oof_meta(
             event_df,
             output_dir,
+            stat_features=active_stat_features,
             splits=splits,
             n_folds=n_folds,
             test_size=test_size,
@@ -3207,6 +3326,7 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
+            'active_stat_features': active_stat_features,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': None,
@@ -3238,6 +3358,7 @@ def run_training_pipeline(
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
+                'stat_feature_limit': stat_feature_limit,
             },
             inputs={
                 'csv': csv_path,
@@ -3249,6 +3370,8 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
+                'active_stat_features': active_stat_features,
+                'active_stat_info': active_stat_info,
             },
         )
         print('\n' + '=' * 65)
@@ -3305,6 +3428,7 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
+            'active_stat_features': active_stat_features,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': list(visual_embeddings.shape),
@@ -3336,6 +3460,7 @@ def run_training_pipeline(
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
+                'stat_feature_limit': stat_feature_limit,
             },
             inputs={
                 'csv': csv_path,
@@ -3347,6 +3472,8 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
+                'active_stat_features': active_stat_features,
+                'active_stat_info': active_stat_info,
             },
         )
         print('\n' + '=' * 65)
@@ -3378,6 +3505,7 @@ def run_training_pipeline(
             coverage_mask=coverage,
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
+            stat_features=active_stat_features,
             meta_feature_names=meta_feature_names,
             event_gate_cfg=event_gate_cfg,
             full_df=df_full,
@@ -3395,6 +3523,8 @@ def run_training_pipeline(
         'rows_full': int(len(df_full)),
         'rows_event': int(len(event_df)),
         'training_mode': training_mode,
+        'active_stat_features': active_stat_features,
+        'active_stat_info': active_stat_info,
         'meta_shape': list(meta_features.shape),
         'meta_coverage_ratio': float(np.mean(coverage)),
         'visual_shape': list(visual_embeddings.shape),
@@ -3430,6 +3560,7 @@ def run_training_pipeline(
             'train_days': train_days,
             'backtest_days': backtest_days,
             'window_end': window_end,
+            'stat_feature_limit': stat_feature_limit,
         },
         inputs={
             'csv': csv_path,
@@ -3443,6 +3574,8 @@ def run_training_pipeline(
             'meta_feature_dim': int(meta_features.shape[1]),
             'event_gate_schema': event_gate_cfg,
             'meta_learner_profile': stage3_summary,
+            'active_stat_features': active_stat_features,
+            'active_stat_info': active_stat_info,
             'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
         },
     )
@@ -3488,6 +3621,7 @@ def main():
     p.add_argument('--train_days', type=float, default=None, help='limit training window to N days immediately before split_time')
     p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
     p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
+    p.add_argument('--stat_feature_limit', type=int, default=int(defaults.get('stat_feature_limit', DEFAULT_STAT_FEATURE_LIMIT)))
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -3515,6 +3649,7 @@ def main():
         train_days=args.train_days,
         backtest_days=args.backtest_days,
         window_end=args.window_end,
+        stat_feature_limit=args.stat_feature_limit,
         config_snapshot=cfg,
     )
 

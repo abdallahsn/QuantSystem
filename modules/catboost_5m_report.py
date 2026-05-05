@@ -68,6 +68,22 @@ def _load_scaler_params(models_dir: str) -> dict:
         return json.load(f)
 
 
+def _load_stat_features(models_dir: str, scaler_params: dict) -> list[str]:
+    schema_path = os.path.join(models_dir, "feature_schema_v19.json")
+    if os.path.exists(schema_path):
+        try:
+            with open(schema_path, "r") as f:
+                payload = json.load(f)
+            stat_features = payload.get("stat_features")
+            if isinstance(stat_features, list) and stat_features:
+                return [str(col) for col in stat_features]
+        except Exception:
+            pass
+    if isinstance(scaler_params, dict) and scaler_params:
+        return [str(col) for col in scaler_params.keys()]
+    return list(CATBOOST_ADVISOR_FEATURES)
+
+
 def _load_catboost_classes(models_dir: str) -> list[int] | None:
     path = os.path.join(models_dir, "catboost_classes_v19.json")
     if not os.path.exists(path):
@@ -377,7 +393,8 @@ def predict_catboost_frame(csv_path: str, models_dir: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Missing CatBoost model: {model_path}")
 
     scaler_params = _load_scaler_params(models_dir)
-    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
+    stat_features = _load_stat_features(models_dir, scaler_params)
+    raw_stat = _raw_stat_frame(df, stat_features)
     X_stat = _apply_scaler_to_stat_frame(
         raw_stat,
         scaler_params,

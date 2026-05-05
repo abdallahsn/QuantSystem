@@ -135,6 +135,7 @@ def main():
     p.add_argument('--train_days', type=float, default=None, help='limit training window to N days immediately before split_time')
     p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
     p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
+    p.add_argument('--stat_feature_limit', type=int, default=int(defaults.get('stat_feature_limit', 20)))
     p.add_argument('--config', default=None, help='optional config file')
     args = p.parse_args()
 
@@ -158,6 +159,7 @@ def main():
         train_days=args.train_days,
         backtest_days=args.backtest_days,
         window_end=args.window_end,
+        stat_feature_limit=args.stat_feature_limit,
         phase='catboost',
         config_snapshot=cfg,
     )
