@@ -193,14 +193,14 @@ def _apply_decision_policy_to_bars(
         float((decision or {}).get("short_threshold", 0.0) or 0.0)
         for decision in decisions
     ]
-    out["cb_direction"] = out["cb_direction_policy"].astype(str)
-    out["cb_direction_idx"] = out["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
-    counts = out["cb_direction"].value_counts().to_dict()
-    neutral_mask = out["cb_direction"].eq("NEUTRAL")
+    out["cb_direction_policy_idx"] = out["cb_direction_policy"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+    counts = out["cb_direction_policy"].value_counts().to_dict()
+    neutral_mask = out["cb_direction_policy"].eq("NEUTRAL")
     rejection_breakdown = out.loc[neutral_mask, "policy_reject_bucket"].value_counts().to_dict()
     diagnostics = {
         "direction_counts": counts,
         "rejection_breakdown": rejection_breakdown,
+        "passed_direction_counts": out.loc[~neutral_mask, "cb_direction_policy"].value_counts().to_dict(),
         "blocked_by_coverage_count": int(rejection_breakdown.get("coverage", 0)),
         "blocked_by_runtime_count": int(rejection_breakdown.get("runtime", 0)),
         "blocked_by_threshold_count": int(rejection_breakdown.get("threshold", 0)),
@@ -211,6 +211,139 @@ def _apply_decision_policy_to_bars(
         "avg_long_threshold": float(out["long_threshold"].mean()) if len(out) else 0.0,
         "avg_short_threshold": float(out["short_threshold"].mean()) if len(out) else 0.0,
         "avg_policy_coverage_ratio": float(out["policy_coverage_ratio"].mean()) if len(out) else 0.0,
+    }
+    return out, diagnostics
+
+
+def _finalize_direction_columns(
+    bars: pd.DataFrame,
+    direction_col: str,
+    *,
+    idx_col: str = "cb_direction_idx",
+) -> pd.DataFrame:
+    out = bars.copy()
+    out["cb_direction"] = out[direction_col].astype(str)
+    out[idx_col] = out["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+    return out
+
+
+def _apply_signal_pipeline_to_bars(
+    bars: pd.DataFrame,
+    *,
+    decision_policy: dict[str, Any] | None,
+    apply_decision_policy: bool,
+    apply_rsm: bool,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    out = bars.copy()
+    raw_direction_col = "cb_direction_model_raw" if "cb_direction_model_raw" in out.columns else "cb_direction"
+    raw_conf_col = "cb_confidence_model_raw" if "cb_confidence_model_raw" in out.columns else "cb_confidence"
+
+    raw_direction_counts = out[raw_direction_col].value_counts().to_dict() if not out.empty else {}
+    policy_diagnostics: dict[str, Any] = {}
+    policy_available = bool(decision_policy) and bool(apply_decision_policy)
+    policy_direction_counts: dict[str, int] = {}
+
+    if policy_available and not out.empty:
+        out, policy_diagnostics = _apply_decision_policy_to_bars(out, decision_policy)
+        policy_direction_counts = (
+            policy_diagnostics.get("direction_counts", {})
+            if isinstance(policy_diagnostics, dict)
+            else {}
+        )
+    else:
+        out["policy_available"] = False
+        out["cb_direction_policy"] = out[raw_direction_col].astype(str)
+        out["cb_direction_policy_idx"] = out["cb_direction_policy"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
+        out["policy_tradeable"] = out["cb_direction_policy"].isin(["LONG", "SHORT"]).astype(bool)
+        out["policy_reason"] = "policy_unavailable"
+        out["chosen_threshold"] = 0.0
+        out["policy_edge_prob"] = out[raw_conf_col].astype(float)
+        out["policy_reject_bucket"] = "passed"
+        out["policy_coverage_ratio"] = 0.0
+        out["expected_value_long_pips"] = 0.0
+        out["expected_value_short_pips"] = 0.0
+        out["long_threshold"] = 0.0
+        out["short_threshold"] = 0.0
+
+    if policy_available:
+        out["cb_direction_rsm_input"] = out["cb_direction_policy"].astype(str)
+        out["cb_confidence_rsm_input"] = pd.to_numeric(
+            out.get("policy_edge_prob", out[raw_conf_col]),
+            errors="coerce",
+        ).fillna(pd.to_numeric(out[raw_conf_col], errors="coerce").fillna(0.0)).astype(float)
+    else:
+        out["cb_direction_rsm_input"] = out[raw_direction_col].astype(str)
+        out["cb_confidence_rsm_input"] = pd.to_numeric(out[raw_conf_col], errors="coerce").fillna(0.0).astype(float)
+
+    rsm_input_direction_counts = out["cb_direction_rsm_input"].value_counts().to_dict() if not out.empty else {}
+    rsm_action_counts: dict[str, int] = {}
+    rsm_enter_direction_counts: dict[str, int] = {}
+
+    if apply_rsm and RSM_AVAILABLE and len(out):
+        out = apply_range_filter_to_dataframe(
+            out,
+            signal_col="cb_direction_rsm_input",
+            conf_col="cb_confidence_rsm_input",
+            regime_col="regime_label",
+        )
+        rsm_enter_mask = out["rsm_action"].astype(str).eq("ENTER") & out["rsm_direction"].astype(str).isin(["LONG", "SHORT"])
+        out["cb_direction_after_rsm"] = np.where(
+            rsm_enter_mask,
+            out["rsm_direction"].astype(str),
+            "NEUTRAL",
+        )
+        rsm_action_counts = out["rsm_action"].value_counts().to_dict()
+        rsm_enter_direction_counts = out.loc[rsm_enter_mask, "rsm_direction"].value_counts().to_dict()
+        out = _finalize_direction_columns(out, "cb_direction_after_rsm")
+    elif policy_available:
+        out = _finalize_direction_columns(out, "cb_direction_policy")
+    else:
+        out = _finalize_direction_columns(out, raw_direction_col)
+
+    final_direction_counts = out["cb_direction"].value_counts().to_dict() if not out.empty else {}
+    raw_non_neutral_mask = out[raw_direction_col].astype(str).isin(["LONG", "SHORT"]) if len(out) else pd.Series(dtype=bool)
+    policy_non_neutral_mask = out["cb_direction_policy"].astype(str).isin(["LONG", "SHORT"]) if len(out) else pd.Series(dtype=bool)
+    rsm_input_non_neutral_mask = out["cb_direction_rsm_input"].astype(str).isin(["LONG", "SHORT"]) if len(out) else pd.Series(dtype=bool)
+    final_non_neutral_mask = out["cb_direction"].astype(str).isin(["LONG", "SHORT"]) if len(out) else pd.Series(dtype=bool)
+
+    neutralized_by_policy_count = int((raw_non_neutral_mask & ~policy_non_neutral_mask).sum()) if len(out) else 0
+    neutralized_by_rsm_count = int((rsm_input_non_neutral_mask & ~final_non_neutral_mask).sum()) if len(out) else 0
+
+    all_neutral_after_policy = bool(
+        policy_available
+        and len(out) > 0
+        and not bool(policy_non_neutral_mask.any())
+        and bool(raw_non_neutral_mask.any())
+    )
+    all_neutral_after_rsm = bool(
+        apply_rsm
+        and len(out) > 0
+        and not bool(final_non_neutral_mask.any())
+        and bool(rsm_input_non_neutral_mask.any())
+    )
+    if all_neutral_after_policy and all_neutral_after_rsm:
+        final_neutral_reason = "policy_and_rsm"
+    elif all_neutral_after_policy:
+        final_neutral_reason = "policy"
+    elif all_neutral_after_rsm:
+        final_neutral_reason = "rsm"
+    else:
+        final_neutral_reason = None
+
+    diagnostics = {
+        "raw_direction_counts": raw_direction_counts,
+        "policy_direction_counts": policy_direction_counts,
+        "rsm_input_direction_counts": rsm_input_direction_counts,
+        "rsm_action_counts": rsm_action_counts,
+        "rsm_enter_direction_counts": rsm_enter_direction_counts,
+        "final_direction_counts": final_direction_counts,
+        "policy_available": bool(policy_available),
+        "policy_diagnostics": policy_diagnostics,
+        "neutralized_by_policy_count": int(neutralized_by_policy_count),
+        "neutralized_by_rsm_count": int(neutralized_by_rsm_count),
+        "all_neutral_after_policy": bool(all_neutral_after_policy),
+        "all_neutral_after_rsm": bool(all_neutral_after_rsm),
+        "all_neutral_final_reason": final_neutral_reason,
     }
     return out, diagnostics
 
@@ -1047,37 +1180,21 @@ def generate_catboost_5m_report(
         "max": float(bars["cb_confidence"].max()) if not bars.empty else 0.0,
     }
     decision_policy = _load_optional_json(os.path.join(models_dir, "decision_policy_v19.json")) if apply_decision_policy else None
-    bars, policy_diagnostics = _apply_decision_policy_to_bars(bars, decision_policy)
-    policy_direction_counts = (
-        policy_diagnostics.get("direction_counts", {})
-        if isinstance(policy_diagnostics, dict)
-        else {}
+    bars, pipeline_diagnostics = _apply_signal_pipeline_to_bars(
+        bars,
+        decision_policy=decision_policy,
+        apply_decision_policy=apply_decision_policy,
+        apply_rsm=apply_rsm,
     )
-    policy_available = bool(decision_policy) and bool(apply_decision_policy)
-    pre_rsm_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
-    if apply_rsm and RSM_AVAILABLE and len(bars):
-        bars["cb_direction_raw"] = bars.get("cb_direction_model_raw", bars["cb_direction"]).astype(str)
-        # Feed raw model direction to RSM, not policy-filtered direction
-        rsm_input_col = "cb_direction_model_raw" if "cb_direction_model_raw" in bars.columns else "cb_direction"
-        rsm_conf_col = "cb_confidence_model_raw" if "cb_confidence_model_raw" in bars.columns else "cb_confidence"
-        bars = apply_range_filter_to_dataframe(
-            bars,
-            signal_col=rsm_input_col,
-            conf_col=rsm_conf_col,
-            regime_col="regime_label",
-        )
-        if "rsm_direction" in bars.columns:
-            # Final direction: must pass BOTH policy AND RSM independently
-            policy_allows = bars["cb_direction_policy"].astype(str).ne("NEUTRAL") if "cb_direction_policy" in bars.columns else pd.Series(True, index=bars.index)
-            rsm_allows = bars["rsm_action"].astype(str).eq("ENTER")
-            bars["cb_direction"] = np.where(
-                rsm_allows & policy_allows,
-                bars["rsm_direction"].astype(str),
-                "NEUTRAL",
-            )
-            bars["cb_direction_idx"] = bars["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)
-    filtered_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
-    rsm_action_counts = bars["rsm_action"].value_counts().to_dict() if "rsm_action" in bars.columns else {}
+    policy_available = bool(pipeline_diagnostics.get("policy_available", False))
+    policy_diagnostics = pipeline_diagnostics.get("policy_diagnostics", {}) if isinstance(pipeline_diagnostics, dict) else {}
+    policy_direction_counts = dict(pipeline_diagnostics.get("policy_direction_counts", {}) or {})
+    pre_rsm_direction_counts = dict(pipeline_diagnostics.get("rsm_input_direction_counts", {}) or {})
+    filtered_direction_counts = dict(pipeline_diagnostics.get("final_direction_counts", {}) or {})
+    rsm_action_counts = dict(pipeline_diagnostics.get("rsm_action_counts", {}) or {})
+    rsm_enter_direction_counts = dict(pipeline_diagnostics.get("rsm_enter_direction_counts", {}) or {})
+    if len(bars):
+        bars["cb_change_flag"] = (bars["cb_direction"].astype(str) != bars["cb_direction"].astype(str).shift(1)).astype(int)
     bars_limit_applied = 0
     if max_bars and len(bars) > max_bars:
         bars = bars.iloc[-max_bars:].reset_index(drop=True)
@@ -1148,7 +1265,9 @@ def generate_catboost_5m_report(
         "raw_direction_counts": raw_direction_counts,
         "policy_direction_counts": policy_direction_counts,
         "pre_rsm_direction_counts": pre_rsm_direction_counts,
+        "rsm_input_direction_counts": pre_rsm_direction_counts,
         "rsm_action_counts": rsm_action_counts,
+        "rsm_enter_direction_counts": rsm_enter_direction_counts,
         "raw_confidence_stats": raw_confidence_stats,
         "policy_available": bool(policy_available),
         "policy_rejection_breakdown": (policy_diagnostics.get("rejection_breakdown", {}) if isinstance(policy_diagnostics, dict) else {}),
@@ -1162,10 +1281,11 @@ def generate_catboost_5m_report(
         "avg_long_threshold": float((policy_diagnostics.get("avg_long_threshold", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
         "avg_short_threshold": float((policy_diagnostics.get("avg_short_threshold", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
         "avg_policy_coverage_ratio": float((policy_diagnostics.get("avg_policy_coverage_ratio", 0.0) if isinstance(policy_diagnostics, dict) else 0.0) or 0.0),
-        "all_neutral_after_rsm": bool(
-            filtered_direction_counts.get("NEUTRAL", 0) == int(len(bars))
-            and any(raw_direction_counts.get(side, 0) > 0 for side in ("LONG", "SHORT"))
-        ),
+        "neutralized_by_policy_count": int(pipeline_diagnostics.get("neutralized_by_policy_count", 0) or 0),
+        "neutralized_by_rsm_count": int(pipeline_diagnostics.get("neutralized_by_rsm_count", 0) or 0),
+        "all_neutral_after_policy": bool(pipeline_diagnostics.get("all_neutral_after_policy", False)),
+        "all_neutral_after_rsm": bool(pipeline_diagnostics.get("all_neutral_after_rsm", False)),
+        "all_neutral_final_reason": pipeline_diagnostics.get("all_neutral_final_reason"),
         "files": {
             "html": html_path,
             "signals_csv": signals_csv,

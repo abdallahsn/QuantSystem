@@ -179,7 +179,7 @@ def main():
             print(f"  raw_direction_counts: {summary.get('raw_direction_counts', {})}")
         if summary.get("policy_available"):
             print(f"  policy_direction_counts: {summary.get('policy_direction_counts', {})}")
-            print(f"  pre_rsm_direction_counts: {summary.get('pre_rsm_direction_counts', {})}")
+            print(f"  rsm_input_direction_counts: {summary.get('pre_rsm_direction_counts', {})}")
             print(f"  policy_rejection_breakdown: {summary.get('policy_rejection_breakdown', {})}")
             print(
                 "  policy_blockers: "
@@ -197,11 +197,29 @@ def main():
             )
         if summary.get("rsm_action_counts"):
             print(f"  rsm_action_counts: {summary.get('rsm_action_counts', {})}")
+        if summary.get("rsm_enter_direction_counts"):
+            print(f"  rsm_enter_direction_counts: {summary.get('rsm_enter_direction_counts', {})}")
         print(f"  direction_counts: {summary.get('direction_counts', {})}")
-        if summary.get("all_neutral_after_rsm"):
+        print(
+            "  final_blockers: "
+            f"policy={int(summary.get('neutralized_by_policy_count', 0) or 0)} | "
+            f"rsm={int(summary.get('neutralized_by_rsm_count', 0) or 0)}"
+        )
+        final_neutral_reason = str(summary.get("all_neutral_final_reason") or "")
+        if final_neutral_reason == "policy":
+            print(
+                "  ℹ️ All plotted bars became NEUTRAL at the decision-policy stage "
+                "before any tradeable signal reached the RSM."
+            )
+        elif final_neutral_reason == "rsm":
             print(
                 "  ℹ️ All plotted bars became NEUTRAL after RSM filtering. "
-                "Check raw_direction_counts vs rsm_action_counts before judging the base model."
+                "The policy passed some signals, but the RSM rejected all of them."
+            )
+        elif final_neutral_reason == "policy_and_rsm":
+            print(
+                "  ℹ️ Final chart is all NEUTRAL because the policy rejected part of the raw flow "
+                "and the RSM rejected the remainder."
             )
         print(f"  transitions: {summary.get('transitions', 0)}")
     except Exception as e:
