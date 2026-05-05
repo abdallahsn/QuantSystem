@@ -25,7 +25,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import log_loss, precision_recall_fscore_support
+from sklearn.metrics import classification_report, confusion_matrix, log_loss, precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -2363,6 +2363,275 @@ def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
     return event_cfg
 
 
+def _build_live_visual_embeddings_for_rows(
+    df: pd.DataFrame,
+    output_dir: str,
+    lob_tensors,
+    lob_timestamps: pd.Series | None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    n_rows = int(len(df))
+    zero_emb = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
+    zero_cov = np.zeros(n_rows, dtype=bool)
+    info = {
+        'enabled': False,
+        'reason': 'uninitialized',
+        'rows': n_rows,
+        'rows_with_visual': 0,
+        'coverage_ratio': 0.0,
+    }
+    if n_rows == 0:
+        info['reason'] = 'empty_frame'
+        return zero_emb, zero_cov, info
+    if lob_tensors is None or lob_timestamps is None or len(lob_tensors) == 0:
+        info['reason'] = 'lob_unavailable'
+        return zero_emb, zero_cov, info
+
+    deeplob_model_path = os.path.join(output_dir, 'deeplob_cnn_v19.keras')
+    if not os.path.exists(deeplob_model_path):
+        info['reason'] = 'deeplob_artifact_missing'
+        return zero_emb, zero_cov, info
+
+    DeepLOBCNN, ok = _load_deeplob_runtime()
+    if not ok:
+        info['reason'] = 'deeplob_runtime_unavailable'
+        return zero_emb, zero_cov, info
+
+    cnn = DeepLOBCNN(brain_file=deeplob_model_path)
+    if getattr(cnn, 'model', None) is None or not getattr(cnn, '_fitted', False):
+        info['reason'] = 'deeplob_model_not_ready'
+        return zero_emb, zero_cov, info
+
+    row_to_tensor, _, _ = _align_lob_to_rows(
+        df,
+        lob_timestamps,
+        max_tensors=len(lob_tensors),
+    )
+    tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
+    if len(tensor_ids) == 0:
+        info['reason'] = 'no_aligned_tensors'
+        return zero_emb, zero_cov, info
+
+    X_eval = np.asarray(lob_tensors[tensor_ids], dtype=np.float32)
+    emb_eval = np.asarray(cnn.get_embeddings(X_eval), dtype=np.float32)
+    emb_map = {int(tensor_id): emb_eval[i] for i, tensor_id in enumerate(tensor_ids)}
+
+    row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
+    row_cov = np.zeros(n_rows, dtype=bool)
+    for row_idx, tensor_idx in enumerate(row_to_tensor):
+        tensor_idx = int(tensor_idx)
+        if tensor_idx < 0 or tensor_idx not in emb_map:
+            continue
+        row_embs[row_idx] = emb_map[tensor_idx]
+        row_cov[row_idx] = True
+
+    info.update({
+        'enabled': True,
+        'reason': 'ok',
+        'rows_with_visual': int(np.sum(row_cov)),
+        'coverage_ratio': float(np.mean(row_cov)) if n_rows else 0.0,
+        'tensor_rows': int(np.sum(row_to_tensor >= 0)),
+        'unique_tensors': int(len(tensor_ids)),
+    })
+    return row_embs, row_cov, info
+
+
+def _generate_end_to_end_holdout_report(
+    full_df: pd.DataFrame,
+    *,
+    output_dir: str,
+    split_time: pd.Timestamp | str | None,
+    train_frac: float,
+    event_gate_cfg: dict | None,
+    lob_tensors=None,
+    lob_timestamps: pd.Series | None = None,
+) -> dict:
+    split_ts = _parse_optional_timestamp(split_time)
+    if len(full_df) == 0 or split_ts is None:
+        return {
+            'enabled': False,
+            'reason': 'missing_holdout_split',
+        }
+
+    split_ctx = _sequence_split_context(
+        full_df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=split_ts,
+    )
+    split_idx = int(split_ctx.get('split_idx', 0))
+    if split_idx >= len(full_df):
+        return {
+            'enabled': False,
+            'reason': 'empty_holdout_rows',
+            'split_idx': split_idx,
+        }
+
+    gate_roll_window = int((event_gate_cfg or {}).get('roll_window', DEFAULT_EVENT_ROLL_WINDOW))
+    context_rows = max(int(SEQ_LEN - 1), int(gate_roll_window - 1))
+    start_idx = max(0, split_idx - context_rows)
+    report_start_idx = int(split_idx - start_idx)
+    eval_df = full_df.iloc[start_idx:].copy().reset_index(drop=True)
+    expected_holdout_rows = int(len(eval_df) - report_start_idx)
+    if expected_holdout_rows <= 0:
+        return {
+            'enabled': False,
+            'reason': 'empty_holdout_rows',
+            'split_idx': split_idx,
+        }
+
+    visual_embeddings, visual_coverage, visual_info = _build_live_visual_embeddings_for_rows(
+        eval_df,
+        output_dir=output_dir,
+        lob_tensors=lob_tensors,
+        lob_timestamps=lob_timestamps,
+    )
+
+    try:
+        from predict_v19 import V19PredictionEngine
+    except Exception as exc:
+        return {
+            'enabled': False,
+            'reason': f'prediction_engine_import_failed: {exc}',
+        }
+
+    engine = V19PredictionEngine(models_dir=output_dir, run_mode='backtest')
+    results = engine.run_backtest(
+        eval_df,
+        already_scaled=True,
+        visual_embeddings=visual_embeddings,
+    )
+    results_df = pd.DataFrame(results)
+    if results_df.empty or 'idx' not in results_df.columns:
+        return {
+            'enabled': False,
+            'reason': 'no_scored_rows',
+            'expected_holdout_rows': expected_holdout_rows,
+        }
+
+    row_idx = pd.to_numeric(results_df.get('idx', -1), errors='coerce').fillna(-1).astype(np.int32)
+    results_df = results_df.loc[row_idx >= int(report_start_idx)].copy().reset_index(drop=True)
+    if results_df.empty:
+        return {
+            'enabled': False,
+            'reason': 'holdout_rows_filtered_empty',
+            'expected_holdout_rows': expected_holdout_rows,
+        }
+
+    y_true = pd.to_numeric(results_df.get('true_bias', 2), errors='coerce').fillna(2).astype(np.int32).to_numpy()
+    y_pred = pd.to_numeric(results_df.get('bias_idx', 2), errors='coerce').fillna(2).astype(np.int32).to_numpy()
+    gate_pass = results_df.get('event_gate_passed', pd.Series(False, index=results_df.index)).fillna(False).astype(bool).to_numpy()
+    tradeable = results_df.get('tradeable', pd.Series(False, index=results_df.index)).fillna(False).astype(bool).to_numpy()
+
+    class_report_text = classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1, 2],
+        target_names=['LONG', 'SHORT', 'NEUTRAL'],
+        zero_division=0,
+    )
+    class_report_dict = classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1, 2],
+        target_names=['LONG', 'SHORT', 'NEUTRAL'],
+        zero_division=0,
+        output_dict=True,
+    )
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2]).tolist()
+
+    directional_mask = np.isin(y_true, [0, 1])
+    directional_metrics = {
+        'precision_macro': 0.0,
+        'recall_macro': 0.0,
+        'f1_macro': 0.0,
+        'rows': int(np.sum(directional_mask)),
+    }
+    if np.any(directional_mask):
+        d_precision, d_recall, d_f1, _ = precision_recall_fscore_support(
+            y_true[directional_mask],
+            y_pred[directional_mask],
+            labels=[0, 1],
+            average='macro',
+            zero_division=0,
+        )
+        directional_metrics.update({
+            'precision_macro': float(d_precision),
+            'recall_macro': float(d_recall),
+            'f1_macro': float(d_f1),
+        })
+
+    true_neutral_mask = y_true == 2
+    pred_neutral_mask = y_pred == 2
+    summary = {
+        'enabled': True,
+        'split_time': str(split_ts),
+        'context_rows': int(report_start_idx),
+        'expected_holdout_rows': int(expected_holdout_rows),
+        'scored_rows': int(len(results_df)),
+        'scored_row_coverage': float(len(results_df) / max(expected_holdout_rows, 1)),
+        'accuracy_3class': float(np.mean(y_true == y_pred)),
+        'macro_f1_3class': float(class_report_dict.get('macro avg', {}).get('f1-score', 0.0)),
+        'weighted_f1_3class': float(class_report_dict.get('weighted avg', {}).get('f1-score', 0.0)),
+        'directional_metrics': directional_metrics,
+        'event_gate_pass_rate': float(np.mean(gate_pass)) if len(gate_pass) else 0.0,
+        'event_gate_pass_rate_directional_true': float(np.mean(gate_pass[directional_mask])) if np.any(directional_mask) else 0.0,
+        'event_gate_pass_rate_neutral_true': float(np.mean(gate_pass[true_neutral_mask])) if np.any(true_neutral_mask) else 0.0,
+        'tradeable_rate': float(np.mean(tradeable)) if len(tradeable) else 0.0,
+        'predicted_neutral_rate': float(np.mean(pred_neutral_mask)) if len(pred_neutral_mask) else 0.0,
+        'predicted_neutral_rows': int(np.sum(pred_neutral_mask)),
+        'correct_neutral_rows': int(np.sum(pred_neutral_mask & true_neutral_mask)),
+        'missed_directional_rows_as_neutral': int(np.sum(pred_neutral_mask & directional_mask)),
+        'true_label_counts': {str(int(k)): int(v) for k, v in pd.Series(y_true).value_counts().sort_index().to_dict().items()},
+        'pred_label_counts': {str(int(k)): int(v) for k, v in pd.Series(y_pred).value_counts().sort_index().to_dict().items()},
+        'reason_counts': {str(k): int(v) for k, v in results_df.get('reason', pd.Series(dtype='object')).fillna('').value_counts().head(15).to_dict().items()},
+        'event_gate_reason_counts': {str(k): int(v) for k, v in results_df.get('event_gate_reason', pd.Series(dtype='object')).fillna('').value_counts().head(15).to_dict().items()},
+        'classification_report': class_report_dict,
+        'confusion_matrix_labels': ['LONG', 'SHORT', 'NEUTRAL'],
+        'confusion_matrix': cm,
+        'visual_runtime': visual_info,
+    }
+
+    report_payload = {
+        'summary': summary,
+        'classification_report_text': class_report_text,
+    }
+    json_path = os.path.join(output_dir, 'end_to_end_holdout_report.json')
+    txt_path = os.path.join(output_dir, 'end_to_end_holdout_report.txt')
+    with open(json_path, 'w') as f:
+        json.dump(report_payload, f, indent=2)
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("End-to-End Holdout Report\n")
+        f.write("=" * 32 + "\n")
+        f.write(
+            f"split_time={summary['split_time']} | context_rows={summary['context_rows']} | "
+            f"scored_rows={summary['scored_rows']}/{summary['expected_holdout_rows']}\n"
+        )
+        f.write(
+            f"accuracy_3class={summary['accuracy_3class']:.4f} | "
+            f"macro_f1_3class={summary['macro_f1_3class']:.4f} | "
+            f"event_gate_pass_rate={summary['event_gate_pass_rate']:.4f} | "
+            f"tradeable_rate={summary['tradeable_rate']:.4f}\n\n"
+        )
+        f.write(class_report_text)
+        f.write("\nConfusion Matrix [LONG, SHORT, NEUTRAL]\n")
+        for row in cm:
+            f.write(" ".join(str(int(x)) for x in row) + "\n")
+
+    print(
+        "  ✅ End-to-End Holdout: "
+        f"rows={summary['scored_rows']:,}/{summary['expected_holdout_rows']:,} "
+        f"| acc_3c={summary['accuracy_3class']:.2%} "
+        f"| macro_f1_3c={summary['macro_f1_3class']:.3f} "
+        f"| gate_pass={summary['event_gate_pass_rate']:.1%} "
+        f"| neutral={summary['predicted_neutral_rate']:.1%}"
+    )
+    return {
+        **summary,
+        'json_path': json_path,
+        'text_path': txt_path,
+    }
+
+
 def _resolve_meta_learner_profile(
     train_sequences: int,
     visual_seq_coverage: float,
@@ -2414,6 +2683,9 @@ def stage3_meta_learner_v19(
     output_dir: str,
     meta_feature_names: list[str] | None = None,
     event_gate_cfg: dict | None = None,
+    full_df: pd.DataFrame | None = None,
+    lob_tensors=None,
+    lob_timestamps: pd.Series | None = None,
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
@@ -2501,6 +2773,7 @@ def stage3_meta_learner_v19(
         'train_sequences': int(profile.get('train_sequences', len(X_tr))),
         'compact_due_to_visual_coverage': bool(profile.get('compact_due_to_visual_coverage', False)),
         'compact_due_to_small_data': bool(profile.get('compact_due_to_small_data', False)),
+        'end_to_end_holdout': None,
     }
     if profile.get('name') == 'compact':
         print(
@@ -2544,7 +2817,20 @@ def stage3_meta_learner_v19(
             if isinstance(val_pred, dict) and 'bias_out' in val_pred
             else np.zeros((len(X_val), 2), dtype=np.float32)
         )
-        temperature, temperature_report = _fit_temperature_from_probs(yb_val, bias_val_probs)
+        threshold_split = dict(getattr(meta, 'bias_threshold_split', {}) or {})
+        calibration_rows = int(threshold_split.get('calibration_rows', 0))
+        report_rows = int(threshold_split.get('report_rows', 0))
+        temp_y = yb_val
+        temp_probs = bias_val_probs
+        if calibration_rows > 0 and report_rows > 0:
+            temp_y = yb_val[:calibration_rows]
+            temp_probs = bias_val_probs[:calibration_rows]
+        temperature, temperature_report = _fit_temperature_from_probs(temp_y, temp_probs)
+        temperature_report.update({
+            'selection_source': str(threshold_split.get('selection_source', 'full_validation_fallback')),
+            'calibration_rows': int(len(temp_y)),
+            'report_rows': int(report_rows),
+        })
         temperature_path = os.path.join(output_dir, 'meta_temperature_v19.json')
         with open(temperature_path, 'w') as f:
             json.dump(
@@ -2557,24 +2843,22 @@ def stage3_meta_learner_v19(
             )
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
         event_gate_cfg = event_gate_cfg or _infer_event_gate_schema(df)
-        with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
-            json.dump(
-                {
-                    'history': hist_dict,
-                    'split': split_stats,
-                    'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
-                    'event_gate': event_gate_cfg,
-                    'profile': profile,
-                    'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
-                    'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
-                    'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
-                    'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
-                    'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
-                    'temperature_scaling': temperature_report,
-                },
-                f,
-                indent=2,
-            )
+        e2e_report = None
+        history_path = os.path.join(output_dir, 'meta_learner_v19_history.json')
+        history_payload = {
+            'history': hist_dict,
+            'split': split_stats,
+            'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
+            'event_gate': event_gate_cfg,
+            'profile': profile,
+            'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
+            'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
+            'threshold_split': getattr(meta, 'bias_threshold_split', {}),
+            'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
+            'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
+            'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
+            'temperature_scaling': temperature_report,
+        }
         artifacts = {
             'catboost_model': 'catboost_advisor_v19.cbm',
             'catboost_classes': 'catboost_classes_v19.json',
@@ -2635,6 +2919,20 @@ def stage3_meta_learner_v19(
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
+        if full_df is not None:
+            e2e_report = _generate_end_to_end_holdout_report(
+                full_df,
+                output_dir=output_dir,
+                split_time=split_time,
+                train_frac=train_frac,
+                event_gate_cfg=event_gate_cfg,
+                lob_tensors=lob_tensors,
+                lob_timestamps=lob_timestamps,
+            )
+            stage3_summary['end_to_end_holdout'] = e2e_report
+            history_payload['end_to_end_holdout'] = e2e_report
+        with open(history_path, 'w') as f:
+            json.dump(history_payload, f, indent=2)
         print("  ✅ MetaLearner V19 history + schema محفوظان")
     return stage3_summary
 
@@ -3082,6 +3380,9 @@ def run_training_pipeline(
             output_dir=output_dir,
             meta_feature_names=meta_feature_names,
             event_gate_cfg=event_gate_cfg,
+            full_df=df_full,
+            lob_tensors=lob_tensors,
+            lob_timestamps=lob_timestamps,
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,

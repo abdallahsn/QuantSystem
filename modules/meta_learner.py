@@ -123,6 +123,11 @@ class MetaLearnerLSTM:
         self.bias_threshold_metrics = {
             'selected_threshold': float(self.bias_long_threshold),
         }
+        self.bias_threshold_split = {
+            'selection_source': 'not_run',
+            'calibration_rows': 0,
+            'report_rows': 0,
+        }
         self.base_conf_loss_weight = 0.3
         self.current_conf_loss_weight = float(self.base_conf_loss_weight)
         self.confidence_head_enabled = True
@@ -348,6 +353,65 @@ class MetaLearnerLSTM:
             best_metrics.pop('selection_key', None)
         return float(best_threshold), best_metrics
 
+    @staticmethod
+    def _resolve_threshold_holdout_split(
+        n_rows: int,
+        calibration_frac: float = 0.50,
+        min_calibration_rows: int = 128,
+    ) -> dict:
+        n_rows = int(max(n_rows, 0))
+        if n_rows <= 1:
+            return {
+                'selection_source': 'full_validation_fallback',
+                'calibration_rows': n_rows,
+                'report_rows': 0,
+            }
+        if n_rows < max(int(min_calibration_rows) * 2, 96):
+            calibration_rows = max(1, n_rows // 2)
+            return {
+                'selection_source': 'small_validation_fallback',
+                'calibration_rows': int(calibration_rows),
+                'report_rows': int(n_rows - calibration_rows),
+            }
+
+        min_report_rows = max(32, int(round(n_rows * 0.20)))
+        max_calibration_rows = n_rows - min_report_rows
+        if max_calibration_rows <= 0:
+            calibration_rows = max(1, n_rows // 2)
+            return {
+                'selection_source': 'small_validation_fallback',
+                'calibration_rows': int(calibration_rows),
+                'report_rows': int(n_rows - calibration_rows),
+            }
+
+        calibration_rows = int(round(n_rows * float(calibration_frac)))
+        calibration_rows = max(
+            calibration_rows,
+            min(int(min_calibration_rows), int(max_calibration_rows)),
+        )
+        calibration_rows = min(calibration_rows, int(max_calibration_rows))
+        report_rows = int(n_rows - calibration_rows)
+        if report_rows <= 0:
+            return {
+                'selection_source': 'full_validation_fallback',
+                'calibration_rows': n_rows,
+                'report_rows': 0,
+            }
+        return {
+            'selection_source': 'earlier_validation_slice',
+            'calibration_rows': int(calibration_rows),
+            'report_rows': int(report_rows),
+        }
+
+    @staticmethod
+    def _slice_prediction_cache(pred_cache: dict | None, start: int, end: int | None = None) -> dict | None:
+        if pred_cache is None:
+            return None
+        out = {}
+        for key, value in pred_cache.items():
+            out[key] = np.asarray(value)[start:end]
+        return out
+
     # ── Fit ─────────────────────────────────────────────────────
     def fit(self,
             X_meta:  np.ndarray,
@@ -470,22 +534,65 @@ class MetaLearnerLSTM:
 
         self._fitted = True
         pred_cache = self.model.predict(X_val, verbose=0) if len(X_val) else None
+        report_X = X_val
+        report_y = yb_val
+        report_cache = pred_cache
+        report_title = 'MetaLearner Validation'
+        report_filename = 'meta_learner_report.txt'
         if pred_cache is not None and 'bias_out' in pred_cache:
+            split_info = self._resolve_threshold_holdout_split(n_val)
+            self.bias_threshold_split = dict(split_info)
+            calibration_rows = int(split_info.get('calibration_rows', 0))
+            report_rows = int(split_info.get('report_rows', 0))
+
+            threshold_cache = pred_cache
+            threshold_y = yb_val
+            if calibration_rows > 0 and report_rows > 0:
+                threshold_cache = self._slice_prediction_cache(pred_cache, 0, calibration_rows)
+                threshold_y = yb_val[:calibration_rows]
+                report_cache = self._slice_prediction_cache(
+                    pred_cache,
+                    calibration_rows,
+                    calibration_rows + report_rows,
+                )
+                report_X = X_val[calibration_rows:calibration_rows + report_rows]
+                report_y = yb_val[calibration_rows:calibration_rows + report_rows]
+                report_title = 'MetaLearner Final Holdout'
+                report_filename = 'meta_learner_holdout_report.txt'
+
             self.bias_long_threshold, self.bias_threshold_metrics = self.choose_bias_long_threshold(
-                pred_cache['bias_out'][:, 0],
-                yb_val,
+                threshold_cache['bias_out'][:, 0],
+                threshold_y,
             )
+            self.bias_threshold_metrics.update(split_info)
             print(
                 "  🎚️ Bias threshold calibration → "
                 f"LONG if p_long >= {self.bias_long_threshold:.3f} "
                 f"| macro_f1={self.bias_threshold_metrics.get('macro_f1', 0.0):.3f} "
                 f"| long_recall={self.bias_threshold_metrics.get('long_recall', 0.0):.3f} "
-                f"| short_recall={self.bias_threshold_metrics.get('short_recall', 0.0):.3f}"
+                f"| short_recall={self.bias_threshold_metrics.get('short_recall', 0.0):.3f} "
+                f"| calibration_rows={int(split_info.get('calibration_rows', 0)):,} "
+                f"| final_holdout_rows={int(split_info.get('report_rows', 0)):,}"
             )
-        self._report(X_val, yb_val, output_dir, pred_cache=pred_cache)
+        self._report(
+            report_X,
+            report_y,
+            output_dir,
+            pred_cache=report_cache,
+            report_title=report_title,
+            report_filename=report_filename,
+        )
         return history
 
-    def _report(self, X_val, yb_val, output_dir, pred_cache=None):
+    def _report(
+        self,
+        X_val,
+        yb_val,
+        output_dir,
+        pred_cache=None,
+        report_title: str = 'MetaLearner Validation',
+        report_filename: str = 'meta_learner_report.txt',
+    ):
         """تقرير التحقق"""
         if not self._fitted:
             return
@@ -501,8 +608,8 @@ class MetaLearnerLSTM:
             if self.bias_long_threshold is not None
             else ""
         )
-        print(f"\n📊 MetaLearner Validation:\n{threshold_text}{rep}")
-        path = os.path.join(output_dir, 'meta_learner_report.txt')
+        print(f"\n📊 {report_title}:\n{threshold_text}{rep}")
+        path = os.path.join(output_dir, report_filename)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(threshold_text + rep)
 
