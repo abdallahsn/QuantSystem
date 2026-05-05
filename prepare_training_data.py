@@ -58,6 +58,8 @@ from modules.session_features        import add_cyclical_session_features, CYCLI
 from modules.context_features        import GARCHVolatilityProxy                                         # التعديل 2
 from modules.gpu_config              import (detect_gpu, get_multiprocessing_workers,
                                               print_gpu_report, N_WORKERS)
+from modules.config_v19              import load_v19_config
+from modules.decision_policy_v19     import effective_round_trip_cost_pips
 from modules.manifest_v19            import write_manifest
 from modules.feature_factory_v19     import ROBUST_IQR_MIN, fit_numeric_scaler_param, resolve_meta_feature_names
 from modules.feature_artifact_v19    import (
@@ -99,7 +101,7 @@ except ImportError as exc:
     DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
     DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
     DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
-    DEFAULT_V19_TP_MULT = 1.5
+    DEFAULT_V19_TP_MULT = 4.0
     V19_LABELS_AVAILABLE = False
     V19_LABELS_IMPORT_ERROR = exc
     V19_LABELS_SOURCE = None
@@ -144,6 +146,47 @@ def _call_build_causal_event_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         print(f"  ℹ️ Label builder compatibility: ignoring unsupported args {dropped}")
 
     return build_causal_event_labels(df, **filtered_kwargs)
+
+
+def _resolve_label_economics(
+    *,
+    tick_size: float,
+    direction_threshold_ticks: float,
+    tp_mult: float,
+    sl_mult: float,
+) -> dict[str, float | dict]:
+    default_cost_cfg = {
+        'tick_size': float(tick_size),
+        'tick_value': 10.0,
+        'round_trip_cost_pips': 1.0,
+        'commission_per_side': 5.0,
+        'min_spread_ticks': 1.0,
+        'min_slippage_ticks': 1.0,
+        'spread_multiplier': 0.5,
+    }
+    try:
+        loaded_cfg = load_v19_config().get('backtest', {}) or {}
+    except Exception:
+        loaded_cfg = {}
+    cost_cfg = dict(default_cost_cfg)
+    if isinstance(loaded_cfg, dict):
+        cost_cfg.update(loaded_cfg)
+    cost_cfg['tick_size'] = float(tick_size)
+
+    cost_model = effective_round_trip_cost_pips(cost_cfg)
+    floor_ticks = max(float(direction_threshold_ticks or 0.0), 0.0)
+    stop_floor_ticks = floor_ticks * max(float(sl_mult or 0.0), 0.0)
+    base_tp_floor_ticks = floor_ticks * max(float(tp_mult or 0.0), 0.0)
+    effective_cost_ticks = max(float(cost_model.get('effective_cost_pips', 0.0) or 0.0), 0.0)
+    economic_tp_floor_ticks = max(base_tp_floor_ticks, stop_floor_ticks + effective_cost_ticks)
+    return {
+        'cost_model': cost_model,
+        'effective_cost_ticks': float(effective_cost_ticks),
+        'stop_floor_ticks': float(stop_floor_ticks),
+        'base_tp_floor_ticks': float(base_tp_floor_ticks),
+        'economic_tp_floor_ticks': float(economic_tp_floor_ticks),
+        'tp_floor_uplift_ticks': float(max(economic_tp_floor_ticks - base_tp_floor_ticks, 0.0)),
+    }
 
 
 def _format_duration_brief(seconds: float | None) -> str:
@@ -3134,6 +3177,25 @@ def run_refinery(
         'sweep_thresh': float(getattr(engines.get('sweep', object()), 'threshold', 0.05)),
     }
     _tick = float(cal.tick_size) if float(cal.tick_size) > 0 else 0.0001
+    label_economics = _resolve_label_economics(
+        tick_size=_tick,
+        direction_threshold_ticks=direction_threshold_ticks,
+        tp_mult=tp_mult,
+        sl_mult=sl_mult,
+    )
+    print(
+        "  💸 Label economics: "
+        f"cost_ticks={float(label_economics['effective_cost_ticks']):.2f} | "
+        f"stop_floor_ticks={float(label_economics['stop_floor_ticks']):.2f} | "
+        f"base_tp_floor_ticks={float(label_economics['base_tp_floor_ticks']):.2f} | "
+        f"economic_tp_floor_ticks={float(label_economics['economic_tp_floor_ticks']):.2f}"
+    )
+    if float(label_economics['tp_floor_uplift_ticks']) > 1e-9:
+        print(
+            "  ⚠️ Economic TP floor uplift applied: "
+            f"+{float(label_economics['tp_floor_uplift_ticks']):.2f} ticks "
+            "to keep labels above execution-cost + stop floor."
+        )
 
     print("\n⚙️  Phase B — MBP Vectorized Shards...")
     pipeline_tracker.start(
@@ -3349,6 +3411,8 @@ def run_refinery(
             sl_mult=sl_mult,
             neutral_mult=0.45,
             tick_size=_tick,
+            execution_cost_pips=float(label_economics['effective_cost_ticks']),
+            enforce_economic_tp_floor=True,
             kalman_slope_threshold=kalman_slope_threshold,
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
@@ -3646,6 +3710,11 @@ def run_refinery(
             'training_event_target_rate': float(training_event_target_rate),
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
+            'label_execution_cost_ticks': float(label_economics['effective_cost_ticks']),
+            'label_stop_floor_ticks': float(label_economics['stop_floor_ticks']),
+            'label_base_tp_floor_ticks': float(label_economics['base_tp_floor_ticks']),
+            'label_economic_tp_floor_ticks': float(label_economics['economic_tp_floor_ticks']),
+            'label_economic_tp_uplift_ticks': float(label_economics['tp_floor_uplift_ticks']),
             'regime_mode': str(_resolve_regime_mode(regime_mode)),
             'regime_stride': int(max(regime_stride, 1)),
             'regime_window': int(max(regime_window, 10)),

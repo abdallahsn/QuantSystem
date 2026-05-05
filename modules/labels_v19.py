@@ -96,7 +96,7 @@ NEUTRAL_REASON_LONG_SL = 2
 NEUTRAL_REASON_SHORT_SL = 3
 
 DEFAULT_V19_DIRECTION_THRESHOLD_TICKS = 1.5
-DEFAULT_V19_TP_MULT = 1.5
+DEFAULT_V19_TP_MULT = 4.0
 DEFAULT_RAW_EVENT_TARGET_RATE = 0.70
 DEFAULT_TRAINING_EVENT_TARGET_RATE = 0.25
 
@@ -153,6 +153,32 @@ def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -
     if rate <= 0:
         return None
     return (total - done) / rate
+
+
+def _resolve_economic_tp_floor_ticks(
+    *,
+    direction_threshold_ticks: float,
+    tp_mult: float,
+    sl_mult: float,
+    execution_cost_pips: float,
+    enforce_economic_tp_floor: bool,
+) -> dict[str, float | bool]:
+    floor_ticks = max(float(direction_threshold_ticks or 0.0), 0.0)
+    base_tp_floor_ticks = floor_ticks * max(float(tp_mult or 0.0), 0.0)
+    stop_floor_ticks = floor_ticks * max(float(sl_mult or 0.0), 0.0)
+    effective_cost_ticks = max(float(execution_cost_pips or 0.0), 0.0)
+    economic_tp_floor_ticks = base_tp_floor_ticks
+    if enforce_economic_tp_floor and effective_cost_ticks > 0.0:
+        economic_tp_floor_ticks = max(base_tp_floor_ticks, stop_floor_ticks + effective_cost_ticks)
+    uplift_ticks = max(economic_tp_floor_ticks - base_tp_floor_ticks, 0.0)
+    return {
+        "base_tp_floor_ticks": float(base_tp_floor_ticks),
+        "stop_floor_ticks": float(stop_floor_ticks),
+        "effective_cost_ticks": float(effective_cost_ticks),
+        "economic_tp_floor_ticks": float(economic_tp_floor_ticks),
+        "tp_floor_uplift_ticks": float(uplift_ticks),
+        "economic_floor_applied": bool(enforce_economic_tp_floor and uplift_ticks > 1e-9),
+    }
 
 
 def _fenwick_add(tree: np.ndarray, idx_zero_based: int, delta: int) -> None:
@@ -617,7 +643,7 @@ def _forward_scan_rows(
     dynamic_threshold: np.ndarray,
     adaptive_horizons: np.ndarray,
     tick_size: float,
-    tp_mult: float = 2.5,
+    tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
     bid_wall_px: Optional[np.ndarray] = None,
     ask_wall_px: Optional[np.ndarray] = None,
@@ -626,6 +652,7 @@ def _forward_scan_rows(
     min_wall_strength: float = 2.5,
     wall_exit_buffer_ticks: float = 1.0,
     min_wall_tp_ticks: float = 2.0,
+    economic_tp_floor_ticks: float = 0.0,
     progress_every_rows: int = 0,
     progress_prefix: str = "Step 4 forward scan",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -641,12 +668,14 @@ def _forward_scan_rows(
     for local_idx, i in enumerate(range(int(start), int(stop))):
         p0 = prices[i]
         thr = max(dynamic_threshold[i], tick_size)
-        tp = thr * tp_mult
+        economic_tp_floor_px = max(float(economic_tp_floor_ticks), 0.0) * float(tick_size)
+        tp = max(thr * tp_mult, economic_tp_floor_px)
         sl = thr * sl_mult
         h = int(adaptive_horizons[i])
         end = min(i + h, n - 1)
         tp_long = tp
         tp_short = tp
+        liquidity_tp_min_ticks = max(float(min_wall_tp_ticks), float(economic_tp_floor_ticks))
 
         liquidity_tp_long = _find_liquidity_tp_distance(
             current_price=p0,
@@ -658,7 +687,7 @@ def _forward_scan_rows(
             ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
             min_wall_strength=min_wall_strength,
             wall_exit_buffer_ticks=wall_exit_buffer_ticks,
-            min_tp_ticks=min_wall_tp_ticks,
+            min_tp_ticks=liquidity_tp_min_ticks,
         )
         if liquidity_tp_long is not None:
             tp_long = min(tp_long, liquidity_tp_long)
@@ -673,7 +702,7 @@ def _forward_scan_rows(
             ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
             min_wall_strength=min_wall_strength,
             wall_exit_buffer_ticks=wall_exit_buffer_ticks,
-            min_tp_ticks=min_wall_tp_ticks,
+            min_tp_ticks=liquidity_tp_min_ticks,
         )
         if liquidity_tp_short is not None:
             tp_short = min(tp_short, liquidity_tp_short)
@@ -766,7 +795,7 @@ def _forward_scan_per_row(
     dynamic_threshold: np.ndarray,
     adaptive_horizons: np.ndarray,
     tick_size: float,
-    tp_mult: float = 2.5,                  # FIX: كان 1.5 → TP ≈ 20-30pip
+    tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
     bid_wall_px: Optional[np.ndarray] = None,
     ask_wall_px: Optional[np.ndarray] = None,
@@ -775,6 +804,7 @@ def _forward_scan_per_row(
     min_wall_strength: float = 2.5,
     wall_exit_buffer_ticks: float = 1.0,
     min_wall_tp_ticks: float = 2.0,
+    economic_tp_floor_ticks: float = 0.0,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
     progress_every_rows: int | None = None,
@@ -832,6 +862,7 @@ def _forward_scan_per_row(
         'min_wall_strength': min_wall_strength,
         'wall_exit_buffer_ticks': wall_exit_buffer_ticks,
         'min_wall_tp_ticks': min_wall_tp_ticks,
+        'economic_tp_floor_ticks': economic_tp_floor_ticks,
     }
 
     if workers <= 1:
@@ -1055,6 +1086,8 @@ def build_causal_event_labels(
     raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     training_event_score_threshold: float | None = None,
+    execution_cost_pips: float = 0.0,
+    enforce_economic_tp_floor: bool = True,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
@@ -1100,6 +1133,11 @@ def build_causal_event_labels(
     raw_event_target_rate : Target keep-rate for the broader `event_flag` mask.
     training_event_target_rate : Target keep-rate for the narrower
                                  `train_event_flag` mask داخل `event_flag`.
+    execution_cost_pips    : Effective round-trip execution cost in tick-sized
+                             price units. Used to prevent economically tiny TP
+                             labels that the live policy would later reject.
+    enforce_economic_tp_floor : If True, raise the TP floor so it cannot fall
+                                below `stop_floor + execution_cost_pips`.
     """
 
     out = df.copy()
@@ -1239,6 +1277,28 @@ def build_causal_event_labels(
     # FIX-4: per-row dynamic threshold (floor = fixed ticks, adaptive = 0.5×ATR)
     fixed_floor       = direction_threshold_ticks * tick_size
     dynamic_threshold = np.maximum(fixed_floor, 0.5 * micro_atr)   # shape (n,)
+    label_economics = _resolve_economic_tp_floor_ticks(
+        direction_threshold_ticks=direction_threshold_ticks,
+        tp_mult=tp_mult,
+        sl_mult=sl_mult,
+        execution_cost_pips=execution_cost_pips,
+        enforce_economic_tp_floor=enforce_economic_tp_floor,
+    )
+    economic_tp_floor_ticks = float(label_economics["economic_tp_floor_ticks"])
+    if bool(label_economics["economic_floor_applied"]):
+        _log_step4(
+            "economic TP floor uplift "
+            f"cost_ticks={float(label_economics['effective_cost_ticks']):.2f} | "
+            f"stop_floor_ticks={float(label_economics['stop_floor_ticks']):.2f} | "
+            f"base_tp_floor_ticks={float(label_economics['base_tp_floor_ticks']):.2f} -> "
+            f"economic_tp_floor_ticks={economic_tp_floor_ticks:.2f}"
+        )
+    else:
+        _log_step4(
+            "economic TP floor "
+            f"cost_ticks={float(label_economics['effective_cost_ticks']):.2f} | "
+            f"tp_floor_ticks={economic_tp_floor_ticks:.2f}"
+        )
 
     # ── 5. FIX-9: adaptive horizon ∝ ATR ─────────────────────────────────────
     #
@@ -1296,6 +1356,7 @@ def build_causal_event_labels(
         ask_wall_px = ask_wall_px_arr,
         bid_wall_strength = bid_wall_strength_arr,
         ask_wall_strength = ask_wall_strength_arr,
+        economic_tp_floor_ticks = economic_tp_floor_ticks,
         n_workers = n_workers,
         min_parallel_rows = min_parallel_rows,
     )
