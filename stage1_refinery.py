@@ -68,6 +68,7 @@ def main():
         adaptive_horizon=bool(defaults.get('adaptive_horizon', False)),
         trend_filter=bool(defaults.get('trend_filter', False)),
         trend_filter_strict=bool(defaults.get('trend_filter_strict', False)),
+        emit_meta_labels=bool(defaults.get('emit_meta_labels', True)),
     )
     p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
                    help='enable ATR-adaptive label horizon')
@@ -81,6 +82,15 @@ def main():
                    help='enable stricter Kalman trend filter behaviour')
     p.add_argument('--no_trend_filter_strict', dest='trend_filter_strict', action='store_false',
                    help='disable stricter Kalman trend filter behaviour')
+    p.add_argument('--emit_meta_labels', dest='emit_meta_labels', action='store_true',
+                   help='emit stable meta-label/context columns (default: on)')
+    p.add_argument('--no_emit_meta_labels', dest='emit_meta_labels', action='store_false',
+                   help='disable meta-label/context column emission')
+    p.add_argument('--soft_label_scenarios', type=int, default=int(defaults.get('soft_label_scenarios', 0)))
+    p.add_argument('--soft_label_seed', type=int, default=int(defaults.get('soft_label_seed', 42)))
+    p.add_argument('--soft_label_horizon_jitter', type=float, default=float(defaults.get('soft_label_horizon_jitter', 0.20)))
+    p.add_argument('--soft_label_tp_jitter', type=float, default=float(defaults.get('soft_label_tp_jitter', 0.15)))
+    p.add_argument('--soft_label_sl_jitter', type=float, default=float(defaults.get('soft_label_sl_jitter', 0.15)))
     p.add_argument('--kalman_slope_threshold', type=float,
                    default=float(defaults.get('kalman_slope_threshold', 0.05)),
                    help='حد قوة الميل في Kalman (default: 0.05, القديم: 1e-5)')
@@ -124,6 +134,12 @@ def main():
         adaptive_horizon=args.adaptive_horizon,
         trend_filter=args.trend_filter,
         trend_filter_strict=args.trend_filter_strict,
+        emit_meta_labels=args.emit_meta_labels,
+        soft_label_scenarios=args.soft_label_scenarios,
+        soft_label_seed=args.soft_label_seed,
+        soft_label_horizon_jitter=args.soft_label_horizon_jitter,
+        soft_label_tp_jitter=args.soft_label_tp_jitter,
+        soft_label_sl_jitter=args.soft_label_sl_jitter,
         kalman_slope_threshold=args.kalman_slope_threshold,
         trend_strength_min=args.trend_strength_min,
         regime_mode=args.regime_mode,

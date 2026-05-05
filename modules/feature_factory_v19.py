@@ -57,6 +57,19 @@ DEFAULT_PASSTHROUGH_COLS = [
     'liq_score',
     'forward_return',
     'label_horizon_steps',
+    'bias_label_raw',
+    'effective_threshold_ticks',
+    'effective_tp_long_ticks',
+    'effective_tp_short_ticks',
+    'effective_sl_ticks',
+    'meta_trade_side',
+    'meta_label',
+    'meta_label_active',
+    'meta_outcome_ticks',
+    'soft_label',
+    'soft_label_confidence',
+    'soft_label_entropy',
+    'soft_label_scenarios',
 ]
 DEFAULT_INT_COLS = {
     'bias_label',
@@ -68,6 +81,11 @@ DEFAULT_INT_COLS = {
     'train_event_flag',
     'event_trigger_count',
     'is_expansion',
+    'bias_label_raw',
+    'meta_trade_side',
+    'meta_label',
+    'meta_label_active',
+    'soft_label_scenarios',
 }
 FORBIDDEN_STAT_FEATURES = {
     'forward_return',
@@ -84,6 +102,19 @@ FORBIDDEN_STAT_FEATURES = {
     'event_trigger_count',
     'is_expansion',
     'label_horizon_steps',
+    'bias_label_raw',
+    'effective_threshold_ticks',
+    'effective_tp_long_ticks',
+    'effective_tp_short_ticks',
+    'effective_sl_ticks',
+    'meta_trade_side',
+    'meta_label',
+    'meta_label_active',
+    'meta_outcome_ticks',
+    'soft_label',
+    'soft_label_confidence',
+    'soft_label_entropy',
+    'soft_label_scenarios',
 }
 
 

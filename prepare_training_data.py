@@ -2978,6 +2978,10 @@ def _normalize_and_save(
                  'is_expansion', 'event_flag', 'train_event_flag', 'event_score', 'event_trigger_count',
                  'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
+                 'bias_label_raw', 'effective_threshold_ticks', 'effective_tp_long_ticks',
+                 'effective_tp_short_ticks', 'effective_sl_ticks', 'meta_trade_side',
+                 'meta_label', 'meta_label_active', 'meta_outcome_ticks', 'soft_label',
+                 'soft_label_confidence', 'soft_label_entropy', 'soft_label_scenarios',
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
     raw_stat_cols = [c for c in (RAW_STAT_FEATURE_COLS + LEAN_RAW_FEATURE_COLS) if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
@@ -3096,6 +3100,12 @@ def run_refinery(
     adaptive_horizon: bool = False,
     trend_filter: bool = False,
     trend_filter_strict: bool = False,
+    emit_meta_labels: bool = True,
+    soft_label_scenarios: int = 0,
+    soft_label_seed: int = 42,
+    soft_label_horizon_jitter: float = 0.20,
+    soft_label_tp_jitter: float = 0.15,
+    soft_label_sl_jitter: float = 0.15,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
     regime_mode: str = 'rules',
@@ -3452,6 +3462,12 @@ def run_refinery(
             adaptive_horizon=adaptive_horizon,
             trend_filter=trend_filter,
             trend_filter_strict=trend_filter_strict,
+            emit_meta_labels=emit_meta_labels,
+            soft_label_scenarios=soft_label_scenarios,
+            soft_label_seed=soft_label_seed,
+            soft_label_horizon_jitter=soft_label_horizon_jitter,
+            soft_label_tp_jitter=soft_label_tp_jitter,
+            soft_label_sl_jitter=soft_label_sl_jitter,
             neutral_mult=0.45,
             tick_size=_tick,
             execution_cost_pips=float(label_economics['effective_cost_ticks']),
@@ -3758,6 +3774,12 @@ def run_refinery(
             'adaptive_horizon': bool(adaptive_horizon),
             'trend_filter': bool(trend_filter),
             'trend_filter_strict': bool(trend_filter_strict),
+            'emit_meta_labels': bool(emit_meta_labels),
+            'soft_label_scenarios': int(max(soft_label_scenarios, 0)),
+            'soft_label_seed': int(soft_label_seed),
+            'soft_label_horizon_jitter': float(soft_label_horizon_jitter),
+            'soft_label_tp_jitter': float(soft_label_tp_jitter),
+            'soft_label_sl_jitter': float(soft_label_sl_jitter),
             'label_execution_cost_ticks': float(label_economics['effective_cost_ticks']),
             'label_stop_floor_ticks': float(label_economics['stop_floor_ticks']),
             'label_base_tp_floor_ticks': float(label_economics['base_tp_floor_ticks']),
@@ -3874,7 +3896,12 @@ if __name__=='__main__':
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
     p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'], default='fixed',
                    help="TP/SL threshold mode for label scan: 'fixed' or 'atr' (default: fixed)")
-    p.set_defaults(adaptive_horizon=False, trend_filter=False, trend_filter_strict=False)
+    p.set_defaults(
+        adaptive_horizon=False,
+        trend_filter=False,
+        trend_filter_strict=False,
+        emit_meta_labels=True,
+    )
     p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
                    help='enable ATR-adaptive forward horizon (default: off)')
     p.add_argument('--no_adaptive_horizon', dest='adaptive_horizon', action='store_false',
@@ -3887,6 +3914,20 @@ if __name__=='__main__':
                    help='if trend filter is enabled, also apply stricter neutral filtering')
     p.add_argument('--no_trend_filter_strict', dest='trend_filter_strict', action='store_false',
                    help='disable strict trend filtering')
+    p.add_argument('--emit_meta_labels', dest='emit_meta_labels', action='store_true',
+                   help='emit stable meta-label/context columns (default: on)')
+    p.add_argument('--no_emit_meta_labels', dest='emit_meta_labels', action='store_false',
+                   help='disable meta-label/context column emission')
+    p.add_argument('--soft_label_scenarios', type=int, default=0,
+                   help='if >0, estimate probabilistic soft labels with this many causal scenarios')
+    p.add_argument('--soft_label_seed', type=int, default=42,
+                   help='deterministic RNG seed for probabilistic soft labels')
+    p.add_argument('--soft_label_horizon_jitter', type=float, default=0.20,
+                   help='relative horizon perturbation for soft labels (default: 0.20)')
+    p.add_argument('--soft_label_tp_jitter', type=float, default=0.15,
+                   help='relative TP perturbation for soft labels (default: 0.15)')
+    p.add_argument('--soft_label_sl_jitter', type=float, default=0.15,
+                   help='relative SL perturbation for soft labels (default: 0.15)')
     p.add_argument('--kalman_slope_threshold', type=float, default=0.05,
                    help='Kalman slope threshold for trend direction (default: 0.05)')
     p.add_argument('--trend_strength_min', type=float, default=0.05,
@@ -3924,6 +3965,12 @@ if __name__=='__main__':
                  adaptive_horizon=a.adaptive_horizon,
                  trend_filter=a.trend_filter,
                  trend_filter_strict=a.trend_filter_strict,
+                 emit_meta_labels=a.emit_meta_labels,
+                 soft_label_scenarios=a.soft_label_scenarios,
+                 soft_label_seed=a.soft_label_seed,
+                 soft_label_horizon_jitter=a.soft_label_horizon_jitter,
+                 soft_label_tp_jitter=a.soft_label_tp_jitter,
+                 soft_label_sl_jitter=a.soft_label_sl_jitter,
                  kalman_slope_threshold=a.kalman_slope_threshold,
                  trend_strength_min=a.trend_strength_min,
                  regime_mode=a.regime_mode,

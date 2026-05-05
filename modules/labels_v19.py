@@ -33,6 +33,8 @@ New optional parameters:
   horizon_max_mult     : float = 3.0    — ceiling: horizon never > base × 3.0
   trend_filter         : bool  = False  — enable FIX-11 only when explicitly requested
   trend_filter_strict  : bool  = False  — if True, neutral rows also filtered by trend
+  emit_meta_labels     : bool  = True   — emit stable meta-label/context columns
+  soft_label_scenarios : int   = 0      — optional probabilistic success surface
 """
 
 from __future__ import annotations
@@ -328,6 +330,19 @@ def _empty_output(out: pd.DataFrame) -> pd.DataFrame:
     out["kalman_trend_strength"] = empty_float32
     out["kalman_price"]         = empty_float32
     out["effective_horizon"]    = empty_int32
+    out["bias_label_raw"]       = empty_int8
+    out["effective_threshold_ticks"] = empty_float32
+    out["effective_tp_long_ticks"] = empty_float32
+    out["effective_tp_short_ticks"] = empty_float32
+    out["effective_sl_ticks"] = empty_float32
+    out["meta_trade_side"] = empty_int8
+    out["meta_label"] = empty_int8
+    out["meta_label_active"] = empty_int8
+    out["meta_outcome_ticks"] = empty_float32
+    out["soft_label"] = empty_float32
+    out["soft_label_confidence"] = empty_float32
+    out["soft_label_entropy"] = empty_float32
+    out["soft_label_scenarios"] = empty_int32
     return out
 
 
@@ -969,6 +984,227 @@ def _forward_scan_per_row(
     return bias_arr, quality_arr, end_idx_arr, path_outcome_arr
 
 
+def _compute_effective_trade_levels(
+    *,
+    prices: np.ndarray,
+    dynamic_threshold: np.ndarray,
+    tick_size: float,
+    tp_mult: float,
+    sl_mult: float,
+    bid_wall_px: Optional[np.ndarray] = None,
+    ask_wall_px: Optional[np.ndarray] = None,
+    bid_wall_strength: Optional[np.ndarray] = None,
+    ask_wall_strength: Optional[np.ndarray] = None,
+    min_wall_strength: float = 2.5,
+    wall_exit_buffer_ticks: float = 1.0,
+    min_wall_tp_ticks: float = 2.0,
+    economic_tp_floor_ticks: float = 0.0,
+) -> dict[str, np.ndarray]:
+    n = len(prices)
+    tick = max(float(tick_size or 0.0), 1e-9)
+    threshold_px = np.maximum(np.asarray(dynamic_threshold, dtype=np.float64), tick)
+    tp_floor_px = max(float(economic_tp_floor_ticks), 0.0) * tick
+    tp_base_px = np.maximum(threshold_px * float(tp_mult), tp_floor_px)
+    sl_px = threshold_px * max(float(sl_mult), 0.0)
+    tp_long_px = tp_base_px.copy()
+    tp_short_px = tp_base_px.copy()
+    liquidity_tp_min_ticks = max(float(min_wall_tp_ticks), float(economic_tp_floor_ticks))
+
+    for i in range(n):
+        p0 = float(prices[i])
+        liquidity_tp_long = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_LONG,
+            tick_size=tick,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=liquidity_tp_min_ticks,
+        )
+        if liquidity_tp_long is not None:
+            tp_long_px[i] = min(tp_long_px[i], liquidity_tp_long)
+
+        liquidity_tp_short = _find_liquidity_tp_distance(
+            current_price=p0,
+            direction=DIR_SHORT,
+            tick_size=tick,
+            bid_wall_px=np.nan if bid_wall_px is None else bid_wall_px[i],
+            ask_wall_px=np.nan if ask_wall_px is None else ask_wall_px[i],
+            bid_wall_strength=np.nan if bid_wall_strength is None else bid_wall_strength[i],
+            ask_wall_strength=np.nan if ask_wall_strength is None else ask_wall_strength[i],
+            min_wall_strength=min_wall_strength,
+            wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+            min_tp_ticks=liquidity_tp_min_ticks,
+        )
+        if liquidity_tp_short is not None:
+            tp_short_px[i] = min(tp_short_px[i], liquidity_tp_short)
+
+    return {
+        "threshold_ticks": (threshold_px / tick).astype(np.float32),
+        "tp_long_ticks": (tp_long_px / tick).astype(np.float32),
+        "tp_short_ticks": (tp_short_px / tick).astype(np.float32),
+        "sl_ticks": (sl_px / tick).astype(np.float32),
+    }
+
+
+def _meta_trade_side_from_path(path_outcome: np.ndarray) -> np.ndarray:
+    arr = np.asarray(path_outcome, dtype=np.int8)
+    return np.select(
+        [
+            np.isin(arr, np.array([PATH_LONG_TP_FIRST, PATH_LONG_SL_FIRST], dtype=np.int8)),
+            np.isin(arr, np.array([PATH_SHORT_TP_FIRST, PATH_SHORT_SL_FIRST], dtype=np.int8)),
+        ],
+        [
+            DIR_LONG,
+            DIR_SHORT,
+        ],
+        default=DIR_NEUTRAL,
+    ).astype(np.int8)
+
+
+def _meta_outcome_ticks_from_path(
+    path_outcome: np.ndarray,
+    tp_long_ticks: np.ndarray,
+    tp_short_ticks: np.ndarray,
+    sl_ticks: np.ndarray,
+) -> np.ndarray:
+    arr = np.asarray(path_outcome, dtype=np.int8)
+    tp_long_ticks = np.asarray(tp_long_ticks, dtype=np.float32)
+    tp_short_ticks = np.asarray(tp_short_ticks, dtype=np.float32)
+    sl_ticks = np.asarray(sl_ticks, dtype=np.float32)
+    out = np.zeros(len(arr), dtype=np.float32)
+    out[arr == PATH_LONG_TP_FIRST] = tp_long_ticks[arr == PATH_LONG_TP_FIRST]
+    out[arr == PATH_SHORT_TP_FIRST] = tp_short_ticks[arr == PATH_SHORT_TP_FIRST]
+    loss_mask = np.isin(arr, np.array([PATH_LONG_SL_FIRST, PATH_SHORT_SL_FIRST], dtype=np.int8))
+    out[loss_mask] = -sl_ticks[loss_mask]
+    return out
+
+
+def _binary_entropy(prob: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(prob, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    entropy = -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
+    return entropy.astype(np.float32)
+
+
+def _build_soft_label_scenarios(
+    *,
+    n_scenarios: int,
+    seed: int,
+    horizon_jitter: float,
+    tp_jitter: float,
+    sl_jitter: float,
+) -> list[tuple[float, float, float]]:
+    total = max(int(n_scenarios), 0)
+    if total <= 0:
+        return []
+    scenarios = [(1.0, 1.0, 1.0)]
+    if total == 1:
+        return scenarios
+    rng = np.random.default_rng(int(seed))
+    h_jit = abs(float(horizon_jitter))
+    tp_jit = abs(float(tp_jitter))
+    sl_jit = abs(float(sl_jitter))
+    while len(scenarios) < total:
+        h_mult = max(0.25, 1.0 + float(rng.uniform(-h_jit, h_jit)))
+        tp_mult = max(0.25, 1.0 + float(rng.uniform(-tp_jit, tp_jit)))
+        sl_mult = max(0.25, 1.0 + float(rng.uniform(-sl_jit, sl_jit)))
+        scenarios.append((h_mult, tp_mult, sl_mult))
+    return scenarios
+
+
+def _estimate_soft_success_probabilities(
+    *,
+    prices: np.ndarray,
+    dynamic_threshold: np.ndarray,
+    adaptive_horizons: np.ndarray,
+    base_trade_side: np.ndarray,
+    base_path_outcome: np.ndarray,
+    tick_size: float,
+    tp_mult: float,
+    sl_mult: float,
+    bid_wall_px: Optional[np.ndarray] = None,
+    ask_wall_px: Optional[np.ndarray] = None,
+    bid_wall_strength: Optional[np.ndarray] = None,
+    ask_wall_strength: Optional[np.ndarray] = None,
+    min_wall_strength: float = 2.5,
+    wall_exit_buffer_ticks: float = 1.0,
+    min_wall_tp_ticks: float = 2.0,
+    economic_tp_floor_ticks: float = 0.0,
+    n_scenarios: int = 0,
+    scenario_seed: int = 42,
+    horizon_jitter: float = 0.20,
+    tp_jitter: float = 0.15,
+    sl_jitter: float = 0.15,
+    n_workers: int | None = None,
+    min_parallel_rows: int = 250_000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = len(prices)
+    base_trade_side = np.asarray(base_trade_side, dtype=np.int8)
+    base_path_outcome = np.asarray(base_path_outcome, dtype=np.int8)
+    active_mask = base_trade_side != DIR_NEUTRAL
+    if n_scenarios <= 0 or not bool(active_mask.any()):
+        zeros = np.zeros(n, dtype=np.float32)
+        return zeros, zeros, np.zeros(n, dtype=np.int32)
+
+    scenarios = _build_soft_label_scenarios(
+        n_scenarios=n_scenarios,
+        seed=scenario_seed,
+        horizon_jitter=horizon_jitter,
+        tp_jitter=tp_jitter,
+        sl_jitter=sl_jitter,
+    )
+    success_sum = np.zeros(n, dtype=np.float32)
+    seen_sum = np.zeros(n, dtype=np.int32)
+    scenario_workers = n_workers if len(scenarios) <= 2 else 1
+
+    for scen_idx, (h_mult, tp_mult_mult, sl_mult_mult) in enumerate(scenarios):
+        if scen_idx == 0:
+            scen_path = base_path_outcome
+        else:
+            scen_horizons = np.maximum(
+                1,
+                np.round(np.asarray(adaptive_horizons, dtype=np.float64) * float(h_mult)).astype(np.int32),
+            )
+            _, _, _, scen_path = _forward_scan_per_row(
+                prices=prices,
+                dynamic_threshold=dynamic_threshold,
+                adaptive_horizons=scen_horizons,
+                tick_size=tick_size,
+                tp_mult=float(tp_mult) * float(tp_mult_mult),
+                sl_mult=float(sl_mult) * float(sl_mult_mult),
+                bid_wall_px=bid_wall_px,
+                ask_wall_px=ask_wall_px,
+                bid_wall_strength=bid_wall_strength,
+                ask_wall_strength=ask_wall_strength,
+                min_wall_strength=min_wall_strength,
+                wall_exit_buffer_ticks=wall_exit_buffer_ticks,
+                min_wall_tp_ticks=min_wall_tp_ticks,
+                economic_tp_floor_ticks=economic_tp_floor_ticks,
+                n_workers=scenario_workers,
+                min_parallel_rows=min_parallel_rows,
+                progress_every_rows=0,
+            )
+        scenario_success = (
+            ((base_trade_side == DIR_LONG) & (scen_path == PATH_LONG_TP_FIRST))
+            | ((base_trade_side == DIR_SHORT) & (scen_path == PATH_SHORT_TP_FIRST))
+        )
+        success_sum[active_mask] += scenario_success[active_mask].astype(np.float32)
+        seen_sum[active_mask] += 1
+
+    soft_label = np.divide(
+        success_sum,
+        np.maximum(seen_sum, 1),
+        out=np.zeros(n, dtype=np.float32),
+        where=seen_sum > 0,
+    ).astype(np.float32)
+    soft_confidence = np.zeros(n, dtype=np.float32)
+    soft_confidence[active_mask] = np.abs(soft_label[active_mask] - 0.5).astype(np.float32) * 2.0
+    return soft_label, soft_confidence, seen_sum.astype(np.int32)
+
+
 # ── FIX-11: Kalman trend gate ─────────────────────────────────────────────────
 
 def _apply_trend_filter(
@@ -1091,6 +1327,12 @@ def build_causal_event_labels(
     enforce_economic_tp_floor: bool = False,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
+    emit_meta_labels: bool = True,
+    soft_label_scenarios: int = 0,
+    soft_label_seed: int = 42,
+    soft_label_horizon_jitter: float = 0.20,
+    soft_label_tp_jitter: float = 0.15,
+    soft_label_sl_jitter: float = 0.15,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
     # 0.05 = نحذف counter-trend الواضح فقط، ولا نمسح الإشارات في الترند الضعيف/المحايد
 ) -> pd.DataFrame:
@@ -1139,6 +1381,10 @@ def build_causal_event_labels(
                              labels that the live policy would later reject.
     enforce_economic_tp_floor : If True, raise the TP floor so it cannot fall
                                 below `stop_floor + execution_cost_pips`.
+    emit_meta_labels     : Emit stable meta-label/context columns derived from
+                           the adaptive TP/SL/horizon state.
+    soft_label_scenarios : If > 0, estimate probabilistic success labels by
+                           perturbing horizon and TP/SL parameters causally.
     """
 
     out = df.copy()
@@ -1378,6 +1624,7 @@ def build_causal_event_labels(
 
     # Merge into labeled DataFrame (keeping all columns from engineer_features)
     labeled = out.copy()
+    labeled["bias_label_raw"] = bias_raw.astype(np.int8)
     labeled["bias_label"]     = bias_raw.astype(np.int8)
     labeled["signal_quality"] = quality_raw.astype(np.int8)
     labeled["path_outcome"]   = path_outcome_raw.astype(np.int8)
@@ -1523,6 +1770,79 @@ def build_causal_event_labels(
     labeled["label_horizon_steps"] = (end_idx - np.arange(n)).astype(np.int32)
     labeled["effective_horizon"]   = adaptive_horizons.astype(np.int32)   # FIX-9: expose per-row
 
+    if emit_meta_labels:
+        level_context = _compute_effective_trade_levels(
+            prices=prices_arr,
+            dynamic_threshold=dynamic_threshold,
+            tick_size=tick_size,
+            tp_mult=tp_mult,
+            sl_mult=sl_mult,
+            bid_wall_px=bid_wall_px_arr,
+            ask_wall_px=ask_wall_px_arr,
+            bid_wall_strength=bid_wall_strength_arr,
+            ask_wall_strength=ask_wall_strength_arr,
+            min_wall_strength=2.5,
+            wall_exit_buffer_ticks=1.0,
+            min_wall_tp_ticks=2.0,
+            economic_tp_floor_ticks=economic_tp_floor_ticks,
+        )
+        meta_trade_side = _meta_trade_side_from_path(path_outcome_raw)
+        meta_outcome_ticks = _meta_outcome_ticks_from_path(
+            path_outcome_raw,
+            level_context["tp_long_ticks"],
+            level_context["tp_short_ticks"],
+            level_context["sl_ticks"],
+        )
+        meta_label_active = (meta_trade_side != DIR_NEUTRAL).astype(np.int8)
+        meta_label = ((meta_outcome_ticks > 0.0) & (meta_label_active == 1)).astype(np.int8)
+
+        soft_label = np.where(meta_label_active == 1, meta_label.astype(np.float32), 0.0).astype(np.float32)
+        soft_confidence = meta_label_active.astype(np.float32)
+        soft_seen = np.zeros(n, dtype=np.int32)
+        if int(soft_label_scenarios) > 0:
+            soft_label, soft_confidence, soft_seen = _estimate_soft_success_probabilities(
+                prices=prices_arr,
+                dynamic_threshold=dynamic_threshold,
+                adaptive_horizons=adaptive_horizons,
+                base_trade_side=meta_trade_side,
+                base_path_outcome=path_outcome_raw,
+                tick_size=tick_size,
+                tp_mult=tp_mult,
+                sl_mult=sl_mult,
+                bid_wall_px=bid_wall_px_arr,
+                ask_wall_px=ask_wall_px_arr,
+                bid_wall_strength=bid_wall_strength_arr,
+                ask_wall_strength=ask_wall_strength_arr,
+                min_wall_strength=2.5,
+                wall_exit_buffer_ticks=1.0,
+                min_wall_tp_ticks=2.0,
+                economic_tp_floor_ticks=economic_tp_floor_ticks,
+                n_scenarios=int(soft_label_scenarios),
+                scenario_seed=int(soft_label_seed),
+                horizon_jitter=float(soft_label_horizon_jitter),
+                tp_jitter=float(soft_label_tp_jitter),
+                sl_jitter=float(soft_label_sl_jitter),
+                n_workers=n_workers,
+                min_parallel_rows=min_parallel_rows,
+            )
+
+        labeled["effective_threshold_ticks"] = level_context["threshold_ticks"].astype(np.float32)
+        labeled["effective_tp_long_ticks"] = level_context["tp_long_ticks"].astype(np.float32)
+        labeled["effective_tp_short_ticks"] = level_context["tp_short_ticks"].astype(np.float32)
+        labeled["effective_sl_ticks"] = level_context["sl_ticks"].astype(np.float32)
+        labeled["meta_trade_side"] = meta_trade_side.astype(np.int8)
+        labeled["meta_label"] = meta_label.astype(np.int8)
+        labeled["meta_label_active"] = meta_label_active.astype(np.int8)
+        labeled["meta_outcome_ticks"] = meta_outcome_ticks.astype(np.float32)
+        labeled["soft_label"] = np.where(meta_label_active == 1, soft_label, 0.0).astype(np.float32)
+        labeled["soft_label_confidence"] = np.where(meta_label_active == 1, soft_confidence, 0.0).astype(np.float32)
+        labeled["soft_label_entropy"] = np.where(
+            meta_label_active == 1,
+            _binary_entropy(soft_label),
+            0.0,
+        ).astype(np.float32)
+        labeled["soft_label_scenarios"] = soft_seen.astype(np.int32)
+
     # FIX-6: broad event flag as context feature + stricter train-event gate
     labeled["event_flag"] = np.asarray(event_flag, dtype=np.int8)
     labeled["train_event_flag"] = train_event_flag.astype(np.int8)
@@ -1638,6 +1958,26 @@ def build_causal_event_labels(
         f"[v19] Horizon→ adaptive={'ON' if adaptive_horizon else 'OFF'}  "
         f"med={h_med}  min={h_min}  max={h_max}  base={horizon}"
     )
+    if emit_meta_labels and "meta_label" in labeled.columns:
+        meta_active = int(labeled["meta_label_active"].sum())
+        meta_success = int(labeled["meta_label"].sum())
+        mean_meta_outcome = float(
+            pd.to_numeric(labeled["meta_outcome_ticks"], errors="coerce").fillna(0.0).mean()
+        ) if len(labeled) else 0.0
+        print(
+            f"[v19] Meta   → active={meta_active:,}/{total:,} ({meta_active/total:.1%})  "
+            f"success={meta_success:,} ({meta_success/max(meta_active, 1):.1%})  "
+            f"mean_outcome_ticks={mean_meta_outcome:.2f}"
+        )
+    if emit_meta_labels and int(soft_label_scenarios) > 0 and "soft_label" in labeled.columns:
+        active_soft = labeled["meta_label_active"].astype(np.int8).values == 1
+        soft_active = pd.to_numeric(labeled.loc[active_soft, "soft_label"], errors="coerce").fillna(0.0)
+        soft_conf = pd.to_numeric(labeled.loc[active_soft, "soft_label_confidence"], errors="coerce").fillna(0.0)
+        print(
+            f"[v19] Soft   → scenarios={int(soft_label_scenarios)}  "
+            f"mean={float(soft_active.mean()) if len(soft_active) else 0.0:.3f}  "
+            f"conf_mean={float(soft_conf.mean()) if len(soft_conf) else 0.0:.3f}"
+        )
 
     if n_directional / total < 0.05:
         print(
