@@ -85,8 +85,10 @@ except ImportError:
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
-except ImportError:
+    XGB_IMPORT_ERROR = None
+except Exception as exc:
     XGB_AVAILABLE = False
+    XGB_IMPORT_ERROR = exc
 
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
@@ -1421,12 +1423,16 @@ def stage1_oof_meta(
     t1: pd.Series | None = None,
     inference_scaler_params: dict | None = None,
     catboost_device: str = 'auto',
+    include_xgboost: bool = False,
     quality_weight_strong: float = 2.0,
     quality_weight_weak: float = 1.0,
     cost_config: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    stage1_label = 'CatBoost + Regime Meta-Features'
+    if include_xgboost:
+        stage1_label = 'CatBoost + XGBoost + Regime Meta-Features'
     print("\n" + "═" * 65)
-    print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
+    print(f"🐱 STAGE 1 — V19 OOF {stage1_label}")
     print("═" * 65)
     if not inference_scaler_params:
         raise RuntimeError(
@@ -1462,7 +1468,7 @@ def stage1_oof_meta(
 
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
-    meta_feature_names = resolve_meta_feature_names(include_xgboost=True)
+    meta_feature_names = resolve_meta_feature_names(include_xgboost=include_xgboost)
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     print(
         "  Meta Layout Guard: "
@@ -1477,10 +1483,11 @@ def stage1_oof_meta(
             "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
             "pip install -r requirements.txt"
         )
-    if not XGB_AVAILABLE:
+    if include_xgboost and not XGB_AVAILABLE:
         raise RuntimeError(
-            "❌ XGBoost غير مثبّت. مرحلة stacked base models تتطلبه الآن.\n"
-            "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
+            "❌ XGBoost غير متاح بينما include_xgboost=True.\n"
+            f"سبب التحميل: {XGB_IMPORT_ERROR}\n"
+            "أصلح البيئة أو عطّل XGBoost ثم أعد التشغيل:\n"
             "pip install -r requirements.txt"
         )
 
@@ -1632,132 +1639,138 @@ def stage1_oof_meta(
     oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(n, N_CB_PROBS, splits, _cb_predict)
     oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
 
-    def _xgb_predict(train_idx, test_idx, fold_no):
-        inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
-        fit_idx = inner_train if inner_train is not None else train_idx
-        early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
-        fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
-        test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
-        fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
-        test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
-        print(
-            f"    XGB Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
-            f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
-            f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-            f"| y_fit={fit_counts} | y_test={test_counts}"
-        )
-        if len(np.unique(y[fit_idx])) < 2:
+    xgb_probs = np.zeros((n, 0), dtype=np.float32)
+    xgb_covered = np.ones(n, dtype=bool)
+    xgb_reports: list[dict] = []
+    if include_xgboost:
+        def _xgb_predict(train_idx, test_idx, fold_no):
+            inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
+            fit_idx = inner_train if inner_train is not None else train_idx
+            early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
+            fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
+            test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
+            fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
+            test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
             print(
-                f"      XGBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
-                "| using class priors"
+                f"    XGB Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
+                f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
+                f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
+                f"| y_fit={fit_counts} | y_test={test_counts}"
             )
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
-                'directional_precision': None,
-                'directional_recall': None,
-                'directional_f1': None,
-                'mode': 'priors_only_single_class_train',
-            }
-        fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
-        fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
-        if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
-            print(
-                f"      XGBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
-                "| using priors"
-            )
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
-                'directional_precision': None,
-                'directional_recall': None,
-                'directional_f1': None,
-                'mode': 'priors_only_degraded_scaler',
-                'fold_scaler_diagnostics': scaler_diag,
-            }
-        X_fit = _apply_scaler_to_stat_frame(
-            raw_stat.iloc[fit_idx],
-            fold_scaler,
-            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
-        ).values.astype(np.float32)
-        X_test = _apply_scaler_to_stat_frame(
-            raw_stat.iloc[test_idx],
-            fold_scaler,
-            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
-        ).values.astype(np.float32)
-        print(
-            f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
-            f"| scaler_fit_rows={len(fit_idx):,}"
-        )
-        class_weights = _compute_binary_class_weights(y[fit_idx])
-        sw = _weighted_quality_weights(fit_idx, class_weights)
-        model_kwargs = {
-            'n_estimators': 800,
-            'max_depth': tree_depth,
-            'learning_rate': 0.03,
-            'subsample': 0.80,
-            'colsample_bytree': 0.70,
-            'reg_lambda': 3.0,
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
-            'random_state': 84 + fold_no,
-            'tree_method': 'hist',
-        }
-        if early_stopping_rounds is not None:
-            model_kwargs['early_stopping_rounds'] = early_stopping_rounds
-        model = XGBClassifier(**model_kwargs)
-        fit_kwargs = {
-            'sample_weight': sw,
-            'verbose': False,
-        }
-        X_val = None
-        if inner_val is not None:
-            X_val = _apply_scaler_to_stat_frame(
-                raw_stat.iloc[inner_val],
+            if len(np.unique(y[fit_idx])) < 2:
+                print(
+                    f"      XGBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
+                    "| using class priors"
+                )
+                return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                    'directional_precision': None,
+                    'directional_recall': None,
+                    'directional_f1': None,
+                    'mode': 'priors_only_single_class_train',
+                }
+            fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+            fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
+            if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
+                print(
+                    f"      XGBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
+                    "| using priors"
+                )
+                return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                    'directional_precision': None,
+                    'directional_recall': None,
+                    'directional_f1': None,
+                    'mode': 'priors_only_degraded_scaler',
+                    'fold_scaler_diagnostics': scaler_diag,
+                }
+            X_fit = _apply_scaler_to_stat_frame(
+                raw_stat.iloc[fit_idx],
                 fold_scaler,
                 clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
             ).values.astype(np.float32)
-            fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
-        model.fit(X_fit, y[fit_idx], **fit_kwargs)
-        present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
-        raw_preds = align_probability_columns(
-            model.predict_proba(X_test),
-            N_XGB_PROBS,
-            classes=present_classes,
-        )
-        calibrator = None
-        calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
-        if X_val is not None:
-            val_raw = align_probability_columns(
-                model.predict_proba(X_val),
+            X_test = _apply_scaler_to_stat_frame(
+                raw_stat.iloc[test_idx],
+                fold_scaler,
+                clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+            ).values.astype(np.float32)
+            print(
+                f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
+                f"| scaler_fit_rows={len(fit_idx):,}"
+            )
+            class_weights = _compute_binary_class_weights(y[fit_idx])
+            sw = _weighted_quality_weights(fit_idx, class_weights)
+            model_kwargs = {
+                'n_estimators': 800,
+                'max_depth': tree_depth,
+                'learning_rate': 0.03,
+                'subsample': 0.80,
+                'colsample_bytree': 0.70,
+                'reg_lambda': 3.0,
+                'objective': 'binary:logistic',
+                'eval_metric': 'logloss',
+                'random_state': 84 + fold_no,
+                'tree_method': 'hist',
+            }
+            if early_stopping_rounds is not None:
+                model_kwargs['early_stopping_rounds'] = early_stopping_rounds
+            model = XGBClassifier(**model_kwargs)
+            fit_kwargs = {
+                'sample_weight': sw,
+                'verbose': False,
+            }
+            X_val = None
+            if inner_val is not None:
+                X_val = _apply_scaler_to_stat_frame(
+                    raw_stat.iloc[inner_val],
+                    fold_scaler,
+                    clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+                ).values.astype(np.float32)
+                fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
+            model.fit(X_fit, y[fit_idx], **fit_kwargs)
+            present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
+            raw_preds = align_probability_columns(
+                model.predict_proba(X_test),
                 N_XGB_PROBS,
                 classes=present_classes,
             )
-            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
-        preds = _apply_long_calibrator(calibrator, raw_preds)
-        test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
-        pred_labels = np.argmax(preds, axis=1)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y[test_idx],
-            pred_labels,
-            labels=[0, 1],
-            average='macro',
-            zero_division=0,
-        )
-        xgb_best_iteration = getattr(model, 'best_iteration', None) if early_stopping_rounds is not None else None
-        return preds, {
-            'directional_precision': float(precision),
-            'directional_recall': float(recall),
-            'directional_f1': float(f1),
-            'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
-            'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
-            'early_stopping_rounds': early_stopping_rounds,
-            'class_weights': class_weights,
-            'fold_scaler_diagnostics': scaler_diag,
-            'calibration': {
-                'inner_validation': calibrator_report,
-                'outer_test': test_metrics,
-            },
-        }
+            calibrator = None
+            calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
+            if X_val is not None:
+                val_raw = align_probability_columns(
+                    model.predict_proba(X_val),
+                    N_XGB_PROBS,
+                    classes=present_classes,
+                )
+                calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+            preds = _apply_long_calibrator(calibrator, raw_preds)
+            test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
+            pred_labels = np.argmax(preds, axis=1)
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                y[test_idx],
+                pred_labels,
+                labels=[0, 1],
+                average='macro',
+                zero_division=0,
+            )
+            xgb_best_iteration = getattr(model, 'best_iteration', None) if early_stopping_rounds is not None else None
+            return preds, {
+                'directional_precision': float(precision),
+                'directional_recall': float(recall),
+                'directional_f1': float(f1),
+                'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
+                'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
+                'early_stopping_rounds': early_stopping_rounds,
+                'class_weights': class_weights,
+                'fold_scaler_diagnostics': scaler_diag,
+                'calibration': {
+                    'inner_validation': calibrator_report,
+                    'outer_test': test_metrics,
+                },
+            }
 
-    xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(n, N_XGB_PROBS, splits, _xgb_predict)
-    xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
+        xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(n, N_XGB_PROBS, splits, _xgb_predict)
+        xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
+    else:
+        print("  ℹ️ XGBoost disabled — Stage 1 meta surface will use CatBoost + regime only.")
 
     regime_meta_dim = len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)
 
@@ -1778,20 +1791,29 @@ def stage1_oof_meta(
 
     coverage_warnings = {
         'catboost': float(prob_covered.mean()) < 0.50,
-        'xgboost': float(xgb_covered.mean()) < 0.50,
+        'xgboost': bool(include_xgboost and float(xgb_covered.mean()) < 0.50),
         'regime': float(regime_covered.mean()) < 0.50,
         'combined': float(coverage.mean()) < 0.50,
     }
     if coverage_warnings['catboost'] or coverage_warnings['xgboost']:
+        xgb_segment = f" | xgboost={float(xgb_covered.mean()):.1%}" if include_xgboost else ""
         print(
             "  ⚠️ Low OOF coverage detected: "
-            f"catboost={float(prob_covered.mean()):.1%} | xgboost={float(xgb_covered.mean()):.1%}"
+            f"catboost={float(prob_covered.mean()):.1%}{xgb_segment}"
         )
 
     cb_calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
     xgb_calibrator_path = os.path.join(output_dir, 'xgboost_calibrator_v19.pkl')
     decision_policy_path = os.path.join(output_dir, DEFAULT_DECISION_POLICY_ARTIFACT)
-    for path in (cb_calibrator_path, xgb_calibrator_path, decision_policy_path):
+    stale_stage1_paths = [cb_calibrator_path, xgb_calibrator_path, decision_policy_path]
+    if not include_xgboost:
+        stale_stage1_paths.extend(
+            [
+                os.path.join(output_dir, 'xgboost_advisor_v19.json'),
+                os.path.join(output_dir, 'xgboost_classes_v19.json'),
+            ]
+        )
+    for path in stale_stage1_paths:
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -1856,50 +1878,53 @@ def stage1_oof_meta(
     )
     live_probs = _apply_long_calibrator(final_cb_calibrator, live_probs_raw)
 
-    final_xgb = XGBClassifier(
-        n_estimators=800,
-        max_depth=tree_depth,
-        learning_rate=0.03,
-        subsample=0.80,
-        colsample_bytree=0.70,
-        reg_lambda=3.0,
-        objective='binary:logistic',
-        eval_metric='logloss',
-        early_stopping_rounds=50 if len(final_holdout_idx) else None,
-        random_state=84,
-        tree_method='hist',
-    )
-    xgb_fit_kwargs = {
-        'sample_weight': final_train_sw,
-        'verbose': False,
-    }
-    if len(final_holdout_idx):
-        xgb_fit_kwargs['eval_set'] = [(X_holdout_final, y_holdout_final)]
-    final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kwargs)
-    final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
-    final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
-    with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
-        json.dump({'classes': final_xgb_classes}, f, indent=2)
-    print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
+    final_xgb_cal_report = {'enabled': False, 'reason': 'disabled'}
+    live_xgb_probs = np.zeros((len(X_final), 0), dtype=np.float32)
+    if include_xgboost:
+        final_xgb = XGBClassifier(
+            n_estimators=800,
+            max_depth=tree_depth,
+            learning_rate=0.03,
+            subsample=0.80,
+            colsample_bytree=0.70,
+            reg_lambda=3.0,
+            objective='binary:logistic',
+            eval_metric='logloss',
+            early_stopping_rounds=50 if len(final_holdout_idx) else None,
+            random_state=84,
+            tree_method='hist',
+        )
+        xgb_fit_kwargs = {
+            'sample_weight': final_train_sw,
+            'verbose': False,
+        }
+        if len(final_holdout_idx):
+            xgb_fit_kwargs['eval_set'] = [(X_holdout_final, y_holdout_final)]
+        final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kwargs)
+        final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
+        final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
+        with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
+            json.dump({'classes': final_xgb_classes}, f, indent=2)
+        print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
 
-    final_xgb_calibrator = None
-    final_xgb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
-    if len(final_holdout_idx):
-        holdout_xgb_raw = align_probability_columns(
-            final_xgb.predict_proba(X_holdout_final),
+        final_xgb_calibrator = None
+        final_xgb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
+        if len(final_holdout_idx):
+            holdout_xgb_raw = align_probability_columns(
+                final_xgb.predict_proba(X_holdout_final),
+                N_XGB_PROBS,
+                classes=final_xgb_classes,
+            )
+            final_xgb_calibrator, final_xgb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_xgb_raw[:, 0])
+            if final_xgb_calibrator is not None:
+                with open(xgb_calibrator_path, 'wb') as f:
+                    pickle.dump(final_xgb_calibrator, f)
+        live_xgb_raw = align_probability_columns(
+            final_xgb.predict_proba(X_final),
             N_XGB_PROBS,
             classes=final_xgb_classes,
         )
-        final_xgb_calibrator, final_xgb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_xgb_raw[:, 0])
-        if final_xgb_calibrator is not None:
-            with open(xgb_calibrator_path, 'wb') as f:
-                pickle.dump(final_xgb_calibrator, f)
-    live_xgb_raw = align_probability_columns(
-        final_xgb.predict_proba(X_final),
-        N_XGB_PROBS,
-        classes=final_xgb_classes,
-    )
-    live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
+        live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
 
     final_regime = RegimeClassifier(n_regimes=N_CLUSTERS, model_type=regime_model_type)
     final_regime.fit(df.copy(), output_dir=output_dir)
@@ -1915,7 +1940,9 @@ def stage1_oof_meta(
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
 
-    ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
+    ensemble_oof_probs = oof_probs.astype(np.float32)
+    if include_xgboost:
+        ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
     decision_policy = build_decision_policy(
         df,
         ensemble_oof_probs,
@@ -1928,12 +1955,14 @@ def stage1_oof_meta(
         json.dump(decision_policy, f, indent=2)
 
     fold_metrics = {
+        'base_models': [str(spec.get('name', 'unknown')) for spec in meta_layout.get('base_models', [])],
         'stat_features': stat_features,
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
         'catboost_coverage_ratio': float(prob_covered.mean()),
-        'xgboost_coverage_ratio': float(xgb_covered.mean()),
+        'xgboost_enabled': bool(include_xgboost),
+        'xgboost_coverage_ratio': float(xgb_covered.mean()) if include_xgboost else None,
         'regime_coverage_ratio': float(regime_covered.mean()),
         'coverage_ratio': float(coverage.mean()),
         'coverage_warning': coverage_warnings,
@@ -1970,15 +1999,16 @@ def stage1_oof_meta(
             'folds': prob_reports,
         },
         'stage1_xgboost_isotonic': {
-            'enabled': any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in xgb_reports),
-            'covered_rows': int(np.sum(xgb_covered)),
-            'total_rows': int(len(xgb_covered)),
+            'enabled': bool(include_xgboost and any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in xgb_reports)),
+            'disabled': bool(not include_xgboost),
+            'covered_rows': int(np.sum(xgb_covered)) if include_xgboost else 0,
+            'total_rows': int(len(xgb_covered)) if include_xgboost else int(len(prob_covered)),
             'folds': xgb_reports,
         },
         'final_catboost_holdout_calibration': final_cb_cal_report,
         'final_xgboost_holdout_calibration': final_xgb_cal_report,
         'catboost_calibrator_artifact': os.path.basename(cb_calibrator_path) if os.path.exists(cb_calibrator_path) else None,
-        'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if os.path.exists(xgb_calibrator_path) else None,
+        'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if include_xgboost and os.path.exists(xgb_calibrator_path) else None,
         'decision_policy_artifact': os.path.basename(decision_policy_path),
         'coverage_warning': coverage_warnings,
         'catboost_low_coverage_warning': bool(coverage_warnings['catboost']),
@@ -3072,7 +3102,7 @@ def _load_required_stage1_artifacts(
     missing = [path for path in required_files if not os.path.exists(path)]
     if missing:
         raise FileNotFoundError(
-            '❌ CatBoost/XGBoost stage artifacts missing. '
+            '❌ Stage1 base-model artifacts missing. '
             'شغّل المرحلة الثانية أولاً:\n'
             'python train_v19.py --data <stage1_artifact_dir> --output <dir> --phase catboost\n'
             f'Missing: {missing}'
@@ -3135,6 +3165,7 @@ def run_training_pipeline(
     stage: int = 0,
     phase: str | None = None,
     catboost_device: str = 'auto',
+    include_xgboost: bool | None = None,
     training_mode: str | None = None,
     quality_weight_strong: float | None = None,
     quality_weight_weak: float | None = None,
@@ -3156,6 +3187,11 @@ def run_training_pipeline(
     print('=' * 65)
 
     train_cfg = (config_snapshot or {}).get('training', {})
+    include_xgboost = bool(
+        train_cfg.get('include_xgboost', False)
+        if include_xgboost is None
+        else include_xgboost
+    )
     training_mode = training_mode or str(train_cfg.get('mode', TRAIN_MODE_EVENT_BINARY))
     quality_weight_strong = float(
         quality_weight_strong if quality_weight_strong is not None else train_cfg.get('quality_weight_strong', 2.0)
@@ -3207,6 +3243,10 @@ def run_training_pipeline(
         f"{len(active_stat_features)}/{max(int(stat_feature_limit), 1)} "
         f"| selected_file_used={active_stat_info['selected_features_used']} "
         f"| features={active_stat_features}"
+    )
+    print(
+        "  🧱 Stage1 Base Models: "
+        f"{'catboost + xgboost + regime' if include_xgboost else 'catboost + regime'}"
     )
 
     effective_source_contract = dict(source_contract)
@@ -3311,6 +3351,7 @@ def run_training_pipeline(
             t1=split_t1,
             inference_scaler_params=inference_scaler_params,
             catboost_device=catboost_device,
+            include_xgboost=include_xgboost,
             quality_weight_strong=quality_weight_strong,
             quality_weight_weak=quality_weight_weak,
             cost_config=(config_snapshot or {}).get('backtest', {}),
@@ -3318,7 +3359,7 @@ def run_training_pipeline(
         meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:
         meta_features, coverage, meta_feature_names = _load_required_stage1_artifacts(output_dir, n_rows=len(event_df))
-        print(f'✅ CatBoost/XGBoost artifacts loaded from cache: {meta_features.shape}')
+        print(f"✅ Stage1 artifacts loaded from cache: {meta_features.shape} | layout={_meta_layout_label(meta_feature_names)}")
 
     if resolved_phase == PHASE_CATBOOST:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
@@ -3614,6 +3655,9 @@ def main():
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
+    p.set_defaults(include_xgboost=bool(defaults.get('include_xgboost', False)))
+    p.add_argument('--include_xgboost', dest='include_xgboost', action='store_true', help='enable XGBoost alongside CatBoost in Stage 1')
+    p.add_argument('--no_xgboost', dest='include_xgboost', action='store_false', help='disable XGBoost and use CatBoost + regime only')
     p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
@@ -3642,6 +3686,7 @@ def main():
         stage=args.stage,
         phase=args.phase,
         catboost_device=args.catboost_device,
+        include_xgboost=args.include_xgboost,
         training_mode=args.training_mode,
         quality_weight_strong=args.quality_weight_strong,
         quality_weight_weak=args.quality_weight_weak,

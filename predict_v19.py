@@ -4,7 +4,7 @@ predict_v19.py - QuantSystem V19 inference engine
 V19 inference uses the exact feature schema and scaler artifacts produced by
 the training pipeline, then reconstructs the same step vector used in training:
 
-  [25 scaled statistical features] + [CatBoost/XGBoost directional probs] +
+  [25 scaled statistical features] + [base-model directional probs] +
   [4 regime one-hot + 3 regime scores] + [8 visual embeddings if available]
 """
 
@@ -60,7 +60,7 @@ except ImportError:
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
-except ImportError:
+except Exception:
     XGB_AVAILABLE = False
 
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}

@@ -1,6 +1,6 @@
 # QuantSystem V19
 
-QuantSystem V19 هو مشروع **quantitative AI trading research system** مبني حول:
+QuantSystem V19 هو مشروع **quantitative AI trading system** مبني حول:
 
 1. `prepare_training_data.py`
    - يحول بيانات السوق الخام `MBO/MBP` إلى dataset جاهز للتدريب

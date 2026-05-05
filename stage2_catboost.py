@@ -1,5 +1,5 @@
 """
-stage2_catboost.py - Standalone entrypoint for CatBoost/XGBoost/regime stage
+stage2_catboost.py - Standalone entrypoint for CatBoost/regime stage
 """
 
 from __future__ import annotations
@@ -13,15 +13,6 @@ try:
 except ImportError as e:
     raise SystemExit(
         "❌ CatBoost غير مثبّت في هذه البيئة.\n"
-        "نفّذ أولًا:\n"
-        "pip install -r requirements.txt"
-    ) from e
-
-try:
-    import xgboost  # noqa: F401
-except ImportError as e:
-    raise SystemExit(
-        "❌ XGBoost غير مثبّت في هذه البيئة.\n"
         "نفّذ أولًا:\n"
         "pip install -r requirements.txt"
     ) from e
@@ -90,14 +81,16 @@ def _print_directional_event_diagnostics(output_dir: str) -> None:
             )
 
     cb_cov = float(stage1_metrics.get('catboost_coverage_ratio', 0.0) or 0.0)
+    xgb_enabled = bool(stage1_metrics.get('xgboost_enabled', False))
     xgb_cov = float(stage1_metrics.get('xgboost_coverage_ratio', 0.0) or 0.0)
     regime_cov = float(stage1_metrics.get('regime_coverage_ratio', 0.0) or 0.0)
     policy_cov = float(stage1_metrics.get('decision_policy_coverage_ratio', 0.0) or 0.0)
     regime_source = stage1_metrics.get('regime_source')
     if stage1_metrics:
+        xgb_segment = f"xgboost={xgb_cov:.1%}" if xgb_enabled else "xgboost=disabled"
         print(
             "  Stage1 Coverage: "
-            f"catboost={cb_cov:.1%} | xgboost={xgb_cov:.1%} | regime={regime_cov:.1%} | policy={policy_cov:.1%}"
+            f"catboost={cb_cov:.1%} | {xgb_segment} | regime={regime_cov:.1%} | policy={policy_cov:.1%}"
         )
         if regime_source:
             print(f"  Regime Source: {regime_source}")
@@ -107,16 +100,17 @@ def _print_directional_event_diagnostics(output_dir: str) -> None:
     cb_cal = (calibration.get('final_catboost_holdout_calibration', {}) or {})
     xgb_cal = (calibration.get('final_xgboost_holdout_calibration', {}) or {})
     if calibration:
+        xgb_status = bool(xgb_cal.get('enabled', False)) if xgb_enabled else 'disabled'
         print(
             "  Holdout Calibration: "
             f"catboost_enabled={bool(cb_cal.get('enabled', False))} | "
-            f"xgboost_enabled={bool(xgb_cal.get('enabled', False))}"
+            f"xgboost_enabled={xgb_status}"
         )
 
 
 def main():
     defaults = load_v19_config().get('training', {})
-    p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 2 CatBoost + XGBoost')
+    p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 2 CatBoost (optional XGBoost)')
     p.add_argument('--csv', required=True, help='training_features_ready.csv from stage 1')
     p.add_argument('--lob', default=None, help='optional lob_tensors.npy')
     p.add_argument('--lob_ts', default=None, help='optional lob_tensor_timestamps.npy')
@@ -128,6 +122,9 @@ def main():
     p.add_argument('--train_frac', type=float, default=float(defaults.get('train_frac', 0.80)))
     p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'])
+    p.set_defaults(include_xgboost=bool(defaults.get('include_xgboost', False)))
+    p.add_argument('--include_xgboost', dest='include_xgboost', action='store_true', help='enable XGBoost alongside CatBoost in Stage 1')
+    p.add_argument('--no_xgboost', dest='include_xgboost', action='store_false', help='disable XGBoost and use CatBoost + regime only')
     p.add_argument('--training_mode', default=str(defaults.get('mode', 'event_binary')))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
@@ -152,6 +149,7 @@ def main():
         train_frac=args.train_frac,
         min_seq_coverage=args.min_seq_coverage,
         catboost_device=args.catboost_device,
+        include_xgboost=args.include_xgboost,
         training_mode=args.training_mode,
         quality_weight_strong=args.quality_weight_strong,
         quality_weight_weak=args.quality_weight_weak,
