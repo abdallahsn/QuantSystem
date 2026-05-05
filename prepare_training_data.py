@@ -3093,6 +3093,7 @@ def run_refinery(
     tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
     tp_sl_threshold_mode: str = 'fixed',
+    tp_sl_anchor_window: int = 1000,
     adaptive_horizon: bool = False,
     trend_filter: bool = False,
     trend_filter_strict: bool = False,
@@ -3449,6 +3450,7 @@ def run_refinery(
             tp_mult=tp_mult,
             sl_mult=sl_mult,
             tp_sl_threshold_mode=tp_sl_threshold_mode,
+            tp_sl_anchor_window=tp_sl_anchor_window,
             adaptive_horizon=adaptive_horizon,
             trend_filter=trend_filter,
             trend_filter_strict=trend_filter_strict,
@@ -3755,6 +3757,7 @@ def run_refinery(
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
             'tp_sl_threshold_mode': str(tp_sl_threshold_mode),
+            'tp_sl_anchor_window': int(tp_sl_anchor_window),
             'adaptive_horizon': bool(adaptive_horizon),
             'trend_filter': bool(trend_filter),
             'trend_filter_strict': bool(trend_filter_strict),
@@ -3872,8 +3875,10 @@ if __name__=='__main__':
                    help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V19_TP_MULT:.1f})')
     p.add_argument('--sl_mult', type=float, default=1.0,
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
-    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'], default='fixed',
-                   help="TP/SL threshold mode for label scan: 'fixed' or 'atr' (default: fixed)")
+    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'anchor_atr', 'atr'], default='fixed',
+                   help="TP/SL threshold mode for label scan: 'fixed', 'anchor_atr', or 'atr' (default: fixed)")
+    p.add_argument('--tp_sl_anchor_window', type=int, default=1000,
+                   help='anchor rows used when tp_sl_threshold_mode=anchor_atr (default: 1000)')
     p.set_defaults(adaptive_horizon=False, trend_filter=False, trend_filter_strict=False)
     p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
                    help='enable ATR-adaptive forward horizon (default: off)')
@@ -3921,6 +3926,7 @@ if __name__=='__main__':
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,
                  tp_sl_threshold_mode=a.tp_sl_threshold_mode,
+                 tp_sl_anchor_window=a.tp_sl_anchor_window,
                  adaptive_horizon=a.adaptive_horizon,
                  trend_filter=a.trend_filter,
                  trend_filter_strict=a.trend_filter_strict,

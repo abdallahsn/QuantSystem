@@ -33,6 +33,7 @@ New optional parameters:
   horizon_max_mult     : float = 3.0    — ceiling: horizon never > base × 3.0
   trend_filter         : bool  = False  — enable FIX-11 only when explicitly requested
   trend_filter_strict  : bool  = False  — if True, neutral rows also filtered by trend
+  tp_sl_anchor_window  : int   = 1000   — anchor rows for stationary ATR-based TP/SL
 """
 
 from __future__ import annotations
@@ -1071,6 +1072,7 @@ def build_causal_event_labels(
     neutral_mult: float = 0.45,
     tick_size: float = 1e-4,
     tp_sl_threshold_mode: str = "fixed",
+    tp_sl_anchor_window: int = 1000,
     # ── FIX-9 ────────────────────────────────────────────────────────────
     adaptive_horizon: bool = False,
     horizon_min_mult: float = 0.5,
@@ -1119,10 +1121,12 @@ def build_causal_event_labels(
     event_roll_window     : Rolling window for event detection (FIX-8).
     feature_roll_window   : Rolling window for feature engineering (FIX-8).
     direction_threshold_ticks : Floor threshold in ticks (FIX-4 floor).
-    tp_mult               : TP multiplier × ATR threshold.
-    sl_mult               : SL multiplier × ATR threshold.
+    tp_mult               : TP multiplier × threshold.
+    sl_mult               : SL multiplier × threshold.
     neutral_mult          : Unused post-FIX-1 but kept for API compat.
     tick_size             : Minimum price increment.
+    tp_sl_threshold_mode  : `fixed`, `anchor_atr`, or `atr`.
+    tp_sl_anchor_window   : Anchor rows used by `anchor_atr` mode.
     adaptive_horizon      : Enable FIX-9 (default False).
     horizon_min_mult      : Floor multiplier for adaptive horizon.
     horizon_max_mult      : Ceiling multiplier for adaptive horizon.
@@ -1276,18 +1280,27 @@ def build_causal_event_labels(
         micro_atr = _compute_micro_atr(prices_arr, window=feat_window)
 
     # FIX-10 ablation/stability mode:
-    #   - fixed: use one stationary TP/SL threshold floor across rows
-    #   - atr:   keep the older per-row ATR-adaptive threshold
+    #   - fixed:      use one stationary tick-floor threshold across rows
+    #   - anchor_atr: use one stationary threshold anchored to early ATR only
+    #   - atr:        keep the older per-row ATR-adaptive threshold
     fixed_floor       = direction_threshold_ticks * tick_size
     tp_sl_mode = str(tp_sl_threshold_mode or "fixed").strip().lower()
+    anchor_rows = int(max(tp_sl_anchor_window, 32))
+    anchor_limit = int(min(max(anchor_rows, 1), n))
+    anchor_slice = np.asarray(micro_atr[:anchor_limit], dtype=np.float64)
+    anchor_valid = anchor_slice[np.isfinite(anchor_slice) & (anchor_slice > 0)]
+    anchor_atr = float(np.nanmedian(anchor_valid)) if anchor_valid.size else float('nan')
     if tp_sl_mode == "atr":
         dynamic_threshold = np.maximum(fixed_floor, 0.5 * micro_atr)
     elif tp_sl_mode == "fixed":
         dynamic_threshold = np.full(n, max(fixed_floor, tick_size), dtype=np.float64)
+    elif tp_sl_mode == "anchor_atr":
+        anchor_threshold = max(fixed_floor, 0.5 * anchor_atr) if np.isfinite(anchor_atr) and anchor_atr > 0 else fixed_floor
+        dynamic_threshold = np.full(n, max(anchor_threshold, tick_size), dtype=np.float64)
     else:
         raise ValueError(
             f"Unsupported tp_sl_threshold_mode={tp_sl_threshold_mode!r}. "
-            "Use 'fixed' or 'atr'."
+            "Use 'fixed', 'anchor_atr', or 'atr'."
         )
     label_economics = _resolve_economic_tp_floor_ticks(
         direction_threshold_ticks=direction_threshold_ticks,
@@ -1587,6 +1600,11 @@ def build_causal_event_labels(
         f"tp_sl_mode={tp_sl_mode}  "
         f"kalman_thr={kalman_slope_threshold:.2f}  trend_min={trend_strength_min:.2f}"
     )
+    if tp_sl_mode == "anchor_atr":
+        print(
+            f"[v19] TP/SL  → anchor_rows={anchor_limit:,}  "
+            f"anchor_atr={0.0 if not np.isfinite(anchor_atr) else float(anchor_atr):.8f}"
+        )
     print(
         _format_bias_line("BiasAll", total, n_long, n_short, n_neutral)
     )
