@@ -111,6 +111,7 @@ def compute_eval_visual_embeddings(
         'used_tensor_count': 0,
         'rows_with_visual': 0,
         'visual_coverage_ratio': 0.0,
+
     }
     zero = np.zeros((len(df), VISUAL_EMB_DIM), dtype=np.float32)
 
