@@ -434,7 +434,7 @@ FEATURE_COLS = [
     # ── Core Statistical Surface + Dynamic Order-Book Context ───────────
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
-    'micro_atr', 'volume_burst', 'inter_event_time',
+    'micro_atr', 'rel_vol', 'volume_burst', 'inter_event_time',
     'micro_price', 'bid_wall_strength', 'ask_wall_strength',
     'distance_to_wall', 'gap_size', 'liquidity_density',
     'fisher_signal', 'anomaly',
@@ -505,6 +505,7 @@ CATBOOST_ADVISOR_FEATURES = [
 
 RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]
+LEAN_RAW_FEATURE_COLS = [f'{RAW_STAT_PREFIX}rel_vol']
 
 # V19 Meta-Features — مخرجات CatBoost تُضاف للـ LSTM
 META_FEATURE_COLS = resolve_meta_feature_names(include_xgboost=True)  # N = 11
@@ -1896,6 +1897,32 @@ def _add_rolling_context(df: pd.DataFrame) -> pd.DataFrame:
     df['volume_accel'] = df['volume_burst'].diff(10).fillna(0)
     return df
 
+
+def _add_relative_volatility(
+    df: pd.DataFrame,
+    *,
+    atr_col: str = 'micro_atr',
+    window: int = 200,
+) -> pd.DataFrame:
+    """
+    Causal relative volatility:
+      rel_vol[t] = micro_atr[t] / mean(micro_atr[t-window+1:t])
+
+    لا يوجد lookahead هنا لأن rolling mean يعتمد على الصف الحالي وما قبله فقط.
+    """
+    df = df.copy()
+
+    if atr_col not in df.columns:
+        df['rel_vol'] = np.float32(1.0)
+        return df
+
+    atr = pd.to_numeric(df[atr_col], errors='coerce').abs().fillna(0.0)
+    baseline = atr.rolling(window=max(int(window), 1), min_periods=1).mean()
+    baseline = baseline.replace(0.0, np.nan)
+    rel_vol = (atr / baseline).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    df['rel_vol'] = rel_vol.astype(np.float32)
+    return df
+
 def _process_mbp10(df_mbp, tick_size: float = 0.0001):
     if df_mbp is None or len(df_mbp) == 0:
         return pd.DataFrame(columns=[
@@ -2739,6 +2766,8 @@ def _normalize_and_save(
         if col not in df.columns:
             df[col] = 0.0
         df[raw_col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(np.float32)
+    if 'rel_vol' in df.columns:
+        df[f'{RAW_STAT_PREFIX}rel_vol'] = pd.to_numeric(df['rel_vol'], errors='coerce').fillna(1.0).astype(np.float32)
 
     # ══════════════════════════════════════════════════════════
     # ANTI-LEAKAGE FIX: FIT scaler على train split فقط (80%)
@@ -2950,7 +2979,7 @@ def _normalize_and_save(
                  'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
-    raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
+    raw_stat_cols = [c for c in (RAW_STAT_FEATURE_COLS + LEAN_RAW_FEATURE_COLS) if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
 
     final_dir = _artifact_phase_dir(output_dir, FINAL_FEATURE_DIR)
@@ -3380,6 +3409,9 @@ def run_refinery(
     df_merged['garch_vol']    = garch_df['garch_vol'].values
     df_merged['garch_regime'] = garch_df['garch_regime'].values
     print(f"  ✅ GARCH: vol range=[{df_merged['garch_vol'].min():.6f}, {df_merged['garch_vol'].max():.6f}]")
+
+    print("  ✅ Relative Volatility...")
+    df_merged = _add_relative_volatility(df_merged, atr_col='micro_atr', window=200)
     pipeline_tracker.finish(rows=int(len(df_merged)))
 
     print("\n⚙️  Step 3c — Fractional Differentiation...")
