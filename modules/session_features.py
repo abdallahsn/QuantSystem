@@ -20,6 +20,29 @@ SESSION_LABEL = {
 }
 
 
+def _coerce_session_timestamp_series(values, *, context: str) -> pd.Series:
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    ts = pd.to_datetime(series, utc=True, errors='coerce')
+    if not isinstance(ts, pd.Series):
+        ts = pd.Series(ts, index=series.index)
+    ts = ts.dt.tz_localize(None)
+    invalid_mask = ts.isna()
+    if bool(invalid_mask.any()):
+        sample = invalid_mask[invalid_mask].index[:5].tolist()
+        raise ValueError(
+            f"❌ Invalid session timestamps in {context}: "
+            f"rows={int(invalid_mask.sum())} sample_indices={sample}"
+        )
+    return ts
+
+
+def _coerce_session_timestamp_scalar(value, *, context: str) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors='coerce')
+    if pd.isna(ts):
+        raise ValueError(f"❌ Invalid session timestamp in {context}: value={value!r}")
+    return ts.tz_convert(None) if getattr(ts, 'tzinfo', None) is not None else pd.Timestamp(ts)
+
+
 def add_session_features(df: pd.DataFrame, ts_col: str = None) -> pd.DataFrame:
     """
     يضيف session zone features للـ DataFrame بأمان
@@ -38,10 +61,7 @@ def add_session_features(df: pd.DataFrame, ts_col: str = None) -> pd.DataFrame:
                 ts_series = df.index.to_series()
                 print("  ⚠️ Session: استخدام الـ Index كعمود وقت.")
             else:
-                print(f"  ❌ Session: لم يتم العثور على أي عمود وقت! — session features = 0")
-                for col in SESSION_FEATURE_COLS:
-                    df[col] = 0
-                return df
+                raise ValueError("❌ Session features require a valid timestamp column or DatetimeIndex")
         else:
             ts_series = df[found_col]
             print(f"  🕒 Session: استخدام عمود '{found_col}' لحساب الجلسات.")
@@ -49,21 +69,8 @@ def add_session_features(df: pd.DataFrame, ts_col: str = None) -> pd.DataFrame:
         ts_series = df[ts_col]
 
     # 2. معالجة الـ Timezone بأمان تام
-    try:
-        # تحويل السلسلة لـ datetime مع محاولة قراءة الـ UTC (utc=True)
-        ts = pd.to_datetime(ts_series, utc=True, errors='coerce')
-        
-        # التأكد من إزالة أي معلومات منطقة زمنية (TZ-naive) لنتمكن من استخراج الساعة بشكل صحيح
-        if ts.dt.tz is not None:
-            ts = ts.dt.tz_convert(None)
-            
-        # استخراج الساعة، وملء الـ NaT (Not a Time) بـ -1 لتجاهله
-        hour = ts.dt.hour.fillna(-1).astype(np.int8)
-    except Exception as e:
-        print(f"  ❌ Session Error: فشل في معالجة الوقت ({e}) — session features = 0")
-        for col in SESSION_FEATURE_COLS:
-            df[col] = 0
-        return df
+    ts = _coerce_session_timestamp_series(ts_series, context=f'session_features.{ts_col or "auto"}')
+    hour = ts.dt.hour.fillna(-1).astype(np.int8)
 
     # 3. حساب الفيتشرز
     df['session_hour']    = hour
@@ -143,19 +150,16 @@ class SessionVWAPEngine:
     def update(self, ts, price: float, volume: float, is_buy_aggressor: bool = True) -> tuple:
         # تحويل ts لـ Timestamp بأمان
         # ② FIX: معالجة شاملة لكل أنواع ts بما فيها numpy.datetime64
-        try:
-            if isinstance(ts, (int, float, np.integer)):
-                ts = pd.Timestamp(int(ts), unit='ns')
-            elif isinstance(ts, np.datetime64):
-                ts = pd.Timestamp(ts)
-            elif isinstance(ts, str):
-                ts = pd.Timestamp(ts)
-            elif not isinstance(ts, pd.Timestamp):
-                ts = pd.Timestamp(ts)
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert(None)
-        except Exception:
-            ts = pd.Timestamp.now()
+        if isinstance(ts, (int, float, np.integer)):
+            ts = _coerce_session_timestamp_scalar(int(ts), context='SessionVWAPEngine.update')
+        elif isinstance(ts, np.datetime64):
+            ts = _coerce_session_timestamp_scalar(ts, context='SessionVWAPEngine.update')
+        elif isinstance(ts, str):
+            ts = _coerce_session_timestamp_scalar(ts, context='SessionVWAPEngine.update')
+        elif not isinstance(ts, pd.Timestamp):
+            ts = _coerce_session_timestamp_scalar(ts, context='SessionVWAPEngine.update')
+        elif ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
         day = ts.date()
 
         # تصفير مع بداية يوم تداول جديد
@@ -229,10 +233,12 @@ def add_cyclical_session_features(df: pd.DataFrame, ts_col: str = 'ts_event') ->
     """
     df = df.copy()
 
-    ts = pd.to_datetime(df.get(ts_col, pd.Series(pd.RangeIndex(len(df)))), utc=True, errors='coerce')
-    if ts.dt.tz is not None:
-        ts = ts.dt.tz_convert(None)
-    ts = ts.ffill().bfill()
+    if ts_col not in df.columns:
+        raise ValueError(f"❌ Cyclical session features require '{ts_col}' in the dataframe")
+    ts = _coerce_session_timestamp_series(
+        df[ts_col],
+        context=f'cyclical_session_features.{ts_col}',
+    )
 
     hour   = ts.dt.hour.fillna(0).astype(float)
     minute = ts.dt.minute.fillna(0).astype(float)

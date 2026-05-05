@@ -125,6 +125,22 @@ def _format_duration_brief(seconds: float | None) -> str:
     return f"{secs:d}s"
 
 
+def _coerce_label_timestamp_series(values, *, context: str) -> pd.Series:
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    ts = pd.to_datetime(series, utc=True, errors='coerce')
+    if not isinstance(ts, pd.Series):
+        ts = pd.Series(ts, index=series.index)
+    ts = ts.dt.tz_localize(None)
+    invalid_mask = ts.isna()
+    if bool(invalid_mask.any()):
+        sample = invalid_mask[invalid_mask].index[:5].tolist()
+        raise ValueError(
+            f"❌ Invalid timestamps in {context}: "
+            f"rows={int(invalid_mask.sum())} sample_indices={sample}"
+        )
+    return ts
+
+
 def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -> float | None:
     done = int(done)
     total = int(total)
@@ -1401,11 +1417,7 @@ def build_causal_event_labels(
 
     # ── 9. timestamps ─────────────────────────────────────────────────────────
     ts_raw = labeled.get("ts_event", pd.Series(pd.RangeIndex(n)))
-    ts     = pd.to_datetime(ts_raw, utc=True, errors="coerce").dt.tz_localize(None)
-    if ts.isna().all():
-        ts = pd.Series(pd.date_range("2026-01-01", periods=n, freq="s"))
-    else:
-        ts = ts.ffill().bfill()
+    ts = _coerce_label_timestamp_series(ts_raw, context='labels_v19.ts_event')
 
     end_idx = np.minimum(end_idx_arr, n - 1).astype(np.int32)
     prices  = labeled["close"].astype(np.float64).values

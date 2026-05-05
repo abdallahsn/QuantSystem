@@ -272,23 +272,6 @@ python -m py_compile \
   modules/slippage_model.py
 ```
 
-```bash
-pytest -q test_training_robustness.py test_leakage_guards.py
-```
-
-```bash
-pytest -q \
-  test_backtest_alignment.py \
-  test_catboost_rsm_regime.py \
-  test_feature_scaler_v19.py \
-  test_prepare_training_data_label_compat.py \
-  test_v19_labels.py
-```
-
-```bash
-python test_system.py
-```
-
 للتحقق التشغيلي النهائي على artifact حقيقي:
 
 ```bash

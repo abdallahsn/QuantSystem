@@ -139,6 +139,7 @@ def _apply_decision_policy_to_bars(
             structure_bucket=structure_bucket_from_row(row),
             uncertainty=float(max(0.0, 1.0 - float(row.get("cb_confidence", 0.0) or 0.0))),
             runtime_penalty=1.0,
+            coverage_ratio=1.0,  # coverage gate is for training data sufficiency, not inference
         )
         decisions.append(decision)
 
@@ -1055,12 +1056,23 @@ def generate_catboost_5m_report(
     policy_available = bool(decision_policy) and bool(apply_decision_policy)
     pre_rsm_direction_counts = bars["cb_direction"].value_counts().to_dict() if not bars.empty else {}
     if apply_rsm and RSM_AVAILABLE and len(bars):
-        bars["cb_direction_raw"] = bars["cb_direction"].astype(str)
-        bars = apply_range_filter_to_dataframe(bars, regime_col="regime_label")
+        bars["cb_direction_raw"] = bars.get("cb_direction_model_raw", bars["cb_direction"]).astype(str)
+        # Feed raw model direction to RSM, not policy-filtered direction
+        rsm_input_col = "cb_direction_model_raw" if "cb_direction_model_raw" in bars.columns else "cb_direction"
+        rsm_conf_col = "cb_confidence_model_raw" if "cb_confidence_model_raw" in bars.columns else "cb_confidence"
+        bars = apply_range_filter_to_dataframe(
+            bars,
+            signal_col=rsm_input_col,
+            conf_col=rsm_conf_col,
+            regime_col="regime_label",
+        )
         if "rsm_direction" in bars.columns:
+            # Final direction: must pass BOTH policy AND RSM independently
+            policy_allows = bars["cb_direction_policy"].astype(str).ne("NEUTRAL") if "cb_direction_policy" in bars.columns else pd.Series(True, index=bars.index)
+            rsm_allows = bars["rsm_action"].astype(str).eq("ENTER")
             bars["cb_direction"] = np.where(
-                bars.get("rsm_action", "HOLD").astype(str).eq("ENTER"),
-                bars.get("rsm_direction", bars["cb_direction"]).astype(str),
+                rsm_allows & policy_allows,
+                bars["rsm_direction"].astype(str),
                 "NEUTRAL",
             )
             bars["cb_direction_idx"] = bars["cb_direction"].map({"LONG": 0, "SHORT": 1}).fillna(2).astype(int)

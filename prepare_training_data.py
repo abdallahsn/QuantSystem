@@ -478,29 +478,109 @@ SETUP_SPOOFING   = 1
 SETUP_OBI        = 2
 SETUP_MIXED      = 3
 
-def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _first_present_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _coerce_naive_timestamp_series(values, *, context: str) -> pd.Series:
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    ts = pd.to_datetime(series, utc=True, errors='coerce')
+    if not isinstance(ts, pd.Series):
+        ts = pd.Series(ts, index=series.index)
+    ts = ts.dt.tz_localize(None)
+    invalid_mask = ts.isna()
+    if bool(invalid_mask.any()):
+        sample = invalid_mask[invalid_mask].index[:5].tolist()
+        raise ValueError(
+            f"❌ Invalid timestamps in {context}: "
+            f"rows={int(invalid_mask.sum())} sample_indices={sample}"
+        )
+    return ts
+
+
+def _coerce_naive_timestamp_scalar(value, *, context: str) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors='coerce')
+    if pd.isna(ts):
+        raise ValueError(f"❌ Invalid timestamp in {context}: value={value!r}")
+    return ts.tz_convert(None) if getattr(ts, 'tzinfo', None) is not None else pd.Timestamp(ts)
+
+
+def _validate_input_schema(df: pd.DataFrame, *, kind: str) -> None:
+    missing: list[str] = []
+    if _first_present_column(df, ('ts_event', 'ts_recv')) is None:
+        missing.append('timestamp column (ts_event or ts_recv)')
+    if _first_present_column(df, ('symbol', 'instrument_id')) is None:
+        missing.append('contract column (symbol or instrument_id)')
+
+    if kind == 'mbo':
+        if 'price' not in df.columns:
+            missing.append('price')
+        if 'action' not in df.columns:
+            missing.append('action')
+        if 'side' not in df.columns:
+            missing.append('side')
+        if _first_present_column(df, ('size', 'qty', 'quantity', 'volume')) is None:
+            missing.append('size column (size, qty, quantity, or volume)')
+        if 'order_id' not in df.columns:
+            missing.append('order_id')
+    elif kind == 'mbp':
+        if _first_present_column(df, ('bid_px_00', 'ask_px_00', 'price')) is None:
+            missing.append('top-of-book price column (bid_px_00, ask_px_00, or price)')
+    else:
+        raise ValueError(f'Unsupported normalize kind: {kind}')
+
+    if missing:
+        raise ValueError(
+            f"❌ Missing required {kind.upper()} schema fields: {', '.join(missing)}"
+        )
+
+
+def _normalize_databento_columns(df: pd.DataFrame, *, kind: str = 'mbo') -> pd.DataFrame:
     df = df.copy()
+    kind = str(kind or 'mbo').strip().lower()
+    _validate_input_schema(df, kind=kind)
 
     if 'ts_event' not in df.columns and 'ts_recv' in df.columns:
         df['ts_event'] = df['ts_recv']
 
     if 'ts_event' in df.columns:
-        df['ts_event'] = pd.to_datetime(df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
-        df = df[df['ts_event'].notna()].reset_index(drop=True)
+        df['ts_event'] = _coerce_naive_timestamp_series(df['ts_event'], context=f'{kind}.ts_event')
+        df = df.sort_values('ts_event').reset_index(drop=True)
 
     if 'action' in df.columns:
         df['action'] = df['action'].astype(str).str.strip().str.upper()
+        invalid_action = df['action'].isin({'', 'NAN', 'NONE'})
+        if kind == 'mbo' and bool(invalid_action.any()):
+            sample = invalid_action[invalid_action].index[:5].tolist()
+            raise ValueError(
+                f"❌ Invalid MBO action values after normalization: "
+                f"rows={int(invalid_action.sum())} sample_indices={sample}"
+            )
         df = df[df['action'] != 'R'].reset_index(drop=True)
-    else:
-        df['action'] = 'A'
 
     if 'side' in df.columns:
         df['side'] = df['side'].astype(str).str.strip().str.upper().replace('N', 'A')
-    else:
-        df['side'] = 'B'
+        invalid_side = df['side'].isin({'', 'NAN', 'NONE'})
+        if kind == 'mbo' and bool(invalid_side.any()):
+            sample = invalid_side[invalid_side].index[:5].tolist()
+            raise ValueError(
+                f"❌ Invalid MBO side values after normalization: "
+                f"rows={int(invalid_side.sum())} sample_indices={sample}"
+            )
 
     if 'price' in df.columns:
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
+        price = pd.to_numeric(df['price'], errors='coerce')
+        invalid_price = price.isna() | (price <= 0)
+        if kind == 'mbo' and bool(invalid_price.any()):
+            sample = invalid_price[invalid_price].index[:5].tolist()
+            raise ValueError(
+                f"❌ Invalid MBO price values after normalization: "
+                f"rows={int(invalid_price.sum())} sample_indices={sample}"
+            )
+        df['price'] = price
         df = df[df['price'].notna() & (df['price'] > 0)].reset_index(drop=True)
         df['price'] = df['price'].astype('float32')
     else:
@@ -520,7 +600,7 @@ def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
             df = df[df['price'].notna() & (df['price'] > 0)].reset_index(drop=True)
             df['price'] = df['price'].astype('float32')
         else:
-            print('  ⚠️ لا يوجد عمود price!')
+            raise ValueError(f'❌ Unable to derive price for {kind.upper()} input')
 
     if 'size' not in df.columns:
         for alt in ['qty', 'quantity', 'volume']:
@@ -528,13 +608,40 @@ def _normalize_databento_columns(df: pd.DataFrame) -> pd.DataFrame:
                 df['size'] = df[alt]
                 break
     if 'size' in df.columns:
-        df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(1).astype(int)
+        size = pd.to_numeric(df['size'], errors='coerce')
+        if kind == 'mbo':
+            invalid_size = size.isna() | (size <= 0)
+            if bool(invalid_size.any()):
+                sample = invalid_size[invalid_size].index[:5].tolist()
+                raise ValueError(
+                    f"❌ Invalid MBO size values after normalization: "
+                    f"rows={int(invalid_size.sum())} sample_indices={sample}"
+                )
+            df['size'] = size.astype(np.int64)
+        else:
+            df['size'] = size.fillna(0).clip(lower=0).astype(np.int64)
 
-    if 'order_id' not in df.columns:
-        df['order_id'] = range(len(df))
+    if kind == 'mbo':
+        order_id_text = df['order_id'].astype(str).str.strip().str.upper()
+        invalid_order_id = df['order_id'].isna() | order_id_text.isin({'', 'NAN', 'NONE'})
+        if bool(invalid_order_id.any()):
+            sample = invalid_order_id[invalid_order_id].index[:5].tolist()
+            raise ValueError(
+                f"❌ Invalid MBO order_id values after normalization: "
+                f"rows={int(invalid_order_id.sum())} sample_indices={sample}"
+            )
 
     if 'symbol' not in df.columns:
-        df['symbol'] = df['instrument_id'].astype(str) if 'instrument_id' in df.columns else 'UNKNOWN'
+        df['symbol'] = df['instrument_id'].astype(str)
+    symbol_text = df['symbol'].astype(str).str.strip()
+    invalid_symbol = df['symbol'].isna() | symbol_text.isin({'', 'NAN', 'NONE', 'UNKNOWN'})
+    if bool(invalid_symbol.any()):
+        sample = invalid_symbol[invalid_symbol].index[:5].tolist()
+        raise ValueError(
+            f"❌ Invalid contract identifiers after normalization for {kind.upper()}: "
+            f"rows={int(invalid_symbol.sum())} sample_indices={sample}"
+        )
+    df['symbol'] = symbol_text
 
     bid_px_cols = [c for c in df.columns if c.startswith('bid_px_')]
     ask_px_cols = [c for c in df.columns if c.startswith('ask_px_')]
@@ -1009,10 +1116,13 @@ def _canonicalize_input_file(
                 )
             continue
 
-        normalized = _normalize_databento_columns(chunk)
+        normalized = _normalize_databento_columns(chunk, kind=kind)
         if 'ts_event' in normalized.columns:
-            normalized['ts_event'] = pd.to_datetime(normalized['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
-            normalized = normalized.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+            normalized['ts_event'] = _coerce_naive_timestamp_series(
+                normalized['ts_event'],
+                context=f'canonicalize.{kind}.ts_event',
+            )
+            normalized = normalized.sort_values('ts_event').reset_index(drop=True)
         _update_integrity_accumulator(integrity, chunk, normalized)
         write_table(normalized, shard_path, compression='snappy')
         record = _shard_record(shard_path, normalized, shard_idx)
@@ -1513,8 +1623,11 @@ def _process_mbo_chunk(args):
         side   = str(getattr(row,'side','')).strip().upper()
         oid    = getattr(row,'order_id', None)
         raw_t  = getattr(row,'ts_event', None)
-        try:    ts=pd.to_datetime(raw_t); ts_ns=int(ts.value)
-        except: ts=pd.Timestamp.now();   ts_ns=int(ts.value)
+        ts = _coerce_naive_timestamp_scalar(
+            raw_t,
+            context=f'process_mbo_shard.chunk={chunk_id}.row={idx}',
+        )
+        ts_ns = int(ts.value)
 
         micro.process_mbo_tick(action, oid, side, size, price, ts_ns)
         _cr = cancel_eng.process_tick(action, oid, size)
@@ -1668,15 +1781,18 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
     
     cvd        = 0; last_cancel_ratio = 0.0; out = []
 
-    for row in _prog(df_mbo.itertuples(index=False), desc='MBO', total=len(df_mbo)):
+    for row_no, row in enumerate(_prog(df_mbo.itertuples(index=False), desc='MBO', total=len(df_mbo)), start=1):
         price  = float(getattr(row,'price',0) or 0)
         size   = int(getattr(row,'size', getattr(row,'qty', getattr(row,'volume',0))) or 0)
         action = str(getattr(row,'action','')).strip().upper()
         side   = str(getattr(row,'side','')).strip().upper()
         oid    = getattr(row,'order_id', None)
         raw_t  = getattr(row,'ts_event', getattr(row,'timestamp', None))
-        try:    ts=pd.to_datetime(raw_t); ts_ns=int(ts.value)
-        except: ts=pd.Timestamp.now();   ts_ns=int(ts.value)
+        ts = _coerce_naive_timestamp_scalar(
+            raw_t,
+            context=f'process_mbo_rows.row={row_no}',
+        )
+        ts_ns = int(ts.value)
 
         micro.process_mbo_tick(action, oid, side, size, price, ts_ns)
         _cr = cancel_eng.process_tick(action, oid, size)
@@ -1755,7 +1871,10 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         if 'timestamp' in df_mbp.columns
         else pd.Series([pd.NaT] * len(df_mbp), index=df_mbp.index)
     )
-    out['ts_event'] = pd.to_datetime(ts_source, errors='coerce').fillna(pd.Timestamp.now())
+    out['ts_event'] = _coerce_naive_timestamp_series(
+        ts_source,
+        context='process_mbp10.ts_event',
+    )
 
     bid_px_cols = [f'bid_px_{i:02d}' for i in range(10)]
     ask_px_cols = [f'ask_px_{i:02d}' for i in range(10)]
@@ -2365,15 +2484,19 @@ def _build_refinery_split_context(
             'train_idx': np.array([], dtype=np.int32),
         }
 
-    ts = pd.to_datetime(df.get('ts_event', pd.Series(pd.RangeIndex(n))), utc=True, errors='coerce').dt.tz_localize(None)
-    ts = ts.ffill()
-    if ts.isna().any():
-        base = pd.Timestamp('2026-01-01')
-        ts = pd.Series([base + pd.Timedelta(seconds=i) for i in range(n)], index=df.index)
+    if 'ts_event' not in df.columns:
+        raise ValueError('❌ refinery split context requires ts_event in the final artifact')
+    if 'label_end_ts' not in df.columns:
+        raise ValueError('❌ refinery split context requires label_end_ts in the final artifact')
+
+    ts = _coerce_naive_timestamp_series(df['ts_event'], context='refinery_split.ts_event')
 
     split_idx = min(max(int(n * train_frac), 1), max(n - 1, 1))
     split_time = ts.iloc[min(split_idx, n - 1)]
-    label_end = pd.to_datetime(df.get('label_end_ts', ts), utc=True, errors='coerce').dt.tz_localize(None).fillna(ts)
+    label_end = _coerce_naive_timestamp_series(
+        df['label_end_ts'],
+        context='refinery_split.label_end_ts',
+    )
 
     row_ids = np.arange(n)
     train_row_ok = (row_ids < split_idx) & (label_end.values < split_time.to_datetime64())

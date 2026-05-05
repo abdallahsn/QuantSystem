@@ -4,15 +4,24 @@ raw_replay_v19.py - Raw market replay dataset builder for QuantSystem V19
 
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
 import pandas as pd
 
-from modules.feature_artifact_v19 import read_table, write_table
+from modules.feature_artifact_v19 import (
+    FINAL_FEATURE_DIR,
+    load_feature_artifact,
+    parquet_shard_paths,
+    read_table,
+    write_parquet_shards,
+    write_table,
+)
 from prepare_training_data import (
     DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
     DEFAULT_V19_TP_MULT,
+    _build_refinery_split_context,
     run_refinery,
 )
 
@@ -25,8 +34,121 @@ def normalize_ts(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if 'ts_event' not in out.columns and 'ts_recv' in out.columns:
         out['ts_event'] = out['ts_recv']
+    if 'ts_event' not in out.columns:
+        raise ValueError('❌ Replay dataset builder requires ts_event or ts_recv in source data')
     out['ts_event'] = pd.to_datetime(out.get('ts_event'), utc=True, errors='coerce').dt.tz_localize(None)
-    return out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    invalid_mask = out['ts_event'].isna()
+    if bool(invalid_mask.any()):
+        sample = invalid_mask[invalid_mask].index[:5].tolist()
+        raise ValueError(
+            "❌ Replay source contains invalid timestamps: "
+            f"rows={int(invalid_mask.sum())} sample_indices={sample}"
+        )
+    return out.sort_values('ts_event').reset_index(drop=True)
+
+
+def _coerce_optional_timestamp(value):
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    return ts.tz_convert(None) if ts.tzinfo is not None else ts
+
+
+def _rewrite_trimmed_feature_artifact(
+    output_dir: str,
+    *,
+    start_ts=None,
+    end_ts=None,
+) -> dict:
+    score_start = _coerce_optional_timestamp(start_ts)
+    score_end = _coerce_optional_timestamp(end_ts)
+    df = load_feature_artifact(output_dir)
+    if len(df) == 0:
+        raise RuntimeError('❌ Cannot trim an empty replay artifact')
+    if 'ts_event' not in df.columns:
+        raise ValueError('❌ Replay artifact is missing ts_event and cannot be trimmed safely')
+
+    ts = pd.to_datetime(df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    invalid_mask = ts.isna()
+    if bool(invalid_mask.any()):
+        sample = invalid_mask[invalid_mask].index[:5].tolist()
+        raise ValueError(
+            "❌ Replay artifact contains invalid ts_event values after refinery: "
+            f"rows={int(invalid_mask.sum())} sample_indices={sample}"
+        )
+
+    keep_mask = np.ones(len(df), dtype=bool)
+    if score_start is not None:
+        keep_mask &= (ts >= score_start).to_numpy(dtype=bool)
+    if score_end is not None:
+        keep_mask &= (ts < score_end).to_numpy(dtype=bool)
+    trimmed = df.loc[keep_mask].reset_index(drop=True)
+    if trimmed.empty:
+        raise RuntimeError(
+            '❌ Replay artifact trimming removed every row. '
+            f'start_ts={score_start} end_ts={score_end}'
+        )
+
+    final_dir = os.path.join(output_dir, FINAL_FEATURE_DIR)
+    for path in parquet_shard_paths(final_dir):
+        os.remove(path)
+    shard_records = write_parquet_shards(
+        trimmed,
+        final_dir,
+        stem='features',
+        rows_per_shard=250_000,
+    )
+    with open(os.path.join(output_dir, 'final_feature_shards.json'), 'w') as f:
+        json.dump(shard_records, f, indent=2)
+
+    split_ctx = _build_refinery_split_context(trimmed, train_frac=0.80)
+    split_time = split_ctx['split_time']
+    split_meta = {
+        'split_idx': int(split_ctx['split_idx']),
+        'split_time': None if pd.isna(split_time) else str(split_time),
+        'train_rows': int(np.sum(split_ctx['train_row_ok'])),
+        'holdout_rows': int(np.sum(split_ctx['holdout_row_ok'])),
+        'purged_rows': int(np.sum(split_ctx['purged_row_ok'])),
+    }
+    with open(os.path.join(output_dir, 'refinery_split.json'), 'w') as f:
+        json.dump(split_meta, f, indent=2)
+
+    manifest_path = os.path.join(output_dir, 'artifact_manifest.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        metrics = manifest.get('metrics', {}) or {}
+        metrics['rows'] = int(len(trimmed))
+        metrics['event_rows'] = int(
+            pd.to_numeric(trimmed.get('event_flag', 0), errors='coerce')
+            .fillna(0)
+            .astype(np.int8)
+            .sum()
+        ) if len(trimmed) else 0
+        manifest['metrics'] = metrics
+
+        extra = manifest.get('extra', {}) or {}
+        extra['rows'] = int(len(trimmed))
+        extra['ts_min'] = str(ts.loc[keep_mask].min())
+        extra['ts_max'] = str(ts.loc[keep_mask].max())
+        extra['split_meta'] = split_meta
+        extra['final_feature_shards'] = shard_records
+        extra['score_window_trim'] = {
+            'applied': True,
+            'rows_before': int(len(df)),
+            'rows_after': int(len(trimmed)),
+            'score_start_ts': None if score_start is None else str(score_start),
+            'score_end_ts': None if score_end is None else str(score_end),
+        }
+        manifest['extra'] = extra
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+    return {
+        'trimmed_rows_before': int(len(df)),
+        'trimmed_rows_after': int(len(trimmed)),
+        'split_meta': split_meta,
+    }
 
 
 def _slice_timerange_with_row_context(
@@ -125,6 +247,7 @@ def build_replay_dataset(
     fit_aux_models: bool = True,
     warmup_rows: int = 0,
     tail_rows: int = 0,
+    trim_to_score_window: bool = False,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     raw_dir = os.path.join(output_dir, 'raw_slice')
@@ -188,6 +311,14 @@ def build_replay_dataset(
         fit_aux_models=fit_aux_models,
     )
 
+    trim_meta = None
+    if trim_to_score_window:
+        trim_meta = _rewrite_trimmed_feature_artifact(
+            output_dir,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+
     return {
         'output_dir': output_dir,
         'mbo_slice': mbo_slice,
@@ -202,6 +333,8 @@ def build_replay_dataset(
             'score_end_ts': None if end_ts is None else str(pd.Timestamp(end_ts)),
             'warmup_rows': int(max(warmup_rows, 0)),
             'tail_rows': int(max(tail_rows, 0)),
+            'trim_to_score_window': bool(trim_to_score_window),
+            'trim_meta': trim_meta,
             'mbo': mbo_window,
             'mbp': mbp_window,
         },

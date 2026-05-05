@@ -280,6 +280,8 @@ def run_walkforward(
             regime_progress_every=int(ref_cfg.get('regime_progress_every', 25000)),
             lob_event_sample=int(ref_cfg.get('lob_event_sample', 100000)),
             merge_tolerance_ms=int(ref_cfg.get('merge_tolerance_ms', 500)),
+            tail_rows=tail_rows,
+            trim_to_score_window=True,
         )
         train_summary = run_training_pipeline(
             csv_path=train_build['csv'],

@@ -48,6 +48,17 @@ REGIME_TRADEABLE = {
 }
 
 
+def _past_only_numeric_series(values, *, index, context: str, fill_value: float = 0.0) -> pd.Series:
+    series = pd.to_numeric(values, errors='coerce')
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series, index=index)
+    if len(series) == 0:
+        return pd.Series(dtype=np.float64, index=index)
+    if series.notna().sum() == 0:
+        raise ValueError(f'❌ {context} has no valid numeric observations')
+    return series.ffill().fillna(float(fill_value)).astype(np.float64)
+
+
 def _resolve_cvd_level(df: pd.DataFrame) -> pd.Series:
     if 'cvd' in df.columns:
         base = pd.to_numeric(df.get('cvd'), errors='coerce')
@@ -55,15 +66,22 @@ def _resolve_cvd_level(df: pd.DataFrame) -> pd.Series:
         base = pd.to_numeric(df.get('cvd_delta'), errors='coerce').fillna(0.0).cumsum()
     else:
         base = pd.Series(np.zeros(len(df)), index=df.index, dtype=np.float64)
-    return base.ffill().bfill().fillna(0.0).astype(np.float64)
+    return _past_only_numeric_series(
+        base,
+        index=df.index,
+        context='regime_classifier.cvd',
+        fill_value=0.0,
+    )
 
 def _build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     features = pd.DataFrame(index=df.index)
 
-    price = pd.to_numeric(
+    price = _past_only_numeric_series(
         df.get('price', pd.Series(np.zeros(len(df)), index=df.index)),
-        errors='coerce',
-    ).ffill().bfill().fillna(0.0)
+        index=df.index,
+        context='regime_classifier.price',
+        fill_value=0.0,
+    )
 
     if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
         features['volatility'] = (df['high'] - df['low']) / df['close'].clip(lower=1e-8)
@@ -742,9 +760,17 @@ class WassersteinRegimeClassifier:
         return feats
 
     def fit(self, df: pd.DataFrame) -> 'WassersteinRegimeClassifier':
-        prices  = df['price'].ffill().bfill().values.astype(np.float64) \
-                  if 'price' in df.columns else \
-                  df['close'].ffill().bfill().values.astype(np.float64)
+        price_series = (
+            df['price']
+            if 'price' in df.columns
+            else df['close']
+        )
+        prices = _past_only_numeric_series(
+            price_series,
+            index=df.index,
+            context='wasserstein_regime.fit.price',
+            fill_value=0.0,
+        ).to_numpy(dtype=np.float64)
         volumes = df['volume'].fillna(0).values.astype(np.float64) \
                   if 'volume' in df.columns else \
                   pd.to_numeric(df.get('size', pd.Series(np.ones(len(df)), index=df.index)), errors='coerce').fillna(0).values.astype(np.float64)
@@ -766,9 +792,17 @@ class WassersteinRegimeClassifier:
         if not self._fitted:
             raise RuntimeError("WassersteinRegimeClassifier: call fit() first")
 
-        prices  = df['price'].ffill().bfill().values.astype(np.float64) \
-                  if 'price' in df.columns else \
-                  df['close'].ffill().bfill().values.astype(np.float64)
+        price_series = (
+            df['price']
+            if 'price' in df.columns
+            else df['close']
+        )
+        prices = _past_only_numeric_series(
+            price_series,
+            index=df.index,
+            context='wasserstein_regime.predict.price',
+            fill_value=0.0,
+        ).to_numpy(dtype=np.float64)
         volumes = df['volume'].fillna(0).values.astype(np.float64) \
                   if 'volume' in df.columns else \
                   pd.to_numeric(df.get('size', pd.Series(np.ones(len(df)), index=df.index)), errors='coerce').fillna(0).values.astype(np.float64)
