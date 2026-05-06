@@ -108,6 +108,13 @@ except ImportError as exc:
     build_causal_event_labels = None
 
 try:
+    from modules.soft_label_engine import SoftLabelConfig
+    SOFT_LABEL_CONFIG_AVAILABLE = True
+except ImportError:
+    SoftLabelConfig = None
+    SOFT_LABEL_CONFIG_AVAILABLE = False
+
+try:
     from tqdm import tqdm
     def _prog(it, desc='', total=None, **kw): return tqdm(it, desc=desc, total=total)
 except ImportError:
@@ -220,6 +227,63 @@ def _estimate_remaining_seconds(done: int, total: int, elapsed_seconds: float) -
     if rate <= 0:
         return None
     return (total - done) / rate
+
+
+def _resolve_soft_label_runtime_config(
+    *,
+    config_path: str | None = None,
+    enabled: bool = True,
+    mode: str | None = None,
+    n_scenarios: int | None = None,
+    random_seed: int | None = None,
+    horizon_std: float | None = None,
+    tp_std: float | None = None,
+    sl_std: float | None = None,
+):
+    cfg = load_v19_config(config_path).get('soft_labels', {}) or {}
+    if not bool(enabled):
+        return None, {
+            'enabled': False,
+            'available': bool(SOFT_LABEL_CONFIG_AVAILABLE),
+            'mode': None,
+        }
+
+    resolved_mode = str(mode or cfg.get('mode', 'analytical')).strip().lower()
+    if resolved_mode not in {'analytical', 'monte_carlo'}:
+        raise ValueError(
+            f"❌ Unsupported soft_label mode: {resolved_mode!r}. "
+            "Use 'analytical' or 'monte_carlo'."
+        )
+
+    report = {
+        'enabled': True,
+        'available': bool(SOFT_LABEL_CONFIG_AVAILABLE),
+        'mode': resolved_mode,
+        'n_scenarios': int(n_scenarios if n_scenarios is not None else cfg.get('n_scenarios', 50)),
+        'random_seed': int(random_seed if random_seed is not None else cfg.get('random_seed', 42)),
+        'horizon_std': float(horizon_std if horizon_std is not None else cfg.get('horizon_std', 0.15)),
+        'tp_std': float(tp_std if tp_std is not None else cfg.get('tp_std', 0.10)),
+        'sl_std': float(sl_std if sl_std is not None else cfg.get('sl_std', 0.10)),
+    }
+    if not SOFT_LABEL_CONFIG_AVAILABLE or SoftLabelConfig is None:
+        return None, report
+
+    config = SoftLabelConfig(
+        mode=resolved_mode,
+        n_scenarios=report['n_scenarios'],
+        horizon_std=report['horizon_std'],
+        tp_std=report['tp_std'],
+        sl_std=report['sl_std'],
+        random_seed=report['random_seed'],
+        strong_quality_boost=float(cfg.get('strong_quality_boost', 1.30)),
+        weak_quality_boost=float(cfg.get('weak_quality_boost', 1.00)),
+        min_sample_weight=float(cfg.get('min_sample_weight', 0.10)),
+        confidence_weight_power=float(cfg.get('confidence_weight_power', 1.0)),
+        min_confidence_threshold=float(cfg.get('min_confidence_threshold', 0.30)),
+        timeout_sigmoid_scale=float(cfg.get('timeout_sigmoid_scale', 1.5)),
+        timeout_soft_label_range=float(cfg.get('timeout_soft_label_range', 0.40)),
+    )
+    return config, report
 
 
 class _RefineryProgressTracker:
@@ -434,7 +498,7 @@ FEATURE_COLS = [
     # ── Core Statistical Surface + Dynamic Order-Book Context ───────────
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
-    'micro_atr', 'rel_vol', 'volume_burst', 'inter_event_time',
+    'micro_atr', 'volume_burst', 'inter_event_time',
     'micro_price', 'bid_wall_strength', 'ask_wall_strength',
     'distance_to_wall', 'gap_size', 'liquidity_density',
     'fisher_signal', 'anomaly',
@@ -505,7 +569,20 @@ CATBOOST_ADVISOR_FEATURES = [
 
 RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]
-LEAN_RAW_FEATURE_COLS = [f'{RAW_STAT_PREFIX}rel_vol']
+SOFT_LABEL_ARTIFACT_COLS = [
+    'path_outcome',
+    'adverse_path_flag',
+    'bias_label_detail',
+    'neutral_reason',
+    'timeout_move_exceeded_band',
+    'label_dynamic_threshold',
+    'effective_horizon',
+    'soft_label',
+    'label_confidence',
+    'soft_label_long',
+    'soft_label_short',
+    'soft_sample_weight',
+]
 
 # V19 Meta-Features — مخرجات CatBoost تُضاف للـ LSTM
 META_FEATURE_COLS = resolve_meta_feature_names(include_xgboost=True)  # N = 11
@@ -701,7 +778,7 @@ def _normalize_databento_columns(df: pd.DataFrame, *, kind: str = 'mbo') -> pd.D
                 hi = q3 + 5 * iqr
                 vals = vals.where(vals <= hi, 0)
         df[col] = vals.astype('float32')
-        
+
     for col in bid_sz_cols + ask_sz_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
@@ -1629,7 +1706,7 @@ def _process_mbo_chunk(args):
     from modules.fim_anomaly      import FastFIMDetector
     from modules.context_features import MomentumContextEngine, LiquiditySweepDetector, DailyContextEngine
     from modules.session_features import SessionVWAPEngine
-    
+
     micro      = FastMicrostructureEngine()
     tape       = FastTapeSpeedTracker()
     mv         = MicroVolatilityEngine()
@@ -1641,12 +1718,12 @@ def _process_mbo_chunk(args):
 
     sweep_thresh   = cal_params.get('sweep_thresh', 0.05)
     min_price_move = cal_params.get('min_price_move', 0.25)
-    
+
     absorb     = AbsorptionIntensityEngine(min_price_move=min_price_move)
     cancel_eng = CancelRatioEngine()
     ctx        = MomentumContextEngine()
     sweep      = LiquiditySweepDetector(sweep_threshold=sweep_thresh)
-    
+
     # 🔴 محركات السياق الجديدة
     daily_ctx  = DailyContextEngine(
         default_adr=80.0 * cal_params.get('tick_size', 0.0001),
@@ -1688,22 +1765,22 @@ def _process_mbo_chunk(args):
 
         if action in TRADE_ACTIONS:
             is_buy = False
-            if side in ('B','BID'):   
+            if side in ('B','BID'):
                 cvd += size
                 is_buy = True
-            elif side in ('A','ASK'): 
+            elif side in ('A','ASK'):
                 cvd -= size
-            
+
             aii                      = absorb.update(price, cvd)
             fs                       = fisher.update_and_get_signal(price, cvd)
             an                       = fim.detect_stop_hunts(price)
             cvd_mom, cvd_div, t_str, corr_d = ctx.update(price, cvd)
             kyle_val                 = kyle.update(price, size)
             vnet_val                 = vnet.update(price, size, side)
-            
+
             # 🔴 تحديث الـ VWAP
             cur_vwap, v_zscore, v_slope, sess_cvd = vwap_eng.update(ts, price, float(size), is_buy)
-            
+
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
                 '__emit': int(getattr(row, '__emit', 1) or 0),
@@ -1720,7 +1797,7 @@ def _process_mbo_chunk(args):
                 'vnet':vnet_val, 'liquidity_gaps':0.0,
                 # الفيتشرز الجديدة
                 'ib_status': ib_stat, 'remaining_fuel': r_fuel, 'fuel_exhausted': f_exh,
-                'current_vwap': cur_vwap, 'vwap_z_score': v_zscore, 
+                'current_vwap': cur_vwap, 'vwap_z_score': v_zscore,
                 'vwap_slope': v_slope, 'session_cvd': sess_cvd
             })
 
@@ -1815,14 +1892,14 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
     vnet       = engines['vnet']
     tape       = FastTapeSpeedTracker()
     mv         = MicroVolatilityEngine()
-    
+
     # 🔴 محركات السياق الجديدة
     daily_ctx  = DailyContextEngine(
         default_adr=80.0 * cal_params.get('tick_size', 0.0001),
         tick_size=cal_params.get('tick_size', 0.0001),
     )
     vwap_eng   = SessionVWAPEngine()
-    
+
     cvd        = 0; last_cancel_ratio = 0.0; out = []
 
     for row_no, row in enumerate(_prog(df_mbo.itertuples(index=False), desc='MBO', total=len(df_mbo)), start=1):
@@ -1852,21 +1929,21 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
 
         if action in TRADE_ACTIONS:
             is_buy = False
-            if side in ('B','BID'):   
+            if side in ('B','BID'):
                 cvd += size
                 is_buy = True
-            elif side in ('A','ASK'): 
+            elif side in ('A','ASK'):
                 cvd -= size
-            
+
             aii                      = absorb.update(price, cvd)
             fs                       = fisher.update_and_get_signal(price, cvd)
             an                       = fim.detect_stop_hunts(price)
             cvd_mom, cvd_div, t_str, corr_d = ctx.update(price, cvd)
             kyle_val                 = kyle.update(price, size)
             vnet_val                 = vnet.update(price, size, side)
-            
+
             cur_vwap, v_zscore, v_slope, sess_cvd = vwap_eng.update(ts, price, float(size), is_buy)
-            
+
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
                 '__emit': int(getattr(row, '__emit', 1) or 0),
@@ -1882,7 +1959,7 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
                 'kyle_lambda':kyle_val, 'hawkes_intensity':hawkes_val,
                 'vnet':vnet_val, 'liquidity_gaps':0.0,
                 'ib_status': ib_stat, 'remaining_fuel': r_fuel, 'fuel_exhausted': f_exh,
-                'current_vwap': cur_vwap, 'vwap_z_score': v_zscore, 
+                'current_vwap': cur_vwap, 'vwap_z_score': v_zscore,
                 'vwap_slope': v_slope, 'session_cvd': sess_cvd
             })
 
@@ -1895,32 +1972,6 @@ def _add_rolling_context(df: pd.DataFrame) -> pd.DataFrame:
     df['cvd_roc_200'] = df['cvd'].diff(200).fillna(0)
     df['cvd_accel'] = df['cvd_roc_10'] - df['cvd_roc_50']
     df['volume_accel'] = df['volume_burst'].diff(10).fillna(0)
-    return df
-
-
-def _add_relative_volatility(
-    df: pd.DataFrame,
-    *,
-    atr_col: str = 'micro_atr',
-    window: int = 200,
-) -> pd.DataFrame:
-    """
-    Causal relative volatility:
-      rel_vol[t] = micro_atr[t] / mean(micro_atr[t-window+1:t])
-
-    لا يوجد lookahead هنا لأن rolling mean يعتمد على الصف الحالي وما قبله فقط.
-    """
-    df = df.copy()
-
-    if atr_col not in df.columns:
-        df['rel_vol'] = np.float32(1.0)
-        return df
-
-    atr = pd.to_numeric(df[atr_col], errors='coerce').abs().fillna(0.0)
-    baseline = atr.rolling(window=max(int(window), 1), min_periods=1).mean()
-    baseline = baseline.replace(0.0, np.nan)
-    rel_vol = (atr / baseline).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    df['rel_vol'] = rel_vol.astype(np.float32)
     return df
 
 def _process_mbp10(df_mbp, tick_size: float = 0.0001):
@@ -2766,8 +2817,6 @@ def _normalize_and_save(
         if col not in df.columns:
             df[col] = 0.0
         df[raw_col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(np.float32)
-    if 'rel_vol' in df.columns:
-        df[f'{RAW_STAT_PREFIX}rel_vol'] = pd.to_numeric(df['rel_vol'], errors='coerce').fillna(1.0).astype(np.float32)
 
     # ══════════════════════════════════════════════════════════
     # ANTI-LEAKAGE FIX: FIT scaler على train split فقط (80%)
@@ -2978,12 +3027,9 @@ def _normalize_and_save(
                  'is_expansion', 'event_flag', 'train_event_flag', 'event_score', 'event_trigger_count',
                  'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
-                 'bias_label_raw', 'effective_threshold_ticks', 'effective_tp_long_ticks',
-                 'effective_tp_short_ticks', 'effective_sl_ticks', 'meta_trade_side',
-                 'meta_label', 'meta_label_active', 'meta_outcome_ticks', 'soft_label',
-                 'soft_label_confidence', 'soft_label_entropy', 'soft_label_scenarios',
                  'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
-    raw_stat_cols = [c for c in (RAW_STAT_FEATURE_COLS + LEAN_RAW_FEATURE_COLS) if c in df.columns]
+    meta_cols += [c for c in SOFT_LABEL_ARTIFACT_COLS if c in df.columns]
+    raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
 
     final_dir = _artifact_phase_dir(output_dir, FINAL_FEATURE_DIR)
@@ -3086,26 +3132,20 @@ def run_refinery(
     target_bars=500,
     label_horizon: int = 150,          # FIX: 50 → 150 (يتوافق مع شمعة 5 دقائق)
     event_roll_window: int = 50,
+    feature_roll_window: int = 150,
     direction_threshold_ticks: float = DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
-    causal_threshold_mode: str = 'fixed',
+    causal_threshold_mode: str = 'expanding',
     raw_event_target_rate: float = DEFAULT_RAW_EVENT_TARGET_RATE,
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
-    training_event_score_threshold: float | None = 0.0,
+    training_event_score_threshold: float | None = None,
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
     tp_mult: float = DEFAULT_V19_TP_MULT,
     sl_mult: float = 1.0,
-    tp_sl_threshold_mode: str = 'fixed',
-    adaptive_horizon: bool = False,
-    trend_filter: bool = False,
+    adaptive_horizon: bool = True,
+    trend_filter: bool = True,
     trend_filter_strict: bool = False,
-    emit_meta_labels: bool = True,
-    soft_label_scenarios: int = 0,
-    soft_label_seed: int = 42,
-    soft_label_horizon_jitter: float = 0.20,
-    soft_label_tp_jitter: float = 0.15,
-    soft_label_sl_jitter: float = 0.15,
     kalman_slope_threshold: float = 0.05,   # FIX: 1e-5 → 0.05
     trend_strength_min: float = 0.05,
     regime_mode: str = 'rules',
@@ -3117,6 +3157,15 @@ def run_refinery(
     merge_tolerance_ms: int = 500,
     shard_warmup_rows: int = 5_000,
     step4_min_parallel_rows: int = 250_000,
+    use_soft_labels: bool = True,         # FIX-12
+    soft_label_mode: str | None = None,
+    soft_label_n_scenarios: int | None = None,
+    soft_label_random_seed: int | None = None,
+    soft_label_horizon_std: float | None = None,
+    soft_label_tp_std: float | None = None,
+    soft_label_sl_std: float | None = None,
+    config_path: str | None = None,
+    **legacy_kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
@@ -3144,6 +3193,35 @@ def run_refinery(
     )
 
     _require_causal_label_runtime(label_mode)
+    if legacy_kwargs:
+        print(
+            "  ⚠️ Ignoring legacy refinery args not supported by the current V19 runtime: "
+            f"{sorted(str(k) for k in legacy_kwargs)}"
+        )
+
+    soft_label_config, soft_label_runtime = _resolve_soft_label_runtime_config(
+        config_path=config_path,
+        enabled=use_soft_labels,
+        mode=soft_label_mode,
+        n_scenarios=soft_label_n_scenarios,
+        random_seed=soft_label_random_seed,
+        horizon_std=soft_label_horizon_std,
+        tp_std=soft_label_tp_std,
+        sl_std=soft_label_sl_std,
+    )
+    if bool(use_soft_labels):
+        if bool(soft_label_runtime.get('available', False)):
+            print(
+                "  🧪 Soft Labels: "
+                f"mode={soft_label_runtime.get('mode')} | "
+                f"n_scenarios={int(soft_label_runtime.get('n_scenarios', 0))} | "
+                f"seed={int(soft_label_runtime.get('random_seed', 0))} | "
+                f"horizon_std={float(soft_label_runtime.get('horizon_std', 0.0)):.3f} | "
+                f"tp_std={float(soft_label_runtime.get('tp_std', 0.0)):.3f} | "
+                f"sl_std={float(soft_label_runtime.get('sl_std', 0.0)):.3f}"
+            )
+        else:
+            print("  ⚠️ Soft labels requested but modules.soft_label_engine is unavailable.")
 
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
     deeplob_enabled = bool(mbp_exists and _load_deeplob_components())
@@ -3424,9 +3502,6 @@ def run_refinery(
     df_merged['garch_vol']    = garch_df['garch_vol'].values
     df_merged['garch_regime'] = garch_df['garch_regime'].values
     print(f"  ✅ GARCH: vol range=[{df_merged['garch_vol'].min():.6f}, {df_merged['garch_vol'].max():.6f}]")
-
-    print("  ✅ Relative Volatility...")
-    df_merged = _add_relative_volatility(df_merged, atr_col='micro_atr', window=200)
     pipeline_tracker.finish(rows=int(len(df_merged)))
 
     print("\n⚙️  Step 3c — Fractional Differentiation...")
@@ -3451,23 +3526,17 @@ def run_refinery(
             df_merged,
             horizon=label_horizon,
             event_roll_window=event_roll_window,
+            feature_roll_window=feature_roll_window,
             direction_threshold_ticks=direction_threshold_ticks,
+            adaptive_horizon=adaptive_horizon,
+            trend_filter=trend_filter,
+            trend_filter_strict=trend_filter_strict,
             causal_threshold_mode=causal_threshold_mode,
             raw_event_target_rate=raw_event_target_rate,
             training_event_target_rate=training_event_target_rate,
             training_event_score_threshold=training_event_score_threshold,
             tp_mult=tp_mult,
             sl_mult=sl_mult,
-            tp_sl_threshold_mode=tp_sl_threshold_mode,
-            adaptive_horizon=adaptive_horizon,
-            trend_filter=trend_filter,
-            trend_filter_strict=trend_filter_strict,
-            emit_meta_labels=emit_meta_labels,
-            soft_label_scenarios=soft_label_scenarios,
-            soft_label_seed=soft_label_seed,
-            soft_label_horizon_jitter=soft_label_horizon_jitter,
-            soft_label_tp_jitter=soft_label_tp_jitter,
-            soft_label_sl_jitter=soft_label_sl_jitter,
             neutral_mult=0.45,
             tick_size=_tick,
             execution_cost_pips=float(label_economics['effective_cost_ticks']),
@@ -3476,6 +3545,8 @@ def run_refinery(
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
             min_parallel_rows=step4_min_parallel_rows,
+            use_soft_labels=use_soft_labels,          # FIX-12
+            soft_label_config=soft_label_config,
         )
         pipeline_tracker.finish(rows=int(len(df_labeled)))
     else:
@@ -3763,23 +3834,19 @@ def run_refinery(
             'shard_warmup_rows': int(max(shard_warmup_rows, 0)),
             'label_horizon': int(label_horizon),
             'event_roll_window': int(event_roll_window),
+            'feature_roll_window': int(feature_roll_window),
             'direction_threshold_ticks': float(direction_threshold_ticks),
+            'adaptive_horizon': bool(adaptive_horizon),
+            'trend_filter': bool(trend_filter),
+            'trend_filter_strict': bool(trend_filter_strict),
             'causal_threshold_mode': str(causal_threshold_mode),
             'raw_event_target_rate': float(raw_event_target_rate),
             'training_event_target_rate': float(training_event_target_rate),
             'training_event_score_threshold': None if training_event_score_threshold is None else float(training_event_score_threshold),
             'tp_mult': float(tp_mult),
             'sl_mult': float(sl_mult),
-            'tp_sl_threshold_mode': str(tp_sl_threshold_mode),
-            'adaptive_horizon': bool(adaptive_horizon),
-            'trend_filter': bool(trend_filter),
-            'trend_filter_strict': bool(trend_filter_strict),
-            'emit_meta_labels': bool(emit_meta_labels),
-            'soft_label_scenarios': int(max(soft_label_scenarios, 0)),
-            'soft_label_seed': int(soft_label_seed),
-            'soft_label_horizon_jitter': float(soft_label_horizon_jitter),
-            'soft_label_tp_jitter': float(soft_label_tp_jitter),
-            'soft_label_sl_jitter': float(soft_label_sl_jitter),
+            'use_soft_labels': bool(use_soft_labels),
+            'soft_labels': soft_label_runtime,
             'label_execution_cost_ticks': float(label_economics['effective_cost_ticks']),
             'label_stop_floor_ticks': float(label_economics['stop_floor_ticks']),
             'label_base_tp_floor_ticks': float(label_economics['base_tp_floor_ticks']),
@@ -3860,90 +3927,92 @@ def _load_deeplob_components() -> bool:
     return DEEPLOB_AVAILABLE
 
 if __name__=='__main__':
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', default=None, help='optional config file to override defaults')
+    pre_args, _ = pre.parse_known_args()
+    _cfg = load_v19_config(pre_args.config)
+    _refinery_defaults = _cfg.get('refinery', {}) or {}
+    _soft_defaults = _cfg.get('soft_labels', {}) or {}
+
     p = argparse.ArgumentParser(description='QuantSystem V19 Data Refinery')
+    p.add_argument('--config', default=pre_args.config, help='optional config file to override defaults')
     p.add_argument('--mbo',        required=True)
     p.add_argument('--mbp',        required=True)
     p.add_argument('--symbol',     default='')
-    p.add_argument('--output',     default='outputs')
-    p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=2_000_000)
-    p.add_argument('--label_mode', choices=['v19'], default='v19')
-    p.add_argument('--n_workers',   type=int, default=None)
-    p.add_argument('--mbo_workers', type=int, default=None)
-    p.add_argument('--mbp_workers', type=int, default=None)
-    p.add_argument('--resume', action='store_true')
-    p.add_argument('--shard_warmup_rows', type=int, default=5_000)
-    p.add_argument('--target_bars', type=int, default=500,
+    p.add_argument('--output',     default=_refinery_defaults.get('output_dir', 'outputs'))
+    p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(_refinery_defaults.get('chunk_rows', _refinery_defaults.get('chunksize', 2_000_000))))
+    p.add_argument('--label_mode', choices=['v19'], default=str(_refinery_defaults.get('label_mode', 'v19')))
+    p.add_argument('--n_workers',   type=int, default=_refinery_defaults.get('n_workers'))
+    p.add_argument('--mbo_workers', type=int, default=_refinery_defaults.get('mbo_workers'))
+    p.add_argument('--mbp_workers', type=int, default=_refinery_defaults.get('mbp_workers'))
+    p.add_argument('--resume', action='store_true', default=bool(_refinery_defaults.get('resume', False)))
+    p.add_argument('--shard_warmup_rows', type=int, default=int(_refinery_defaults.get('shard_warmup_rows', 5_000)))
+    p.add_argument('--target_bars', type=int, default=int(_refinery_defaults.get('target_bars', 500)),
                    help='عدد الـ Volume Bars لكل session (500=swing, 200=scalp, 1000=position)')
-    p.add_argument('--label_horizon', type=int, default=150,
+    p.add_argument('--label_horizon', type=int, default=int(_refinery_defaults.get('label_horizon', 150)),
                    help='Base forward horizon for causal labels (default: 150)')
-    p.add_argument('--event_roll_window', type=int, default=50,
+    p.add_argument('--event_roll_window', type=int, default=int(_refinery_defaults.get('event_roll_window', 50)),
                    help='Rolling window for event filter (default: 50)')
-    p.add_argument('--direction_threshold_ticks', type=float, default=DEFAULT_V19_DIRECTION_THRESHOLD_TICKS,
+    p.add_argument('--feature_roll_window', type=int, default=int(_refinery_defaults.get('feature_roll_window', 150)),
+                   help='Rolling window used by the label feature-engineering stage (default: 150)')
+    p.add_argument('--direction_threshold_ticks', type=float, default=float(_refinery_defaults.get('direction_threshold_ticks', DEFAULT_V19_DIRECTION_THRESHOLD_TICKS)),
                    help=f'Directional threshold floor in ticks (default: {DEFAULT_V19_DIRECTION_THRESHOLD_TICKS:.1f})')
-    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default='fixed',
-                   help='threshold mode for train_event_flag selection (default: fixed)')
-    p.add_argument('--raw_event_target_rate', type=float, default=DEFAULT_RAW_EVENT_TARGET_RATE,
+    p.add_argument('--causal_threshold_mode', choices=['expanding', 'fixed'], default=str(_refinery_defaults.get('causal_threshold_mode', 'expanding')),
+                   help='threshold mode for train_event_flag selection (default: expanding)')
+    p.add_argument('--raw_event_target_rate', type=float, default=float(_refinery_defaults.get('raw_event_target_rate', DEFAULT_RAW_EVENT_TARGET_RATE)),
                    help=f'target keep-rate for broad event_flag (default: {DEFAULT_RAW_EVENT_TARGET_RATE:.2f})')
-    p.add_argument('--training_event_target_rate', type=float, default=DEFAULT_TRAINING_EVENT_TARGET_RATE,
+    p.add_argument('--training_event_target_rate', type=float, default=float(_refinery_defaults.get('training_event_target_rate', DEFAULT_TRAINING_EVENT_TARGET_RATE)),
                    help=f'target keep-rate for narrower train_event_flag (default: {DEFAULT_TRAINING_EVENT_TARGET_RATE:.2f})')
-    p.add_argument('--training_event_score_threshold', type=float, default=0.0,
-                   help='fixed threshold for train_event_flag score when causal_threshold_mode=fixed (default: 0.0)')
-    p.add_argument('--lob_event_sample', type=int, default=LOB_EVENT_SAMPLE_DEFAULT,
+    p.add_argument('--training_event_score_threshold', type=float, default=_refinery_defaults.get('training_event_score_threshold', None),
+                   help='optional fixed score threshold for train_event_flag selection')
+    p.add_argument('--lob_event_sample', type=int, default=int(_refinery_defaults.get('lob_event_sample', LOB_EVENT_SAMPLE_DEFAULT)),
                    help='Max event-rich emit positions for LOB tensors')
-    p.add_argument('--tp_mult', type=float, default=DEFAULT_V19_TP_MULT,
+    p.add_argument('--tp_mult', type=float, default=float(_refinery_defaults.get('tp_mult', DEFAULT_V19_TP_MULT)),
                    help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V19_TP_MULT:.1f})')
-    p.add_argument('--sl_mult', type=float, default=1.0,
+    p.add_argument('--sl_mult', type=float, default=float(_refinery_defaults.get('sl_mult', 1.0)),
                    help='SL multiplier applied to dynamic threshold (default: 1.0)')
-    p.add_argument('--tp_sl_threshold_mode', choices=['fixed', 'atr'], default='fixed',
-                   help="TP/SL threshold mode for label scan: 'fixed' or 'atr' (default: fixed)")
-    p.set_defaults(
-        adaptive_horizon=False,
-        trend_filter=False,
-        trend_filter_strict=False,
-        emit_meta_labels=True,
-    )
-    p.add_argument('--adaptive_horizon', dest='adaptive_horizon', action='store_true',
-                   help='enable ATR-adaptive forward horizon (default: off)')
-    p.add_argument('--no_adaptive_horizon', dest='adaptive_horizon', action='store_false',
-                   help='disable ATR-adaptive forward horizon')
-    p.add_argument('--trend_filter', dest='trend_filter', action='store_true',
-                   help='enable Kalman trend filter on labels (default: off)')
-    p.add_argument('--no_trend_filter', dest='trend_filter', action='store_false',
-                   help='disable Kalman trend filter on labels')
-    p.add_argument('--trend_filter_strict', dest='trend_filter_strict', action='store_true',
-                   help='if trend filter is enabled, also apply stricter neutral filtering')
-    p.add_argument('--no_trend_filter_strict', dest='trend_filter_strict', action='store_false',
-                   help='disable strict trend filtering')
-    p.add_argument('--emit_meta_labels', dest='emit_meta_labels', action='store_true',
-                   help='emit stable meta-label/context columns (default: on)')
-    p.add_argument('--no_emit_meta_labels', dest='emit_meta_labels', action='store_false',
-                   help='disable meta-label/context column emission')
-    p.add_argument('--soft_label_scenarios', type=int, default=0,
-                   help='if >0, estimate probabilistic soft labels with this many causal scenarios')
-    p.add_argument('--soft_label_seed', type=int, default=42,
-                   help='deterministic RNG seed for probabilistic soft labels')
-    p.add_argument('--soft_label_horizon_jitter', type=float, default=0.20,
-                   help='relative horizon perturbation for soft labels (default: 0.20)')
-    p.add_argument('--soft_label_tp_jitter', type=float, default=0.15,
-                   help='relative TP perturbation for soft labels (default: 0.15)')
-    p.add_argument('--soft_label_sl_jitter', type=float, default=0.15,
-                   help='relative SL perturbation for soft labels (default: 0.15)')
-    p.add_argument('--kalman_slope_threshold', type=float, default=0.05,
+    p.add_argument('--adaptive_horizon', action=argparse.BooleanOptionalAction, default=bool(_refinery_defaults.get('adaptive_horizon', True)),
+                   help='enable ATR-adaptive labeling horizon')
+    p.add_argument('--trend_filter', action=argparse.BooleanOptionalAction, default=bool(_refinery_defaults.get('trend_filter', True)),
+                   help='enable Kalman trend veto on directional labels')
+    p.add_argument('--trend_filter_strict', action=argparse.BooleanOptionalAction, default=bool(_refinery_defaults.get('trend_filter_strict', False)),
+                   help='enable stricter Kalman trend filtering')
+    p.add_argument('--kalman_slope_threshold', type=float, default=float(_refinery_defaults.get('kalman_slope_threshold', 0.05)),
                    help='Kalman slope threshold for trend direction (default: 0.05)')
-    p.add_argument('--trend_strength_min', type=float, default=0.05,
+    p.add_argument('--trend_strength_min', type=float, default=float(_refinery_defaults.get('trend_strength_min', 0.05)),
                    help='Minimum opposite-trend strength required to veto directional labels (default: 0.05)')
-    p.add_argument('--regime_mode', choices=['rules', 'wasserstein', 'off'], default='rules',
+    p.add_argument('--regime_mode', choices=['rules', 'wasserstein', 'off'], default=str(_refinery_defaults.get('regime_mode', 'rules')),
                    help='regime surface mode for stage1 metadata (default: rules)')
-    p.add_argument('--regime_stride', type=int, default=50,
+    p.add_argument('--regime_stride', type=int, default=int(_refinery_defaults.get('regime_stride', 50)),
                    help='sample every N rows before expanding regime back to full rows (default: 50)')
-    p.add_argument('--regime_window', type=int, default=50,
+    p.add_argument('--regime_window', type=int, default=int(_refinery_defaults.get('regime_window', 50)),
                    help='window size for optional Wasserstein regime mode (default: 50)')
-    p.add_argument('--regime_progress_every', type=int, default=25_000,
+    p.add_argument('--regime_progress_every', type=int, default=int(_refinery_defaults.get('regime_progress_every', 25_000)),
                    help='progress print cadence for Wasserstein rolling loops (default: 25000, 0 disables)')
-    p.add_argument('--merge_tolerance_ms', type=int, default=500,
+    p.add_argument('--merge_tolerance_ms', type=int, default=int(_refinery_defaults.get('merge_tolerance_ms', 500)),
                    help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
-    p.add_argument('--step4_min_parallel_rows', type=int, default=250_000,
+    p.add_argument('--step4_min_parallel_rows', type=int, default=int(_refinery_defaults.get('step4_min_parallel_rows', 250_000)),
                    help='minimum rows before Step 4 forward scan enables multiprocessing on fork-capable platforms (default: 250000)')
+    p.add_argument('--use_soft_labels', action=argparse.BooleanOptionalAction, default=bool(_soft_defaults.get('enabled', True)),
+                   help='FIX-12: أضف Soft Labels بعد الـ forward scan (--no-use_soft_labels لتعطيل)')
+    p.add_argument('--soft_label_mode', choices=['analytical', 'monte_carlo'],
+                   default=str(_soft_defaults.get('mode', 'analytical')),
+                   help='soft-label generation mode (default from config)')
+    p.add_argument('--soft_label_n_scenarios', '--soft_label_scenarios', dest='soft_label_n_scenarios', type=int,
+                   default=int(_soft_defaults.get('n_scenarios', 50)),
+                   help='number of Monte Carlo scenarios when soft_label_mode=monte_carlo')
+    p.add_argument('--soft_label_random_seed', '--soft_label_seed', dest='soft_label_random_seed', type=int,
+                   default=int(_soft_defaults.get('random_seed', 42)),
+                   help='Monte Carlo random seed for soft labels')
+    p.add_argument('--soft_label_horizon_std', '--soft_label_horizon_jitter', dest='soft_label_horizon_std', type=float,
+                   default=float(_soft_defaults.get('horizon_std', 0.15)),
+                   help='relative std used to perturb label horizon in Monte Carlo mode')
+    p.add_argument('--soft_label_tp_std', '--soft_label_tp_jitter', dest='soft_label_tp_std', type=float,
+                   default=float(_soft_defaults.get('tp_std', 0.10)),
+                   help='relative std used to perturb TP in Monte Carlo mode')
+    p.add_argument('--soft_label_sl_std', '--soft_label_sl_jitter', dest='soft_label_sl_std', type=float,
+                   default=float(_soft_defaults.get('sl_std', 0.10)),
+                   help='relative std used to perturb SL in Monte Carlo mode')
     a  = p.parse_args()
     cs = None if a.chunk_rows == 0 else a.chunk_rows
     run_refinery(a.mbo, a.mbp, a.symbol, a.output,
@@ -3953,6 +4022,7 @@ if __name__=='__main__':
                  resume=a.resume, shard_warmup_rows=a.shard_warmup_rows,
                  label_horizon=a.label_horizon,
                  event_roll_window=a.event_roll_window,
+                 feature_roll_window=a.feature_roll_window,
                  direction_threshold_ticks=a.direction_threshold_ticks,
                  causal_threshold_mode=a.causal_threshold_mode,
                  raw_event_target_rate=a.raw_event_target_rate,
@@ -3961,16 +4031,9 @@ if __name__=='__main__':
                  lob_event_sample=a.lob_event_sample,
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,
-                 tp_sl_threshold_mode=a.tp_sl_threshold_mode,
                  adaptive_horizon=a.adaptive_horizon,
                  trend_filter=a.trend_filter,
                  trend_filter_strict=a.trend_filter_strict,
-                 emit_meta_labels=a.emit_meta_labels,
-                 soft_label_scenarios=a.soft_label_scenarios,
-                 soft_label_seed=a.soft_label_seed,
-                 soft_label_horizon_jitter=a.soft_label_horizon_jitter,
-                 soft_label_tp_jitter=a.soft_label_tp_jitter,
-                 soft_label_sl_jitter=a.soft_label_sl_jitter,
                  kalman_slope_threshold=a.kalman_slope_threshold,
                  trend_strength_min=a.trend_strength_min,
                  regime_mode=a.regime_mode,
@@ -3978,4 +4041,12 @@ if __name__=='__main__':
                  regime_window=a.regime_window,
                  regime_progress_every=a.regime_progress_every,
                  merge_tolerance_ms=a.merge_tolerance_ms,
-                 step4_min_parallel_rows=a.step4_min_parallel_rows)
+                 step4_min_parallel_rows=a.step4_min_parallel_rows,
+                 use_soft_labels=a.use_soft_labels,
+                 soft_label_mode=a.soft_label_mode,
+                 soft_label_n_scenarios=a.soft_label_n_scenarios,
+                 soft_label_random_seed=a.soft_label_random_seed,
+                 soft_label_horizon_std=a.soft_label_horizon_std,
+                 soft_label_tp_std=a.soft_label_tp_std,
+                 soft_label_sl_std=a.soft_label_sl_std,
+                 config_path=a.config)

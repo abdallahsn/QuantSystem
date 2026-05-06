@@ -25,7 +25,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import classification_report, confusion_matrix, log_loss, precision_recall_fscore_support
+from sklearn.metrics import log_loss, precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -85,10 +85,8 @@ except ImportError:
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
-    XGB_IMPORT_ERROR = None
-except Exception as exc:
+except ImportError:
     XGB_AVAILABLE = False
-    XGB_IMPORT_ERROR = exc
 
 BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
@@ -115,15 +113,6 @@ SEQUENCE_AUX_ALL_STEPS = 'all_steps'
 VISUAL_COVERAGE_FAIL_FAST = True
 TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 DEFAULT_LOB_MAX_AGE = '500ms'
-DEFAULT_STAT_FEATURE_LIMIT = 20
-EXTRA_STAT_FEATURE_CANDIDATES = [
-    'rel_vol',
-    'hour_sin',
-    'hour_cos',
-    'london_active',
-    'ny_active',
-    'overlap_active',
-]
 TREE_CLASS_WEIGHT_MAX = 2.5
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
@@ -142,22 +131,17 @@ FORBIDDEN_MODEL_INPUT_COLS = {
     'label_horizon_steps',
     'path_outcome',
     'adverse_path_flag',
+    'bias_label_detail',
+    'neutral_reason',
+    'timeout_move_exceeded_band',
     'kalman_trend_label',
     'kalman_trend_strength',
     'kalman_price',
-    'bias_label_raw',
-    'effective_threshold_ticks',
-    'effective_tp_long_ticks',
-    'effective_tp_short_ticks',
-    'effective_sl_ticks',
-    'meta_trade_side',
-    'meta_label',
-    'meta_label_active',
-    'meta_outcome_ticks',
     'soft_label',
-    'soft_label_confidence',
-    'soft_label_entropy',
-    'soft_label_scenarios',
+    'label_confidence',
+    'soft_label_long',
+    'soft_label_short',
+    'soft_sample_weight',
 }
 TRAINING_PASSTHROUGH_COLS = [
     col for col in (list(DEFAULT_PASSTHROUGH_COLS) + RAW_STAT_FEATURE_COLS)
@@ -179,19 +163,18 @@ TRAINING_PASSTHROUGH_COLS = [
         'liq_score',
         'forward_return',
         'label_horizon_steps',
-        'bias_label_raw',
-        'effective_threshold_ticks',
-        'effective_tp_long_ticks',
-        'effective_tp_short_ticks',
-        'effective_sl_ticks',
-        'meta_trade_side',
-        'meta_label',
-        'meta_label_active',
-        'meta_outcome_ticks',
+        'path_outcome',
+        'adverse_path_flag',
+        'bias_label_detail',
+        'neutral_reason',
+        'timeout_move_exceeded_band',
+        'label_dynamic_threshold',
+        'effective_horizon',
         'soft_label',
-        'soft_label_confidence',
-        'soft_label_entropy',
-        'soft_label_scenarios',
+        'label_confidence',
+        'soft_label_long',
+        'soft_label_short',
+        'soft_sample_weight',
         *RAW_STAT_FEATURE_COLS,
     }
 ]
@@ -206,76 +189,6 @@ def _assert_no_forbidden_model_inputs(cols: list[str]) -> None:
             "❌ Forbidden leakage-prone columns requested for model inputs: "
             f"{leaked}"
         )
-
-
-def _ordered_unique(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        key = str(value).strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        ordered.append(key)
-    return ordered
-
-
-def _stat_feature_candidates() -> list[str]:
-    return _ordered_unique(list(CATBOOST_ADVISOR_FEATURES) + list(EXTRA_STAT_FEATURE_CANDIDATES))
-
-
-def _feature_available(df: pd.DataFrame, feature: str) -> bool:
-    feature = str(feature)
-    return feature in df.columns or f'{RAW_STAT_PREFIX}{feature}' in df.columns
-
-
-def _load_ranked_selected_features(path: str) -> list[str]:
-    if not path or not os.path.exists(path):
-        return []
-    with open(path) as f:
-        lines = [str(line).strip() for line in f.read().splitlines()]
-    return [line for line in lines if line]
-
-
-def _resolve_active_stat_features(
-    df: pd.DataFrame,
-    *,
-    artifacts_dir: str,
-    feature_limit: int = DEFAULT_STAT_FEATURE_LIMIT,
-) -> tuple[list[str], dict]:
-    limit = max(int(feature_limit), 1)
-    candidate_pool = _stat_feature_candidates()
-    available_candidates = [feat for feat in candidate_pool if _feature_available(df, feat)]
-    selected_path = os.path.join(artifacts_dir, 'selected_features.txt')
-    ranked_selected = _load_ranked_selected_features(selected_path)
-    ranked_candidates = [
-        feat for feat in ranked_selected
-        if feat in candidate_pool and feat in available_candidates
-    ]
-    active = ranked_candidates[:limit] if ranked_candidates else available_candidates[:limit]
-    if len(active) < limit:
-        for feat in available_candidates:
-            if feat not in active:
-                active.append(feat)
-            if len(active) >= limit:
-                break
-    active = _ordered_unique(active)[:limit]
-    if not active:
-        raise RuntimeError(
-            '❌ No active statistical features available after resolving selected_features.txt '
-            f'under {artifacts_dir}.'
-        )
-    info = {
-        'feature_limit': int(limit),
-        'selected_features_path': selected_path if os.path.exists(selected_path) else None,
-        'selected_features_count': int(len(ranked_selected)),
-        'selected_candidates_count': int(len(ranked_candidates)),
-        'available_candidate_count': int(len(available_candidates)),
-        'active_feature_count': int(len(active)),
-        'selected_features_used': bool(len(ranked_candidates) > 0),
-        'active_features': list(active),
-    }
-    return active, info
 
 
 def _resolve_phase(stage: int = 0, phase: str | None = None) -> str:
@@ -561,16 +474,14 @@ def _meta_layout_label(meta_feature_names: list[str]) -> str:
 def _write_feature_coverage_drift_report(
     df: pd.DataFrame,
     *,
-    stat_features: list[str] | None = None,
     split_time: pd.Timestamp | str | None,
     output_dir: str,
     protected_features: set[str] | None = None,
 ) -> str:
     protected_features = protected_features or set()
-    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
     ts = _time_series(df, 'ts_event')
     months = ts.dt.to_period('M').astype(str)
-    raw_stat = _raw_stat_frame(df, stat_features)
+    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
     split_ts = _parse_optional_timestamp(split_time)
     train_mask = np.ones(len(df), dtype=bool) if split_ts is None else (ts < split_ts).to_numpy(dtype=bool)
     train_ref = raw_stat.loc[train_mask] if np.any(train_mask) else raw_stat
@@ -580,14 +491,13 @@ def _write_feature_coverage_drift_report(
         'split_time': None if split_ts is None else str(split_ts),
         'months': [],
         'dead_features_3m': [],
-        'stat_features': stat_features,
     }
-    dead_streak = {feat: 0 for feat in stat_features}
+    dead_streak = {feat: 0 for feat in CATBOOST_ADVISOR_FEATURES}
     for month in sorted(months.unique()):
         month_mask = (months == month).to_numpy(dtype=bool)
         month_frame = raw_stat.loc[month_mask]
         feature_stats = {}
-        for feat in stat_features:
+        for feat in CATBOOST_ADVISOR_FEATURES:
             vals = pd.to_numeric(month_frame[feat], errors='coerce')
             ref_vals = pd.to_numeric(train_ref[feat], errors='coerce')
             non_zero_rate = float((vals.fillna(0.0) != 0.0).mean()) if len(vals) else 0.0
@@ -664,22 +574,16 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         )
 
     df = _sanitize_df(df)
-    stat_candidates = _stat_feature_candidates()
-    raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in stat_candidates if f'{RAW_STAT_PREFIX}{col}' in df.columns]
-    safe_nonraw_features = {'hour_sin', 'hour_cos', 'london_active', 'ny_active', 'overlap_active'}
-    if len(raw_cols) < len(stat_candidates):
-        missing = [
-            col for col in stat_candidates
-            if f'{RAW_STAT_PREFIX}{col}' not in df.columns and col not in safe_nonraw_features
-        ]
-        if missing:
-            print(
-                "  ⚠️ Missing raw stat columns for fold-clean scaling: "
-                f"{missing}. Re-run prepare_training_data.py to unlock the strict anti-leakage path."
-            )
+    raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' in df.columns]
+    if len(raw_cols) < len(CATBOOST_ADVISOR_FEATURES):
+        missing = [col for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' not in df.columns]
+        print(
+            "  ⚠️ Missing raw stat columns for fold-clean scaling: "
+            f"{missing}. Re-run prepare_training_data.py to unlock the strict anti-leakage path."
+        )
     df = prepare_feature_frame(
         df,
-        stat_features=stat_candidates + raw_cols,
+        stat_features=CATBOOST_ADVISOR_FEATURES + raw_cols,
         scaler_params=None,
         already_scaled=True,
         passthrough_cols=TRAINING_PASSTHROUGH_COLS,
@@ -705,6 +609,19 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         f"label_end_ts=[{label_end.iloc[0]} → {label_end.iloc[-1]}] | "
         f"rows={len(df):,}"
     )
+    if 'soft_sample_weight' in df.columns and 'soft_label' in df.columns:
+        soft_w = pd.to_numeric(df['soft_sample_weight'], errors='coerce').fillna(1.0).astype(np.float32)
+        soft_p = pd.to_numeric(df['soft_label'], errors='coerce').fillna(0.5).astype(np.float32)
+        near_half = float(((soft_p > 0.45) & (soft_p < 0.55)).mean())
+        print(
+            "  🧪 Soft Labels: "
+            f"rows={int(soft_w.notna().sum()):,} | "
+            f"weight_mean={float(soft_w.mean()):.3f} | "
+            f"weight_max={float(soft_w.max()):.3f} | "
+            f"near_0.5={near_half:.1%}"
+        )
+    else:
+        print("  ⚠️ Soft Labels absent in artifact: training will fall back to quality-only sample weights.")
     print(f"  Shape: {df.shape}")
     print(f"  Labels: {df['bias_label'].value_counts().to_dict()}")
     return df
@@ -841,24 +758,12 @@ def _raw_stat_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     # Hard guard: passthrough/meta columns such as forward_return may exist in
     # the CSV for analysis/backtesting, but they must never enter model inputs.
     _assert_no_forbidden_model_inputs(list(cols))
-    ts_event = _time_series(df, 'ts_event') if 'ts_event' in df.columns else None
-    hour_values = None if ts_event is None else ts_event.dt.hour.to_numpy(dtype=np.float32)
     data = {}
     for col in cols:
         raw_col = _raw_feature_name(col)
         src = raw_col if raw_col in df.columns else col
         if src in df.columns:
             series = pd.to_numeric(df[src], errors='coerce').fillna(0.0).astype(np.float32)
-        elif hour_values is not None and col == 'hour_sin':
-            series = pd.Series(np.sin(2.0 * np.pi * hour_values / 24.0).astype(np.float32), index=df.index)
-        elif hour_values is not None and col == 'hour_cos':
-            series = pd.Series(np.cos(2.0 * np.pi * hour_values / 24.0).astype(np.float32), index=df.index)
-        elif hour_values is not None and col == 'london_active':
-            series = pd.Series(((hour_values >= 7.0) & (hour_values < 16.0)).astype(np.float32), index=df.index)
-        elif hour_values is not None and col == 'ny_active':
-            series = pd.Series(((hour_values >= 13.0) & (hour_values < 22.0)).astype(np.float32), index=df.index)
-        elif hour_values is not None and col == 'overlap_active':
-            series = pd.Series(((hour_values >= 13.0) & (hour_values < 16.0)).astype(np.float32), index=df.index)
         else:
             series = pd.Series(np.zeros(len(df), dtype=np.float32), index=df.index)
         data[col] = series
@@ -982,8 +887,30 @@ def _project_sequence_aux_context(
 
 
 def _quality_sample_weights(df: pd.DataFrame, strong_weight: float = 2.0, weak_weight: float = 1.0) -> np.ndarray:
+    """
+    FIX-12: أوزان التدريب الموحّدة = quality weights × soft label confidence.
+
+    - بدون Soft Labels : نفس السلوك القديم (STRONG=2×، WEAK=1×)
+    - مع Soft Labels   : STRONG/WEAK مضروبة في (confidence × clarity)
+      → الصفوف الواضحة عالية الثقة تحصل على وزن أعلى
+      → الصفوف الغامضة (soft_label≈0.5) تُهمَّش تلقائياً
+    """
     quality = pd.to_numeric(df.get('signal_quality', 1), errors='coerce').fillna(1).astype(np.int32).values
-    return np.where(quality == 2, float(strong_weight), float(weak_weight)).astype(np.float32)
+    base_w  = np.where(quality == 2, float(strong_weight), float(weak_weight)).astype(np.float32)
+
+    # FIX-12: دمج Soft Label Weights إذا كانت متوفرة
+    if 'soft_sample_weight' in df.columns:
+        try:
+            sl_w = pd.to_numeric(df['soft_sample_weight'], errors='coerce').fillna(1.0).to_numpy(dtype=np.float32)
+            sl_w = np.clip(sl_w, 0.05, None)
+            combined = base_w * sl_w
+            mean_w   = float(np.mean(combined))
+            if mean_w > 1e-8:
+                return (combined / mean_w).astype(np.float32)
+        except Exception:
+            pass
+
+    return base_w
 
 
 def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
@@ -1439,7 +1366,6 @@ def _build_inner_time_split(
 def stage1_oof_meta(
     df: pd.DataFrame,
     output_dir: str,
-    stat_features: list[str] | None = None,
     splits=None,
     n_folds: int = 6,
     test_size: float = 0.10,
@@ -1449,16 +1375,12 @@ def stage1_oof_meta(
     t1: pd.Series | None = None,
     inference_scaler_params: dict | None = None,
     catboost_device: str = 'auto',
-    include_xgboost: bool = False,
     quality_weight_strong: float = 2.0,
     quality_weight_weak: float = 1.0,
     cost_config: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    stage1_label = 'CatBoost + Regime Meta-Features'
-    if include_xgboost:
-        stage1_label = 'CatBoost + XGBoost + Regime Meta-Features'
     print("\n" + "═" * 65)
-    print(f"🐱 STAGE 1 — V19 OOF {stage1_label}")
+    print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
     print("═" * 65)
     if not inference_scaler_params:
         raise RuntimeError(
@@ -1467,8 +1389,7 @@ def stage1_oof_meta(
         )
 
     n = len(df)
-    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
-    raw_stat = _raw_stat_frame(df, stat_features)
+    raw_stat = _raw_stat_frame(df, CATBOOST_ADVISOR_FEATURES)
     y = df['bias_label'].fillna(1).astype(np.int32).values
     if splits is None:
         splits, t0, t1, _ = build_time_splits(
@@ -1494,7 +1415,7 @@ def stage1_oof_meta(
 
     priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
     priors = priors / max(priors.sum(), 1.0)
-    meta_feature_names = resolve_meta_feature_names(include_xgboost=include_xgboost)
+    meta_feature_names = resolve_meta_feature_names(include_xgboost=True)
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     print(
         "  Meta Layout Guard: "
@@ -1509,18 +1430,17 @@ def stage1_oof_meta(
             "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
             "pip install -r requirements.txt"
         )
-    if include_xgboost and not XGB_AVAILABLE:
+    if not XGB_AVAILABLE:
         raise RuntimeError(
-            "❌ XGBoost غير متاح بينما include_xgboost=True.\n"
-            f"سبب التحميل: {XGB_IMPORT_ERROR}\n"
-            "أصلح البيئة أو عطّل XGBoost ثم أعد التشغيل:\n"
+            "❌ XGBoost غير مثبّت. مرحلة stacked base models تتطلبه الآن.\n"
+            "ثبّت الحزمة داخل البيئة الحالية ثم أعد التشغيل:\n"
             "pip install -r requirements.txt"
         )
 
     regime_model_type = 'hmm' if HMM_AVAILABLE else 'rules'
     regime_tmp_dir = tempfile.mkdtemp(prefix='_oof_regime_tmp_', dir=output_dir)
     os.makedirs(regime_tmp_dir, exist_ok=True)
-    tree_depth = _adaptive_tree_depth(len(stat_features))
+    tree_depth = _adaptive_tree_depth(len(CATBOOST_ADVISOR_FEATURES))
 
     def _weighted_quality_weights(indices: np.ndarray, class_weights: list[float] | None) -> np.ndarray:
         weights = _quality_sample_weights(
@@ -1590,6 +1510,12 @@ def stage1_oof_meta(
 
         class_weights = _compute_binary_class_weights(y[fit_idx])
         sw = _weighted_quality_weights(fit_idx, class_weights)
+        sw_mean = float(np.mean(sw)) if len(sw) else 0.0
+        sw_max = float(np.max(sw)) if len(sw) else 0.0
+        print(
+            f"      CatBoost Weights[{fold_no}]: mean={sw_mean:.3f} "
+            f"max={sw_max:.3f} | soft_labels={'yes' if 'soft_sample_weight' in df.columns else 'no'}"
+        )
         model = CatBoostClassifier(
             iterations=1000,
             depth=tree_depth,
@@ -1607,7 +1533,7 @@ def stage1_oof_meta(
             task_type=cb_task_type,
             devices=cb_devices,
         )
-        tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=stat_features)
+        tr_pool = Pool(X_fit, y[fit_idx], weight=sw, feature_names=CATBOOST_ADVISOR_FEATURES)
         eval_set = None
         X_val = None
         if inner_val is not None:
@@ -1616,7 +1542,7 @@ def stage1_oof_meta(
                 fold_scaler,
                 clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
             ).values.astype(np.float32)
-            eval_set = Pool(X_val, y[inner_val], feature_names=stat_features)
+            eval_set = Pool(X_val, y[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
         model.fit(tr_pool, eval_set=eval_set, plot=False)
         present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
         raw_preds = align_probability_columns(
@@ -1655,6 +1581,9 @@ def stage1_oof_meta(
             'best_iteration': cb_best_iteration,
             'early_stopping_rounds': early_stopping_rounds,
             'class_weights': class_weights,
+            'sample_weight_mean': sw_mean,
+            'sample_weight_max': sw_max,
+            'soft_weights_enabled': bool('soft_sample_weight' in df.columns),
             'fold_scaler_diagnostics': scaler_diag,
             'calibration': {
                 'inner_validation': calibrator_report,
@@ -1665,138 +1594,141 @@ def stage1_oof_meta(
     oof_probs_raw, prob_covered, prob_reports = run_sequential_oof(n, N_CB_PROBS, splits, _cb_predict)
     oof_probs = fill_uncovered_probabilities(oof_probs_raw, prob_covered, priors=priors)
 
-    xgb_probs = np.zeros((n, 0), dtype=np.float32)
-    xgb_covered = np.ones(n, dtype=bool)
-    xgb_reports: list[dict] = []
-    if include_xgboost:
-        def _xgb_predict(train_idx, test_idx, fold_no):
-            inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
-            fit_idx = inner_train if inner_train is not None else train_idx
-            early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
-            fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
-            test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
-            fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
-            test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
+    def _xgb_predict(train_idx, test_idx, fold_no):
+        inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
+        fit_idx = inner_train if inner_train is not None else train_idx
+        early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
+        fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
+        test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
+        fit_counts = pd.Series(y[fit_idx]).value_counts().sort_index().to_dict()
+        test_counts = pd.Series(y[test_idx]).value_counts().sort_index().to_dict()
+        print(
+            f"    XGB Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
+            f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
+            f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
+            f"| y_fit={fit_counts} | y_test={test_counts}"
+        )
+        if len(np.unique(y[fit_idx])) < 2:
             print(
-                f"    XGB Fold {fold_no}: fit={len(fit_idx):,} test={len(test_idx):,} "
-                f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
-                f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-                f"| y_fit={fit_counts} | y_test={test_counts}"
+                f"      XGBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
+                "| using class priors"
             )
-            if len(np.unique(y[fit_idx])) < 2:
-                print(
-                    f"      XGBoost Fold {fold_no}: single-class train labels {sorted(np.unique(y[fit_idx]).tolist())} "
-                    "| using class priors"
-                )
-                return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
-                    'directional_precision': None,
-                    'directional_recall': None,
-                    'directional_f1': None,
-                    'mode': 'priors_only_single_class_train',
-                }
-            fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
-            fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
-            if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
-                print(
-                    f"      XGBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
-                    "| using priors"
-                )
-                return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
-                    'directional_precision': None,
-                    'directional_recall': None,
-                    'directional_f1': None,
-                    'mode': 'priors_only_degraded_scaler',
-                    'fold_scaler_diagnostics': scaler_diag,
-                }
-            X_fit = _apply_scaler_to_stat_frame(
-                raw_stat.iloc[fit_idx],
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_single_class_train',
+            }
+        fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
+        fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
+        if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
+            print(
+                f"      XGBoost Fold {fold_no}: degraded scaler (zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) "
+                "| using priors"
+            )
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+                'directional_precision': None,
+                'directional_recall': None,
+                'directional_f1': None,
+                'mode': 'priors_only_degraded_scaler',
+                'fold_scaler_diagnostics': scaler_diag,
+            }
+        X_fit = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[fit_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
+        X_test = _apply_scaler_to_stat_frame(
+            raw_stat.iloc[test_idx],
+            fold_scaler,
+            clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
+        ).values.astype(np.float32)
+        print(
+            f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
+            f"| scaler_fit_rows={len(fit_idx):,}"
+        )
+        class_weights = _compute_binary_class_weights(y[fit_idx])
+        sw = _weighted_quality_weights(fit_idx, class_weights)
+        sw_mean = float(np.mean(sw)) if len(sw) else 0.0
+        sw_max = float(np.max(sw)) if len(sw) else 0.0
+        print(
+            f"      XGBoost Weights[{fold_no}]: mean={sw_mean:.3f} "
+            f"max={sw_max:.3f} | soft_labels={'yes' if 'soft_sample_weight' in df.columns else 'no'}"
+        )
+        model_kwargs = {
+            'n_estimators': 800,
+            'max_depth': tree_depth,
+            'learning_rate': 0.03,
+            'subsample': 0.80,
+            'colsample_bytree': 0.70,
+            'reg_lambda': 3.0,
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'random_state': 84 + fold_no,
+            'tree_method': 'hist',
+        }
+        if early_stopping_rounds is not None:
+            model_kwargs['early_stopping_rounds'] = early_stopping_rounds
+        model = XGBClassifier(**model_kwargs)
+        fit_kwargs = {
+            'sample_weight': sw,
+            'verbose': False,
+        }
+        X_val = None
+        if inner_val is not None:
+            X_val = _apply_scaler_to_stat_frame(
+                raw_stat.iloc[inner_val],
                 fold_scaler,
                 clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
             ).values.astype(np.float32)
-            X_test = _apply_scaler_to_stat_frame(
-                raw_stat.iloc[test_idx],
-                fold_scaler,
-                clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
-            ).values.astype(np.float32)
-            print(
-                f"      XGBoost Shapes[{fold_no}]: fit={X_fit.shape} test={X_test.shape} "
-                f"| scaler_fit_rows={len(fit_idx):,}"
-            )
-            class_weights = _compute_binary_class_weights(y[fit_idx])
-            sw = _weighted_quality_weights(fit_idx, class_weights)
-            model_kwargs = {
-                'n_estimators': 800,
-                'max_depth': tree_depth,
-                'learning_rate': 0.03,
-                'subsample': 0.80,
-                'colsample_bytree': 0.70,
-                'reg_lambda': 3.0,
-                'objective': 'binary:logistic',
-                'eval_metric': 'logloss',
-                'random_state': 84 + fold_no,
-                'tree_method': 'hist',
-            }
-            if early_stopping_rounds is not None:
-                model_kwargs['early_stopping_rounds'] = early_stopping_rounds
-            model = XGBClassifier(**model_kwargs)
-            fit_kwargs = {
-                'sample_weight': sw,
-                'verbose': False,
-            }
-            X_val = None
-            if inner_val is not None:
-                X_val = _apply_scaler_to_stat_frame(
-                    raw_stat.iloc[inner_val],
-                    fold_scaler,
-                    clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
-                ).values.astype(np.float32)
-                fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
-            model.fit(X_fit, y[fit_idx], **fit_kwargs)
-            present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
-            raw_preds = align_probability_columns(
-                model.predict_proba(X_test),
+            fit_kwargs['eval_set'] = [(X_val, y[inner_val])]
+        model.fit(X_fit, y[fit_idx], **fit_kwargs)
+        present_classes = getattr(model, 'classes_', np.unique(y[fit_idx]))
+        raw_preds = align_probability_columns(
+            model.predict_proba(X_test),
+            N_XGB_PROBS,
+            classes=present_classes,
+        )
+        calibrator = None
+        calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
+        if X_val is not None:
+            val_raw = align_probability_columns(
+                model.predict_proba(X_val),
                 N_XGB_PROBS,
                 classes=present_classes,
             )
-            calibrator = None
-            calibrator_report = {'enabled': False, 'reason': 'no_inner_validation'}
-            if X_val is not None:
-                val_raw = align_probability_columns(
-                    model.predict_proba(X_val),
-                    N_XGB_PROBS,
-                    classes=present_classes,
-                )
-                calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
-            preds = _apply_long_calibrator(calibrator, raw_preds)
-            test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
-            pred_labels = np.argmax(preds, axis=1)
-            precision, recall, f1, _ = precision_recall_fscore_support(
-                y[test_idx],
-                pred_labels,
-                labels=[0, 1],
-                average='macro',
-                zero_division=0,
-            )
-            xgb_best_iteration = getattr(model, 'best_iteration', None) if early_stopping_rounds is not None else None
-            return preds, {
-                'directional_precision': float(precision),
-                'directional_recall': float(recall),
-                'directional_f1': float(f1),
-                'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
-                'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
-                'early_stopping_rounds': early_stopping_rounds,
-                'class_weights': class_weights,
-                'fold_scaler_diagnostics': scaler_diag,
-                'calibration': {
-                    'inner_validation': calibrator_report,
-                    'outer_test': test_metrics,
-                },
-            }
+            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+        preds = _apply_long_calibrator(calibrator, raw_preds)
+        test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
+        pred_labels = np.argmax(preds, axis=1)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y[test_idx],
+            pred_labels,
+            labels=[0, 1],
+            average='macro',
+            zero_division=0,
+        )
+        xgb_best_iteration = getattr(model, 'best_iteration', None) if early_stopping_rounds is not None else None
+        return preds, {
+            'directional_precision': float(precision),
+            'directional_recall': float(recall),
+            'directional_f1': float(f1),
+            'classes': [int(cls) for cls in np.asarray(present_classes).reshape(-1).tolist()],
+            'best_iteration': None if xgb_best_iteration is None else int(xgb_best_iteration),
+            'early_stopping_rounds': early_stopping_rounds,
+            'class_weights': class_weights,
+            'sample_weight_mean': sw_mean,
+            'sample_weight_max': sw_max,
+            'soft_weights_enabled': bool('soft_sample_weight' in df.columns),
+            'fold_scaler_diagnostics': scaler_diag,
+            'calibration': {
+                'inner_validation': calibrator_report,
+                'outer_test': test_metrics,
+            },
+        }
 
-        xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(n, N_XGB_PROBS, splits, _xgb_predict)
-        xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
-    else:
-        print("  ℹ️ XGBoost disabled — Stage 1 meta surface will use CatBoost + regime only.")
+    xgb_probs_raw, xgb_covered, xgb_reports = run_sequential_oof(n, N_XGB_PROBS, splits, _xgb_predict)
+    xgb_probs = fill_uncovered_probabilities(xgb_probs_raw, xgb_covered, priors=priors)
 
     regime_meta_dim = len(REGIME_ONE_HOT_COLS) + len(REGIME_META_SCORE_COLS)
 
@@ -1817,29 +1749,20 @@ def stage1_oof_meta(
 
     coverage_warnings = {
         'catboost': float(prob_covered.mean()) < 0.50,
-        'xgboost': bool(include_xgboost and float(xgb_covered.mean()) < 0.50),
+        'xgboost': float(xgb_covered.mean()) < 0.50,
         'regime': float(regime_covered.mean()) < 0.50,
         'combined': float(coverage.mean()) < 0.50,
     }
     if coverage_warnings['catboost'] or coverage_warnings['xgboost']:
-        xgb_segment = f" | xgboost={float(xgb_covered.mean()):.1%}" if include_xgboost else ""
         print(
             "  ⚠️ Low OOF coverage detected: "
-            f"catboost={float(prob_covered.mean()):.1%}{xgb_segment}"
+            f"catboost={float(prob_covered.mean()):.1%} | xgboost={float(xgb_covered.mean()):.1%}"
         )
 
     cb_calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
     xgb_calibrator_path = os.path.join(output_dir, 'xgboost_calibrator_v19.pkl')
     decision_policy_path = os.path.join(output_dir, DEFAULT_DECISION_POLICY_ARTIFACT)
-    stale_stage1_paths = [cb_calibrator_path, xgb_calibrator_path, decision_policy_path]
-    if not include_xgboost:
-        stale_stage1_paths.extend(
-            [
-                os.path.join(output_dir, 'xgboost_advisor_v19.json'),
-                os.path.join(output_dir, 'xgboost_classes_v19.json'),
-            ]
-        )
-    for path in stale_stage1_paths:
+    for path in (cb_calibrator_path, xgb_calibrator_path, decision_policy_path):
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -1876,8 +1799,8 @@ def stage1_oof_meta(
         task_type=cb_task_type,
         devices=cb_devices,
     )
-    final_pool = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=stat_features)
-    final_eval_pool = Pool(X_holdout_final, y_holdout_final, feature_names=stat_features) if len(final_holdout_idx) else None
+    final_pool = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+    final_eval_pool = Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES) if len(final_holdout_idx) else None
     final_model.fit(final_pool, eval_set=final_eval_pool, plot=False)
     final_model.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
     final_cb_classes = np.asarray(getattr(final_model, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
@@ -1904,53 +1827,50 @@ def stage1_oof_meta(
     )
     live_probs = _apply_long_calibrator(final_cb_calibrator, live_probs_raw)
 
-    final_xgb_cal_report = {'enabled': False, 'reason': 'disabled'}
-    live_xgb_probs = np.zeros((len(X_final), 0), dtype=np.float32)
-    if include_xgboost:
-        final_xgb = XGBClassifier(
-            n_estimators=800,
-            max_depth=tree_depth,
-            learning_rate=0.03,
-            subsample=0.80,
-            colsample_bytree=0.70,
-            reg_lambda=3.0,
-            objective='binary:logistic',
-            eval_metric='logloss',
-            early_stopping_rounds=50 if len(final_holdout_idx) else None,
-            random_state=84,
-            tree_method='hist',
-        )
-        xgb_fit_kwargs = {
-            'sample_weight': final_train_sw,
-            'verbose': False,
-        }
-        if len(final_holdout_idx):
-            xgb_fit_kwargs['eval_set'] = [(X_holdout_final, y_holdout_final)]
-        final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kwargs)
-        final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
-        final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
-        with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
-            json.dump({'classes': final_xgb_classes}, f, indent=2)
-        print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
+    final_xgb = XGBClassifier(
+        n_estimators=800,
+        max_depth=tree_depth,
+        learning_rate=0.03,
+        subsample=0.80,
+        colsample_bytree=0.70,
+        reg_lambda=3.0,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        early_stopping_rounds=50 if len(final_holdout_idx) else None,
+        random_state=84,
+        tree_method='hist',
+    )
+    xgb_fit_kwargs = {
+        'sample_weight': final_train_sw,
+        'verbose': False,
+    }
+    if len(final_holdout_idx):
+        xgb_fit_kwargs['eval_set'] = [(X_holdout_final, y_holdout_final)]
+    final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kwargs)
+    final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
+    final_xgb_classes = np.asarray(getattr(final_xgb, 'classes_', np.unique(y_train_final)), dtype=np.int32).tolist()
+    with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
+        json.dump({'classes': final_xgb_classes}, f, indent=2)
+    print(f"  ✅ XGBoost final classes: {final_xgb_classes}")
 
-        final_xgb_calibrator = None
-        final_xgb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
-        if len(final_holdout_idx):
-            holdout_xgb_raw = align_probability_columns(
-                final_xgb.predict_proba(X_holdout_final),
-                N_XGB_PROBS,
-                classes=final_xgb_classes,
-            )
-            final_xgb_calibrator, final_xgb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_xgb_raw[:, 0])
-            if final_xgb_calibrator is not None:
-                with open(xgb_calibrator_path, 'wb') as f:
-                    pickle.dump(final_xgb_calibrator, f)
-        live_xgb_raw = align_probability_columns(
-            final_xgb.predict_proba(X_final),
+    final_xgb_calibrator = None
+    final_xgb_cal_report = {'enabled': False, 'reason': 'no_holdout'}
+    if len(final_holdout_idx):
+        holdout_xgb_raw = align_probability_columns(
+            final_xgb.predict_proba(X_holdout_final),
             N_XGB_PROBS,
             classes=final_xgb_classes,
         )
-        live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
+        final_xgb_calibrator, final_xgb_cal_report = _fit_long_isotonic_calibrator(y_holdout_final, holdout_xgb_raw[:, 0])
+        if final_xgb_calibrator is not None:
+            with open(xgb_calibrator_path, 'wb') as f:
+                pickle.dump(final_xgb_calibrator, f)
+    live_xgb_raw = align_probability_columns(
+        final_xgb.predict_proba(X_final),
+        N_XGB_PROBS,
+        classes=final_xgb_classes,
+    )
+    live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
 
     final_regime = RegimeClassifier(n_regimes=N_CLUSTERS, model_type=regime_model_type)
     final_regime.fit(df.copy(), output_dir=output_dir)
@@ -1966,9 +1886,7 @@ def stage1_oof_meta(
     np.save(os.path.join(output_dir, 'meta_features_oof_v19.npy'), meta)
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
 
-    ensemble_oof_probs = oof_probs.astype(np.float32)
-    if include_xgboost:
-        ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
+    ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
     decision_policy = build_decision_policy(
         df,
         ensemble_oof_probs,
@@ -1981,14 +1899,11 @@ def stage1_oof_meta(
         json.dump(decision_policy, f, indent=2)
 
     fold_metrics = {
-        'base_models': [str(spec.get('name', 'unknown')) for spec in meta_layout.get('base_models', [])],
-        'stat_features': stat_features,
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
         'catboost_coverage_ratio': float(prob_covered.mean()),
-        'xgboost_enabled': bool(include_xgboost),
-        'xgboost_coverage_ratio': float(xgb_covered.mean()) if include_xgboost else None,
+        'xgboost_coverage_ratio': float(xgb_covered.mean()),
         'regime_coverage_ratio': float(regime_covered.mean()),
         'coverage_ratio': float(coverage.mean()),
         'coverage_warning': coverage_warnings,
@@ -2025,16 +1940,15 @@ def stage1_oof_meta(
             'folds': prob_reports,
         },
         'stage1_xgboost_isotonic': {
-            'enabled': bool(include_xgboost and any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in xgb_reports)),
-            'disabled': bool(not include_xgboost),
-            'covered_rows': int(np.sum(xgb_covered)) if include_xgboost else 0,
-            'total_rows': int(len(xgb_covered)) if include_xgboost else int(len(prob_covered)),
+            'enabled': any(bool((report.get('calibration', {}).get('inner_validation', {}) or {}).get('enabled', False)) for report in xgb_reports),
+            'covered_rows': int(np.sum(xgb_covered)),
+            'total_rows': int(len(xgb_covered)),
             'folds': xgb_reports,
         },
         'final_catboost_holdout_calibration': final_cb_cal_report,
         'final_xgboost_holdout_calibration': final_xgb_cal_report,
         'catboost_calibrator_artifact': os.path.basename(cb_calibrator_path) if os.path.exists(cb_calibrator_path) else None,
-        'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if include_xgboost and os.path.exists(xgb_calibrator_path) else None,
+        'xgboost_calibrator_artifact': os.path.basename(xgb_calibrator_path) if os.path.exists(xgb_calibrator_path) else None,
         'decision_policy_artifact': os.path.basename(decision_policy_path),
         'coverage_warning': coverage_warnings,
         'catboost_low_coverage_warning': bool(coverage_warnings['catboost']),
@@ -2522,275 +2436,6 @@ def _infer_event_gate_schema(df: pd.DataFrame) -> dict:
     return event_cfg
 
 
-def _build_live_visual_embeddings_for_rows(
-    df: pd.DataFrame,
-    output_dir: str,
-    lob_tensors,
-    lob_timestamps: pd.Series | None,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    n_rows = int(len(df))
-    zero_emb = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
-    zero_cov = np.zeros(n_rows, dtype=bool)
-    info = {
-        'enabled': False,
-        'reason': 'uninitialized',
-        'rows': n_rows,
-        'rows_with_visual': 0,
-        'coverage_ratio': 0.0,
-    }
-    if n_rows == 0:
-        info['reason'] = 'empty_frame'
-        return zero_emb, zero_cov, info
-    if lob_tensors is None or lob_timestamps is None or len(lob_tensors) == 0:
-        info['reason'] = 'lob_unavailable'
-        return zero_emb, zero_cov, info
-
-    deeplob_model_path = os.path.join(output_dir, 'deeplob_cnn_v19.keras')
-    if not os.path.exists(deeplob_model_path):
-        info['reason'] = 'deeplob_artifact_missing'
-        return zero_emb, zero_cov, info
-
-    DeepLOBCNN, ok = _load_deeplob_runtime()
-    if not ok:
-        info['reason'] = 'deeplob_runtime_unavailable'
-        return zero_emb, zero_cov, info
-
-    cnn = DeepLOBCNN(brain_file=deeplob_model_path)
-    if getattr(cnn, 'model', None) is None or not getattr(cnn, '_fitted', False):
-        info['reason'] = 'deeplob_model_not_ready'
-        return zero_emb, zero_cov, info
-
-    row_to_tensor, _, _ = _align_lob_to_rows(
-        df,
-        lob_timestamps,
-        max_tensors=len(lob_tensors),
-    )
-    tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
-    if len(tensor_ids) == 0:
-        info['reason'] = 'no_aligned_tensors'
-        return zero_emb, zero_cov, info
-
-    X_eval = np.asarray(lob_tensors[tensor_ids], dtype=np.float32)
-    emb_eval = np.asarray(cnn.get_embeddings(X_eval), dtype=np.float32)
-    emb_map = {int(tensor_id): emb_eval[i] for i, tensor_id in enumerate(tensor_ids)}
-
-    row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
-    row_cov = np.zeros(n_rows, dtype=bool)
-    for row_idx, tensor_idx in enumerate(row_to_tensor):
-        tensor_idx = int(tensor_idx)
-        if tensor_idx < 0 or tensor_idx not in emb_map:
-            continue
-        row_embs[row_idx] = emb_map[tensor_idx]
-        row_cov[row_idx] = True
-
-    info.update({
-        'enabled': True,
-        'reason': 'ok',
-        'rows_with_visual': int(np.sum(row_cov)),
-        'coverage_ratio': float(np.mean(row_cov)) if n_rows else 0.0,
-        'tensor_rows': int(np.sum(row_to_tensor >= 0)),
-        'unique_tensors': int(len(tensor_ids)),
-    })
-    return row_embs, row_cov, info
-
-
-def _generate_end_to_end_holdout_report(
-    full_df: pd.DataFrame,
-    *,
-    output_dir: str,
-    split_time: pd.Timestamp | str | None,
-    train_frac: float,
-    event_gate_cfg: dict | None,
-    lob_tensors=None,
-    lob_timestamps: pd.Series | None = None,
-) -> dict:
-    split_ts = _parse_optional_timestamp(split_time)
-    if len(full_df) == 0 or split_ts is None:
-        return {
-            'enabled': False,
-            'reason': 'missing_holdout_split',
-        }
-
-    split_ctx = _sequence_split_context(
-        full_df,
-        seq_len=SEQ_LEN,
-        train_frac=train_frac,
-        split_time=split_ts,
-    )
-    split_idx = int(split_ctx.get('split_idx', 0))
-    if split_idx >= len(full_df):
-        return {
-            'enabled': False,
-            'reason': 'empty_holdout_rows',
-            'split_idx': split_idx,
-        }
-
-    gate_roll_window = int((event_gate_cfg or {}).get('roll_window', DEFAULT_EVENT_ROLL_WINDOW))
-    context_rows = max(int(SEQ_LEN - 1), int(gate_roll_window - 1))
-    start_idx = max(0, split_idx - context_rows)
-    report_start_idx = int(split_idx - start_idx)
-    eval_df = full_df.iloc[start_idx:].copy().reset_index(drop=True)
-    expected_holdout_rows = int(len(eval_df) - report_start_idx)
-    if expected_holdout_rows <= 0:
-        return {
-            'enabled': False,
-            'reason': 'empty_holdout_rows',
-            'split_idx': split_idx,
-        }
-
-    visual_embeddings, visual_coverage, visual_info = _build_live_visual_embeddings_for_rows(
-        eval_df,
-        output_dir=output_dir,
-        lob_tensors=lob_tensors,
-        lob_timestamps=lob_timestamps,
-    )
-
-    try:
-        from predict_v19 import V19PredictionEngine
-    except Exception as exc:
-        return {
-            'enabled': False,
-            'reason': f'prediction_engine_import_failed: {exc}',
-        }
-
-    engine = V19PredictionEngine(models_dir=output_dir, run_mode='backtest')
-    results = engine.run_backtest(
-        eval_df,
-        already_scaled=True,
-        visual_embeddings=visual_embeddings,
-    )
-    results_df = pd.DataFrame(results)
-    if results_df.empty or 'idx' not in results_df.columns:
-        return {
-            'enabled': False,
-            'reason': 'no_scored_rows',
-            'expected_holdout_rows': expected_holdout_rows,
-        }
-
-    row_idx = pd.to_numeric(results_df.get('idx', -1), errors='coerce').fillna(-1).astype(np.int32)
-    results_df = results_df.loc[row_idx >= int(report_start_idx)].copy().reset_index(drop=True)
-    if results_df.empty:
-        return {
-            'enabled': False,
-            'reason': 'holdout_rows_filtered_empty',
-            'expected_holdout_rows': expected_holdout_rows,
-        }
-
-    y_true = pd.to_numeric(results_df.get('true_bias', 2), errors='coerce').fillna(2).astype(np.int32).to_numpy()
-    y_pred = pd.to_numeric(results_df.get('bias_idx', 2), errors='coerce').fillna(2).astype(np.int32).to_numpy()
-    gate_pass = results_df.get('event_gate_passed', pd.Series(False, index=results_df.index)).fillna(False).astype(bool).to_numpy()
-    tradeable = results_df.get('tradeable', pd.Series(False, index=results_df.index)).fillna(False).astype(bool).to_numpy()
-
-    class_report_text = classification_report(
-        y_true,
-        y_pred,
-        labels=[0, 1, 2],
-        target_names=['LONG', 'SHORT', 'NEUTRAL'],
-        zero_division=0,
-    )
-    class_report_dict = classification_report(
-        y_true,
-        y_pred,
-        labels=[0, 1, 2],
-        target_names=['LONG', 'SHORT', 'NEUTRAL'],
-        zero_division=0,
-        output_dict=True,
-    )
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2]).tolist()
-
-    directional_mask = np.isin(y_true, [0, 1])
-    directional_metrics = {
-        'precision_macro': 0.0,
-        'recall_macro': 0.0,
-        'f1_macro': 0.0,
-        'rows': int(np.sum(directional_mask)),
-    }
-    if np.any(directional_mask):
-        d_precision, d_recall, d_f1, _ = precision_recall_fscore_support(
-            y_true[directional_mask],
-            y_pred[directional_mask],
-            labels=[0, 1],
-            average='macro',
-            zero_division=0,
-        )
-        directional_metrics.update({
-            'precision_macro': float(d_precision),
-            'recall_macro': float(d_recall),
-            'f1_macro': float(d_f1),
-        })
-
-    true_neutral_mask = y_true == 2
-    pred_neutral_mask = y_pred == 2
-    summary = {
-        'enabled': True,
-        'split_time': str(split_ts),
-        'context_rows': int(report_start_idx),
-        'expected_holdout_rows': int(expected_holdout_rows),
-        'scored_rows': int(len(results_df)),
-        'scored_row_coverage': float(len(results_df) / max(expected_holdout_rows, 1)),
-        'accuracy_3class': float(np.mean(y_true == y_pred)),
-        'macro_f1_3class': float(class_report_dict.get('macro avg', {}).get('f1-score', 0.0)),
-        'weighted_f1_3class': float(class_report_dict.get('weighted avg', {}).get('f1-score', 0.0)),
-        'directional_metrics': directional_metrics,
-        'event_gate_pass_rate': float(np.mean(gate_pass)) if len(gate_pass) else 0.0,
-        'event_gate_pass_rate_directional_true': float(np.mean(gate_pass[directional_mask])) if np.any(directional_mask) else 0.0,
-        'event_gate_pass_rate_neutral_true': float(np.mean(gate_pass[true_neutral_mask])) if np.any(true_neutral_mask) else 0.0,
-        'tradeable_rate': float(np.mean(tradeable)) if len(tradeable) else 0.0,
-        'predicted_neutral_rate': float(np.mean(pred_neutral_mask)) if len(pred_neutral_mask) else 0.0,
-        'predicted_neutral_rows': int(np.sum(pred_neutral_mask)),
-        'correct_neutral_rows': int(np.sum(pred_neutral_mask & true_neutral_mask)),
-        'missed_directional_rows_as_neutral': int(np.sum(pred_neutral_mask & directional_mask)),
-        'true_label_counts': {str(int(k)): int(v) for k, v in pd.Series(y_true).value_counts().sort_index().to_dict().items()},
-        'pred_label_counts': {str(int(k)): int(v) for k, v in pd.Series(y_pred).value_counts().sort_index().to_dict().items()},
-        'reason_counts': {str(k): int(v) for k, v in results_df.get('reason', pd.Series(dtype='object')).fillna('').value_counts().head(15).to_dict().items()},
-        'event_gate_reason_counts': {str(k): int(v) for k, v in results_df.get('event_gate_reason', pd.Series(dtype='object')).fillna('').value_counts().head(15).to_dict().items()},
-        'classification_report': class_report_dict,
-        'confusion_matrix_labels': ['LONG', 'SHORT', 'NEUTRAL'],
-        'confusion_matrix': cm,
-        'visual_runtime': visual_info,
-    }
-
-    report_payload = {
-        'summary': summary,
-        'classification_report_text': class_report_text,
-    }
-    json_path = os.path.join(output_dir, 'end_to_end_holdout_report.json')
-    txt_path = os.path.join(output_dir, 'end_to_end_holdout_report.txt')
-    with open(json_path, 'w') as f:
-        json.dump(report_payload, f, indent=2)
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write("End-to-End Holdout Report\n")
-        f.write("=" * 32 + "\n")
-        f.write(
-            f"split_time={summary['split_time']} | context_rows={summary['context_rows']} | "
-            f"scored_rows={summary['scored_rows']}/{summary['expected_holdout_rows']}\n"
-        )
-        f.write(
-            f"accuracy_3class={summary['accuracy_3class']:.4f} | "
-            f"macro_f1_3class={summary['macro_f1_3class']:.4f} | "
-            f"event_gate_pass_rate={summary['event_gate_pass_rate']:.4f} | "
-            f"tradeable_rate={summary['tradeable_rate']:.4f}\n\n"
-        )
-        f.write(class_report_text)
-        f.write("\nConfusion Matrix [LONG, SHORT, NEUTRAL]\n")
-        for row in cm:
-            f.write(" ".join(str(int(x)) for x in row) + "\n")
-
-    print(
-        "  ✅ End-to-End Holdout: "
-        f"rows={summary['scored_rows']:,}/{summary['expected_holdout_rows']:,} "
-        f"| acc_3c={summary['accuracy_3class']:.2%} "
-        f"| macro_f1_3c={summary['macro_f1_3class']:.3f} "
-        f"| gate_pass={summary['event_gate_pass_rate']:.1%} "
-        f"| neutral={summary['predicted_neutral_rate']:.1%}"
-    )
-    return {
-        **summary,
-        'json_path': json_path,
-        'text_path': txt_path,
-    }
-
-
 def _resolve_meta_learner_profile(
     train_sequences: int,
     visual_seq_coverage: float,
@@ -2840,12 +2485,8 @@ def stage3_meta_learner_v19(
     coverage_mask: np.ndarray,
     inference_scaler_params: dict,
     output_dir: str,
-    stat_features: list[str] | None = None,
     meta_feature_names: list[str] | None = None,
     event_gate_cfg: dict | None = None,
-    full_df: pd.DataFrame | None = None,
-    lob_tensors=None,
-    lob_timestamps: pd.Series | None = None,
     epochs: int = 100,
     batch: int = 64,
     train_frac: float = 0.80,
@@ -2856,7 +2497,6 @@ def stage3_meta_learner_v19(
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
     MetaLearnerLSTM = _load_meta_learner_class()
-    stat_features = list(stat_features or CATBOOST_ADVISOR_FEATURES)
     meta_feature_names = list(meta_feature_names or resolve_meta_feature_names(meta_dim=int(meta_features.shape[1])))
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     if int(meta_features.shape[1]) != len(meta_feature_names):
@@ -2873,7 +2513,7 @@ def stage3_meta_learner_v19(
         )
 
     sequence_aux_mode = SEQUENCE_AUX_ALL_STEPS
-    X_stat = _build_scaled_stat_matrix(df, stat_features, inference_scaler_params)
+    X_stat = _build_scaled_stat_matrix(df, CATBOOST_ADVISOR_FEATURES, inference_scaler_params)
     X_rows = np.concatenate([X_stat, meta_features, visual_embeddings], axis=1).astype(np.float32)
     print(
         "  Meta Surface Layout: "
@@ -2894,7 +2534,7 @@ def stage3_meta_learner_v19(
         train_frac=train_frac,
         split_time=split_time,
         min_seq_coverage=min_seq_coverage,
-        n_stat_feat=len(stat_features),
+        n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
         sequence_aux_mode=sequence_aux_mode,
     )
     if len(X_tr) == 0 or len(X_val) == 0:
@@ -2934,7 +2574,6 @@ def stage3_meta_learner_v19(
         'train_sequences': int(profile.get('train_sequences', len(X_tr))),
         'compact_due_to_visual_coverage': bool(profile.get('compact_due_to_visual_coverage', False)),
         'compact_due_to_small_data': bool(profile.get('compact_due_to_small_data', False)),
-        'end_to_end_holdout': None,
     }
     if profile.get('name') == 'compact':
         print(
@@ -2952,7 +2591,7 @@ def stage3_meta_learner_v19(
 
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
-        n_stat_feat=len(stat_features),
+        n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
         n_meta_feat=int(meta_features.shape[1]),
         n_visual_emb=VISUAL_EMB_DIM,
         brain_file=meta_brain_path,
@@ -2978,20 +2617,7 @@ def stage3_meta_learner_v19(
             if isinstance(val_pred, dict) and 'bias_out' in val_pred
             else np.zeros((len(X_val), 2), dtype=np.float32)
         )
-        threshold_split = dict(getattr(meta, 'bias_threshold_split', {}) or {})
-        calibration_rows = int(threshold_split.get('calibration_rows', 0))
-        report_rows = int(threshold_split.get('report_rows', 0))
-        temp_y = yb_val
-        temp_probs = bias_val_probs
-        if calibration_rows > 0 and report_rows > 0:
-            temp_y = yb_val[:calibration_rows]
-            temp_probs = bias_val_probs[:calibration_rows]
-        temperature, temperature_report = _fit_temperature_from_probs(temp_y, temp_probs)
-        temperature_report.update({
-            'selection_source': str(threshold_split.get('selection_source', 'full_validation_fallback')),
-            'calibration_rows': int(len(temp_y)),
-            'report_rows': int(report_rows),
-        })
+        temperature, temperature_report = _fit_temperature_from_probs(yb_val, bias_val_probs)
         temperature_path = os.path.join(output_dir, 'meta_temperature_v19.json')
         with open(temperature_path, 'w') as f:
             json.dump(
@@ -3004,22 +2630,24 @@ def stage3_meta_learner_v19(
             )
         hist_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
         event_gate_cfg = event_gate_cfg or _infer_event_gate_schema(df)
-        e2e_report = None
-        history_path = os.path.join(output_dir, 'meta_learner_v19_history.json')
-        history_payload = {
-            'history': hist_dict,
-            'split': split_stats,
-            'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
-            'event_gate': event_gate_cfg,
-            'profile': profile,
-            'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
-            'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
-            'threshold_split': getattr(meta, 'bias_threshold_split', {}),
-            'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
-            'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
-            'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
-            'temperature_scaling': temperature_report,
-        }
+        with open(os.path.join(output_dir, 'meta_learner_v19_history.json'), 'w') as f:
+            json.dump(
+                {
+                    'history': hist_dict,
+                    'split': split_stats,
+                    'bias_class_weights': {str(k): float(v) for k, v in bias_class_weights.items()},
+                    'event_gate': event_gate_cfg,
+                    'profile': profile,
+                    'bias_long_threshold': float(getattr(meta, 'bias_long_threshold', 0.5)),
+                    'threshold_metrics': getattr(meta, 'bias_threshold_metrics', {}),
+                    'confidence_head_enabled': bool(getattr(meta, 'confidence_head_enabled', True)),
+                    'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
+                    'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
+                    'temperature_scaling': temperature_report,
+                },
+                f,
+                indent=2,
+            )
         artifacts = {
             'catboost_model': 'catboost_advisor_v19.cbm',
             'catboost_classes': 'catboost_classes_v19.json',
@@ -3049,7 +2677,7 @@ def stage3_meta_learner_v19(
         schema = {
             'version': SCHEMA_VERSION,
             'seq_len': SEQ_LEN,
-            'stat_features': stat_features,
+            'stat_features': CATBOOST_ADVISOR_FEATURES,
             'meta_features': meta_feature_names,
             'visual_features': VISUAL_FEATURE_NAMES,
             'sequence_aux_mode': sequence_aux_mode,
@@ -3080,20 +2708,6 @@ def stage3_meta_learner_v19(
         }
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
-        if full_df is not None:
-            e2e_report = _generate_end_to_end_holdout_report(
-                full_df,
-                output_dir=output_dir,
-                split_time=split_time,
-                train_frac=train_frac,
-                event_gate_cfg=event_gate_cfg,
-                lob_tensors=lob_tensors,
-                lob_timestamps=lob_timestamps,
-            )
-            stage3_summary['end_to_end_holdout'] = e2e_report
-            history_payload['end_to_end_holdout'] = e2e_report
-        with open(history_path, 'w') as f:
-            json.dump(history_payload, f, indent=2)
         print("  ✅ MetaLearner V19 history + schema محفوظان")
     return stage3_summary
 
@@ -3128,7 +2742,7 @@ def _load_required_stage1_artifacts(
     missing = [path for path in required_files if not os.path.exists(path)]
     if missing:
         raise FileNotFoundError(
-            '❌ Stage1 base-model artifacts missing. '
+            '❌ CatBoost/XGBoost stage artifacts missing. '
             'شغّل المرحلة الثانية أولاً:\n'
             'python train_v19.py --data <stage1_artifact_dir> --output <dir> --phase catboost\n'
             f'Missing: {missing}'
@@ -3191,7 +2805,6 @@ def run_training_pipeline(
     stage: int = 0,
     phase: str | None = None,
     catboost_device: str = 'auto',
-    include_xgboost: bool | None = None,
     training_mode: str | None = None,
     quality_weight_strong: float | None = None,
     quality_weight_weak: float | None = None,
@@ -3199,7 +2812,6 @@ def run_training_pipeline(
     train_days: float | None = None,
     backtest_days: float | None = None,
     window_end: str | None = None,
-    stat_feature_limit: int = DEFAULT_STAT_FEATURE_LIMIT,
     config_snapshot: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
@@ -3213,11 +2825,6 @@ def run_training_pipeline(
     print('=' * 65)
 
     train_cfg = (config_snapshot or {}).get('training', {})
-    include_xgboost = bool(
-        train_cfg.get('include_xgboost', False)
-        if include_xgboost is None
-        else include_xgboost
-    )
     training_mode = training_mode or str(train_cfg.get('mode', TRAIN_MODE_EVENT_BINARY))
     quality_weight_strong = float(
         quality_weight_strong if quality_weight_strong is not None else train_cfg.get('quality_weight_strong', 2.0)
@@ -3259,21 +2866,6 @@ def run_training_pipeline(
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
     if copied_artifacts:
         print(f"  ✅ Inference artifacts copied: {list(copied_artifacts)}")
-    active_stat_features, active_stat_info = _resolve_active_stat_features(
-        event_df,
-        artifacts_dir=output_dir,
-        feature_limit=stat_feature_limit,
-    )
-    print(
-        "  ✅ Active stat features: "
-        f"{len(active_stat_features)}/{max(int(stat_feature_limit), 1)} "
-        f"| selected_file_used={active_stat_info['selected_features_used']} "
-        f"| features={active_stat_features}"
-    )
-    print(
-        "  🧱 Stage1 Base Models: "
-        f"{'catboost + xgboost + regime' if include_xgboost else 'catboost + regime'}"
-    )
 
     effective_source_contract = dict(source_contract)
     effective_source_contract.update({
@@ -3288,7 +2880,7 @@ def run_training_pipeline(
 
     inference_scaler_params, scaler_info = build_inference_scaler_params(
         event_df,
-        active_stat_features,
+        CATBOOST_ADVISOR_FEATURES,
         train_frac=train_frac,
         split_time=training_window.get('split_time'),
     )
@@ -3299,10 +2891,9 @@ def run_training_pipeline(
     )
     feature_drift_report_path = _write_feature_coverage_drift_report(
         event_df,
-        stat_features=active_stat_features,
         split_time=training_window.get('split_time'),
         output_dir=output_dir,
-        protected_features=set(active_stat_features) & {'cvd', 'obi', 'micro_atr', 'kyle_lambda', 'hawkes_intensity', 'vwap_z_score'},
+        protected_features={'cvd', 'obi', 'micro_atr', 'kyle_lambda', 'hawkes_intensity', 'vwap_z_score'},
     )
     print(f"  ✅ Feature coverage/drift report: {feature_drift_report_path}")
 
@@ -3367,7 +2958,6 @@ def run_training_pipeline(
         meta_features, coverage = stage1_oof_meta(
             event_df,
             output_dir,
-            stat_features=active_stat_features,
             splits=splits,
             n_folds=n_folds,
             test_size=test_size,
@@ -3377,7 +2967,6 @@ def run_training_pipeline(
             t1=split_t1,
             inference_scaler_params=inference_scaler_params,
             catboost_device=catboost_device,
-            include_xgboost=include_xgboost,
             quality_weight_strong=quality_weight_strong,
             quality_weight_weak=quality_weight_weak,
             cost_config=(config_snapshot or {}).get('backtest', {}),
@@ -3385,7 +2974,7 @@ def run_training_pipeline(
         meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:
         meta_features, coverage, meta_feature_names = _load_required_stage1_artifacts(output_dir, n_rows=len(event_df))
-        print(f"✅ Stage1 artifacts loaded from cache: {meta_features.shape} | layout={_meta_layout_label(meta_feature_names)}")
+        print(f'✅ CatBoost/XGBoost artifacts loaded from cache: {meta_features.shape}')
 
     if resolved_phase == PHASE_CATBOOST:
         elapsed = (datetime.datetime.now() - started_at).total_seconds()
@@ -3393,7 +2982,6 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
-            'active_stat_features': active_stat_features,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': None,
@@ -3425,7 +3013,6 @@ def run_training_pipeline(
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
-                'stat_feature_limit': stat_feature_limit,
             },
             inputs={
                 'csv': csv_path,
@@ -3437,8 +3024,6 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
-                'active_stat_features': active_stat_features,
-                'active_stat_info': active_stat_info,
             },
         )
         print('\n' + '=' * 65)
@@ -3495,7 +3080,6 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
-            'active_stat_features': active_stat_features,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': list(visual_embeddings.shape),
@@ -3527,7 +3111,6 @@ def run_training_pipeline(
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
-                'stat_feature_limit': stat_feature_limit,
             },
             inputs={
                 'csv': csv_path,
@@ -3539,8 +3122,6 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
-                'active_stat_features': active_stat_features,
-                'active_stat_info': active_stat_info,
             },
         )
         print('\n' + '=' * 65)
@@ -3572,12 +3153,8 @@ def run_training_pipeline(
             coverage_mask=coverage,
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
-            stat_features=active_stat_features,
             meta_feature_names=meta_feature_names,
             event_gate_cfg=event_gate_cfg,
-            full_df=df_full,
-            lob_tensors=lob_tensors,
-            lob_timestamps=lob_timestamps,
             epochs=epochs,
             batch=batch,
             train_frac=train_frac,
@@ -3590,8 +3167,6 @@ def run_training_pipeline(
         'rows_full': int(len(df_full)),
         'rows_event': int(len(event_df)),
         'training_mode': training_mode,
-        'active_stat_features': active_stat_features,
-        'active_stat_info': active_stat_info,
         'meta_shape': list(meta_features.shape),
         'meta_coverage_ratio': float(np.mean(coverage)),
         'visual_shape': list(visual_embeddings.shape),
@@ -3627,7 +3202,6 @@ def run_training_pipeline(
             'train_days': train_days,
             'backtest_days': backtest_days,
             'window_end': window_end,
-            'stat_feature_limit': stat_feature_limit,
         },
         inputs={
             'csv': csv_path,
@@ -3641,8 +3215,6 @@ def run_training_pipeline(
             'meta_feature_dim': int(meta_features.shape[1]),
             'event_gate_schema': event_gate_cfg,
             'meta_learner_profile': stage3_summary,
-            'active_stat_features': active_stat_features,
-            'active_stat_info': active_stat_info,
             'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
         },
     )
@@ -3681,9 +3253,6 @@ def main():
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
-    p.set_defaults(include_xgboost=bool(defaults.get('include_xgboost', False)))
-    p.add_argument('--include_xgboost', dest='include_xgboost', action='store_true', help='enable XGBoost alongside CatBoost in Stage 1')
-    p.add_argument('--no_xgboost', dest='include_xgboost', action='store_false', help='disable XGBoost and use CatBoost + regime only')
     p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
@@ -3691,7 +3260,6 @@ def main():
     p.add_argument('--train_days', type=float, default=None, help='limit training window to N days immediately before split_time')
     p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
     p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
-    p.add_argument('--stat_feature_limit', type=int, default=int(defaults.get('stat_feature_limit', DEFAULT_STAT_FEATURE_LIMIT)))
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
@@ -3712,7 +3280,6 @@ def main():
         stage=args.stage,
         phase=args.phase,
         catboost_device=args.catboost_device,
-        include_xgboost=args.include_xgboost,
         training_mode=args.training_mode,
         quality_weight_strong=args.quality_weight_strong,
         quality_weight_weak=args.quality_weight_weak,
@@ -3720,7 +3287,6 @@ def main():
         train_days=args.train_days,
         backtest_days=args.backtest_days,
         window_end=args.window_end,
-        stat_feature_limit=args.stat_feature_limit,
         config_snapshot=cfg,
     )
 

@@ -21,14 +21,20 @@ def _configure_stage1_runtime_env() -> None:
 
 
 def main():
-    defaults = load_v19_config().get('refinery', {})
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', default=None, help='optional config override file')
+    pre_args, _ = pre.parse_known_args()
+    full_cfg = load_v19_config(pre_args.config)
+    defaults = full_cfg.get('refinery', {}) or {}
+    soft_defaults = full_cfg.get('soft_labels', {}) or {}
     _configure_stage1_runtime_env()
     from prepare_training_data import run_refinery
     p = argparse.ArgumentParser(description='QuantSystem V19 - Stage 1 refinery only')
+    p.add_argument('--config', default=pre_args.config, help='optional config override file')
     p.add_argument('--mbo', required=True)
     p.add_argument('--mbp', required=True)
     p.add_argument('--symbol', default='')
-    p.add_argument('--output', default='outputs_v19')
+    p.add_argument('--output', default=defaults.get('output_dir', 'outputs_v19'))
     p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(defaults.get('chunk_rows', defaults.get('chunksize', 2_000_000))))
     p.add_argument('--label_mode', choices=['v19'], default=defaults.get('label_mode', 'v19'))
     p.add_argument('--n_workers', type=int, default=defaults.get('n_workers'))
@@ -44,6 +50,7 @@ def main():
     p.add_argument('--label_horizon', type=int, default=int(defaults.get('label_horizon', 150)))
 
     p.add_argument('--event_roll_window', type=int, default=int(defaults.get('event_roll_window', 30)))
+    p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
 
     # FIX: خُفّض من 5.0 → 2.0 tick
     # 5 tick floor كان يرفع TP/SL بشكل مبالغ فيه على بيانات منخفضة التذبذب
@@ -54,7 +61,6 @@ def main():
     p.add_argument('--training_event_score_threshold', type=float, default=defaults.get('training_event_score_threshold', 0.0))
 
     p.add_argument('--lob_event_sample', type=int, default=int(defaults.get('lob_event_sample', 100000)))
-    p.add_argument('--feature_roll_window', type=int, default=int(defaults.get('feature_roll_window', 150)))
 
     # معاملات جديدة للمصفاة
     p.add_argument('--tp_mult', type=float, default=float(defaults.get('tp_mult', 1.2)),
@@ -65,8 +71,8 @@ def main():
                    default=str(defaults.get('tp_sl_threshold_mode', 'fixed')),
                    help="label TP/SL threshold mode: 'fixed' or 'atr' (default: fixed)")
     p.set_defaults(
-        adaptive_horizon=bool(defaults.get('adaptive_horizon', False)),
-        trend_filter=bool(defaults.get('trend_filter', False)),
+        adaptive_horizon=bool(defaults.get('adaptive_horizon', True)),
+        trend_filter=bool(defaults.get('trend_filter', True)),
         trend_filter_strict=bool(defaults.get('trend_filter_strict', False)),
         emit_meta_labels=bool(defaults.get('emit_meta_labels', True)),
     )
@@ -86,11 +92,20 @@ def main():
                    help='emit stable meta-label/context columns (default: on)')
     p.add_argument('--no_emit_meta_labels', dest='emit_meta_labels', action='store_false',
                    help='disable meta-label/context column emission')
-    p.add_argument('--soft_label_scenarios', type=int, default=int(defaults.get('soft_label_scenarios', 0)))
-    p.add_argument('--soft_label_seed', type=int, default=int(defaults.get('soft_label_seed', 42)))
-    p.add_argument('--soft_label_horizon_jitter', type=float, default=float(defaults.get('soft_label_horizon_jitter', 0.20)))
-    p.add_argument('--soft_label_tp_jitter', type=float, default=float(defaults.get('soft_label_tp_jitter', 0.15)))
-    p.add_argument('--soft_label_sl_jitter', type=float, default=float(defaults.get('soft_label_sl_jitter', 0.15)))
+    p.add_argument('--use_soft_labels', action=argparse.BooleanOptionalAction, default=bool(soft_defaults.get('enabled', True)),
+                   help='enable/disable soft labels in the label refinery')
+    p.add_argument('--soft_label_mode', choices=['analytical', 'monte_carlo'],
+                   default=str(soft_defaults.get('mode', 'analytical')))
+    p.add_argument('--soft_label_n_scenarios', '--soft_label_scenarios', dest='soft_label_n_scenarios', type=int,
+                   default=int(soft_defaults.get('n_scenarios', 50)))
+    p.add_argument('--soft_label_random_seed', '--soft_label_seed', dest='soft_label_random_seed', type=int,
+                   default=int(soft_defaults.get('random_seed', 42)))
+    p.add_argument('--soft_label_horizon_std', '--soft_label_horizon_jitter', dest='soft_label_horizon_std', type=float,
+                   default=float(soft_defaults.get('horizon_std', 0.15)))
+    p.add_argument('--soft_label_tp_std', '--soft_label_tp_jitter', dest='soft_label_tp_std', type=float,
+                   default=float(soft_defaults.get('tp_std', 0.10)))
+    p.add_argument('--soft_label_sl_std', '--soft_label_sl_jitter', dest='soft_label_sl_std', type=float,
+                   default=float(soft_defaults.get('sl_std', 0.10)))
     p.add_argument('--kalman_slope_threshold', type=float,
                    default=float(defaults.get('kalman_slope_threshold', 0.05)),
                    help='حد قوة الميل في Kalman (default: 0.05, القديم: 1e-5)')
@@ -122,6 +137,7 @@ def main():
         target_bars=args.target_bars,
         label_horizon=args.label_horizon,
         event_roll_window=args.event_roll_window,
+        feature_roll_window=args.feature_roll_window,
         direction_threshold_ticks=args.direction_threshold_ticks,
         causal_threshold_mode=args.causal_threshold_mode,
         raw_event_target_rate=args.raw_event_target_rate,
@@ -130,16 +146,16 @@ def main():
         lob_event_sample=args.lob_event_sample,
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
-        tp_sl_threshold_mode=args.tp_sl_threshold_mode,
         adaptive_horizon=args.adaptive_horizon,
         trend_filter=args.trend_filter,
         trend_filter_strict=args.trend_filter_strict,
-        emit_meta_labels=args.emit_meta_labels,
-        soft_label_scenarios=args.soft_label_scenarios,
-        soft_label_seed=args.soft_label_seed,
-        soft_label_horizon_jitter=args.soft_label_horizon_jitter,
-        soft_label_tp_jitter=args.soft_label_tp_jitter,
-        soft_label_sl_jitter=args.soft_label_sl_jitter,
+        use_soft_labels=args.use_soft_labels,
+        soft_label_mode=args.soft_label_mode,
+        soft_label_n_scenarios=args.soft_label_n_scenarios,
+        soft_label_random_seed=args.soft_label_random_seed,
+        soft_label_horizon_std=args.soft_label_horizon_std,
+        soft_label_tp_std=args.soft_label_tp_std,
+        soft_label_sl_std=args.soft_label_sl_std,
         kalman_slope_threshold=args.kalman_slope_threshold,
         trend_strength_min=args.trend_strength_min,
         regime_mode=args.regime_mode,
@@ -149,6 +165,7 @@ def main():
         shard_warmup_rows=args.shard_warmup_rows,
         merge_tolerance_ms=args.merge_tolerance_ms,
         step4_min_parallel_rows=args.step4_min_parallel_rows,
+        config_path=args.config,
     )
 
 

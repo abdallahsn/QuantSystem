@@ -227,12 +227,16 @@ class CatBoostQuantBrain:
     # ── Training ────────────────────────────────────────────────────────────────
 
     def fit(self, X: np.ndarray, y_bias: np.ndarray, embeddings: np.ndarray = None,
-            output_dir: str = 'outputs') -> dict:
+            output_dir: str = 'outputs',
+            soft_label_weights: np.ndarray = None) -> dict:
         """
         يدرّب CatBoost
         X: (n_samples, n_features) — آخر تيك من كل sequence
         y_bias: (n_samples,) — LONG/SHORT/NEUTRAL
         embeddings: (n_samples, embeddings_dim) — مخرجات الـ Autoencoder
+        soft_label_weights: (n_samples,) — أوزان Soft Labels الاختيارية
+            إذا مُرّرت: تُضرب في class-balance weights بدلاً من استخدام quality weights فقط
+            احصل عليها من: soft_label_engine.compute_soft_sample_weights(labeled_df)
         """
         if not CB_AVAILABLE:
             return {}
@@ -284,6 +288,31 @@ class CatBoostQuantBrain:
         counts = np.bincount(y_tr, minlength=3)
         cw     = {k: total / (3 * max(c,1)) for k, c in enumerate(counts)}
         sample_w = np.array([cw[y] for y in y_tr], dtype=np.float32)
+
+        # ── FIX-12: دمج Soft Label Weights ──────────────────────────────────
+        # إذا مُرّرت soft_label_weights، نضربها في class-balance weights
+        # هذا يجعل النموذج يُركّز على الإشارات الواضحة عالية الثقة
+        # بينما يُهمّش الصفوف الغامضة (soft_label ≈ 0.5) تلقائياً
+        if soft_label_weights is not None:
+            try:
+                sl_w = np.asarray(soft_label_weights, dtype=np.float32)
+                # فلتر نفس valid_mask المُطبّق على X و y
+                sl_w_clean = sl_w[valid_mask] if len(sl_w) == (len(valid_mask) if hasattr(valid_mask, '__len__') else len(y_bias)) else sl_w
+                if len(sl_w_clean) == len(sample_w):
+                    sl_w_tr = sl_w_clean[:split]
+                    # حوّل الأوزان إلى نفس scale
+                    sl_w_tr = np.clip(sl_w_tr, 0.05, None)
+                    sl_w_tr = sl_w_tr / float(np.mean(sl_w_tr) + 1e-8)
+                    sample_w = sample_w * sl_w_tr
+                    # أعد التطبيع
+                    sample_w = sample_w / float(np.mean(sample_w) + 1e-8)
+                    print(f"  ✅ Soft Label Weights مُطبّقة: mean={float(np.mean(sample_w)):.2f} "
+                          f"max={float(np.max(sample_w)):.2f}")
+                else:
+                    print(f"  ⚠️ soft_label_weights طولها {len(sl_w_clean)} ≠ {len(sample_w)} — تجاهل")
+            except Exception as _sw_err:
+                print(f"  ⚠️ خطأ في تطبيق soft_label_weights: {_sw_err!r} — تجاهل")
+        # ── نهاية FIX-12 ────────────────────────────────────────────────────
 
         print(f"  Train: {len(X_tr):,} | Val: {len(X_val):,}")
         print(f"  Weights: LONG={cw[0]:.2f} SHORT={cw[1]:.2f} NEUTRAL={cw[2]:.2f}")
@@ -358,6 +387,143 @@ class CatBoostQuantBrain:
         names = self._effective_feature_names(len(imp))
         ranked = sorted(zip(names, imp), key=lambda x: -x[1])
         return {name: round(float(val), 4) for name, val in ranked}
+
+    # ── FIX-12: Binary Soft Label Head ───────────────────────────────────────
+
+    def fit_soft_binary(
+        self,
+        X: np.ndarray,
+        soft_label: np.ndarray,
+        label_confidence: np.ndarray = None,
+        output_dir: str = 'outputs',
+        model_suffix: str = '_soft_binary',
+    ) -> dict:
+        """
+        FIX-12 — تدريب رأس ثنائي بـ CrossEntropy مع Soft Labels.
+
+        يُكمّل الـ MultiClass الأساسي بنموذج ثنائي يُقدّر:
+          P(win | direction, features) ∈ [0, 1]
+
+        الفرق عن fit() الأساسي:
+          - loss_function = 'CrossEntropy'  (يقبل احتمالية مستمرة، ليس 0/1 فقط)
+          - target = soft_label ∈ [0, 1]   (بدلاً من class index 0/1/2)
+          - sample_weight = confidence × |soft_label - 0.5| × 2
+          - eval_metric = 'AUC'             (أفضل للتمييز)
+
+        المدخلات:
+          X              : (n_samples, n_features) — نفس ميزات fit() الأساسي
+          soft_label     : (n_samples,) — P(win) ∈ [0, 1] من soft_label_engine
+          label_confidence: (n_samples,) — وزن الثقة ∈ [0, 1] (اختياري)
+          output_dir     : مجلد الحفظ
+          model_suffix   : لاحقة اسم ملف النموذج
+
+        المخرجات:
+          dict مع: val_auc, val_logloss, best_iteration
+        """
+        if not CB_AVAILABLE:
+            return {}
+
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        print("\n🎯 CatBoost Soft Binary Training (CrossEntropy)...")
+
+        # تحضير الأوزان
+        n = len(soft_label)
+        soft_label = np.clip(np.asarray(soft_label, dtype=np.float32), 0.01, 0.99)
+        clarity = np.abs(soft_label - 0.5) * 2.0
+
+        if label_confidence is not None:
+            conf = np.clip(np.asarray(label_confidence, dtype=np.float32), 0.01, 1.0)
+        else:
+            conf = np.ones(n, dtype=np.float32)
+
+        sample_w = conf * clarity
+        sample_w = np.clip(sample_w, 0.05, None)
+        sample_w = sample_w / float(np.mean(sample_w) + 1e-8)
+
+        # تقسيم بدون خلط (بيانات مالية → ترتيب زمني ضروري)
+        split = int(n * 0.8)
+        split = min(max(split, 1), n - 1)
+        X_tr, X_val = X[:split], X[split:]
+        y_tr, y_val = soft_label[:split], soft_label[split:]
+        sw_tr       = sample_w[:split]
+
+        print(f"  Train: {len(X_tr):,} | Val: {len(X_val):,}")
+        print(f"  soft_label mean(train)={float(y_tr.mean()):.3f} | "
+              f"clarity mean={float(clarity[:split].mean()):.3f}")
+
+        feature_names = getattr(self, '_ctx_feature_cols', None)
+
+        train_pool = Pool(
+            X_tr, y_tr,
+            sample_weight=sw_tr,
+            feature_names=feature_names,
+        )
+        val_pool = Pool(
+            X_val, y_val,
+            feature_names=feature_names,
+        )
+
+        from modules.gpu_config import GPU_AVAILABLE
+
+        soft_model = CatBoostClassifier(
+            iterations            = self.iterations,
+            depth                 = self.depth,
+            learning_rate         = self.learning_rate,
+            l2_leaf_reg           = self.l2_leaf_reg,
+            loss_function         = 'CrossEntropy',   # يقبل soft labels [0,1]
+            eval_metric           = 'AUC',             # AUC أفضل من Accuracy للتمييز
+            early_stopping_rounds = 50,
+            use_best_model        = True,
+            verbose               = 50,
+            random_seed           = 42,
+            task_type             = 'GPU' if GPU_AVAILABLE else 'CPU',
+            devices               = '0'   if GPU_AVAILABLE else None,
+        )
+
+        soft_model.fit(train_pool, eval_set=val_pool, plot=False)
+
+        # حفظ النموذج الثنائي بجانب النموذج الأساسي
+        base_path  = self._resolved_model_path(output_dir)
+        soft_path  = base_path.replace('.cbm', f'{model_suffix}.cbm')
+        soft_model.save_model(soft_path)
+        print(f"\n  ✅ Soft Binary Model → {soft_path}")
+
+        # تقييم
+        val_proba = soft_model.predict_proba(X_val)[:, 1]
+        from sklearn.metrics import roc_auc_score, log_loss
+        try:
+            val_auc = float(roc_auc_score(y_val > 0.5, val_proba))
+        except Exception:
+            val_auc = float('nan')
+        try:
+            val_logloss = float(log_loss(y_val, val_proba))
+        except Exception:
+            val_logloss = float('nan')
+
+        print(f"  Val AUC = {val_auc:.4f} | LogLoss = {val_logloss:.4f}")
+
+        # حفظ مرجع للنموذج الثنائي
+        self._soft_binary_model   = soft_model
+        self._soft_binary_path    = soft_path
+
+        return {
+            'val_auc':       val_auc,
+            'val_logloss':   val_logloss,
+            'best_iteration': soft_model.get_best_iteration(),
+            'model_path':    soft_path,
+        }
+
+    def predict_soft_binary(self, X: np.ndarray) -> np.ndarray:
+        """
+        FIX-12 — تنبؤ بـ P(win) من الرأس الثنائي.
+        يُرجع array من الاحتماليات ∈ [0, 1].
+        يتطلب استدعاء fit_soft_binary() أولاً.
+        """
+        if not hasattr(self, '_soft_binary_model') or self._soft_binary_model is None:
+            raise RuntimeError("fit_soft_binary() لم يُستدعَ بعد.")
+        proba = self._soft_binary_model.predict_proba(X)[:, 1]
+        return proba.astype(np.float32)
 
     def _compute_shap(self, X_val: np.ndarray,
                        y_val: np.ndarray,
