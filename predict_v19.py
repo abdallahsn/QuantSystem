@@ -52,13 +52,13 @@ except Exception as exc:
     print(f"  ⚠️ DeepLOB inference غير متاح — {exc}")
 
 try:
-    from catboost import CatBoostClassifier
+    from catboost import CatBoostClassifier, CatBoostRegressor
     CB_AVAILABLE = True
 except ImportError:
     CB_AVAILABLE = False
 
 try:
-    from xgboost import XGBClassifier
+    from xgboost import XGBClassifier, XGBRegressor
     XGB_AVAILABLE = True
 except Exception:
     XGB_AVAILABLE = False
@@ -67,6 +67,14 @@ BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 2
 N_XGB_PROBS = 2
+STAGE1_TARGET_SOFT_LABEL = 'soft_label'
+
+
+def _pseudo_prob_head(pred: np.ndarray) -> np.ndarray:
+    """Scalar regression output in (0,1) -> [p, 1-p] aligned with meta stacking."""
+    p = np.asarray(pred, dtype=np.float64).reshape(-1)
+    p = np.clip(p, 1e-6, 1.0 - 1e-6).astype(np.float32)
+    return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
 def _directional_metrics_from_rows(rows: list[dict]) -> dict:
@@ -162,6 +170,7 @@ class V19PredictionEngine:
 
         self.cb_advisor = None
         self.cb_calibrator = None
+        self._cb_soft_regression = False
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
         self.cb_classes = None
         cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
@@ -169,13 +178,20 @@ class V19PredictionEngine:
         if os.path.exists(cb_classes_path):
             try:
                 with open(cb_classes_path, 'r') as f:
-                    self.cb_classes = json.load(f).get('classes')
+                    _cbc = json.load(f)
+                    self.cb_classes = _cbc.get('classes')
+                    self._cb_soft_regression = str(_cbc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
             except Exception:
                 self.cb_classes = None
+                self._cb_soft_regression = False
         if CB_AVAILABLE and os.path.exists(cb_path):
-            self.cb_advisor = CatBoostClassifier()
+            self.cb_advisor = (
+                CatBoostRegressor()
+                if self._cb_soft_regression
+                else CatBoostClassifier()
+            )
             self.cb_advisor.load_model(cb_path)
-            print(f"  ✅ CatBoost V19: {cb_path}")
+            print(f"  ✅ CatBoost V19: {cb_path} ({'regress-soft' if self._cb_soft_regression else 'classify'})")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
         if run_mode != 'backtest' and 'catboost' in required_base_models and self.cb_advisor is None:
@@ -195,18 +211,22 @@ class V19PredictionEngine:
         self.xgb_advisor = None
         self.xgb_calibrator = None
         self.xgb_classes = None
+        self._xgb_soft_regression = False
         xgb_path = os.path.join(models_dir, artifacts.get('xgboost_model', 'xgboost_advisor_v19.json'))
         xgb_classes_path = os.path.join(models_dir, artifacts.get('xgboost_classes', 'xgboost_classes_v19.json'))
         if os.path.exists(xgb_classes_path):
             try:
                 with open(xgb_classes_path, 'r') as f:
-                    self.xgb_classes = json.load(f).get('classes')
+                    _xjc = json.load(f)
+                    self.xgb_classes = _xjc.get('classes')
+                    self._xgb_soft_regression = str(_xjc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
             except Exception:
                 self.xgb_classes = None
+                self._xgb_soft_regression = False
         if XGB_AVAILABLE and os.path.exists(xgb_path):
-            self.xgb_advisor = XGBClassifier()
+            self.xgb_advisor = XGBRegressor() if self._xgb_soft_regression else XGBClassifier()
             self.xgb_advisor.load_model(xgb_path)
-            print(f"  ✅ XGBoost V19: {xgb_path}")
+            print(f"  ✅ XGBoost V19: {xgb_path} ({'regress-soft' if self._xgb_soft_regression else 'classify'})")
         else:
             print(f"  ⚠️ XGBoost V19 missing: {xgb_path}")
         if run_mode != 'backtest' and 'xgboost' in required_base_models and self.xgb_advisor is None:
@@ -368,12 +388,16 @@ class V19PredictionEngine:
         if self.cb_advisor is None:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
         try:
-            probs = self.cb_advisor.predict_proba(X_stat)
-            aligned = align_probability_columns(
-                probs,
-                N_CB_PROBS,
-                classes=getattr(self.cb_advisor, 'classes_', None) or self.cb_classes,
-            )
+            if getattr(self, '_cb_soft_regression', False):
+                probs = _pseudo_prob_head(self.cb_advisor.predict(X_stat))
+                aligned = align_probability_columns(probs, N_CB_PROBS)
+            else:
+                probs = self.cb_advisor.predict_proba(X_stat)
+                aligned = align_probability_columns(
+                    probs,
+                    N_CB_PROBS,
+                    classes=getattr(self.cb_advisor, 'classes_', None) or self.cb_classes,
+                )
             return self._apply_long_calibrator(aligned)
         except Exception:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
@@ -383,12 +407,16 @@ class V19PredictionEngine:
         if self.xgb_advisor is None:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
         try:
-            probs = self.xgb_advisor.predict_proba(X_stat)
-            aligned = align_probability_columns(
-                probs,
-                N_XGB_PROBS,
-                classes=getattr(self.xgb_advisor, 'classes_', None) or self.xgb_classes,
-            )
+            if getattr(self, '_xgb_soft_regression', False):
+                probs = _pseudo_prob_head(self.xgb_advisor.predict(X_stat))
+                aligned = align_probability_columns(probs, N_XGB_PROBS)
+            else:
+                probs = self.xgb_advisor.predict_proba(X_stat)
+                aligned = align_probability_columns(
+                    probs,
+                    N_XGB_PROBS,
+                    classes=getattr(self.xgb_advisor, 'classes_', None) or self.xgb_classes,
+                )
             return self._apply_long_calibrator(aligned, calibrator=self.xgb_calibrator)
         except Exception:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
@@ -599,7 +627,8 @@ class V19PredictionEngine:
             already_scaled=already_scaled,
             include_meta=True,
         )
-        self._update_regime_context(stat_df)
+        if meta_override is None:
+            self._update_regime_context(stat_df)
         health = evaluate_system_health(
             models_dir=self.models_dir,
             engine_status=self.get_runtime_status(),

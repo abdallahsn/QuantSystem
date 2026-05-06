@@ -206,9 +206,10 @@ def get_multiprocessing_workers(target_workers: int = None) -> int:
 
 def print_gpu_report():
     info = detect_gpu()
-    print('\n' + '─'*50)
-    print('⚡ Hardware & GPU Configuration:')
-    if info['available']:
+    sep = "-" * 50
+    print("\n" + sep)
+    print("Hardware & GPU Configuration:")
+    if info["available"]:
         print(f'   GPU:       {info["name"]}')
         total_vram = info.get("memory_total_gb", 0.0)
         if total_vram and info.get("n_gpus", 0) > 1:
@@ -218,13 +219,13 @@ def print_gpu_report():
         print(f'   GPUs:      {info["n_gpus"]}')
         print(f'   Framework: {info["framework"]}')
         batch = get_optimal_batch_size()
-        print(f'   Optimal Batch Size: {batch}')
+        print(f"   Optimal Batch Size: {batch}")
     else:
-        print('   GPU: غير متاح — Running on CPU mode 🐢')
-    
-    print(f'   CPU Cores: {N_CPU_CORES} (Available)')
-    print(f'   MP Workers:{N_WORKERS}')
-    print('─'*50 + '\n')
+        print("   GPU: not available - running on CPU")
+
+    print(f"   CPU Cores: {N_CPU_CORES} (Available)")
+    print(f"   MP Workers:{N_WORKERS}")
+    print(sep + "\n")
     return info
 
 # نتجنب استكشاف العتاد أثناء الاستيراد حتى لا يفرض TensorFlow side effects

@@ -20,10 +20,30 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+# Child processes (Windows spawn) inherit env; avoids cp1256 UnicodeEncodeError on emoji logs.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import numpy as np
 import pandas as pd
 import gc
+
+
+def _configure_stdio_utf8() -> None:
+    """Windows consoles often default to cp1256; emoji/unicode logs then crash on print."""
+    for _name in ("stdout", "stderr"):
+        _stream = getattr(sys, _name, None)
+        _reconf = getattr(_stream, "reconfigure", None) if _stream is not None else None
+        if callable(_reconf):
+            try:
+                _reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _pool_worker_init() -> None:
+    """Ensure worker processes (spawn) can emit UTF-8 without UnicodeEncodeError."""
+    _configure_stdio_utf8()
+
 
 from modules.microstructure          import (FastMicrostructureEngine,
                                               AbsorptionIntensityEngine, CancelRatioEngine,
@@ -582,6 +602,8 @@ SOFT_LABEL_ARTIFACT_COLS = [
     'soft_label_long',
     'soft_label_short',
     'soft_sample_weight',
+    'mc_sample_weight',
+    'label_stability',
 ]
 
 # V19 Meta-Features — مخرجات CatBoost تُضاف للـ LSTM
@@ -1312,7 +1334,10 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     available_methods = set(multiprocessing.get_all_start_methods())
     preferred_method = 'fork' if sys.platform != 'win32' and 'fork' in available_methods else 'spawn'
     ctx_mp = multiprocessing.get_context(preferred_method)
-    with ctx_mp.Pool(processes=min(int(workers), len(tasks))) as pool:
+    with ctx_mp.Pool(
+        processes=min(int(workers), len(tasks)),
+        initializer=_pool_worker_init,
+    ) as pool:
         for result in pool.imap_unordered(worker_fn, tasks):
             _collect(result)
     return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
@@ -3117,6 +3142,7 @@ def apply_scaler_params(df: pd.DataFrame, scaler_path: str) -> pd.DataFrame:
 
     return df
 
+
 def run_refinery(
     mbo_path,
     mbp_path,
@@ -3167,6 +3193,7 @@ def run_refinery(
     config_path: str | None = None,
     **legacy_kwargs,
 ):
+    _configure_stdio_utf8()
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
 

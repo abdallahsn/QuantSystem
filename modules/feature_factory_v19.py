@@ -81,6 +81,8 @@ DEFAULT_PASSTHROUGH_COLS = [
     'soft_label_confidence',
     'soft_label_entropy',
     'soft_label_scenarios',
+    'mc_sample_weight',
+    'label_stability',
 ]
 DEFAULT_INT_COLS = {
     'bias_label',
@@ -141,6 +143,8 @@ FORBIDDEN_STAT_FEATURES = {
     'soft_label_confidence',
     'soft_label_entropy',
     'soft_label_scenarios',
+    'mc_sample_weight',
+    'label_stability',
 }
 
 

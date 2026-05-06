@@ -79,6 +79,14 @@ except ImportError:
     _SOFT_LABEL_AVAILABLE = False
     _SoftLabelConfig = None   # type: ignore[assignment,misc]
 
+try:
+    from modules.mc_label_weights import attach_mc_prior_columns as _attach_mc_prior_columns
+
+    _MC_LABEL_WEIGHTS_AVAILABLE = True
+except ImportError:
+    _MC_LABEL_WEIGHTS_AVAILABLE = False
+    _attach_mc_prior_columns = None  # type: ignore[assignment,misc]
+
 # ── public aliases (backwards-compat) ─────────────────────────────────────────
 BIAS_LONG    = DIR_LONG
 BIAS_SHORT   = DIR_SHORT
@@ -1110,6 +1118,9 @@ def build_causal_event_labels(
     # False = تعطيل (للمقارنة أو الـ ablation فقط)
     soft_label_config: "Optional[_SoftLabelConfig]" = None,
     # إعدادات محرك Soft Labels — None = استخدام الإعدادات الافتراضية
+    use_mc_prior_weights: bool = True,
+    label_stability_shifts: tuple[int, ...] = (-5, -3, -1, 1, 3, 5),
+    mc_weights_verbose: bool = False,
 ) -> pd.DataFrame:
     """
     Build causal labels using unified order-book features + price-action forward scan.
@@ -1156,6 +1167,10 @@ def build_causal_event_labels(
                              labels that the live policy would later reject.
     enforce_economic_tp_floor : If True, raise the TP floor so it cannot fall
                                 below `stop_floor + execution_cost_pips`.
+    use_mc_prior_weights : If True, attach `mc_sample_weight` (Gambler prior on
+                             TP vs SL distances) and neighbour `label_stability`.
+    label_stability_shifts : Signed row shifts for the stability heuristic.
+    mc_weights_verbose : If True, print `mc_label_weights` validation report.
     """
 
     out = df.copy()
@@ -1688,5 +1703,27 @@ def build_causal_event_labels(
             )
     elif bool(use_soft_labels) and not bool(_SOFT_LABEL_AVAILABLE):
         print("[v19] FIX-12 → soft_label_engine غير متوفر — تأكد من وجود modules/soft_label_engine.py")
+
+    if bool(use_mc_prior_weights) and bool(_MC_LABEL_WEIGHTS_AVAILABLE) and _attach_mc_prior_columns is not None:
+        try:
+            labeled = _attach_mc_prior_columns(
+                labeled,
+                tp_mult=float(tp_mult),
+                sl_mult=float(sl_mult),
+                stability_shifts=label_stability_shifts,
+                quiet=not bool(mc_weights_verbose),
+            )
+            print(
+                "[v19] mc_label_weights → columns: mc_sample_weight, label_stability "
+                f"(shifts={label_stability_shifts})"
+            )
+        except Exception as _mc_exc:
+            warnings.warn(
+                f"[v19] mc_label_weights فشل ({_mc_exc!r}) — يُكمل بدون الأعمدة الجديدة.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    elif bool(use_mc_prior_weights) and not bool(_MC_LABEL_WEIGHTS_AVAILABLE):
+        print("[v19] mc_label_weights غير متوفر — تأكد من وجود modules/mc_label_weights.py")
 
     return labeled

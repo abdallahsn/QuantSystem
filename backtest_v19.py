@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -974,7 +975,10 @@ def run_causal_backtest(
     _assert_single_contract_df(df, context='run_causal_backtest_input')
     source_has_labels = 'bias_label' in df.columns
     source_has_fwd = 'forward_return' in df.columns
+    print(f"  ⏳ Building replay feature frame ({len(df):,} rows, input_scaled={input_scaled})...", flush=True)
+    t_pf0 = time.perf_counter()
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
+    print(f"  ✅ replay_df ready: {replay_df.shape[0]:,} × {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
     price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
     horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
     if 'raw__micro_atr' in replay_df.columns:
@@ -994,6 +998,13 @@ def run_causal_backtest(
     if not bool(scoring_mask.any()):
         raise ValueError('❌ نافذة التقييم المطلوبة لا تحتوي أي صفوف داخل replay_df.')
 
+    n_replay = len(replay_df)
+    print(
+        f"  ▶️ Causal replay: {n_replay:,} iterate rows | "
+        f"scoring_mask={int(scoring_mask.sum()):,} (per-row dict built lazily)",
+        flush=True,
+    )
+
     results = []
     trades = []
     equity_curve = [float(starting_equity)]
@@ -1007,7 +1018,10 @@ def run_causal_backtest(
     active_trade = None
     cooldown_until = -1
 
-    for i, (_, row) in enumerate(replay_df.iterrows()):
+    for i in range(n_replay):
+        row = replay_df.iloc[i].to_dict()
+        if i > 0 and i % 5000 == 0:
+            print(f"  ⏳ causal replay progress: {i:,}/{n_replay:,}", flush=True)
         ts = row.get('ts_event', None)
         if active_trade is not None and i >= int(active_trade['exit_idx']):
             equity += float(active_trade['pnl'])
@@ -1029,7 +1043,7 @@ def run_causal_backtest(
 
         visual = visual_embeddings[i] if visual_embeddings.size else None
         pred = engine.predict_step(
-            row.to_dict(),
+            row,
             visual_embedding=visual,
             meta_override=meta_features[i] if meta_features is not None else None,
             ts=ts,
@@ -1082,7 +1096,7 @@ def run_causal_backtest(
                 results.append(pred)
                 continue
             entry_idx = min(i + max(int(latency_rows), 0), len(replay_df) - 1)
-            entry_row_data = replay_df.iloc[entry_idx].to_dict() if 0 <= entry_idx < len(replay_df) else row.to_dict()
+            entry_row_data = replay_rows[entry_idx] if 0 <= entry_idx < n_replay else row
             trade_path = _simulate_trade_path(
                 entry_idx=entry_idx,
                 direction=direction,
@@ -1121,7 +1135,7 @@ def run_causal_backtest(
             raw_pnl_pips = float(trade_path['raw_pnl_pips'])
             exit_idx = int(trade_path['exit_idx'])
             exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
-            exit_row = replay_df.iloc[exit_idx].to_dict() if 0 <= exit_idx < len(replay_df) else {}
+            exit_row = replay_rows[exit_idx] if 0 <= exit_idx < n_replay else {}
             fill_pricing = _realized_fill_pricing(
                 entry_row=entry_row_data,
                 exit_row=exit_row,
