@@ -77,6 +77,15 @@ def _pseudo_prob_head(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
+def _soft_stage1_runtime_error(model_name: str) -> RuntimeError:
+    return RuntimeError(
+        f"❌ {model_name} Stage-1 artifact uses stage1_target=soft_label, "
+        "but soft_label means P(win | bias_label) rather than direct LONG/SHORT probability. "
+        "Runtime inference has no per-row bias anchor here, so remapping would be ambiguous and unsafe. "
+        "Retrain with --stage1_target bias for live/backtest inference."
+    )
+
+
 def _constant_prob_vector_from_meta(payload: dict | None, n_outputs: int) -> np.ndarray | None:
     if not isinstance(payload, dict):
         return None
@@ -277,6 +286,11 @@ class V19PredictionEngine:
             except Exception as exc:
                 self.xgb_calibrator = None
                 print(f"  ⚠️ XGBoost calibrator unavailable: {exc}")
+
+        if self._cb_soft_regression:
+            raise _soft_stage1_runtime_error('CatBoost')
+        if self._xgb_soft_regression:
+            raise _soft_stage1_runtime_error('XGBoost')
 
         self.decision_policy = None
         decision_policy_name = (

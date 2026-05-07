@@ -1050,6 +1050,37 @@ def _pseudo_probs_two_col(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
+def _directional_probs_from_soft_win_prob(
+    pred: np.ndarray,
+    bias_label: np.ndarray | pd.Series | list | tuple | None,
+) -> np.ndarray:
+    """
+    Map soft_label = P(win | current bias_label) into directional [LONG, SHORT] probs.
+
+    LONG rows:  [p, 1-p]
+    SHORT rows: [1-p, p]
+    unknown:    [0.5, 0.5]
+    """
+    base = _pseudo_probs_two_col(pred).astype(np.float32, copy=True)
+    if bias_label is None:
+        return base
+
+    bias_arr = pd.to_numeric(pd.Series(bias_label), errors='coerce').fillna(2).astype(np.int32).to_numpy()
+    if len(bias_arr) != len(base):
+        raise ValueError(
+            f"bias_label length mismatch for soft-label directional remap: {len(bias_arr)} != {len(base)}"
+        )
+
+    out = np.full_like(base, 0.5, dtype=np.float32)
+    long_mask = bias_arr == 0
+    short_mask = bias_arr == 1
+    out[long_mask] = base[long_mask]
+    if np.any(short_mask):
+        out[short_mask, 0] = base[short_mask, 1]
+        out[short_mask, 1] = base[short_mask, 0]
+    return out
+
+
 def _soft_target_summary(
     target: np.ndarray,
     *,
@@ -1120,14 +1151,26 @@ def _constant_soft_prob_block(
     n_rows: int,
     target: np.ndarray | float,
     *,
+    bias_label: np.ndarray | pd.Series | list | tuple | None = None,
     fallback: float = 0.5,
 ) -> tuple[np.ndarray, dict]:
     p, summary = _constant_soft_prediction_from_target(target, fallback=fallback)
-    block = np.repeat(_pseudo_probs_two_col(np.array([p], dtype=np.float32)), max(int(n_rows), 0), axis=0)
+    if bias_label is not None:
+        block = _directional_probs_from_soft_win_prob(
+            np.full(max(int(n_rows), 0), p, dtype=np.float32),
+            bias_label,
+        )
+    else:
+        block = np.repeat(_pseudo_probs_two_col(np.array([p], dtype=np.float32)), max(int(n_rows), 0), axis=0)
+    long_probs = [float(p), float(1.0 - p)]
+    short_probs = [float(1.0 - p), float(p)]
     return block.astype(np.float32), {
         'constant_prediction': float(p),
-        'constant_probs': [float(block[0, 0]), float(block[0, 1])] if len(block) else [float(p), float(1.0 - p)],
+        'constant_probs': [float(block[0, 0]), float(block[0, 1])] if len(block) else long_probs,
+        'constant_probs_long_bias': long_probs,
+        'constant_probs_short_bias': short_probs,
         'soft_target_summary': summary,
+        'soft_label_semantics': 'P(win | bias_label)',
     }
 
 
@@ -1155,8 +1198,11 @@ def _write_constant_soft_model_metadata(
         'reason': str(reason),
         'constant_prediction': float(payload['constant_prediction']),
         'constant_probs': [float(x) for x in payload['constant_probs']],
+        'constant_probs_long_bias': [float(x) for x in payload['constant_probs_long_bias']],
+        'constant_probs_short_bias': [float(x) for x in payload['constant_probs_short_bias']],
         'train_soft_target_summary': payload['soft_target_summary'],
-        'pseudo_prob_head': '[p, 1-p] from constant soft-label fallback',
+        'soft_label_semantics': payload['soft_label_semantics'],
+        'pseudo_prob_head': 'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] from constant soft-label fallback',
     }
     with open(metadata_path, 'w') as f:
         json.dump(meta, f, indent=2)
@@ -1576,12 +1622,21 @@ def build_time_splits(
     )
     if not splits:
         raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
+    actual_split_count = int(len(splits))
+    split_count_warning = actual_split_count > int(effective_requested_folds)
+    if split_count_warning:
+        print(
+            "  ⚠️ Split count exceeded effective request: "
+            f"effective_requested={effective_requested_folds} actual={actual_split_count}"
+        )
     return splits, t0, t1, {
         'dynamic_embargo_rows': int(dynamic_embargo_rows),
         'effective_embargo_pct': float(effective_embargo_pct),
         'embargo_horizon_quantile': float(embargo_horizon_quantile),
         'requested_n_folds': int(requested_n_folds),
         'effective_requested_n_folds': int(effective_requested_folds),
+        'actual_split_count': actual_split_count,
+        'split_count_warning': bool(split_count_warning),
     }
 
 
@@ -1617,6 +1672,7 @@ def stage1_oof_meta(
     df: pd.DataFrame,
     output_dir: str,
     splits=None,
+    split_meta: dict | None = None,
     n_folds: int = 6,
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
@@ -1654,25 +1710,36 @@ def stage1_oof_meta(
         ys = pd.to_numeric(df['soft_label'], errors='coerce').fillna(0.5).to_numpy(dtype=np.float64)
         y_soft = np.clip(ys, 1e-4, 1.0 - 1e-4).astype(np.float32)
     if splits is None:
-        splits, t0, t1, _ = build_time_splits(
+        splits, t0, t1, generated_split_meta = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
             min_train_pct=min_train_pct,
         )
+        if split_meta is None:
+            split_meta = generated_split_meta
     elif t0 is None or t1 is None:
-        _, t0, t1, _ = build_time_splits(
+        _, t0, t1, generated_split_meta = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
             min_train_pct=min_train_pct,
         )
+        if split_meta is None:
+            split_meta = generated_split_meta
 
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
     cb_task_type, cb_devices = _resolve_catboost_device(catboost_device)
     print(f"  CatBoost device: {cb_task_type}")
+    if split_meta:
+        print(
+            "  Split contract: "
+            f"requested={int(split_meta.get('requested_n_folds', n_folds))} "
+            f"| effective={int(split_meta.get('effective_requested_n_folds', len(splits)))} "
+            f"| actual={int(split_meta.get('actual_split_count', len(splits)))}"
+        )
     if use_soft_target:
         soft_global_degenerate, soft_global_summary = _is_degenerate_soft_target(y_soft)
         print(
@@ -1680,6 +1747,7 @@ def stage1_oof_meta(
             f"soft mean={float(np.mean(y_soft)):.3f} std={float(np.std(y_soft)):.3f} | "
             f"sample_weight = mc_sample_weight × label_stability only"
         )
+        print("  soft_label semantics: P(win | bias_label) → direction-aware LONG/SHORT remap per row")
         print(f"  bias_label distribution (context only): {pd.Series(y).value_counts().sort_index().to_dict()}")
         print(
             "  soft_label support: "
@@ -1765,7 +1833,12 @@ def stage1_oof_meta(
             f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f} std={float(np.std(fit_soft)):.3f}"
         )
         if fit_soft_degenerate:
-            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            const_preds, const_info = _constant_soft_prob_block(
+                len(test_idx),
+                fit_soft,
+                bias_label=df.iloc[test_idx]['bias_label'],
+                fallback=0.5,
+            )
             print(
                 f"      CatBoost Fold {fold_no}: degenerate soft_label "
                 f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
@@ -1787,7 +1860,12 @@ def stage1_oof_meta(
                 f"      CatBoost Fold {fold_no}: degraded scaler "
                 f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
             )
-            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            const_preds, const_info = _constant_soft_prob_block(
+                len(test_idx),
+                fit_soft,
+                bias_label=df.iloc[test_idx]['bias_label'],
+                fallback=0.5,
+            )
             return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
@@ -1845,7 +1923,7 @@ def stage1_oof_meta(
             eval_set_cb = Pool(X_val, y_soft[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
         model_cb.fit(tr_pool, eval_set=eval_set_cb, plot=False)
         pred_raw = np.asarray(model_cb.predict(X_test), dtype=np.float32).reshape(-1)
-        preds = _pseudo_probs_two_col(pred_raw)
+        preds = _directional_probs_from_soft_win_prob(pred_raw, df.iloc[test_idx]['bias_label'])
         test_mae = float(np.mean(np.abs(pred_raw - y_soft[test_idx])))
         rmse_fold = float(np.sqrt(np.mean((pred_raw - y_soft[test_idx]) ** 2)))
         cb_best_iteration = None
@@ -2034,7 +2112,12 @@ def stage1_oof_meta(
             f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f}"
         )
         if fit_soft_degenerate:
-            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            const_preds, const_info = _constant_soft_prob_block(
+                len(test_idx),
+                fit_soft,
+                bias_label=df.iloc[test_idx]['bias_label'],
+                fallback=0.5,
+            )
             print(
                 f"      XGBoost Fold {fold_no}: degenerate soft_label "
                 f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
@@ -2056,7 +2139,12 @@ def stage1_oof_meta(
                 f"      XGBoost Fold {fold_no}: degraded scaler "
                 f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
             )
-            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            const_preds, const_info = _constant_soft_prob_block(
+                len(test_idx),
+                fit_soft,
+                bias_label=df.iloc[test_idx]['bias_label'],
+                fallback=0.5,
+            )
             return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
@@ -2113,7 +2201,7 @@ def stage1_oof_meta(
             fit_kwargs['eval_set'] = [(X_val, y_soft[inner_val])]
         model_xgb.fit(X_fit, y_soft[fit_idx], **fit_kwargs)
         pred_raw = np.asarray(model_xgb.predict(X_test), dtype=np.float32).reshape(-1)
-        preds = _pseudo_probs_two_col(pred_raw)
+        preds = _directional_probs_from_soft_win_prob(pred_raw, df.iloc[test_idx]['bias_label'])
         test_mae = float(np.mean(np.abs(pred_raw - y_soft[test_idx])))
         rmse_fold = float(np.sqrt(np.mean((pred_raw - y_soft[test_idx]) ** 2)))
         xgb_best_iteration = getattr(model_xgb, 'best_iteration', None) if early_stopping_rounds is not None else None
@@ -2420,12 +2508,16 @@ def stage1_oof_meta(
                     {
                         'classes': [0, 1],
                         'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                        'pseudo_prob_head': '[p, 1-p] from CatBoostRegressor.predict on soft_label',
+                        'soft_label_semantics': 'P(win | bias_label)',
+                        'pseudo_prob_head': (
+                            'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] '
+                            'from CatBoostRegressor.predict on soft_label'
+                        ),
                     },
                     f,
                     indent=2,
                 )
-            print("  ✅ CatBoost final: regress soft_label → stack [p, 1-p] for meta layer")
+            print("  ✅ CatBoost final: regress soft_label → direction-aware LONG/SHORT stack for meta layer")
 
             final_cb_calibrator = None
             final_cb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
@@ -2436,7 +2528,10 @@ def stage1_oof_meta(
                     'reason': 'soft_regression',
                     'holdout_mae_vs_soft': float(np.mean(np.abs(hold_p - y_holdout_final))),
                 }
-            live_probs = _pseudo_probs_two_col(np.asarray(final_cb.predict(X_final), dtype=np.float32))
+            live_probs = _directional_probs_from_soft_win_prob(
+                np.asarray(final_cb.predict(X_final), dtype=np.float32),
+                df['bias_label'],
+            )
 
             final_xgb = XGBRegressor(
                 n_estimators=800,
@@ -2461,12 +2556,16 @@ def stage1_oof_meta(
                     {
                         'classes': [0, 1],
                         'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                        'pseudo_prob_head': '[p, 1-p] from XGBRegressor.predict on soft_label',
+                        'soft_label_semantics': 'P(win | bias_label)',
+                        'pseudo_prob_head': (
+                            'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] '
+                            'from XGBRegressor.predict on soft_label'
+                        ),
                     },
                     f,
                     indent=2,
                 )
-            print("  ✅ XGBoost final: regress soft_label → stack [p, 1-p] for meta layer")
+            print("  ✅ XGBoost final: regress soft_label → direction-aware LONG/SHORT stack for meta layer")
 
             final_xgb_calibrator = None
             final_xgb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
@@ -2477,7 +2576,10 @@ def stage1_oof_meta(
                     'reason': 'soft_regression',
                     'holdout_mae_vs_soft': float(np.mean(np.abs(hx - y_holdout_final))),
                 }
-            live_xgb_probs = _pseudo_probs_two_col(np.asarray(final_xgb.predict(X_final), dtype=np.float32))
+            live_xgb_probs = _directional_probs_from_soft_win_prob(
+                np.asarray(final_xgb.predict(X_final), dtype=np.float32),
+                df['bias_label'],
+            )
     else:
         y_train_final = y[final_train_idx]
         y_holdout_final = y[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.int32)
@@ -2599,8 +2701,26 @@ def stage1_oof_meta(
 
     fold_metrics = {
         'stage1_target': STAGE1_TARGET_SOFT_LABEL if use_soft_target else STAGE1_TARGET_BIAS,
+        'sample_weight_mode_requested': str(sw_mode),
+        'effective_sample_weight_mode': 'stability_mc_only' if use_soft_target else str(sw_mode),
+        'comparison_warning': (
+            'soft_label Stage-1 uses regression on P(win | bias_label) with stability_mc_only weighting; '
+            'do not compare directly to bias-classification runs without controlling for both target and weights.'
+            if use_soft_target
+            else None
+        ),
+        'soft_label_semantics': 'P(win | bias_label)' if use_soft_target else None,
+        'soft_label_directional_mapping': (
+            'LONG->[p,1-p], SHORT->[1-p,p], unknown->[0.5,0.5]' if use_soft_target else None
+        ),
         'soft_target_global_summary': soft_global_summary if use_soft_target else None,
         'soft_target_global_degenerate': bool(soft_global_degenerate) if use_soft_target else False,
+        'split_meta': {
+            'requested_n_folds': int((split_meta or {}).get('requested_n_folds', n_folds)),
+            'effective_requested_n_folds': int((split_meta or {}).get('effective_requested_n_folds', len(splits))),
+            'actual_split_count': int((split_meta or {}).get('actual_split_count', len(splits))),
+            'split_count_warning': bool((split_meta or {}).get('split_count_warning', False)),
+        },
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
@@ -3729,6 +3849,8 @@ def run_training_pipeline(
             {
                 **split_meta,
                 'n_splits': int(len(splits)),
+                'actual_split_count': int(split_meta.get('actual_split_count', len(splits))),
+                'split_count_warning': bool(split_meta.get('split_count_warning', False)),
                 'rows': int(len(event_df)),
                 'folds': [
                     {
@@ -3765,6 +3887,7 @@ def run_training_pipeline(
             event_df,
             output_dir,
             splits=splits,
+            split_meta=split_meta,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
