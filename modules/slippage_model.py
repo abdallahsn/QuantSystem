@@ -215,6 +215,9 @@ def position_size_from_prediction(
         avg_win_pips = prediction.get('selected_avg_win_pips')
         avg_loss_pips = prediction.get('selected_avg_loss_pips')
         if edge_prob is not None and avg_win_pips is not None and avg_loss_pips is not None:
+            # Do not pass decisionPolicy `sizing_penalty` here: it already blends
+            # (1-uncertainty), (1-regime_entropy), and runtime_penalty — using it again
+            # as FK's runtime_penalty double-counts and drives size→0 despite tradeable.
             size = fractional_kelly_bet_size(
                 float(edge_prob),
                 float(avg_win_pips),
@@ -222,15 +225,22 @@ def position_size_from_prediction(
                 uncertainty=float(prediction.get('uncertainty', 0.0) or 0.0),
                 coverage_ratio=float(prediction.get('policy_coverage_ratio', 1.0) or 0.0),
                 regime_entropy=float(prediction.get('regime_entropy', 0.0) or 0.0),
-                runtime_penalty=float(prediction.get('sizing_penalty', 1.0) or 0.0),
+                runtime_penalty=1.0,
                 fraction=fraction,
                 max_size=max_size,
                 min_size=base_size,
                 allow_zero=True,
             )
             if size > 0:
-                return size
-            return 0
+                fk = float(np.clip(prediction.get('sizing_penalty', 1.0) or 1.0, 0.0, 1.0))
+                scaled = max(1, int(round(float(size) * fk))) if fk < 1.0 else int(size)
+                return min(scaled, max(int(max_size), 1))
+            # marginal edges + FK rounding → zero; fallback so backtest/paper can execute
+            return confidence_bet_size(
+                float(prediction.get('confidence', 0.0) or 0.0),
+                base_size=int(base_size),
+                max_size=int(max_size),
+            )
 
     return confidence_bet_size(
         float(prediction.get('confidence', 0.0) or 0.0),

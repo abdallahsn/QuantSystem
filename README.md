@@ -3,60 +3,56 @@
 QuantSystem V19 هو مشروع **quantitative AI trading system** مبني حول:
 
 1. `prepare_training_data.py`
-   - يحول بيانات السوق الخام `MBO/MBP` إلى dataset جاهز للتدريب
-   - يبني features
-   - يبني labels
-   - يحفظ `LOB tensors`
-
+  - يحول بيانات السوق الخام `MBO/MBP` إلى dataset جاهز للتدريب
+  - يبني features
+  - يبني labels
+  - يحفظ `LOB tensors`
 2. `train_v19.py`
-   - يدرب pipeline ثلاثي المراحل بشكل آمن ضد الـ leakage
-   - Stage 1: `CatBoost + Regime meta-features`
-   - Stage 2: `OOF DeepLOB visual embeddings`
-   - Stage 3: `MetaLearner LSTM`
+  - يدرب pipeline ثلاثي المراحل بشكل آمن ضد الـ leakage
+  - Stage 1: `CatBoost + Regime meta-features`
+  - Stage 2: `OOF DeepLOB visual embeddings`
+  - Stage 3: `MetaLearner LSTM`
 
 ### Recommended Operational Phases
 
 للتشغيل العملي المبسط، يُفضّل تقسيم المشروع إلى 3 مراحل واضحة:
 
 1. `stage1_refinery.py`
-   - يبني dataset التدريب من الخام
-   - يحفظ artifact جديدًا مبنيًا على `sharded parquet + manifest + checkpoints`
-   - يعمل افتراضيًا على streaming/shards بدل full-load
-   - يستخدم `rules` كـ default للـ regime metadata مع coarse sampling لتقليل زمن الـ stage1
-
+  - يبني dataset التدريب من الخام
+  - يحفظ artifact جديدًا مبنيًا على `sharded parquet + manifest + checkpoints`
+  - يعمل افتراضيًا على streaming/shards بدل full-load
+  - يستخدم `rules` كـ default للـ regime metadata مع coarse sampling لتقليل زمن الـ stage1
 2. `stage2_catboost.py`
-   - يدرب `CatBoost + Regime`
-   - يحفظ `meta_features_oof_v19.npy`
-   - يحفظ `catboost_advisor_v19.cbm`
-
+  - يدرب `CatBoost + Regime`
+  - يحفظ `meta_features_oof_v19.npy`
+  - يحفظ `catboost_advisor_v19.cbm`
 3. `stage3_train.py`
-   - يدرب `MetaLearner`
-   - يعتمد على نواتج المرحلة الثانية
-   - يستخدم الـ visual embeddings من الكاش إن وُجدت، وإلا يكمل بأصفار
-
-3. `backtest_v19.py`
-   - يشغل causal replay backtest على dataset V19 الجاهز
-
-4. `walkforward_v19.py`
-   - ينفذ walk-forward evaluation من raw market data
-   - يعيد بناء train/test folds
-   - يطبق release gates
-
-5. `shadow_v19.py` و `paper_v19.py`
-   - لتشغيل طبقات التشغيل غير الحي:
-   - shadow mode
-   - paper mode
-   - rollout control logic بدون broker integration
-
+  - يدرب `MetaLearner`
+  - يعتمد على نواتج المرحلة الثانية
+  - يستخدم الـ visual embeddings من الكاش إن وُجدت، وإلا يكمل بأصفار
+4. `backtest_v19.py`
+  - يشغل causal replay backtest على dataset V19 الجاهز
+5. `walkforward_v19.py`
+  - ينفذ walk-forward evaluation من raw market data
+  - يعيد بناء train/test folds
+  - يطبق release gates
+6. `shadow_v19.py` و `paper_v19.py`
+  - لتشغيل طبقات التشغيل غير الحي:
+  - shadow mode
+  - paper mode
+  - rollout control logic بدون broker integration
 
 ## Architecture
 
 ### 1. Raw Data Layer
+
 - `MBO`: market-by-order / trades / add / cancel
 - `MBP10`: top-10 order book snapshots
 
 ### 2. Feature Layer
+
 يتم استخراج:
+
 - microstructure features
 - order book features
 - context / rolling / session features
@@ -64,12 +60,14 @@ QuantSystem V19 هو مشروع **quantitative AI trading system** مبني حو
 - `LOB tensors` للـ CNN
 
 ### 3. Model Layer
+
 - `CatBoost advisor`
 - `Regime classifier`
 - `DeepLOB CNN`
 - `MetaLearner LSTM`
 
 ### Regime Defaults In This Version
+
 - `stage1_refinery.py` لم يعد يستخدم `Wasserstein` كمسار افتراضي على كل الصفوف.
 - الافتراضي الآن:
   - `regime_mode=rules`
@@ -79,11 +77,11 @@ QuantSystem V19 هو مشروع **quantitative AI trading system** مبني حو
 - إذا أردت `Wasserstein`, شغّله يدويًا فقط كـ `research mode` وليس كمسار إنتاج افتراضي.
 
 ### 4. Evaluation Layer
+
 - causal backtest
 - walk-forward validation
 - monitoring + drift
 - release gates
-
 
 ## Project Structure
 
@@ -115,16 +113,18 @@ QuantSystem V19/
     └── ...
 ```
 
-
 ## Recommended Environment
 
 ### Python
+
 - يوصى بـ `Python 3.10` أو `Python 3.11`
 - `Python 3.12` مدعوم أيضًا إذا كنت ستثبّت TensorFlow الحديث عبر `pip`
 - بيئة `venv` كافية ومفضّلة؛ `conda` اختياري وليس مطلوبًا
 
 ### Base Dependencies
+
 الموجودة في [requirements.txt](/Users/abdallah/Downloads/QS_FINAL/requirements.txt):
+
 - `numpy`
 - `pandas`
 - `scikit-learn`
@@ -139,7 +139,9 @@ QuantSystem V19/
 - `tqdm`
 
 ### Common Optional Dependencies
+
 بعض أجزاء المشروع تستخدم أو تستفيد من:
+
 - `jupyterlab`
 - `ipykernel`
 - `hmmlearn`
@@ -151,7 +153,6 @@ pip install -r requirements.txt
 pip install jupyterlab ipykernel hmmlearn
 ```
 
-
 ## Quick Start
 
 ### 1. تجهيز البيانات
@@ -161,6 +162,7 @@ python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --l
 ```
 
 السلوك الافتراضي المهم في النسخة الحالية:
+
 - `stage1` صار pipeline sharded/resumable بدل `CSV` واحد في النهاية
 - `MBO` و`MBP` يُعالجان على shards مع warmup boundaries وcheckpoints
 - `regime` يعمل افتراضيًا بـ `rules` بدل `Wasserstein`
@@ -169,6 +171,7 @@ python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --l
 للتشغيل الكبير يفضّل ترك هذه الافتراضيات كما هي واستخدام `--resume` إذا انقطع التشغيل.
 
 النواتج المهمة:
+
 - `outputs_v19/artifact_manifest.json`
 - `outputs_v19/checkpoints/*.json`
 - `outputs_v19/normalized/mbo/*.parquet`
@@ -181,11 +184,66 @@ python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --l
 - `outputs_v19/refinery_report.txt`
 
 ملاحظة:
+
 - `lob_tensors.npy` و`lob_tensor_timestamps.npy` يُبنيان من الـ shards نفسها إذا كان `MBP` موجودًا و`DeepLOB runtime` متاحًا.
 - إذا قررت Stage1 تخطي `Step 3e` بسبب الميزانية أو غياب runtime، ستجد السبب في `outputs_v19/lob_build_meta.json`.
 - على Windows native، TensorFlow سيعمل غالبًا على `CPU` فقط؛ إذا أردت `GPU` للـ DeepLOB فشغّل التدريب على Linux/WSL2.
 
-### 1b. Regime Research Mode
+### 1b. دمج الأوامر «القوية» مع النظام الحالي (Soft + Monte Carlo + FIX-13)
+
+- **الافتراضي في `configs/v19/defaults.yaml`**: `soft_labels.mode = monte_carlo` مع `n_scenarios: 200` وتمريرات jitter أقوى؛ تشغيل المصفاة بدون إعداد مخالف ينتج soft labels أوضح ويحدّ تجمع احتمالات حول 0.5 مقارنة بالوضع التحليلي. للاختبار السريع فقط: `--soft_label_mode analytical`.
+
+النسخة الحالية تدمج أيضًا افتراضيًا:
+
+- **أرضية TP الاقتصادية**: `enforce_economic_tp_floor` في `configs/v19/defaults.yaml` (ومفتاح `--enforce-economic-tp-floor` في المصفاة) حتى لا تُبنى صفقات TP أصغر من وقف التكلفة + التنفيذ؛ هذا يتوافق مع أوزان Gambler وأهداف الهيكل (رينج/جدار) لأن مسافات TP/SL تصبح أكثر واقعية.
+- **`range_ctx` / `bid_wall_delta_fwd_k` / `ask_wall_delta_fwd_k`**: تُولَّد من المصفاة عند تشغيل `labels_v19` كامل؛ مرحلة الـ Meta تستخدمها للتعلم متعدد المهام عند توفر شروط القناع الكافية.
+- **`--stage1_target soft_label`**: CatBoost/XGBoost ينزلان إلى **انحدار** على `soft_label`؛ أوزان التدريب في هذا المسار هي **`mc_sample_weight × label_stability`** فقط؛ علَم **`--sample_weight_mode geometric`** يُسجَّل للتمييز عن مسار التصنيف؛ على مسار **`soft_label`** يُستخدم دائمًا وزن **`mc_sample_weight × label_stability`** (مكافئ نيًّا للسياسة الهندسية).
+
+**1) نفس إعداد Monte Carlo صراحةً (اختياري إن خالفته في config):**
+
+```powershell
+$root = "E:\QuantSystem-master (3) (2)\QuantSystem-master"
+Set-Location -LiteralPath $root
+py -3.13 stage1_refinery.py `
+  --mbo "mbo2.csv" --mbp "mbp2.csv" `
+  --output "pipeline_deep_mc_200" `
+  --chunk_rows 2000000 --mbo_workers 8 --mbp_workers 8 `
+  --use_soft_labels --soft_label_mode monte_carlo `
+  --soft_label_n_scenarios 200 `
+  --soft_label_horizon_std 0.30 --soft_label_tp_std 0.20 --soft_label_sl_std 0.20
+```
+
+**2) CatBoost-only (قوة Soft كما وثّقت؛ CPU يتفادى تعارضات GPU مع `rsm`):**
+
+```powershell
+$root = "E:\QuantSystem-master (3) (2)\QuantSystem-master"
+Set-Location -LiteralPath $root
+py -3.13 train_v19.py `
+  --data "$root\pipeline_deep_mc_200" `
+  --output "$root\pipeline_deep_mc_200\train_catboost_soft_geom" `
+  --phase catboost `
+  --catboost_device cpu `
+  --stage1_target soft_label `
+  --sample_weight_mode geometric
+```
+
+يمكن أيضًا استخدام `--data "... \final"`؛ دالة تحميل البيانات تتعرّف على جذر الـ `artifact_manifest.json` تلقائيًا عندما يُمرَّر مجلد `final`.
+
+**3) تشغيل الـ pipeline كاملًا (CatBoost + DeepLOB + Meta) بعد المصفاة نفسها:**
+
+```powershell
+py -3.13 train_v19.py `
+  --data "$root\pipeline_deep_mc_200" `
+  --output "$root\pipeline_deep_mc_200\train_full_soft_geom" `
+  --phase full `
+  --catboost_device cpu `
+  --stage1_target soft_label `
+  --sample_weight_mode geometric
+```
+
+`train_v19` يحمّل `lob_tensors.npy` من مجلد الـ artifact نفسه عند وجوده. للتحكم في تدريب رؤوس الرينج/الجدار على الـ Meta يمكن ضبط `META_MULTITASK_MIN_WALL_TR` و`META_RANGE_PHASE1_FRAC` في البيئة قبل التشغيل.
+
+### 1c. Regime Research Mode
 
 إذا أردت اختبار `Wasserstein` يدويًا على dataset أصغر أو في تجربة بحثية:
 
@@ -202,10 +260,10 @@ python3 stage1_refinery.py \
 ```
 
 ملاحظات مهمة:
+
 - `Wasserstein` لم يعد default لأنه أبطأ بكثير على datasets ضخمة.
 - `regime_stride` يتحكم بعدد الصفوف المستخدمة لبناء `regime surface` قبل توسيعها على كامل dataset.
 - كلما زاد `regime_stride` أصبح stage1 أسرع، لكن surface أدقّتها الزمنية تصبح أخشن.
-
 
 ### 2. CatBoost Stage
 
@@ -214,12 +272,12 @@ python stage2_catboost.py --data outputs_v19 --output outputs_v19
 ```
 
 النواتج المهمة:
+
 - `catboost_advisor_v19.cbm`
 - `catboost_classes_v19.json`
 - `regime_classifier.pkl`
 - `meta_features_oof_v19.npy`
 - `meta_coverage_v19.npy`
-
 
 ### 3. Final Training Stage
 
@@ -230,10 +288,10 @@ python3 stage3_train.py \
 ```
 
 النواتج المهمة:
+
 - `meta_learner_v19.keras`
 - `feature_schema_v19.json`
 - `manifest.json`
-
 
 ### 4. Full Pipeline Shortcut
 
@@ -254,7 +312,6 @@ python3 train_v19.py \
 python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase catboost
 python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase train
 ```
-
 
 ### 4b. Diagnostic Verification Commands
 
@@ -292,12 +349,12 @@ python backtest_v19.py \
 ```
 
 إذا كان هدفك التحقق من إصلاحات التقرير الأخيرة بالتحديد، راقب هذه الملفات بعد التشغيل:
+
 - `stage1_v19_metrics.json`
 - `calibration_report.json`
 - `feature_schema_v19.json`
 - `meta_learner_v19_history.json`
 - `manifest.json`
-
 
 ### 5. Backtest
 
@@ -311,10 +368,10 @@ python3 backtest_v19.py \
 ```
 
 النواتج:
+
 - `backtest_v19_results.csv`
 - `backtest_v19_trades.csv`
 - `backtest_v19_summary.json`
-
 
 ### 6. Walk-Forward
 
@@ -326,6 +383,7 @@ python3 walkforward_v19.py \
 ```
 
 النواتج:
+
 - `fold_XX/`
 - `walkforward_summary.json`
 - `release_gates_report.json`
@@ -341,7 +399,6 @@ python3 walkforward_v19.py \
   - ابدأ بـ `chunk_rows=2_000_000`
   - اضبط `mbo_workers` و`mbp_workers` حسب عدد الأنوية الفعلية
   - فعّل `--resume` في السيرفرات الرخيصة أو المعرضة للانقطاع
-
 
 ## Running On Jupyter Notebook On A Remote Server
 
@@ -429,13 +486,14 @@ http://127.0.0.1:8888
 Python (QuantSystem V19)
 ```
 
-
 ## Recommended Notebook Workflow
 
 داخل Jupyter Notebook، يفضّل تقسيم العمل إلى 4 notebooks:
 
 ### 1. `01_prepare_data.ipynb`
+
 يشغل:
+
 - قراءة raw data paths
 - `prepare_training_data.py`
 - مراجعة التقارير والـ CSV
@@ -452,6 +510,7 @@ Python (QuantSystem V19)
 ```
 
 ### 2. `02_train_v19.ipynb`
+
 يشغل:
 
 ```python
@@ -461,6 +520,7 @@ Python (QuantSystem V19)
 ```
 
 ### 3. `03_backtest_v19.ipynb`
+
 يشغل:
 
 ```python
@@ -482,6 +542,7 @@ summary
 ```
 
 ### 4. `04_walkforward_v19.ipynb`
+
 يشغل:
 
 ```python
@@ -490,7 +551,6 @@ summary
   --mbp /data/mbp.csv \
   --output outputs_v19_walkforward
 ```
-
 
 ## Direct Python Usage Inside Notebook
 
@@ -537,10 +597,10 @@ summary = run_paper(
 summary
 ```
 
-
 ## Outputs You Should Track
 
 ### Training
+
 - `feature_schema_v19.json`
 - `manifest.json`
 - `meta_learner_v19_history.json`
@@ -548,14 +608,17 @@ summary
 - `visual_metrics_v19.json`
 
 ### Backtest
+
 - `backtest_v19_summary.json`
 - `backtest_v19_trades.csv`
 
 ### Walk-Forward
+
 - `walkforward_summary.json`
 - `release_gates_report.json`
 
 ### Monitoring / Shadow / Paper
+
 - `shadow_predictions.jsonl`
 - `shadow_outcomes.jsonl`
 - `paper_orders.jsonl`
@@ -565,23 +628,24 @@ summary
 - `drift_report.json`
 - `alerts.jsonl`
 
-
 ## Recommended Server Specs
 
 الحد الأدنى العملي:
+
 - CPU: 8 vCPU
 - RAM: 32 GB
 - Disk: SSD
 
 أفضلية للتدريب المريح:
+
 - CPU: 16+ vCPU
 - RAM: 64 GB
 - GPU: اختياري لكنه مفيد إذا كان `TensorFlow` و`DeepLOB` سيُستخدمان فعلاً
 
-
 ## Common Issues
 
 ### 1. TensorFlow غير مثبت
+
 سترى تحذيرات مثل:
 
 ```text
@@ -609,6 +673,7 @@ pip install -r requirements.txt
 ```
 
 ### 3. مشاكل `OpenMP SHM`
+
 قد تظهر أحياناً على بعض السيرفرات أو الحاويات.
 
 جرّب:
@@ -626,17 +691,16 @@ export KMP_INIT_AT_FORK=FALSE
 pip install pyarrow
 ```
 
-
 ## Current Focus
 
 حالياً المشروع مهيأ بشكل ممتاز لـ:
+
 - offline training
 - backtesting
 - walk-forward evaluation
 - shadow/paper operational layers
 
 وما زلنا **مؤجلين broker/live data integration** لمرحلة لاحقة.
-
 
 ## Suggested First Session On A Remote Server
 
@@ -651,22 +715,26 @@ pip install pyarrow
 7. شغّل `03_backtest_v19.ipynb`
 8. فقط بعد ذلك انتقل إلى `walkforward_v19.py`
 
-
 ## Notes
 
 - المرجع الأحدث والوحيد للمشروع الحالي هو هذا الملف: [README.md](/Users/abdallah/Downloads/QS_FINAL/README.md)
+
 ## 🔍 Codex Evaluation Instructions
 
 If you are an AI system reviewing this project (e.g. OpenAI Codex), follow these strict rules:
 
 ### 1. Do NOT assume profitability
+
 This is a research system. Any performance must be verified via:
+
 - walk-forward validation
 - out-of-sample testing
 - realistic backtesting
 
 ### 2. Prioritize detecting data leakage
+
 Check:
+
 - feature construction
 - label generation
 - scaling
@@ -675,25 +743,32 @@ Check:
 Any leakage invalidates results.
 
 ### 3. Validate labeling logic
+
 Ensure:
+
 - labels use future price path only
 - features use only past/current data
 - no overlap contamination
 - TP / SL / horizon are consistent
 
 ### 4. Reject invalid validation
+
 Do NOT accept:
+
 - random train_test_split
 - shuffled data
 - mixing future with past
 
 Only accept:
+
 - chronological split
 - walk-forward
 - purged validation
 
 ### 5. Evaluate trading metrics, not just ML metrics
+
 Must include:
+
 - profit factor
 - max drawdown
 - win rate
@@ -702,17 +777,23 @@ Must include:
 - stability across time
 
 ### 6. Check backtesting realism
+
 Ensure:
+
 - slippage
 - fees
 - execution constraints
 - no impossible fills
 
 ### 7. Prefer robustness over performance
+
 A slightly worse but stable model is better than an unstable high-performing one.
 
 ### 8. All improvements must be verifiable
+
 Every suggested change must include:
+
 - why
 - expected effect
 - how to test it
+

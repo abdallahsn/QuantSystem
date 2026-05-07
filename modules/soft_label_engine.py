@@ -94,12 +94,12 @@ _BASE_SOFT_SHORT: dict[int, dict[int, float]] = {
 @dataclass
 class SoftLabelConfig:
     """إعدادات محرك Soft Labels"""
-    mode: Literal["analytical", "monte_carlo"] = "analytical"
-    # ── Monte Carlo فقط ─────────────────────────────────────────────────────
-    n_scenarios: int = 50
-    horizon_std: float = 0.15     # ±15% تغيير في الأفق
-    tp_std: float = 0.10          # ±10% تغيير في TP
-    sl_std: float = 0.10          # ±10% تغيير في SL
+    mode: Literal["analytical", "monte_carlo"] = "monte_carlo"
+    # ── Monte Carlo (افتراضي — تمايز أفضل من analytical عند الغموض / الرينج) ──
+    n_scenarios: int = 200
+    horizon_std: float = 0.30     # تباين أفقي أوسع للسيناريوهات
+    tp_std: float = 0.20          # تباين أهداف TP
+    sl_std: float = 0.20          # تباين أهداف SL
     random_seed: int = 42
     # ── أوزان التدريب النهائية ───────────────────────────────────────────────
     strong_quality_boost: float = 1.30   # مضاعف الجودة القوية
@@ -252,15 +252,13 @@ class SoftLabelEngine:
         self._print_diagnostics(df)
         return df
 
-    # ── الوضع Monte Carlo (للبحث فقط) ────────────────────────────────────────
+    # ── الوضع Monte Carlo (افتراضي للتدريب عندما تريد soft_label غنيًّا) ─────
 
     def _attach_monte_carlo(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Monte Carlo كامل: يُشغّل n_scenarios سيناريو مع perturbation
-        على horizon + tp_mult + sl_mult.
-        
-        تحذير: O(n × n_scenarios) — بطيء على مجموعات البيانات الكبيرة.
-        استخدم analytical mode في الإنتاج.
+        Monte Carlo: n_scenarios اختبارات مع perturbations على horizon / TP / SL.
+        تعقيد O(n × n_scenarios) — أبطأ من analytical، لكنه يحدّ كثافة soft_label≈0.5.
+        للسرعة الخالصة أو الـ smoke فقط استخدم الوضع التحليلي صراحةً (--soft_label_mode analytical).
         """
         cfg = self.config
         rng = np.random.default_rng(cfg.random_seed)
@@ -450,8 +448,19 @@ class SoftLabelEngine:
 
         # تحذيرات
         if near_half > 0.30:
+            hint = ""
+            if str(self.config.mode).lower() == "analytical":
+                hint = (
+                    " اعتمد monte_carlo في المصفاة (مثال: "
+                    "--soft_label_mode monte_carlo --soft_label_n_scenarios 200)."
+                )
             print(f"  ⚠️  نسبة عالية من الصفوف قرب 0.5 ({near_half:.1%}) — "
-                  "قد تعني أن الإشارات غامضة في معظمها")
+                  f"قد تعني غموضًا في الإشارات.{hint}")
+        elif str(self.config.mode).lower() == "analytical" and clarity < 0.20:
+            print(
+                "  ⚠️  وضوح منخفض مع الوضع التحليلي — للتمايز أنصح monte_carlo "
+                "(انظر configs/v19/defaults.yaml أو --soft_label_mode monte_carlo)."
+            )
         if avg_conf < 0.50:
             print(f"  ⚠️  متوسط الثقة منخفض ({avg_conf:.3f}) — "
                   "فكّر في رفع حدود event_score")

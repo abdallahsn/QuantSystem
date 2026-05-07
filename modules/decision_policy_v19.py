@@ -260,7 +260,7 @@ def build_decision_policy(
         structures[str(bucket)] = bucket_payload
 
     regime_priors = normalize_regime_probs(np.mean(regime_arr[:, :4], axis=0)).tolist()
-    return {
+    out_pol = {
         "policy_version": POLICY_VERSION,
         "source": str(source),
         "coverage_ratio": float(np.mean(coverage.astype(np.float32))) if len(coverage) else 0.0,
@@ -272,6 +272,7 @@ def build_decision_policy(
         "regime_priors": [float(v) for v in regime_priors],
         "structure_buckets": sorted(structures),
     }
+    return out_pol
 
 
 def _coerce_side_block(block: dict | None, fallback: dict) -> dict:
@@ -333,6 +334,8 @@ def evaluate_decision_policy(
     uncertainty: float = 0.0,
     runtime_penalty: float = 1.0,
     coverage_ratio: float | None = None,
+    require_positive_ev: bool = True,
+    edge_prob_override: float | None = None,
 ) -> dict | None:
     if not isinstance(policy, dict) or not policy:
         return None
@@ -356,6 +359,12 @@ def evaluate_decision_policy(
     runtime_penalty = _clip01(runtime_penalty)
     uncertainty = _clip01(uncertainty)
 
+    long_thr = float(_safe_float(long_side.get("threshold_from_cost", 0.5), 0.5))
+    short_thr = float(_safe_float(short_side.get("threshold_from_cost", 0.5), 0.5))
+    if edge_prob_override is not None:
+        o = _clip01(float(edge_prob_override))
+        long_thr = o
+        short_thr = o
     decision = {
         "policy_available": True,
         "policy_version": str(policy.get("policy_version", POLICY_VERSION)),
@@ -368,16 +377,28 @@ def evaluate_decision_policy(
         "cost_pips": float(cost_pips),
         "expected_value_long_pips": float(ev_long),
         "expected_value_short_pips": float(ev_short),
-        "long_threshold": float(_safe_float(long_side.get("threshold_from_cost", 0.5), 0.5)),
-        "short_threshold": float(_safe_float(short_side.get("threshold_from_cost", 0.5), 0.5)),
+        "long_threshold": float(long_thr),
+        "short_threshold": float(short_thr),
         "long_policy": long_side,
         "short_policy": short_side,
+        "require_positive_ev": bool(require_positive_ev),
+        "edge_prob_override": None if edge_prob_override is None else float(_clip01(float(edge_prob_override))),
     }
 
-    passes_long = coverage_ok and runtime_penalty >= 0.5 and p_long >= decision["long_threshold"] and ev_long > 0.0
-    passes_short = coverage_ok and runtime_penalty >= 0.5 and p_short >= decision["short_threshold"] and ev_short > 0.0
-    long_threshold_ok = bool(p_long >= decision["long_threshold"])
-    short_threshold_ok = bool(p_short >= decision["short_threshold"])
+    passes_long = (
+        coverage_ok
+        and runtime_penalty >= 0.5
+        and p_long >= long_thr
+        and (ev_long > 0.0 if require_positive_ev else True)
+    )
+    passes_short = (
+        coverage_ok
+        and runtime_penalty >= 0.5
+        and p_short >= short_thr
+        and (ev_short > 0.0 if require_positive_ev else True)
+    )
+    long_threshold_ok = bool(p_long >= long_thr)
+    short_threshold_ok = bool(p_short >= short_thr)
     long_ev_positive = bool(ev_long > 0.0)
     short_ev_positive = bool(ev_short > 0.0)
     decision["long_threshold_ok"] = long_threshold_ok

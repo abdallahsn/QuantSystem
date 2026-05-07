@@ -22,6 +22,22 @@ from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _configure_stdio_utf8() -> None:
+    """Avoid UnicodeEncodeError on Windows consoles when printing non-ASCII log lines."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+
+
+_configure_stdio_utf8()
+
 from modules.feature_artifact_v19 import (
     load_artifact_manifest,
     load_feature_artifact,
@@ -967,18 +983,27 @@ def run_causal_backtest(
     score_start_ts: str | None = None,
     score_end_ts: str | None = None,
     scenario_name: str = 'base',
+    relax_policy_ev: bool = False,
+    policy_min_edge: float | None = None,
+    skip_event_gate: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    engine = V19PredictionEngine(models_dir, run_mode='backtest')
+    engine = V19PredictionEngine(
+        models_dir,
+        run_mode='backtest',
+        policy_require_positive_ev=(not relax_policy_ev),
+        policy_edge_prob_override=policy_min_edge,
+        skip_event_gate=skip_event_gate,
+    )
     engine.reset_state()
     engine.loss_guard.max_daily_loss_pct = float(max_daily_loss_pct)
     engine.loss_guard.update_equity(starting_equity)
     _assert_single_contract_df(df, context='run_causal_backtest_input')
     source_has_labels = 'bias_label' in df.columns
     source_has_fwd = 'forward_return' in df.columns
-    print(f"  ⏳ Building replay feature frame ({len(df):,} rows, input_scaled={input_scaled})...", flush=True)
+    print(f"  [backtest] Building replay feature frame ({len(df):,} rows, input_scaled={input_scaled})...", flush=True)
     t_pf0 = time.perf_counter()
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
-    print(f"  ✅ replay_df ready: {replay_df.shape[0]:,} × {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
+    print(f"  [backtest] replay_df ready: {replay_df.shape[0]:,} x {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
     price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
     horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
     if 'raw__micro_atr' in replay_df.columns:
@@ -1000,8 +1025,8 @@ def run_causal_backtest(
 
     n_replay = len(replay_df)
     print(
-        f"  ▶️ Causal replay: {n_replay:,} iterate rows | "
-        f"scoring_mask={int(scoring_mask.sum()):,} (per-row dict built lazily)",
+        f"  [backtest] Causal replay: {n_replay:,} rows | "
+        f"scoring_mask={int(scoring_mask.sum()):,}",
         flush=True,
     )
 
@@ -1021,7 +1046,7 @@ def run_causal_backtest(
     for i in range(n_replay):
         row = replay_df.iloc[i].to_dict()
         if i > 0 and i % 5000 == 0:
-            print(f"  ⏳ causal replay progress: {i:,}/{n_replay:,}", flush=True)
+            print(f"  [backtest] progress: {i:,}/{n_replay:,}", flush=True)
         ts = row.get('ts_event', None)
         if active_trade is not None and i >= int(active_trade['exit_idx']):
             equity += float(active_trade['pnl'])
@@ -1067,7 +1092,9 @@ def run_causal_backtest(
             pred['true_label'] = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}.get(true_bias, '?')
             pred['correct'] = (pred.get('bias_idx') == true_bias)
 
-        if pred.get('reason') and 'Warming up' not in pred.get('reason', ''):
+        # Count rows where the engine did not emit a tradeable directional signal
+        # (not every non-empty policy `reason` — approved trades use reasons too).
+        if not bool(pred.get('tradeable', False)):
             blocked_count += 1
 
         tradeable = bool(pred.get('tradeable', False))
@@ -1096,7 +1123,7 @@ def run_causal_backtest(
                 results.append(pred)
                 continue
             entry_idx = min(i + max(int(latency_rows), 0), len(replay_df) - 1)
-            entry_row_data = replay_rows[entry_idx] if 0 <= entry_idx < n_replay else row
+            entry_row_data = replay_df.iloc[entry_idx].to_dict() if 0 <= entry_idx < n_replay else row
             trade_path = _simulate_trade_path(
                 entry_idx=entry_idx,
                 direction=direction,
@@ -1135,7 +1162,7 @@ def run_causal_backtest(
             raw_pnl_pips = float(trade_path['raw_pnl_pips'])
             exit_idx = int(trade_path['exit_idx'])
             exit_ts = ts_arr.iloc[exit_idx] if exit_idx < len(ts_arr) else pd.NaT
-            exit_row = replay_rows[exit_idx] if 0 <= exit_idx < n_replay else {}
+            exit_row = replay_df.iloc[exit_idx].to_dict() if 0 <= exit_idx < n_replay else {}
             fill_pricing = _realized_fill_pricing(
                 entry_row=entry_row_data,
                 exit_row=exit_row,
@@ -1315,6 +1342,30 @@ def run_causal_backtest(
     return results_df, trades_df, summary
 
 
+_STAGE1_SOFT = 'soft_label'
+_SOFT_BUNDLE_FALLBACK_POLICY_MIN_EDGE = 0.52  # mirrors predict_v19.V19PredictionEngine._base_fallback_min_edge()
+
+
+def _infer_soft_bundle_default_policy_min_edge(models_dir: str) -> float | None:
+    """When stage-1 trains on soft_label, pseudo-probs use a softer scale than cost-derived ~2/3 thresholds."""
+    soft = False
+    for fname in ('catboost_classes_v19.json', 'xgboost_classes_v19.json'):
+        path = os.path.join(models_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                payload = json.load(f)
+            if str(payload.get('stage1_target', '') or '').strip().lower() == _STAGE1_SOFT:
+                soft = True
+                break
+        except Exception:
+            continue
+    if not soft:
+        return None
+    return float(_SOFT_BUNDLE_FALLBACK_POLICY_MIN_EDGE)
+
+
 def main():
     p = argparse.ArgumentParser(description='Causal replay backtester for QuantSystem V19')
     p.add_argument('--data', '--csv', dest='data', required=True, help='stage1 artifact dir/manifest/parquet')
@@ -1352,7 +1403,31 @@ def main():
                    help='allow overlapping trades; default keeps one active position at a time')
     p.add_argument('--cooldown_rows', type=int, default=0,
                    help='rows to wait after closing a trade before opening a new one')
+    p.add_argument('--relax_policy_ev', action='store_true',
+                   help='cost-aware policy: do not require positive EV (recommended when trades=0: placeholder symmetric win/loss in policy vs cost)')
+    p.add_argument('--policy_min_edge', type=float, default=None,
+                   help=(
+                       'override LONG/SHORT prob threshold vs policy-derived cost floor; '
+                       'omit to auto-use 0.52 for soft_label CatBoost/XGB bundles (matches live predict fallback)'
+                   ))
+    p.add_argument('--skip_event_gate', action='store_true',
+                   help='disable EventGate for this run (diagnostic only)')
     args = p.parse_args()
+
+    inferred_policy_edge = _infer_soft_bundle_default_policy_min_edge(args.models)
+    if args.policy_min_edge is None and inferred_policy_edge is not None:
+        args.policy_min_edge = inferred_policy_edge
+        print(
+            f"  [backtest] soft_label artifacts: policy_min_edge={args.policy_min_edge} "
+            f"(aligned with predict_v19 soft pseudo-prob scale; override with --policy_min_edge)",
+            flush=True,
+        )
+        if not args.relax_policy_ev:
+            print(
+                '  [backtest] hint: symmetric placeholder win/loss in decision_policy often makes '
+                'EV>0 impossible at any probability — if you see zero trades, add --relax_policy_ev',
+                flush=True,
+            )
 
     df_raw = _load_csv(args.data)
     model_window = _load_model_training_window(args.models)
@@ -1376,13 +1451,25 @@ def main():
     if df_score.empty:
         raise ValueError('❌ نافذة الباك تست المطلوبة فارغة. راجع start_ts/end_ts أو training_window في manifest.')
 
+    print(
+        f"  [backtest] Replay timeline rows: {len(df_aligned):,} | "
+        f"holdout/scored window: {len(df_score):,}",
+        flush=True,
+    )
+
     oos_guard = _enforce_oos_backtest_guard(
         df_score,
         csv_path=args.data,
         models_dir=args.models,
         allow_in_sample_data_override=args.allow_in_sample_data_override,
     )
-    engine = V19PredictionEngine(args.models)
+    engine = V19PredictionEngine(
+        args.models,
+        run_mode='backtest',
+        policy_require_positive_ev=(not args.relax_policy_ev),
+        policy_edge_prob_override=args.policy_min_edge,
+        skip_event_gate=args.skip_event_gate,
+    )
     visual_full = _load_visual_embeddings(
         df_aligned,
         explicit_path=args.visual_npy,
@@ -1431,6 +1518,9 @@ def main():
         cooldown_rows=args.cooldown_rows,
         score_start_ts=start_ts,
         score_end_ts=end_ts,
+        relax_policy_ev=args.relax_policy_ev,
+        policy_min_edge=args.policy_min_edge,
+        skip_event_gate=args.skip_event_gate,
     )
     summary['oos_guard'] = oos_guard
     summary['backtest_window'] = {
@@ -1441,7 +1531,7 @@ def main():
         'rows': int(len(df_score)),
     }
 
-    print("\n✅ V19 causal backtest complete")
+    print("\n[backtest] V19 causal backtest complete")
     print(json.dumps(summary, indent=2))
 
 

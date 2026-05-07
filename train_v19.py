@@ -39,10 +39,7 @@ from prepare_training_data import (
 )
 VISUAL_EMB_DIM = 8
 from modules.config_v19 import load_v19_config
-from modules.decision_policy_v19 import (
-    DEFAULT_DECISION_POLICY_ARTIFACT,
-    build_decision_policy,
-)
+from modules.decision_policy_v19 import DEFAULT_DECISION_POLICY_ARTIFACT, build_decision_policy
 from modules.dynamic_labels import (
     DEFAULT_EVENT_OBI_THR,
     DEFAULT_EVENT_ROLL_WINDOW,
@@ -121,8 +118,6 @@ VISUAL_COVERAGE_FAIL_FAST = True
 TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 DEFAULT_LOB_MAX_AGE = '500ms'
 TREE_CLASS_WEIGHT_MAX = 2.5
-SOFT_TARGET_DEGENERATE_ATOL = 1e-6
-SOFT_TARGET_ROUND_DECIMALS = 6
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
     'label_end_ts',
@@ -265,6 +260,13 @@ def _resolve_catboost_device(catboost_device: str = 'auto') -> tuple[str, str | 
 
     gpu_info = detect_gpu()
     return ('GPU', '0') if gpu_info.get('available') else ('CPU', None)
+
+
+def _catboost_rsm_for_task(task_type: str, rsm: float = 0.70) -> float:
+    """GPU CatBoost rejects rsm below 1.0 unless pairwise modes; CPU keeps stochastic rsm."""
+    if str(task_type or '').strip().upper() == 'GPU' and float(rsm) + 1e-12 < 1.0:
+        return 1.0
+    return float(rsm)
 
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1050,165 +1052,6 @@ def _pseudo_probs_two_col(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
-def _directional_probs_from_soft_win_prob(
-    pred: np.ndarray,
-    bias_label: np.ndarray | pd.Series | list | tuple | None,
-) -> np.ndarray:
-    """
-    Map soft_label = P(win | current bias_label) into directional [LONG, SHORT] probs.
-
-    LONG rows:  [p, 1-p]
-    SHORT rows: [1-p, p]
-    unknown:    [0.5, 0.5]
-    """
-    base = _pseudo_probs_two_col(pred).astype(np.float32, copy=True)
-    if bias_label is None:
-        return base
-
-    bias_arr = pd.to_numeric(pd.Series(bias_label), errors='coerce').fillna(2).astype(np.int32).to_numpy()
-    if len(bias_arr) != len(base):
-        raise ValueError(
-            f"bias_label length mismatch for soft-label directional remap: {len(bias_arr)} != {len(base)}"
-        )
-
-    out = np.full_like(base, 0.5, dtype=np.float32)
-    long_mask = bias_arr == 0
-    short_mask = bias_arr == 1
-    out[long_mask] = base[long_mask]
-    if np.any(short_mask):
-        out[short_mask, 0] = base[short_mask, 1]
-        out[short_mask, 1] = base[short_mask, 0]
-    return out
-
-
-def _soft_target_summary(
-    target: np.ndarray,
-    *,
-    round_decimals: int = SOFT_TARGET_ROUND_DECIMALS,
-) -> dict:
-    arr = np.asarray(target, dtype=np.float64).reshape(-1)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return {
-            'count': 0,
-            'mean': None,
-            'std': None,
-            'min': None,
-            'max': None,
-            'range': None,
-            'rounded_unique_count': 0,
-            'rounded_unique_sample': [],
-        }
-    rounded = np.round(finite, int(round_decimals))
-    unique_vals = np.unique(rounded)
-    return {
-        'count': int(finite.size),
-        'mean': float(np.mean(finite)),
-        'std': float(np.std(finite)),
-        'min': float(np.min(finite)),
-        'max': float(np.max(finite)),
-        'range': float(np.max(finite) - np.min(finite)),
-        'rounded_unique_count': int(unique_vals.size),
-        'rounded_unique_sample': [float(x) for x in unique_vals[:8].tolist()],
-    }
-
-
-def _is_degenerate_soft_target(
-    target: np.ndarray,
-    *,
-    atol: float = SOFT_TARGET_DEGENERATE_ATOL,
-    round_decimals: int = SOFT_TARGET_ROUND_DECIMALS,
-) -> tuple[bool, dict]:
-    summary = _soft_target_summary(target, round_decimals=round_decimals)
-    is_degenerate = (
-        summary['count'] <= 1
-        or summary['rounded_unique_count'] <= 1
-        or (summary['range'] is not None and float(summary['range']) <= float(atol))
-        or (summary['std'] is not None and float(summary['std']) <= float(atol))
-    )
-    summary['degenerate'] = bool(is_degenerate)
-    summary['degenerate_atol'] = float(atol)
-    return bool(is_degenerate), summary
-
-
-def _constant_soft_prediction_from_target(
-    target: np.ndarray | float,
-    *,
-    fallback: float = 0.5,
-) -> tuple[float, dict]:
-    arr = np.asarray(target, dtype=np.float64).reshape(-1)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        p = float(np.clip(fallback, 1e-6, 1.0 - 1e-6))
-        summary = _soft_target_summary(np.array([], dtype=np.float64))
-    else:
-        p = float(np.clip(np.mean(finite), 1e-6, 1.0 - 1e-6))
-        summary = _soft_target_summary(finite)
-    return p, summary
-
-
-def _constant_soft_prob_block(
-    n_rows: int,
-    target: np.ndarray | float,
-    *,
-    bias_label: np.ndarray | pd.Series | list | tuple | None = None,
-    fallback: float = 0.5,
-) -> tuple[np.ndarray, dict]:
-    p, summary = _constant_soft_prediction_from_target(target, fallback=fallback)
-    if bias_label is not None:
-        block = _directional_probs_from_soft_win_prob(
-            np.full(max(int(n_rows), 0), p, dtype=np.float32),
-            bias_label,
-        )
-    else:
-        block = np.repeat(_pseudo_probs_two_col(np.array([p], dtype=np.float32)), max(int(n_rows), 0), axis=0)
-    long_probs = [float(p), float(1.0 - p)]
-    short_probs = [float(1.0 - p), float(p)]
-    return block.astype(np.float32), {
-        'constant_prediction': float(p),
-        'constant_probs': [float(block[0, 0]), float(block[0, 1])] if len(block) else long_probs,
-        'constant_probs_long_bias': long_probs,
-        'constant_probs_short_bias': short_probs,
-        'soft_target_summary': summary,
-        'soft_label_semantics': 'P(win | bias_label)',
-    }
-
-
-def _remove_stale_artifact(path: str) -> None:
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def _write_constant_soft_model_metadata(
-    metadata_path: str,
-    *,
-    model_family: str,
-    target: np.ndarray,
-    reason: str,
-) -> dict:
-    _, payload = _constant_soft_prob_block(1, target, fallback=0.5)
-    meta = {
-        'classes': [0, 1],
-        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-        'artifact_mode': 'constant_soft_baseline',
-        'model_family': str(model_family),
-        'reason': str(reason),
-        'constant_prediction': float(payload['constant_prediction']),
-        'constant_probs': [float(x) for x in payload['constant_probs']],
-        'constant_probs_long_bias': [float(x) for x in payload['constant_probs_long_bias']],
-        'constant_probs_short_bias': [float(x) for x in payload['constant_probs_short_bias']],
-        'train_soft_target_summary': payload['soft_target_summary'],
-        'soft_label_semantics': payload['soft_label_semantics'],
-        'pseudo_prob_head': 'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] from constant soft-label fallback',
-    }
-    with open(metadata_path, 'w') as f:
-        json.dump(meta, f, indent=2)
-    return meta
-
-
 def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
     primary = None
     if col in df.columns:
@@ -1622,21 +1465,12 @@ def build_time_splits(
     )
     if not splits:
         raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
-    actual_split_count = int(len(splits))
-    split_count_warning = actual_split_count > int(effective_requested_folds)
-    if split_count_warning:
-        print(
-            "  ⚠️ Split count exceeded effective request: "
-            f"effective_requested={effective_requested_folds} actual={actual_split_count}"
-        )
     return splits, t0, t1, {
         'dynamic_embargo_rows': int(dynamic_embargo_rows),
         'effective_embargo_pct': float(effective_embargo_pct),
         'embargo_horizon_quantile': float(embargo_horizon_quantile),
         'requested_n_folds': int(requested_n_folds),
         'effective_requested_n_folds': int(effective_requested_folds),
-        'actual_split_count': actual_split_count,
-        'split_count_warning': bool(split_count_warning),
     }
 
 
@@ -1672,7 +1506,6 @@ def stage1_oof_meta(
     df: pd.DataFrame,
     output_dir: str,
     splits=None,
-    split_meta: dict | None = None,
     n_folds: int = 6,
     test_size: float = 0.10,
     embargo_pct: float = 0.02,
@@ -1710,59 +1543,34 @@ def stage1_oof_meta(
         ys = pd.to_numeric(df['soft_label'], errors='coerce').fillna(0.5).to_numpy(dtype=np.float64)
         y_soft = np.clip(ys, 1e-4, 1.0 - 1e-4).astype(np.float32)
     if splits is None:
-        splits, t0, t1, generated_split_meta = build_time_splits(
+        splits, t0, t1, _ = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
             min_train_pct=min_train_pct,
         )
-        if split_meta is None:
-            split_meta = generated_split_meta
     elif t0 is None or t1 is None:
-        _, t0, t1, generated_split_meta = build_time_splits(
+        _, t0, t1, _ = build_time_splits(
             df,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,
             min_train_pct=min_train_pct,
         )
-        if split_meta is None:
-            split_meta = generated_split_meta
 
     print(f"  Splits: {len(splits)} | Rows: {n:,}")
     cb_task_type, cb_devices = _resolve_catboost_device(catboost_device)
     print(f"  CatBoost device: {cb_task_type}")
-    if split_meta:
-        print(
-            "  Split contract: "
-            f"requested={int(split_meta.get('requested_n_folds', n_folds))} "
-            f"| effective={int(split_meta.get('effective_requested_n_folds', len(splits)))} "
-            f"| actual={int(split_meta.get('actual_split_count', len(splits)))}"
-        )
     if use_soft_target:
-        soft_global_degenerate, soft_global_summary = _is_degenerate_soft_target(y_soft)
         print(
             f"  stage1_target: soft_label (CatBoostRegressor+XGBRegressor) | "
             f"soft mean={float(np.mean(y_soft)):.3f} std={float(np.std(y_soft)):.3f} | "
             f"sample_weight = mc_sample_weight × label_stability only"
         )
-        print("  soft_label semantics: P(win | bias_label) → direction-aware LONG/SHORT remap per row")
         print(f"  bias_label distribution (context only): {pd.Series(y).value_counts().sort_index().to_dict()}")
-        print(
-            "  soft_label support: "
-            f"min={soft_global_summary['min']:.6f} max={soft_global_summary['max']:.6f} "
-            f"| rounded_unique={soft_global_summary['rounded_unique_count']}"
-        )
-        if soft_global_degenerate:
-            print(
-                "  ⚠️ soft_label collapsed across the Stage-1 event view; "
-                f"base learners will emit constant soft predictions at p={float(soft_global_summary['mean']):.6f}"
-            )
         priors = np.asarray([0.5, 0.5], dtype=np.float32)
     else:
-        soft_global_degenerate = False
-        soft_global_summary = {}
         print(f"  Class distribution: {pd.Series(y).value_counts().sort_index().to_dict()}")
         priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
         priors = priors / max(priors.sum(), 1.0)
@@ -1822,58 +1630,40 @@ def stage1_oof_meta(
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
         early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
-        fit_soft = y_soft[fit_idx]
-        fit_soft_degenerate, fit_soft_summary = _is_degenerate_soft_target(fit_soft)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         print(
             f"    Fold {fold_no} [soft RMSE]: fit={len(fit_idx):,} test={len(test_idx):,} "
             f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
             f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-            f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f} std={float(np.std(fit_soft)):.3f}"
+            f"| y_soft_fit mean={float(np.mean(y_soft[fit_idx])):.3f} std={float(np.std(y_soft[fit_idx])):.3f}"
         )
-        if fit_soft_degenerate:
-            const_preds, const_info = _constant_soft_prob_block(
-                len(test_idx),
-                fit_soft,
-                bias_label=df.iloc[test_idx]['bias_label'],
-                fallback=0.5,
-            )
-            print(
-                f"      CatBoost Fold {fold_no}: degenerate soft_label "
-                f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
-                f"→ constant p={const_info['constant_prediction']:.6f}"
-            )
-            return const_preds, {
+        _yf = np.asarray(y_soft[fit_idx], dtype=np.float64).reshape(-1)
+        _degen_soft = (
+            _yf.size < 2
+            or float(np.ptp(_yf)) <= 1e-12
+            or float(np.std(_yf, ddof=0)) < 1e-6
+        )
+        if _degen_soft:
+            print(f"      CatBoost Fold {fold_no}: degenerate soft_label (~constant train; ptp/std) → priors")
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'constant_soft_target_fallback',
-                'constant_prediction': float(const_info['constant_prediction']),
-                'constant_probs': const_info['constant_probs'],
-                'soft_target_summary': fit_soft_summary,
+                'mode': 'priors_only_constant_soft_target',
             }
         fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
         fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
         if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
             print(
                 f"      CatBoost Fold {fold_no}: degraded scaler "
-                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
+                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using priors"
             )
-            const_preds, const_info = _constant_soft_prob_block(
-                len(test_idx),
-                fit_soft,
-                bias_label=df.iloc[test_idx]['bias_label'],
-                fallback=0.5,
-            )
-            return const_preds, {
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'constant_soft_target_degraded_scaler',
-                'constant_prediction': float(const_info['constant_prediction']),
-                'constant_probs': const_info['constant_probs'],
-                'soft_target_summary': fit_soft_summary,
+                'mode': 'priors_only_degraded_scaler',
                 'fold_scaler_diagnostics': scaler_diag,
             }
         X_fit = _apply_scaler_to_stat_frame(
@@ -1901,7 +1691,7 @@ def stage1_oof_meta(
             l2_leaf_reg=3.0,
             bootstrap_type='Bernoulli',
             subsample=0.80,
-            rsm=0.70,
+            rsm=_catboost_rsm_for_task(cb_task_type, 0.70),
             loss_function='RMSE',
             eval_metric='RMSE',
             early_stopping_rounds=early_stopping_rounds,
@@ -1923,7 +1713,7 @@ def stage1_oof_meta(
             eval_set_cb = Pool(X_val, y_soft[inner_val], feature_names=CATBOOST_ADVISOR_FEATURES)
         model_cb.fit(tr_pool, eval_set=eval_set_cb, plot=False)
         pred_raw = np.asarray(model_cb.predict(X_test), dtype=np.float32).reshape(-1)
-        preds = _directional_probs_from_soft_win_prob(pred_raw, df.iloc[test_idx]['bias_label'])
+        preds = _pseudo_probs_two_col(pred_raw)
         test_mae = float(np.mean(np.abs(pred_raw - y_soft[test_idx])))
         rmse_fold = float(np.sqrt(np.mean((pred_raw - y_soft[test_idx]) ** 2)))
         cb_best_iteration = None
@@ -2023,7 +1813,7 @@ def stage1_oof_meta(
             l2_leaf_reg=3.0,
             bootstrap_type='Bernoulli',
             subsample=0.80,
-            rsm=0.70,
+            rsm=_catboost_rsm_for_task(cb_task_type, 0.70),
             loss_function='Logloss',
             eval_metric='Logloss',
             early_stopping_rounds=early_stopping_rounds,
@@ -2101,58 +1891,40 @@ def stage1_oof_meta(
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
         early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
-        fit_soft = y_soft[fit_idx]
-        fit_soft_degenerate, fit_soft_summary = _is_degenerate_soft_target(fit_soft)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         print(
             f"    XGB Fold {fold_no} [soft RMSE]: fit={len(fit_idx):,} test={len(test_idx):,} "
             f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
             f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-            f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f}"
+            f"| y_soft_fit mean={float(np.mean(y_soft[fit_idx])):.3f}"
         )
-        if fit_soft_degenerate:
-            const_preds, const_info = _constant_soft_prob_block(
-                len(test_idx),
-                fit_soft,
-                bias_label=df.iloc[test_idx]['bias_label'],
-                fallback=0.5,
-            )
-            print(
-                f"      XGBoost Fold {fold_no}: degenerate soft_label "
-                f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
-                f"→ constant p={const_info['constant_prediction']:.6f}"
-            )
-            return const_preds, {
+        _yf_x = np.asarray(y_soft[fit_idx], dtype=np.float64).reshape(-1)
+        _degen_soft_x = (
+            _yf_x.size < 2
+            or float(np.ptp(_yf_x)) <= 1e-12
+            or float(np.std(_yf_x, ddof=0)) < 1e-6
+        )
+        if _degen_soft_x:
+            print(f"      XGBoost Fold {fold_no}: degenerate soft_label (~constant train; ptp/std) → priors")
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'constant_soft_target_fallback',
-                'constant_prediction': float(const_info['constant_prediction']),
-                'constant_probs': const_info['constant_probs'],
-                'soft_target_summary': fit_soft_summary,
+                'mode': 'priors_only_constant_soft_target',
             }
         fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
         fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
         if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
             print(
                 f"      XGBoost Fold {fold_no}: degraded scaler "
-                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
+                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using priors"
             )
-            const_preds, const_info = _constant_soft_prob_block(
-                len(test_idx),
-                fit_soft,
-                bias_label=df.iloc[test_idx]['bias_label'],
-                fallback=0.5,
-            )
-            return const_preds, {
+            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'constant_soft_target_degraded_scaler',
-                'constant_prediction': float(const_info['constant_prediction']),
-                'constant_probs': const_info['constant_probs'],
-                'soft_target_summary': fit_soft_summary,
+                'mode': 'priors_only_degraded_scaler',
                 'fold_scaler_diagnostics': scaler_diag,
             }
         X_fit = _apply_scaler_to_stat_frame(
@@ -2201,7 +1973,7 @@ def stage1_oof_meta(
             fit_kwargs['eval_set'] = [(X_val, y_soft[inner_val])]
         model_xgb.fit(X_fit, y_soft[fit_idx], **fit_kwargs)
         pred_raw = np.asarray(model_xgb.predict(X_test), dtype=np.float32).reshape(-1)
-        preds = _directional_probs_from_soft_win_prob(pred_raw, df.iloc[test_idx]['bias_label'])
+        preds = _pseudo_probs_two_col(pred_raw)
         test_mae = float(np.mean(np.abs(pred_raw - y_soft[test_idx])))
         rmse_fold = float(np.sqrt(np.mean((pred_raw - y_soft[test_idx]) ** 2)))
         xgb_best_iteration = getattr(model_xgb, 'best_iteration', None) if early_stopping_rounds is not None else None
@@ -2424,162 +2196,114 @@ def stage1_oof_meta(
     if use_soft_target:
         y_train_final = y_soft[final_train_idx]
         y_holdout_final = y_soft[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.float32)
-        final_soft_degenerate, final_soft_summary = _is_degenerate_soft_target(y_train_final)
-        cb_model_path = os.path.join(output_dir, 'catboost_advisor_v19.cbm')
-        cb_meta_path = os.path.join(output_dir, 'catboost_classes_v19.json')
-        xgb_model_path = os.path.join(output_dir, 'xgboost_advisor_v19.json')
-        xgb_meta_path = os.path.join(output_dir, 'xgboost_classes_v19.json')
-        if final_soft_degenerate:
-            cb_meta = _write_constant_soft_model_metadata(
-                cb_meta_path,
-                model_family='catboost',
-                target=y_train_final,
-                reason='final_train_soft_target_degenerate',
-            )
-            xgb_meta = _write_constant_soft_model_metadata(
-                xgb_meta_path,
-                model_family='xgboost',
-                target=y_train_final,
-                reason='final_train_soft_target_degenerate',
-            )
-            for stale_path in (cb_model_path, xgb_model_path, cb_calibrator_path, xgb_calibrator_path):
-                _remove_stale_artifact(stale_path)
-            live_probs = np.repeat(
-                np.asarray(cb_meta['constant_probs'], dtype=np.float32).reshape(1, -1),
-                len(df),
-                axis=0,
-            )
-            live_xgb_probs = np.repeat(
-                np.asarray(xgb_meta['constant_probs'], dtype=np.float32).reshape(1, -1),
-                len(df),
-                axis=0,
-            )
-            final_cb_calibrator = None
-            final_xgb_calibrator = None
-            final_cb_cal_report = {
-                'enabled': False,
-                'reason': 'constant_soft_baseline',
-                'constant_prediction': float(cb_meta['constant_prediction']),
-                'train_soft_target_summary': final_soft_summary,
-            }
-            final_xgb_cal_report = {
-                'enabled': False,
-                'reason': 'constant_soft_baseline',
-                'constant_prediction': float(xgb_meta['constant_prediction']),
-                'train_soft_target_summary': final_soft_summary,
-            }
-            if len(final_holdout_idx):
-                hold_p = np.full(len(final_holdout_idx), float(cb_meta['constant_prediction']), dtype=np.float32)
-                hold_x = np.full(len(final_holdout_idx), float(xgb_meta['constant_prediction']), dtype=np.float32)
-                final_cb_cal_report['holdout_mae_vs_soft'] = float(np.mean(np.abs(hold_p - y_holdout_final)))
-                final_xgb_cal_report['holdout_mae_vs_soft'] = float(np.mean(np.abs(hold_x - y_holdout_final)))
+        _yt_eff = np.asarray(y_train_final, dtype=np.float64).reshape(-1)
+        degenerate_final = (
+            _yt_eff.size < 2
+            or float(np.ptp(_yt_eff)) <= 1e-12
+            or float(np.std(_yt_eff, ddof=0)) < 1e-6
+        )
+        if degenerate_final:
             print(
-                "  ⚠️ Final Stage-1 soft target is degenerate; "
-                f"saved constant CatBoost/XGBoost baselines at p={float(cb_meta['constant_prediction']):.6f}"
+                "  ⚠️ Final train soft_label is (~)constant — applying tiny RNG jitter so CatBoost/XGBoost can finish "
+                "(OOF already used priors; refinery/MC should widen soft_label spread for meaningful regression)."
+            )
+            _rng_final = np.random.default_rng(42)
+            jitter_tr = _rng_final.normal(0.0, 5e-5, size=len(y_train_final)).astype(np.float32)
+            y_train_final_fit = np.clip(
+                np.asarray(y_train_final, dtype=np.float32) + jitter_tr,
+                1e-4,
+                1.0 - 1e-4,
             )
         else:
-            final_cb = CatBoostRegressor(
-                iterations=1000,
-                depth=tree_depth,
-                learning_rate=0.01,
-                l2_leaf_reg=3.0,
-                bootstrap_type='Bernoulli',
-                subsample=0.80,
-                rsm=0.70,
-                loss_function='RMSE',
-                eval_metric='RMSE',
-                use_best_model=len(final_holdout_idx) > 0,
-                early_stopping_rounds=50 if len(final_holdout_idx) > 0 else None,
-                verbose=50,
-                random_seed=42,
-                task_type=cb_task_type,
-                devices=cb_devices,
+            y_train_final_fit = np.asarray(y_train_final, dtype=np.float32)
+        final_cb = CatBoostRegressor(
+            iterations=1000,
+            depth=tree_depth,
+            learning_rate=0.01,
+            l2_leaf_reg=3.0,
+            bootstrap_type='Bernoulli',
+            subsample=0.80,
+            rsm=_catboost_rsm_for_task(cb_task_type, 0.70),
+            loss_function='RMSE',
+            eval_metric='RMSE',
+            use_best_model=len(final_holdout_idx) > 0,
+            early_stopping_rounds=50 if len(final_holdout_idx) > 0 else None,
+            verbose=50,
+            random_seed=42,
+            task_type=cb_task_type,
+            devices=cb_devices,
+        )
+        tr_pool_final = Pool(X_train_final, y_train_final_fit, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+        ev_pool_final = (
+            Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES)
+            if len(final_holdout_idx)
+            else None
+        )
+        final_cb.fit(tr_pool_final, eval_set=ev_pool_final, plot=False)
+        final_cb.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
+        with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
+            json.dump(
+                {
+                    'classes': [0, 1],
+                    'stage1_target': STAGE1_TARGET_SOFT_LABEL,
+                    'pseudo_prob_head': '[p, 1-p] from CatBoostRegressor.predict on soft_label',
+                },
+                f,
+                indent=2,
             )
-            tr_pool_final = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
-            ev_pool_final = (
-                Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES)
-                if len(final_holdout_idx)
-                else None
-            )
-            final_cb.fit(tr_pool_final, eval_set=ev_pool_final, plot=False)
-            final_cb.save_model(cb_model_path)
-            with open(cb_meta_path, 'w') as f:
-                json.dump(
-                    {
-                        'classes': [0, 1],
-                        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                        'soft_label_semantics': 'P(win | bias_label)',
-                        'pseudo_prob_head': (
-                            'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] '
-                            'from CatBoostRegressor.predict on soft_label'
-                        ),
-                    },
-                    f,
-                    indent=2,
-                )
-            print("  ✅ CatBoost final: regress soft_label → direction-aware LONG/SHORT stack for meta layer")
+        print("  ✅ CatBoost final: regress soft_label → stack [p, 1-p] for meta layer")
 
-            final_cb_calibrator = None
-            final_cb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
-            if len(final_holdout_idx):
-                hold_p = np.asarray(final_cb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
-                final_cb_cal_report = {
-                    'enabled': False,
-                    'reason': 'soft_regression',
-                    'holdout_mae_vs_soft': float(np.mean(np.abs(hold_p - y_holdout_final))),
-                }
-            live_probs = _directional_probs_from_soft_win_prob(
-                np.asarray(final_cb.predict(X_final), dtype=np.float32),
-                df['bias_label'],
-            )
+        final_cb_calibrator = None
+        final_cb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
+        if len(final_holdout_idx):
+            hold_p = np.asarray(final_cb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
+            final_cb_cal_report = {
+                'enabled': False,
+                'reason': 'soft_regression',
+                'holdout_mae_vs_soft': float(np.mean(np.abs(hold_p - y_holdout_final))),
+            }
+        live_probs = _pseudo_probs_two_col(np.asarray(final_cb.predict(X_final), dtype=np.float32))
 
-            final_xgb = XGBRegressor(
-                n_estimators=800,
-                max_depth=tree_depth,
-                learning_rate=0.03,
-                subsample=0.80,
-                colsample_bytree=0.70,
-                reg_lambda=3.0,
-                objective='reg:squarederror',
-                eval_metric='rmse',
-                early_stopping_rounds=50 if len(final_holdout_idx) else None,
-                random_state=84,
-                tree_method='hist',
+        final_xgb = XGBRegressor(
+            n_estimators=800,
+            max_depth=tree_depth,
+            learning_rate=0.03,
+            subsample=0.80,
+            colsample_bytree=0.70,
+            reg_lambda=3.0,
+            objective='reg:squarederror',
+            eval_metric='rmse',
+            early_stopping_rounds=50 if len(final_holdout_idx) else None,
+            random_state=84,
+            tree_method='hist',
+        )
+        xgb_fit_kw: dict[str, object] = {'sample_weight': final_train_sw, 'verbose': False}
+        if len(final_holdout_idx):
+            xgb_fit_kw['eval_set'] = [(X_holdout_final, y_holdout_final)]
+        final_xgb.fit(X_train_final, y_train_final_fit, **xgb_fit_kw)
+        final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
+        with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
+            json.dump(
+                {
+                    'classes': [0, 1],
+                    'stage1_target': STAGE1_TARGET_SOFT_LABEL,
+                    'pseudo_prob_head': '[p, 1-p] from XGBRegressor.predict on soft_label',
+                },
+                f,
+                indent=2,
             )
-            xgb_fit_kw: dict[str, object] = {'sample_weight': final_train_sw, 'verbose': False}
-            if len(final_holdout_idx):
-                xgb_fit_kw['eval_set'] = [(X_holdout_final, y_holdout_final)]
-            final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kw)
-            final_xgb.save_model(xgb_model_path)
-            with open(xgb_meta_path, 'w') as f:
-                json.dump(
-                    {
-                        'classes': [0, 1],
-                        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                        'soft_label_semantics': 'P(win | bias_label)',
-                        'pseudo_prob_head': (
-                            'direction-aware: LONG->[p,1-p], SHORT->[1-p,p] '
-                            'from XGBRegressor.predict on soft_label'
-                        ),
-                    },
-                    f,
-                    indent=2,
-                )
-            print("  ✅ XGBoost final: regress soft_label → direction-aware LONG/SHORT stack for meta layer")
+        print("  ✅ XGBoost final: regress soft_label → stack [p, 1-p] for meta layer")
 
-            final_xgb_calibrator = None
-            final_xgb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
-            if len(final_holdout_idx):
-                hx = np.asarray(final_xgb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
-                final_xgb_cal_report = {
-                    'enabled': False,
-                    'reason': 'soft_regression',
-                    'holdout_mae_vs_soft': float(np.mean(np.abs(hx - y_holdout_final))),
-                }
-            live_xgb_probs = _directional_probs_from_soft_win_prob(
-                np.asarray(final_xgb.predict(X_final), dtype=np.float32),
-                df['bias_label'],
-            )
+        final_xgb_calibrator = None
+        final_xgb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
+        if len(final_holdout_idx):
+            hx = np.asarray(final_xgb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
+            final_xgb_cal_report = {
+                'enabled': False,
+                'reason': 'soft_regression',
+                'holdout_mae_vs_soft': float(np.mean(np.abs(hx - y_holdout_final))),
+            }
+        live_xgb_probs = _pseudo_probs_two_col(np.asarray(final_xgb.predict(X_final), dtype=np.float32))
     else:
         y_train_final = y[final_train_idx]
         y_holdout_final = y[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.int32)
@@ -2590,7 +2314,7 @@ def stage1_oof_meta(
             l2_leaf_reg=3.0,
             bootstrap_type='Bernoulli',
             subsample=0.80,
-            rsm=0.70,
+            rsm=_catboost_rsm_for_task(cb_task_type, 0.70),
             loss_function='Logloss',
             eval_metric='Logloss',
             use_best_model=len(final_holdout_idx) > 0,
@@ -2701,26 +2425,6 @@ def stage1_oof_meta(
 
     fold_metrics = {
         'stage1_target': STAGE1_TARGET_SOFT_LABEL if use_soft_target else STAGE1_TARGET_BIAS,
-        'sample_weight_mode_requested': str(sw_mode),
-        'effective_sample_weight_mode': 'stability_mc_only' if use_soft_target else str(sw_mode),
-        'comparison_warning': (
-            'soft_label Stage-1 uses regression on P(win | bias_label) with stability_mc_only weighting; '
-            'do not compare directly to bias-classification runs without controlling for both target and weights.'
-            if use_soft_target
-            else None
-        ),
-        'soft_label_semantics': 'P(win | bias_label)' if use_soft_target else None,
-        'soft_label_directional_mapping': (
-            'LONG->[p,1-p], SHORT->[1-p,p], unknown->[0.5,0.5]' if use_soft_target else None
-        ),
-        'soft_target_global_summary': soft_global_summary if use_soft_target else None,
-        'soft_target_global_degenerate': bool(soft_global_degenerate) if use_soft_target else False,
-        'split_meta': {
-            'requested_n_folds': int((split_meta or {}).get('requested_n_folds', n_folds)),
-            'effective_requested_n_folds': int((split_meta or {}).get('effective_requested_n_folds', len(splits))),
-            'actual_split_count': int((split_meta or {}).get('actual_split_count', len(splits))),
-            'split_count_warning': bool((split_meta or {}).get('split_count_warning', False)),
-        },
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
@@ -3097,7 +2801,7 @@ def build_safe_sequences(
     min_seq_coverage: float = 0.80,
     n_stat_feat: int = len(CATBOOST_ADVISOR_FEATURES),
     sequence_aux_mode: str = SEQUENCE_AUX_LAST_STEP_ONLY,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, dict | None, dict | None]:
     n = len(df)
     split_ctx = _sequence_split_context(
         df,
@@ -3116,11 +2820,26 @@ def build_safe_sequences(
     else:
         y_conf = df.get('conf_label', pd.Series(np.zeros(n))).fillna(0).astype(np.float32).values
 
+    meta_aux_ok = (
+        ('range_ctx' in df.columns)
+        and ('bid_wall_delta_fwd_k' in df.columns)
+        and ('ask_wall_delta_fwd_k' in df.columns)
+    )
+    if meta_aux_ok:
+        rng_series = pd.to_numeric(df['range_ctx'], errors='coerce').fillna(0).clip(0, 1)
+        rng_all = rng_series.astype(np.float32).to_numpy().reshape(-1)
+        wb_all = pd.to_numeric(df['bid_wall_delta_fwd_k'], errors='coerce').astype(np.float32).to_numpy().reshape(-1)
+        wa_all = pd.to_numeric(df['ask_wall_delta_fwd_k'], errors='coerce').astype(np.float32).to_numpy().reshape(-1)
+    else:
+        rng_all = wb_all = wa_all = None
+
     train_row_ok = split_ctx['train_row_ok']
     val_row_ok = split_ctx['val_row_ok']
 
     X_tr, yb_tr, yc_tr = [], [], []
     X_val, yb_val, yc_val = [], [], []
+    aux_rng_tr, aux_wb_tr, aux_wa_tr = [], [], []
+    aux_rng_va, aux_wb_va, aux_wa_va = [], [], []
 
     def _coverage_ok(window_cov: np.ndarray) -> bool:
         cov = np.asarray(window_cov, dtype=bool)
@@ -3147,6 +2866,10 @@ def build_safe_sequences(
         )
         yb_tr.append(y_bias[end_idx])
         yc_tr.append(y_conf[end_idx])
+        if meta_aux_ok:
+            aux_rng_tr.append(float(rng_all[end_idx]))
+            aux_wb_tr.append(float(wb_all[end_idx]))
+            aux_wa_tr.append(float(wa_all[end_idx]))
 
     for end_idx in range(split_idx + seq_len - 1, n):
         start_idx = end_idx - seq_len + 1
@@ -3165,6 +2888,10 @@ def build_safe_sequences(
         )
         yb_val.append(y_bias[end_idx])
         yc_val.append(y_conf[end_idx])
+        if meta_aux_ok:
+            aux_rng_va.append(float(rng_all[end_idx]))
+            aux_wb_va.append(float(wb_all[end_idx]))
+            aux_wa_va.append(float(wa_all[end_idx]))
 
     X_tr = np.array(X_tr, dtype=np.float32)
     yb_tr = np.array(yb_tr, dtype=np.int32)
@@ -3180,8 +2907,77 @@ def build_safe_sequences(
         'val_sequences': int(len(X_val)),
         'min_seq_coverage': float(min_seq_coverage),
         'sequence_aux_mode': str(sequence_aux_mode),
+        'meta_multitask_aux_columns': bool(meta_aux_ok),
     }
-    return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats
+    aux_train = None
+    aux_val = None
+    if meta_aux_ok and len(aux_rng_tr) == len(X_tr) and len(aux_rng_va) == len(X_val):
+        wb_tr = np.asarray(aux_wb_tr, dtype=np.float32)
+        wa_tr = np.asarray(aux_wa_tr, dtype=np.float32)
+        wb_va = np.asarray(aux_wb_va, dtype=np.float32)
+        wa_va = np.asarray(aux_wa_va, dtype=np.float32)
+        mask_tr = (np.isfinite(wb_tr) & np.isfinite(wa_tr)).astype(np.float32)
+        mask_va = (np.isfinite(wb_va) & np.isfinite(wa_va)).astype(np.float32)
+        aux_train = {
+            'range_ctx': np.asarray(aux_rng_tr, dtype=np.float32),
+            'wall_bid': wb_tr,
+            'wall_ask': wa_tr,
+            'wall_mask': mask_tr,
+        }
+        aux_val = {
+            'range_ctx': np.asarray(aux_rng_va, dtype=np.float32),
+            'wall_bid': wb_va,
+            'wall_ask': wa_va,
+            'wall_mask': mask_va,
+        }
+
+    return X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, stats, aux_train, aux_val
+
+
+def _wall_delta_scales(aux_train: dict | None, min_valid: int = 64, eps: float = 1e-8) -> tuple[float, float]:
+    """MAE scale على انقساط التدريب (حتى لا تهيمن القيم الشاذة)."""
+    if not aux_train:
+        return 1.0, 1.0
+    m = aux_train['wall_mask'].astype(bool)
+    wb = aux_train['wall_bid'][m]
+    wa = aux_train['wall_ask'][m]
+    wb = wb[np.isfinite(wb)]
+    wa = wa[np.isfinite(wa)]
+    if wb.size < int(min_valid) or wa.size < int(min_valid):
+        return 1.0, 1.0
+    cb = float(np.median(np.abs(wb.astype(np.float64) - np.median(wb))))
+    ca = float(np.median(np.abs(wa.astype(np.float64) - np.median(wa))))
+    sb = cb if cb > eps else float(np.std(wb.astype(np.float64))) or 1.0
+    sa = ca if ca > eps else float(np.std(wa.astype(np.float64))) or 1.0
+    return float(max(sb, eps)), float(max(sa, eps))
+
+
+def _apply_wall_scales(aux: dict, scale_bid: float, scale_ask: float) -> dict:
+    out = dict(aux)
+    m = aux['wall_mask'].astype(np.float32).reshape(-1)
+    wb = np.nan_to_num(aux['wall_bid'].astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    wa = np.nan_to_num(aux['wall_ask'].astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    out['wall_bid_scaled'] = (wb / float(scale_bid)).astype(np.float32)
+    out['wall_ask_scaled'] = (wa / float(scale_ask)).astype(np.float32)
+    out['wall_mask'] = m
+    return out
+
+
+def _keras_meta_checkpoint_has_aux(path: str) -> bool:
+    try:
+        import tensorflow as tf
+    except ImportError:
+        return False
+    try:
+        m = tf.keras.models.load_model(path, compile=False)
+    except Exception:
+        return False
+    try:
+        names = list(m.output_names)
+    except Exception:
+        outs = getattr(m, 'outputs', None) or []
+        names = [getattr(o, 'name', '') or getattr(o, '_name', '') for o in outs]
+    return {'range_ctx_out', 'wall_bid_out', 'wall_ask_out'}.issubset(set(names))
 
 
 def _compute_bias_class_weights(y_bias: np.ndarray, max_weight: float = 2.5) -> dict[int, float]:
@@ -3348,7 +3144,7 @@ def stage3_meta_learner_v19(
         f"X_stat={X_stat.shape} | meta={meta_features.shape} | visual={visual_embeddings.shape} | rows={X_rows.shape}"
     )
 
-    X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, split_stats = build_safe_sequences(
+    X_tr, yb_tr, yc_tr, X_val, yb_val, yc_val, split_stats, aux_train, aux_val = build_safe_sequences(
         df,
         X_rows,
         coverage_mask=coverage_mask,
@@ -3411,6 +3207,46 @@ def stage3_meta_learner_v19(
         except OSError:
             pass
 
+    min_wall_tr = int(os.environ.get('META_MULTITASK_MIN_WALL_TR', '64'))
+    min_wall_va = max(16, min_wall_tr // 4)
+    multitask_requested = bool(
+        aux_train is not None
+        and aux_val is not None
+        and split_stats.get('meta_multitask_aux_columns')
+    )
+    if multitask_requested:
+        nw_tr = int(np.sum(aux_train['wall_mask'].astype(np.float32)))
+        nw_va = int(np.sum(aux_val['wall_mask'].astype(np.float32)))
+        multitask_requested = nw_tr >= min_wall_tr and nw_va >= min_wall_va
+        if not multitask_requested:
+            print(
+                "  ⚠️ عمود الرينج/الجدار موجود لكن نقاط الجدار الصالحة قليلة على الموسعات — "
+                f"masked_train={nw_tr:,} masked_val={nw_va:,} (min train/val={min_wall_tr}/{min_wall_va}); "
+                "Meta بدون مساعدين ثانويين حتى لا يغرقهم الـ Huber بالـ NaNs."
+            )
+
+    if os.path.exists(meta_brain_path) and (not multitask_requested) and _keras_meta_checkpoint_has_aux(meta_brain_path):
+        try:
+            os.remove(meta_brain_path)
+            print(
+                "  ♻️ حُذف وزن Meta القديم (متعدد الرؤوس) لأن الجلسة الحالية بدون إشراف الرينج/الجدار؛ "
+                "سيُبنى نموذج bias+conf فقط لتفادي تمرين ناقص للمخرجات الثانوية."
+            )
+        except OSError:
+            pass
+
+    wall_scale_bid = 1.0
+    wall_scale_ask = 1.0
+    aux_fit_tr = aux_fit_va = None
+    if multitask_requested:
+        wall_scale_bid, wall_scale_ask = _wall_delta_scales(aux_train)
+        aux_fit_tr = _apply_wall_scales(aux_train, wall_scale_bid, wall_scale_ask)
+        aux_fit_va = _apply_wall_scales(aux_val, wall_scale_bid, wall_scale_ask)
+        print(
+            "  🧭 Meta multitask supervision: RANGE→WALL phased | "
+            f"wall scales (Δ raw) MAD≈ bid={wall_scale_bid:.4g} ask={wall_scale_ask:.4g}"
+        )
+
     meta = MetaLearnerLSTM(
         seq_len=SEQ_LEN,
         n_stat_feat=len(CATBOOST_ADVISOR_FEATURES),
@@ -3421,7 +3257,11 @@ def stage3_meta_learner_v19(
         lstm_units_2=int(profile['lstm_units_2']),
         dropout=float(profile['visual_dropout_rate']),
         confidence_threshold=float(profile['confidence_threshold']),
+        multitask_meta=multitask_requested,
+        range_then_wall_phase1_frac=float(os.environ.get('META_RANGE_PHASE1_FRAC', '0.28')),
     )
+    meta.wall_scale_bid = float(wall_scale_bid)
+    meta.wall_scale_ask = float(wall_scale_ask)
 
     history = meta.fit_train_val(
         X_tr, yb_tr, yc_tr,
@@ -3430,6 +3270,8 @@ def stage3_meta_learner_v19(
         batch=batch,
         output_dir=output_dir,
         class_weights=bias_class_weights,
+        aux_train=aux_fit_tr,
+        aux_val=aux_fit_va,
     )
 
     if history is not None:
@@ -3466,6 +3308,10 @@ def stage3_meta_learner_v19(
                     'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
                     'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
                     'temperature_scaling': temperature_report,
+                    'multitask_meta': bool(getattr(meta, 'multitask_meta', False)),
+                    'wall_scale_bid': float(getattr(meta, 'wall_scale_bid', 1.0)),
+                    'wall_scale_ask': float(getattr(meta, 'wall_scale_ask', 1.0)),
+                    'range_wall_phase1_frac': float(getattr(meta, 'range_then_wall_phase1_frac', 0.28)),
                 },
                 f,
                 indent=2,
@@ -3524,6 +3370,10 @@ def stage3_meta_learner_v19(
                 'confidence_loss_weight': float(getattr(meta, 'current_conf_loss_weight', 0.3)),
                 'confidence_target_std': float(getattr(meta, 'confidence_target_std', 0.0)),
                 'temperature_scaling': temperature_report,
+                'multitask_meta': bool(getattr(meta, 'multitask_meta', False)),
+                'wall_scale_bid': float(getattr(meta, 'wall_scale_bid', 1.0)),
+                'wall_scale_ask': float(getattr(meta, 'wall_scale_ask', 1.0)),
+                'range_wall_phase1_frac': float(getattr(meta, 'range_then_wall_phase1_frac', 0.28)),
             },
             'artifacts': artifacts,
             'event_gate': event_gate_cfg,
@@ -3531,21 +3381,11 @@ def stage3_meta_learner_v19(
         with open(os.path.join(output_dir, 'feature_schema_v19.json'), 'w') as f:
             json.dump(schema, f, indent=2)
         print("  ✅ MetaLearner V19 history + schema محفوظان")
+    stage3_summary['multitask_meta'] = bool(getattr(meta, 'multitask_meta', False))
+    stage3_summary['wall_scale_bid'] = float(getattr(meta, 'wall_scale_bid', 1.0))
+    stage3_summary['wall_scale_ask'] = float(getattr(meta, 'wall_scale_ask', 1.0))
+    stage3_summary['meta_multitask_aux_columns_ok'] = bool(split_stats.get('meta_multitask_aux_columns'))
     return stage3_summary
-
-
-def _has_constant_soft_baseline_metadata(metadata_path: str) -> bool:
-    if not metadata_path or not os.path.exists(metadata_path):
-        return False
-    try:
-        with open(metadata_path, 'r') as f:
-            payload = json.load(f)
-    except Exception:
-        return False
-    if str(payload.get('artifact_mode', '')).strip().lower() != 'constant_soft_baseline':
-        return False
-    probs = payload.get('constant_probs')
-    return isinstance(probs, list) and len(probs) >= 2
 
 
 def _load_required_stage1_artifacts(
@@ -3561,25 +3401,21 @@ def _load_required_stage1_artifacts(
         raise ValueError(f'❌ Stage1 cached meta surface must be 2D, got {meta_arr.shape}')
     meta_feature_names = _load_stage1_meta_feature_names(output_dir, meta_dim=int(meta_arr.shape[1]))
     layout = infer_meta_feature_layout(meta_feature_names)
-    cb_model_path = os.path.join(output_dir, 'catboost_advisor_v19.cbm')
-    cb_classes_path = os.path.join(output_dir, 'catboost_classes_v19.json')
-    xgb_model_path = os.path.join(output_dir, 'xgboost_advisor_v19.json')
-    xgb_classes_path = os.path.join(output_dir, 'xgboost_classes_v19.json')
     required_files = [
         meta_path,
         coverage_path,
-        cb_classes_path,
+        os.path.join(output_dir, 'catboost_advisor_v19.cbm'),
+        os.path.join(output_dir, 'catboost_classes_v19.json'),
         os.path.join(output_dir, 'regime_classifier.pkl'),
     ]
-    missing = [path for path in required_files if not os.path.exists(path)]
-    if not (os.path.exists(cb_model_path) or _has_constant_soft_baseline_metadata(cb_classes_path)):
-        missing.append(cb_model_path)
     if any(spec.get('name') == 'xgboost' for spec in layout.get('base_models', [])):
-        required_files.append(xgb_classes_path)
-        if not os.path.exists(xgb_classes_path):
-            missing.append(xgb_classes_path)
-        if not (os.path.exists(xgb_model_path) or _has_constant_soft_baseline_metadata(xgb_classes_path)):
-            missing.append(xgb_model_path)
+        required_files.extend(
+            [
+                os.path.join(output_dir, 'xgboost_advisor_v19.json'),
+                os.path.join(output_dir, 'xgboost_classes_v19.json'),
+            ]
+        )
+    missing = [path for path in required_files if not os.path.exists(path)]
     if missing:
         raise FileNotFoundError(
             '❌ CatBoost/XGBoost stage artifacts missing. '
@@ -3849,8 +3685,6 @@ def run_training_pipeline(
             {
                 **split_meta,
                 'n_splits': int(len(splits)),
-                'actual_split_count': int(split_meta.get('actual_split_count', len(splits))),
-                'split_count_warning': bool(split_meta.get('split_count_warning', False)),
                 'rows': int(len(event_df)),
                 'folds': [
                     {
@@ -3887,7 +3721,6 @@ def run_training_pipeline(
             event_df,
             output_dir,
             splits=splits,
-            split_meta=split_meta,
             n_folds=n_folds,
             test_size=test_size,
             embargo_pct=embargo_pct,

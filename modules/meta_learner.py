@@ -86,6 +86,20 @@ else:
 # ══════════════════════════════════════════════════════════════════
 # MetaLearner — LSTM Meta-Learning Brain
 # ══════════════════════════════════════════════════════════════════
+def _multitask_aux_heads(shared_tensor, dropout: float) -> dict:
+    """Range (sigmoid) + wall forward-delta regressors — shared trunk."""
+    r = layers.Dense(48, activation='gelu')(shared_tensor)
+    r = layers.Dropout(dropout * 0.5)(r)
+    range_ctx_out = layers.Dense(1, activation='sigmoid', name='range_ctx_out')(r)
+
+    w = layers.Dense(48, activation='gelu')(shared_tensor)
+    w = layers.Dropout(dropout * 0.5)(w)
+    wall_bid_out = layers.Dense(1, activation='linear', name='wall_bid_out')(w)
+    wall_ask_out = layers.Dense(1, activation='linear', name='wall_ask_out')(w)
+
+    return {'range_ctx_out': range_ctx_out, 'wall_bid_out': wall_bid_out, 'wall_ask_out': wall_ask_out}
+
+
 class MetaLearnerLSTM:
     """
     LSTM يقرأ "القصة الكاملة" للسوق عبر الزمن ويصدر القرار النهائي.
@@ -107,7 +121,9 @@ class MetaLearnerLSTM:
                  lstm_units_2:  int   = 64,
                  dropout:       float = 0.25,
                  confidence_threshold: float = 0.65,
-                 bias_long_threshold: float = 0.50):
+                 bias_long_threshold: float = 0.50,
+                 multitask_meta: bool = False,
+                 range_then_wall_phase1_frac: float = 0.28):
 
         self.seq_len      = seq_len
         self.n_stat       = n_stat_feat
@@ -120,6 +136,12 @@ class MetaLearnerLSTM:
         self.drop         = dropout
         self.conf_thresh  = confidence_threshold
         self.bias_long_threshold = float(np.clip(bias_long_threshold, 0.05, 0.95))
+        self.multitask_meta = bool(multitask_meta)
+        self.range_then_wall_phase1_frac = float(np.clip(range_then_wall_phase1_frac, 0.05, 0.95))
+        self.aux_loss_phase = 'phase1_range'
+        self.wall_scale_bid = 1.0
+        self.wall_scale_ask = 1.0
+
         self.bias_threshold_metrics = {
             'selected_threshold': float(self.bias_long_threshold),
         }
@@ -152,10 +174,25 @@ class MetaLearnerLSTM:
                     )
                     self.model = self._build()
                 else:
-                    self.model = loaded_model
-                    self._recompile()
-                    self._fitted = True
-                    print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
+                    out_names = []
+                    try:
+                        out_names = list(loaded_model.output_names)
+                    except Exception:
+                        outs = getattr(loaded_model, 'outputs', None) or []
+                        out_names = [getattr(o, 'name', '') or getattr(o, '_name', '') for o in outs]
+                    multitask_loaded = {'range_ctx_out', 'wall_bid_out', 'wall_ask_out'}.issubset(set(out_names))
+                    if multitask_loaded:
+                        self.multitask_meta = True
+                    if self.multitask_meta and not multitask_loaded:
+                        print(
+                            "[MetaLearner] ⚠️ multitask checkpoint missing auxiliary heads → rebuilding skeleton"
+                        )
+                        self.model = self._build()
+                    else:
+                        self.model = loaded_model
+                        self._recompile()
+                        self._fitted = True
+                        print(f"[MetaLearner] 🧠 تحميل: {brain_file}")
             except Exception as e:
                 print(f"[MetaLearner] ⚠️ ({e}) — بنبني جديد")
                 self.model = self._build()
@@ -224,27 +261,49 @@ class MetaLearnerLSTM:
         c = layers.Dense(32, activation='gelu')(shared)
         conf_out = layers.Dense(1, activation='sigmoid', name='conf_out')(c)
 
-        model = Model(inp,
-                      {'bias_out': bias_out, 'conf_out': conf_out},
-                      name='MetaLearner_LSTM')
+        out_map: dict = {'bias_out': bias_out, 'conf_out': conf_out}
+        if self.multitask_meta:
+            out_map.update(_multitask_aux_heads(shared, self.drop))
+
+        model = Model(inp, out_map, name='MetaLearner_LSTM_multitask' if self.multitask_meta else 'MetaLearner_LSTM')
 
         self.model = model
-        self._recompile()
+        self._recompile(auxiliary_phase=getattr(self, 'aux_loss_phase', 'phase1_range'))
         model.summary(line_length=80)
         return model
 
-    def _recompile(self, conf_loss_weight: float | None = None):
+    def _recompile(self, conf_loss_weight: float | None = None, auxiliary_phase: str | None = None):
         if conf_loss_weight is not None:
             self.current_conf_loss_weight = float(max(conf_loss_weight, 0.0))
             self.confidence_head_enabled = self.current_conf_loss_weight > 0.0
+        if auxiliary_phase:
+            self.aux_loss_phase = str(auxiliary_phase)
         lr = WarmupCosineDecay(d_model=self.lstm2, warmup_steps=500)
+        losses: dict = {
+            'bias_out': 'sparse_categorical_crossentropy',
+            'conf_out': 'binary_crossentropy',
+        }
+        loss_weights = {'bias_out': 1.0, 'conf_out': float(self.current_conf_loss_weight)}
+        out_names: list[str] = []
+        try:
+            out_names = list(self.model.output_names)
+        except Exception:
+            outs = getattr(self.model, 'outputs', None) or []
+            out_names = [getattr(o, 'name', '') or getattr(o, '_name', '') for o in outs]
+        has_aux = {'range_ctx_out', 'wall_bid_out', 'wall_ask_out'}.issubset(set(out_names))
+        if has_aux:
+            losses['range_ctx_out'] = 'binary_crossentropy'
+            losses['wall_bid_out'] = 'huber'
+            losses['wall_ask_out'] = 'huber'
+            if self.aux_loss_phase == 'phase1_range':
+                loss_weights.update({'range_ctx_out': 0.45, 'wall_bid_out': 0.0, 'wall_ask_out': 0.0})
+            else:
+                loss_weights.update({'range_ctx_out': 0.32, 'wall_bid_out': 0.18, 'wall_ask_out': 0.18})
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-            loss={
-                'bias_out': 'sparse_categorical_crossentropy',
-                'conf_out': 'binary_crossentropy',
-            },
-            loss_weights={'bias_out': 1.0, 'conf_out': float(self.current_conf_loss_weight)},
+            loss=losses,
+            loss_weights=loss_weights,
+            metrics={},  # keep quiet for multi-loss history keys
         )
 
     # ── Build Input ──────────────────────────────────────────────
@@ -412,6 +471,17 @@ class MetaLearnerLSTM:
             out[key] = np.asarray(value)[start:end]
         return out
 
+    @staticmethod
+    def _outputs_include_aux(model) -> bool:
+        if model is None:
+            return False
+        try:
+            names = list(model.output_names)
+        except Exception:
+            outs = getattr(model, 'outputs', None) or []
+            names = [getattr(o, 'name', '') or getattr(o, '_name', '') for o in outs]
+        return {'range_ctx_out', 'wall_bid_out', 'wall_ask_out'}.issubset(set(names))
+
     # ── Fit ─────────────────────────────────────────────────────
     def fit(self,
             X_meta:  np.ndarray,
@@ -454,7 +524,9 @@ class MetaLearnerLSTM:
                       epochs: int = 100,
                       batch: int = 64,
                       output_dir: str = 'outputs',
-                      class_weights: dict = None) -> 'History':
+                      class_weights: dict | None = None,
+                      aux_train: dict[str, np.ndarray] | None = None,
+                      aux_val: dict[str, np.ndarray] | None = None) -> object | None:
         if not TF_AVAILABLE or self.model is None:
             print("  ❌ TensorFlow غير متاح")
             return None
@@ -464,30 +536,23 @@ class MetaLearnerLSTM:
         if not os.path.isabs(brain_path) and not os.path.dirname(brain_path):
             brain_path = os.path.join(output_dir, brain_path)
 
-        n_tr  = len(X_tr)
+        n_tr = len(X_tr)
         n_val = len(X_val)
 
-        # ── FIX: حل مشكلة LONG imbalance ────────────────────────────────
-        # المشكلة: LONG recall=0.10 لأن الداتا 84% NEUTRAL والنموذج يتجاهل LONG
-        # الحل:    sample weights تُعطي LONG وزن أعلى بكثير من SHORT و NEUTRAL
-        yb_arr   = np.asarray(yb_tr, dtype=np.int32)
-        yc_arr   = np.asarray(yc_tr, dtype=np.float32)
+        yb_arr = np.asarray(yb_tr, dtype=np.int32)
+        yc_arr = np.asarray(yc_tr, dtype=np.float32)
 
-        # حساب تلقائي لأوزان الـ class من التوزيع الفعلي
-        n_long   = max(int((yb_arr == 0).sum()), 1)
-        n_short  = max(int((yb_arr == 1).sum()), 1)
-        n_total  = n_tr
+        n_long = max(int((yb_arr == 0).sum()), 1)
+        n_short = max(int((yb_arr == 1).sum()), 1)
+        n_total = n_tr
 
-        # وزن عكسي للتوزيع: class أقل → وزن أعلى
-        w_long   = n_total / (2.0 * n_long)
-        w_short  = n_total / (2.0 * n_short)
+        w_long = n_total / (2.0 * n_long)
+        w_short = n_total / (2.0 * n_short)
 
-        # تطبيق الأوزان: LONG × w_long | SHORT × w_short
-        # + مضاعفة للإشارات القوية (yc > 0.5)
         quality_boost = np.where(yc_arr > 0.5, 2.0, 1.0).astype(np.float32)
-        class_w_arr   = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
-        sample_w      = (class_w_arr * quality_boost).astype(np.float32)
-        conf_w        = quality_boost.copy()
+        class_w_arr = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
+        sample_w = (class_w_arr * quality_boost).astype(np.float32)
+        conf_w = quality_boost.copy()
         self.confidence_target_std = float(np.std(yc_arr)) if len(yc_arr) else 0.0
         if self.confidence_target_std < 1e-4:
             self._recompile(conf_loss_weight=0.0)
@@ -502,35 +567,115 @@ class MetaLearnerLSTM:
                 f"(std(conf_target)={self.confidence_target_std:.6f})"
             )
 
+        aux_ready = (
+            bool(self.multitask_meta)
+            and self._outputs_include_aux(self.model)
+            and aux_train is not None
+            and aux_val is not None
+        )
+        if self.multitask_meta and aux_train is None:
+            print("  ⚠️ multitask_meta=True لكن لم تُمرّر aux_train/aux_val → تمرين بدون الأهداف الثانوية")
+        elif aux_ready:
+            print(
+                "  🧭 Meta multitask aux → range_ctx + wall deltas "
+                f"(phase1_frac={self.range_then_wall_phase1_frac:.0%})"
+            )
+
         print(f"\n🧠 MetaLearner Training: {n_tr + n_val:,} sequences | split={n_tr:,}/{n_val:,}")
-        print(f"   Class distribution → LONG={n_long:,} ({n_long/n_tr*100:.1f}%) | SHORT={n_short:,} ({n_short/n_tr*100:.1f}%)")
+        print(
+            f"   Class distribution → LONG={n_long:,} ({n_long/n_total*100:.1f}%) | "
+            f"SHORT={n_short:,} ({n_short/n_total*100:.1f}%)"
+        )
         print(f"   Class weights      → w_LONG={w_long:.2f} | w_SHORT={w_short:.2f}")
         print(f"   Quality boost      → STRONG×2.0 | WEAK×1.0")
 
-        cbs = [
-            EarlyStopping(monitor='val_loss',
-                          patience=15, mode='min',
-                          restore_best_weights=True, verbose=1),
-            ModelCheckpoint(brain_path,
-                            monitor='val_loss',
-                            save_best_only=True, mode='min', verbose=1),
+        callbacks_phase = [
+            EarlyStopping(monitor='val_loss', patience=15, mode='min', restore_best_weights=True, verbose=1),
+            ModelCheckpoint(brain_path, monitor='val_loss', save_best_only=True, mode='min', verbose=1),
         ]
 
-        history = self.model.fit(
-            X_tr,
-            {'bias_out': yb_tr, 'conf_out': yc_tr},
-            validation_data=(
-                X_val,
-                {'bias_out': yb_val, 'conf_out': yc_val}),
-            epochs=epochs,
-            batch_size=batch,
-            sample_weight={
-                'bias_out': sample_w,
-                'conf_out': conf_w,
-            },
-            callbacks=cbs,
-            verbose=1,
-        )
+        history = None
+
+        def _run_fit(
+            e_run: int,
+            sw_phase_note: str,
+            initial_epoch_num: int = 0,
+        ) -> object | None:
+            y_tr_pkg = {'bias_out': yb_tr, 'conf_out': yc_tr}
+            y_val_pkg = {'bias_out': yb_val, 'conf_out': yc_val}
+            sw_tr_pkg = {'bias_out': sample_w, 'conf_out': conf_w}
+            fit_val: tuple = (X_val, y_val_pkg)
+            if aux_ready:
+                y_tr_pkg.update(
+                    {
+                        'range_ctx_out': aux_train['range_ctx'].astype(np.float32).reshape(-1, 1),
+                        'wall_bid_out': aux_train['wall_bid_scaled'].astype(np.float32).reshape(-1, 1),
+                        'wall_ask_out': aux_train['wall_ask_scaled'].astype(np.float32).reshape(-1, 1),
+                    }
+                )
+                y_val_pkg.update(
+                    {
+                        'range_ctx_out': aux_val['range_ctx'].astype(np.float32).reshape(-1, 1),
+                        'wall_bid_out': aux_val['wall_bid_scaled'].astype(np.float32).reshape(-1, 1),
+                        'wall_ask_out': aux_val['wall_ask_scaled'].astype(np.float32).reshape(-1, 1),
+                    }
+                )
+                wm_tr = aux_train['wall_mask'].astype(np.float32).reshape(-1)
+                wm_va = aux_val['wall_mask'].astype(np.float32).reshape(-1)
+                sw_tr_pkg.update(
+                    {
+                        'range_ctx_out': np.ones(n_tr, dtype=np.float32),
+                        'wall_bid_out': wm_tr,
+                        'wall_ask_out': wm_tr,
+                    }
+                )
+                sw_val_pkg = {
+                    'bias_out': np.ones(n_val, dtype=np.float32),
+                    'conf_out': np.ones(n_val, dtype=np.float32),
+                    'range_ctx_out': np.ones(n_val, dtype=np.float32),
+                    'wall_bid_out': wm_va,
+                    'wall_ask_out': wm_va,
+                }
+                fit_val = (X_val, y_val_pkg, sw_val_pkg)
+            e_cap = max(int(initial_epoch_num) + int(e_run), 1)
+            print(
+                f"   [{sw_phase_note}] epochs→{initial_epoch_num}..{e_cap}"
+                + ("" if not aux_ready else " (weighted wall NaNs masked on val)")
+            )
+            return self.model.fit(
+                X_tr,
+                y_tr_pkg,
+                validation_data=fit_val,
+                initial_epoch=int(initial_epoch_num),
+                epochs=int(e_cap),
+                batch_size=batch,
+                sample_weight=sw_tr_pkg if aux_ready else {'bias_out': sample_w, 'conf_out': conf_w},
+                callbacks=callbacks_phase,
+                verbose=1,
+            )
+
+        if aux_ready:
+            epochs1 = max(8, int(round(epochs * float(self.range_then_wall_phase1_frac))))
+            epochs2 = max(8, int(epochs) - epochs1)
+            self.aux_loss_phase = 'phase1_range'
+            self._recompile()
+            hist1 = _run_fit(epochs1, 'phase1 RANGE only (wall λ=0)', initial_epoch_num=0)
+            ie2 = len(hist1.history.get('loss', [])) if hist1 else 0
+            self.aux_loss_phase = 'phase2_wall'
+            self._recompile()
+            hist2 = _run_fit(epochs2, 'phase2 RANGE+WALL (weighted losses)', initial_epoch_num=ie2)
+            history = hist2 or hist1
+        else:
+            history = self.model.fit(
+                X_tr,
+                {'bias_out': yb_tr, 'conf_out': yc_tr},
+                validation_data=(X_val, {'bias_out': yb_val, 'conf_out': yc_val}),
+                epochs=epochs,
+                batch_size=batch,
+                sample_weight={'bias_out': sample_w, 'conf_out': conf_w},
+                callbacks=callbacks_phase,
+                verbose=1,
+            )
 
         self._fitted = True
         pred_cache = self.model.predict(X_val, verbose=0) if len(X_val) else None
@@ -555,8 +700,8 @@ class MetaLearnerLSTM:
                     calibration_rows,
                     calibration_rows + report_rows,
                 )
-                report_X = X_val[calibration_rows:calibration_rows + report_rows]
-                report_y = yb_val[calibration_rows:calibration_rows + report_rows]
+                report_X = X_val[calibration_rows : calibration_rows + report_rows]
+                report_y = yb_val[calibration_rows : calibration_rows + report_rows]
                 report_title = 'MetaLearner Final Holdout'
                 report_filename = 'meta_learner_holdout_report.txt'
 
@@ -613,6 +758,23 @@ class MetaLearnerLSTM:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(threshold_text + rep)
 
+    def _aux_fields_from_batch_pred(self, pred_batch: dict) -> dict:
+        """مخرجات الرؤوس الثانوية (رينج + جدار) بعد denorm لدلتا الجدار."""
+        out: dict = {}
+        if not self._outputs_include_aux(self.model):
+            return out
+        if 'range_ctx_out' in pred_batch:
+            out['range_ctx_prob'] = float(np.asarray(pred_batch['range_ctx_out'], dtype=np.float32).reshape(-1)[0])
+        if 'wall_bid_out' in pred_batch:
+            vb = float(np.asarray(pred_batch['wall_bid_out'], dtype=np.float32).reshape(-1)[0])
+            out['wall_bid_delta_hat'] = vb * float(self.wall_scale_bid)
+            out['wall_bid_scaled'] = vb
+        if 'wall_ask_out' in pred_batch:
+            va = float(np.asarray(pred_batch['wall_ask_out'], dtype=np.float32).reshape(-1)[0])
+            out['wall_ask_delta_hat'] = va * float(self.wall_scale_ask)
+            out['wall_ask_scaled'] = va
+        return out
+
     # ── Predict ─────────────────────────────────────────────────
     def predict(self,
                 X_meta: np.ndarray,
@@ -629,10 +791,10 @@ class MetaLearnerLSTM:
         if single:
             X_meta = X_meta[np.newaxis]
         if not self.confidence_head_enabled:
-            bias_out = self.model.predict(X_meta, verbose=0)['bias_out']
-            bias_mean = bias_out[0]
+            det = self.model.predict(X_meta, verbose=0)
+            bias_mean = np.asarray(det['bias_out'], dtype=np.float32)[0]
             bias_idx = int(self._labels_from_long_probs(np.array([bias_mean[0]], dtype=np.float32), self.bias_long_threshold)[0])
-            return {
+            out = {
                 'bias':        BIAS_LABELS[bias_idx],
                 'bias_idx':    bias_idx,
                 'bias_probs':  bias_mean.tolist(),
@@ -640,6 +802,8 @@ class MetaLearnerLSTM:
                 'uncertainty': 0.0,
                 'tradeable':   True,
             }
+            out.update(self._aux_fields_from_batch_pred(det))
+            return out
 
         # MC Dropout: n_mc forward passes
         X_tiled = np.tile(X_meta, (n_mc, 1, 1))
@@ -653,7 +817,7 @@ class MetaLearnerLSTM:
         conf_std  = float(np.std(conf))
 
         bias_idx = int(self._labels_from_long_probs(np.array([bias_mean[0]], dtype=np.float32), self.bias_long_threshold)[0])
-        return {
+        result = {
             'bias':        BIAS_LABELS[bias_idx],
             'bias_idx':    bias_idx,
             'bias_probs':  bias_mean.tolist(),
@@ -661,6 +825,9 @@ class MetaLearnerLSTM:
             'uncertainty': round(conf_std, 4),
             'tradeable':   (conf_mean >= self.conf_thresh),
         }
+        det_aux = self.model.predict(X_meta, verbose=0)
+        result.update(self._aux_fields_from_batch_pred(det_aux))
+        return result
 
     def save(self, output_dir: str = 'outputs'):
         if self.model:
@@ -782,11 +949,19 @@ class MetaLearnerTCNLSTM(MetaLearnerLSTM):
         c = layers.Dense(32, activation='gelu')(shared)
         conf_out = layers.Dense(1, activation='sigmoid', name='conf_out')(c)
 
-        model = Model(inp,
-                      {'bias_out': bias_out, 'conf_out': conf_out},
-                      name='MetaLearner_TCN_LSTM')
+        out_map: dict = {'bias_out': bias_out, 'conf_out': conf_out}
+        if self.multitask_meta:
+            out_map.update(_multitask_aux_heads(shared, self.drop))
+
+        model = Model(
+            inp,
+            out_map,
+            name=(
+                'MetaLearner_TCN_LSTM_multitask' if self.multitask_meta else 'MetaLearner_TCN_LSTM'
+            ),
+        )
         self.model = model
-        self._recompile()
+        self._recompile(auxiliary_phase=getattr(self, 'aux_loss_phase', 'phase1_range'))
         model.summary(line_length=80)
         return model
 

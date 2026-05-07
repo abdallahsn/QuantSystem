@@ -268,7 +268,7 @@ def _resolve_soft_label_runtime_config(
             'mode': None,
         }
 
-    resolved_mode = str(mode or cfg.get('mode', 'analytical')).strip().lower()
+    resolved_mode = str(mode or cfg.get('mode', 'monte_carlo')).strip().lower()
     if resolved_mode not in {'analytical', 'monte_carlo'}:
         raise ValueError(
             f"❌ Unsupported soft_label mode: {resolved_mode!r}. "
@@ -3191,6 +3191,7 @@ def run_refinery(
     soft_label_tp_std: float | None = None,
     soft_label_sl_std: float | None = None,
     config_path: str | None = None,
+    enforce_economic_tp_floor: bool | None = None,
     **legacy_kwargs,
 ):
     _configure_stdio_utf8()
@@ -3226,6 +3227,13 @@ def run_refinery(
             f"{sorted(str(k) for k in legacy_kwargs)}"
         )
 
+    _refinery_early = load_v19_config(config_path).get('refinery', {}) or {}
+    resolved_enforce_economic_tp_floor = (
+        bool(enforce_economic_tp_floor)
+        if enforce_economic_tp_floor is not None
+        else bool(_refinery_early.get('enforce_economic_tp_floor', True))
+    )
+
     soft_label_config, soft_label_runtime = _resolve_soft_label_runtime_config(
         config_path=config_path,
         enabled=use_soft_labels,
@@ -3249,6 +3257,15 @@ def run_refinery(
             )
         else:
             print("  ⚠️ Soft labels requested but modules.soft_label_engine is unavailable.")
+
+    print(
+        "  💼 Economic TP floor: "
+        + (
+            "ON — TP ≥ SL floor + effective cost ticks (aligned with FIX-13 structural + soft/MC weights)."
+            if resolved_enforce_economic_tp_floor
+            else "OFF — legacy causal TP; rely on decision policy / backtest gates for cost realism."
+        )
+    )
 
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
     deeplob_enabled = bool(mbp_exists and _load_deeplob_components())
@@ -3340,12 +3357,21 @@ def run_refinery(
         f"economic_tp_floor_ticks={float(label_economics['economic_tp_floor_ticks']):.2f}"
     )
     if float(label_economics['tp_floor_uplift_ticks']) > 1e-9:
-        print(
-            "  ⚠️ Economic mismatch warning: "
-            f"base_tp_floor={float(label_economics['base_tp_floor_ticks']):.2f} ticks "
-            f"< stop+cost floor {float(label_economics['economic_tp_floor_ticks']):.2f} ticks. "
-            "Keeping labels causal/light and leaving strict cost filtering to decision policy."
-        )
+        if resolved_enforce_economic_tp_floor:
+            print(
+                "  ✅ Economic TP uplift will be applied in Step 4: "
+                f"base_tp_floor={float(label_economics['base_tp_floor_ticks']):.2f} ticks → "
+                f"effective floor={float(label_economics['economic_tp_floor_ticks']):.2f} ticks "
+                f"(covers stop_floor {float(label_economics['stop_floor_ticks']):.2f} + execution cost)."
+            )
+        else:
+            print(
+                "  ⚠️ Base TP floor sits below stop+cost breakeven: "
+                f"base_tp_floor={float(label_economics['base_tp_floor_ticks']):.2f} ticks, "
+                f"breakeven TP≈{float(label_economics['economic_tp_floor_ticks']):.2f} ticks — "
+                "economic enforcement is OFF; use refinery `--enforce-economic-tp-floor` or "
+                "`refinery.enforce_economic_tp_floor` in config to align labels with costs."
+            )
 
     print("\n⚙️  Phase B — MBP Vectorized Shards...")
     pipeline_tracker.start(
@@ -3567,7 +3593,7 @@ def run_refinery(
             neutral_mult=0.45,
             tick_size=_tick,
             execution_cost_pips=float(label_economics['effective_cost_ticks']),
-            enforce_economic_tp_floor=False,
+            enforce_economic_tp_floor=resolved_enforce_economic_tp_floor,
             kalman_slope_threshold=kalman_slope_threshold,
             trend_strength_min=trend_strength_min,
             n_workers=effective_workers,
@@ -3879,6 +3905,7 @@ def run_refinery(
             'label_base_tp_floor_ticks': float(label_economics['base_tp_floor_ticks']),
             'label_economic_tp_floor_ticks': float(label_economics['economic_tp_floor_ticks']),
             'label_economic_tp_uplift_ticks': float(label_economics['tp_floor_uplift_ticks']),
+            'enforce_economic_tp_floor': bool(resolved_enforce_economic_tp_floor),
             'regime_mode': str(_resolve_regime_mode(regime_mode)),
             'regime_stride': int(max(regime_stride, 1)),
             'regime_window': int(max(regime_window, 10)),
@@ -4020,10 +4047,17 @@ if __name__=='__main__':
                    help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
     p.add_argument('--step4_min_parallel_rows', type=int, default=int(_refinery_defaults.get('step4_min_parallel_rows', 250_000)),
                    help='minimum rows before Step 4 forward scan enables multiprocessing on fork-capable platforms (default: 250000)')
+    p.add_argument(
+        '--enforce-economic-tp-floor',
+        dest='enforce_economic_tp_floor',
+        action=argparse.BooleanOptionalAction,
+        default=bool(_refinery_defaults.get('enforce_economic_tp_floor', True)),
+        help='Raise TP distance floor by stop+cost (default on); use --no-enforce-economic-tp-floor for legacy light labels.',
+    )
     p.add_argument('--use_soft_labels', action=argparse.BooleanOptionalAction, default=bool(_soft_defaults.get('enabled', True)),
                    help='FIX-12: أضف Soft Labels بعد الـ forward scan (--no-use_soft_labels لتعطيل)')
     p.add_argument('--soft_label_mode', choices=['analytical', 'monte_carlo'],
-                   default=str(_soft_defaults.get('mode', 'analytical')),
+                   default=str(_soft_defaults.get('mode', 'monte_carlo')),
                    help='soft-label generation mode (default from config)')
     p.add_argument('--soft_label_n_scenarios', '--soft_label_scenarios', dest='soft_label_n_scenarios', type=int,
                    default=int(_soft_defaults.get('n_scenarios', 50)),
@@ -4076,4 +4110,6 @@ if __name__=='__main__':
                  soft_label_horizon_std=a.soft_label_horizon_std,
                  soft_label_tp_std=a.soft_label_tp_std,
                  soft_label_sl_std=a.soft_label_sl_std,
-                 config_path=a.config)
+                 config_path=a.config,
+                 enforce_economic_tp_floor=a.enforce_economic_tp_floor,
+    )

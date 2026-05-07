@@ -33,8 +33,8 @@
     "event_roll_window": 50,
     "direction_threshold_ticks": 1.5,
     "causal_threshold_mode": "expanding",
-    "raw_event_target_rate": 0.7,
-    "training_event_target_rate": 0.25,
+    "raw_event_target_rate": 0.9,
+    "training_event_target_rate": 0.6,
     "tp_mult": 1.5,
     "sl_mult": 1.0,
     "kalman_slope_threshold": 0.05,
@@ -45,7 +45,8 @@
     "regime_progress_every": 25000,
     "lob_event_sample": 100000,
     "merge_tolerance_ms": 500,
-    "step4_min_parallel_rows": 250000
+    "step4_min_parallel_rows": 250000,
+    "enforce_economic_tp_floor": true
   },
   "backtest": {
     "tick_size": 0.0001,
@@ -130,12 +131,12 @@
     "max_notional_per_trade": 10000.0,
     "max_contracts": 5,
     "max_open_positions": 1,
-    "min_confidence_default": 0.65,
+    "min_confidence_default": 0.5,
     "min_confidence_by_regime": {
-      "Trending": 0.65,
-      "Ranging": 0.75,
-      "Volatile": 0.7,
-      "Low_Liquidity": 0.8
+      "Trending": 0.5,
+      "Ranging": 0.5,
+      "Volatile": 0.5,
+      "Low_Liquidity": 0.5
     },
     "max_spread_pips": 3.0,
     "max_latency_ms": 500.0,
@@ -144,11 +145,11 @@
   },
   "soft_labels": {
     "enabled": true,
-    "mode": "analytical",
-    "n_scenarios": 50,
-    "horizon_std": 0.15,
-    "tp_std": 0.1,
-    "sl_std": 0.1,
+    "mode": "monte_carlo",
+    "n_scenarios": 200,
+    "horizon_std": 0.30,
+    "tp_std": 0.20,
+    "sl_std": 0.20,
     "random_seed": 42,
     "strong_quality_boost": 1.3,
     "weak_quality_boost": 1.0,

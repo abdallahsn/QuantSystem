@@ -33,6 +33,11 @@ New optional parameters:
   horizon_max_mult     : float = 3.0    — ceiling: horizon never > base × 3.0
   trend_filter         : bool  = True   — enable FIX-11 (disable for ablation)
   trend_filter_strict  : bool  = False  — if True, neutral rows also filtered by trend
+
+  FIX-13 Structural context (optional, default ON)
+          - Kalman-based **range_ctx** (+ run length / boundary flags), strictly causal.
+          - **Wall forward deltas** bid_wall_delta_fwd_k / ask_wall_delta_fwd_k
+            (fixed-horizon supervision — do not use as live inputs without shifting).
 """
 
 from __future__ import annotations
@@ -86,6 +91,16 @@ try:
 except ImportError:
     _MC_LABEL_WEIGHTS_AVAILABLE = False
     _attach_mc_prior_columns = None  # type: ignore[assignment,misc]
+
+try:
+    from modules.structural_context_labels_v19 import append_kalman_range_context as _append_kalman_range_context
+    from modules.structural_context_labels_v19 import append_wall_forward_deltas as _append_wall_forward_deltas
+
+    _STRUCTURAL_CONTEXT_V19_AVAILABLE = True
+except ImportError:
+    _STRUCTURAL_CONTEXT_V19_AVAILABLE = False
+    _append_kalman_range_context = None  # type: ignore[assignment,misc]
+    _append_wall_forward_deltas = None  # type: ignore[assignment,misc]
 
 # ── public aliases (backwards-compat) ─────────────────────────────────────────
 BIAS_LONG    = DIR_LONG
@@ -1106,7 +1121,7 @@ def build_causal_event_labels(
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     training_event_score_threshold: float | None = None,
     execution_cost_pips: float = 0.0,
-    enforce_economic_tp_floor: bool = False,
+    enforce_economic_tp_floor: bool = True,
     n_workers: int | None = None,
     min_parallel_rows: int = 250_000,
     # الحد الأدنى لقوة الترند المعاكس لتفعيل الحذف في trend filter
@@ -1121,6 +1136,12 @@ def build_causal_event_labels(
     use_mc_prior_weights: bool = True,
     label_stability_shifts: tuple[int, ...] = (-5, -3, -1, 1, 3, 5),
     mc_weights_verbose: bool = False,
+    # ── FIX-13: structural context (range + wall supervision) ──────────────
+    structural_range_labels: bool = True,
+    range_kalman_strength_max: float = 0.10,
+    range_require_kalman_neutral: bool = True,
+    # 0 = disable; None = auto min(horizon, 50); >0 = fixed k for wall deltas
+    wall_fwd_delta_steps: int | None = None,
 ) -> pd.DataFrame:
     """
     Build causal labels using unified order-book features + price-action forward scan.
@@ -1165,8 +1186,9 @@ def build_causal_event_labels(
     execution_cost_pips    : Effective round-trip execution cost in tick-sized
                              price units. Used to prevent economically tiny TP
                              labels that the live policy would later reject.
-    enforce_economic_tp_floor : If True, raise the TP floor so it cannot fall
-                                below `stop_floor + execution_cost_pips`.
+    enforce_economic_tp_floor : If True (default), TP distance floor is at least
+        stop_floor + execution_cost so causal labels align with soft_label /
+        Gambler priors and FIX-13 range/wall supervision (not microscopic TPs).
     use_mc_prior_weights : If True, attach `mc_sample_weight` (Gambler prior on
                              TP vs SL distances) and neighbour `label_stability`.
     label_stability_shifts : Signed row shifts for the stability heuristic.
@@ -1512,6 +1534,24 @@ def build_causal_event_labels(
             LABEL_CANCEL,
         ).astype(np.int8)
 
+    # ── FIX-13a: Kalman range context (causal) ────────────────────────────────
+    if _STRUCTURAL_CONTEXT_V19_AVAILABLE and _append_kalman_range_context is not None and structural_range_labels:
+        try:
+            labeled = _append_kalman_range_context(
+                labeled,
+                trend_lbl,
+                trend_strength,
+                strength_max=float(range_kalman_strength_max),
+                require_kalman_neutral=bool(range_require_kalman_neutral),
+                trend_neutral_code=int(TREND_NEUTRAL),
+            )
+        except Exception as _rng_exc:
+            warnings.warn(
+                f"[v19] FIX-13: range context skipped ({_rng_exc!r}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     # ── 9. timestamps ─────────────────────────────────────────────────────────
     ts_raw = labeled.get("ts_event", pd.Series(pd.RangeIndex(n)))
     ts = _coerce_label_timestamp_series(ts_raw, context='labels_v19.ts_event')
@@ -1544,6 +1584,22 @@ def build_causal_event_labels(
     labeled["forward_return"]      = (prices[end_idx] - prices).astype(np.float32)
     labeled["label_horizon_steps"] = (end_idx - np.arange(n)).astype(np.int32)
     labeled["effective_horizon"]   = adaptive_horizons.astype(np.int32)   # FIX-9: expose per-row
+
+    # ── FIX-13b: Wall forward deltas (fixed k, supervision targets) ───────────
+    if _STRUCTURAL_CONTEXT_V19_AVAILABLE and _append_wall_forward_deltas is not None:
+        if wall_fwd_delta_steps is None:
+            _k_wall = int(min(max(int(horizon), 1), 50))
+        else:
+            _k_wall = int(wall_fwd_delta_steps)
+        if _k_wall > 0:
+            try:
+                labeled = _append_wall_forward_deltas(labeled, fwd_steps=_k_wall)
+            except Exception as _w_exc:
+                warnings.warn(
+                    f"[v19] FIX-13: wall forward deltas skipped ({_w_exc!r}).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     # FIX-6: broad event flag as context feature + stricter train-event gate
     labeled["event_flag"] = np.asarray(event_flag, dtype=np.int8)
@@ -1647,6 +1703,13 @@ def build_causal_event_labels(
         f"DOWN={n_down:,} ({n_down/total:.1%})  "
         f"NEUTRAL={n_trend_neutral:,} ({n_trend_neutral/total:.1%})"
     )
+    if "range_ctx" in labeled.columns:
+        n_rng = int(pd.to_numeric(labeled["range_ctx"], errors="coerce").fillna(0).astype(np.int64).sum())
+        print(
+            f"[v19] RangeCTX→ rows={n_rng:,} ({n_rng/total:.1%}) "
+            f"(weak≤{range_kalman_strength_max:.2f} "
+            f"{'& neutral' if range_require_kalman_neutral else '| neutral'})"
+        )
     print(
         f"[v19] Paths  → long_tp={int((labeled['path_outcome'] == PATH_LONG_TP_FIRST).sum()):,}  "
         f"short_tp={int((labeled['path_outcome'] == PATH_SHORT_TP_FIRST).sum()):,}  "

@@ -24,6 +24,22 @@ from sklearn.metrics import precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _configure_stdio_utf8() -> None:
+    """Avoid UnicodeEncodeError on Windows consoles when printing non-ASCII log lines."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+
+
+_configure_stdio_utf8()
+
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
 from modules.decision_policy_v19 import (
     DEFAULT_DECISION_POLICY_ARTIFACT,
@@ -77,30 +93,6 @@ def _pseudo_prob_head(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
-def _soft_stage1_runtime_error(model_name: str) -> RuntimeError:
-    return RuntimeError(
-        f"❌ {model_name} Stage-1 artifact uses stage1_target=soft_label, "
-        "but soft_label means P(win | bias_label) rather than direct LONG/SHORT probability. "
-        "Runtime inference has no per-row bias anchor here, so remapping would be ambiguous and unsafe. "
-        "Retrain with --stage1_target bias for live/backtest inference."
-    )
-
-
-def _constant_prob_vector_from_meta(payload: dict | None, n_outputs: int) -> np.ndarray | None:
-    if not isinstance(payload, dict):
-        return None
-    probs = payload.get('constant_probs')
-    if isinstance(probs, list) and len(probs) >= 2:
-        arr = np.asarray(probs[:n_outputs], dtype=np.float32).reshape(1, -1)
-        return align_probability_columns(arr, n_outputs).reshape(-1).astype(np.float32)
-    constant_prediction = payload.get('constant_prediction')
-    is_soft = str(payload.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
-    if constant_prediction is None or not is_soft:
-        return None
-    arr = _pseudo_prob_head(np.array([constant_prediction], dtype=np.float32))
-    return align_probability_columns(arr, n_outputs).reshape(-1).astype(np.float32)
-
-
 def _directional_metrics_from_rows(rows: list[dict]) -> dict:
     if not rows:
         return {
@@ -140,6 +132,10 @@ class V19PredictionEngine:
         manifest_path: str | None = None,
         symbol: str = '',
         failsafe_policy: dict | None = None,
+        *,
+        policy_require_positive_ev: bool = True,
+        policy_edge_prob_override: float | None = None,
+        skip_event_gate: bool = False,
     ):
         self.models_dir = models_dir
         self.run_mode = run_mode
@@ -195,7 +191,6 @@ class V19PredictionEngine:
         self.cb_advisor = None
         self.cb_calibrator = None
         self._cb_soft_regression = False
-        self._cb_constant_probs = None
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
         self.cb_classes = None
         cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
@@ -206,11 +201,9 @@ class V19PredictionEngine:
                     _cbc = json.load(f)
                     self.cb_classes = _cbc.get('classes')
                     self._cb_soft_regression = str(_cbc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
-                    self._cb_constant_probs = _constant_prob_vector_from_meta(_cbc, N_CB_PROBS)
             except Exception:
                 self.cb_classes = None
                 self._cb_soft_regression = False
-                self._cb_constant_probs = None
         if CB_AVAILABLE and os.path.exists(cb_path):
             self.cb_advisor = (
                 CatBoostRegressor()
@@ -219,16 +212,9 @@ class V19PredictionEngine:
             )
             self.cb_advisor.load_model(cb_path)
             print(f"  ✅ CatBoost V19: {cb_path} ({'regress-soft' if self._cb_soft_regression else 'classify'})")
-        elif self._cb_constant_probs is not None:
-            print(f"  ✅ CatBoost V19: constant soft baseline from {cb_classes_path}")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
-        if (
-            run_mode != 'backtest'
-            and 'catboost' in required_base_models
-            and self.cb_advisor is None
-            and self._cb_constant_probs is None
-        ):
+        if run_mode != 'backtest' and 'catboost' in required_base_models and self.cb_advisor is None:
             raise FileNotFoundError(
                 "❌ CatBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -246,7 +232,6 @@ class V19PredictionEngine:
         self.xgb_calibrator = None
         self.xgb_classes = None
         self._xgb_soft_regression = False
-        self._xgb_constant_probs = None
         xgb_path = os.path.join(models_dir, artifacts.get('xgboost_model', 'xgboost_advisor_v19.json'))
         xgb_classes_path = os.path.join(models_dir, artifacts.get('xgboost_classes', 'xgboost_classes_v19.json'))
         if os.path.exists(xgb_classes_path):
@@ -255,25 +240,16 @@ class V19PredictionEngine:
                     _xjc = json.load(f)
                     self.xgb_classes = _xjc.get('classes')
                     self._xgb_soft_regression = str(_xjc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
-                    self._xgb_constant_probs = _constant_prob_vector_from_meta(_xjc, N_XGB_PROBS)
             except Exception:
                 self.xgb_classes = None
                 self._xgb_soft_regression = False
-                self._xgb_constant_probs = None
         if XGB_AVAILABLE and os.path.exists(xgb_path):
             self.xgb_advisor = XGBRegressor() if self._xgb_soft_regression else XGBClassifier()
             self.xgb_advisor.load_model(xgb_path)
             print(f"  ✅ XGBoost V19: {xgb_path} ({'regress-soft' if self._xgb_soft_regression else 'classify'})")
-        elif self._xgb_constant_probs is not None:
-            print(f"  ✅ XGBoost V19: constant soft baseline from {xgb_classes_path}")
         else:
             print(f"  ⚠️ XGBoost V19 missing: {xgb_path}")
-        if (
-            run_mode != 'backtest'
-            and 'xgboost' in required_base_models
-            and self.xgb_advisor is None
-            and self._xgb_constant_probs is None
-        ):
+        if run_mode != 'backtest' and 'xgboost' in required_base_models and self.xgb_advisor is None:
             raise FileNotFoundError(
                 "❌ XGBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -286,11 +262,6 @@ class V19PredictionEngine:
             except Exception as exc:
                 self.xgb_calibrator = None
                 print(f"  ⚠️ XGBoost calibrator unavailable: {exc}")
-
-        if self._cb_soft_regression:
-            raise _soft_stage1_runtime_error('CatBoost')
-        if self._xgb_soft_regression:
-            raise _soft_stage1_runtime_error('XGBoost')
 
         self.decision_policy = None
         decision_policy_name = (
@@ -353,6 +324,8 @@ class V19PredictionEngine:
                 brain_file=meta_path,
                 bias_long_threshold=float(meta_cfg.get('bias_long_threshold', 0.50)),
             )
+            self.meta.wall_scale_bid = float(meta_cfg.get('wall_scale_bid', getattr(self.meta, 'wall_scale_bid', 1.0)))
+            self.meta.wall_scale_ask = float(meta_cfg.get('wall_scale_ask', getattr(self.meta, 'wall_scale_ask', 1.0)))
         else:
             self.meta = None
 
@@ -379,7 +352,15 @@ class V19PredictionEngine:
             max_daily_trades=20,
             max_drawdown_pct=0.05,
         )
-
+        self.policy_require_positive_ev = bool(policy_require_positive_ev)
+        self.policy_edge_prob_override = policy_edge_prob_override
+        self.skip_event_gate = bool(skip_event_gate)
+        if self.skip_event_gate and run_mode == 'backtest':
+            print("  [backtest] EventGate skipped (--skip_event_gate)")
+        if not self.policy_require_positive_ev and run_mode == 'backtest':
+            print("  [backtest] Cost-aware policy: EV>0 not required (--relax_policy_ev)")
+        if self.policy_edge_prob_override is not None and run_mode == 'backtest':
+            print(f"  [backtest] Cost-aware policy: edge prob override = {self.policy_edge_prob_override}")
         self._seq_buffer = deque(maxlen=self.seq_len)
         self._regime_buffer = deque(maxlen=max(self.seq_len * 4, 128))
         self.event_writer = event_writer
@@ -409,6 +390,12 @@ class V19PredictionEngine:
             'run_mode': self.run_mode,
         }
 
+    def _base_fallback_min_edge(self) -> float:
+        """Meta-off: soft regression path uses a lower bar than classifier probs."""
+        if getattr(self, '_cb_soft_regression', False) or getattr(self, '_xgb_soft_regression', False):
+            return 0.52
+        return 0.60
+
     def _neutral_result(
         self,
         *,
@@ -434,8 +421,6 @@ class V19PredictionEngine:
 
     def _get_cb_probs(self, X_stat: np.ndarray) -> np.ndarray:
         n = X_stat.shape[0]
-        if self.cb_advisor is None and self._cb_constant_probs is not None:
-            return np.repeat(self._cb_constant_probs.reshape(1, -1), n, axis=0).astype(np.float32)
         if self.cb_advisor is None:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
         try:
@@ -455,8 +440,6 @@ class V19PredictionEngine:
 
     def _get_xgb_probs(self, X_stat: np.ndarray) -> np.ndarray:
         n = X_stat.shape[0]
-        if self.xgb_advisor is None and self._xgb_constant_probs is not None:
-            return np.repeat(self._xgb_constant_probs.reshape(1, -1), n, axis=0).astype(np.float32)
         if self.xgb_advisor is None:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
         try:
@@ -613,13 +596,14 @@ class V19PredictionEngine:
             else:
                 probs = np.ones(N_CB_PROBS, dtype=np.float32) / N_CB_PROBS
             bias_idx = int(np.argmax(probs))
+            min_edge = self._base_fallback_min_edge()
             return {
                 'bias': BIAS_LABELS[bias_idx],
                 'bias_idx': bias_idx,
                 'bias_probs': probs.tolist(),
                 'confidence': float(probs[bias_idx]),
                 'uncertainty': 0.5,
-                'tradeable': float(probs[bias_idx]) >= 0.60,
+                'tradeable': float(probs[bias_idx]) >= min_edge,
                 'source': 'BaseModels_Fallback_V19',
             }
         result = self.meta.predict(seq)
@@ -712,18 +696,21 @@ class V19PredictionEngine:
         if 'timestamp_stale' in runtime_mode.get('blocking_issues', []):
             self.data_logger.log_data_issue('data_gap_detected', reason='timestamp stale for incoming row', ts=ts, extra=runtime_mode)
 
-        gate_result = self.event_gate.evaluate(stat_features or {})
-        if not gate_result.get('passed', False):
-            result = self._neutral_result(
-                reason=f"Event gate blocked ({gate_result.get('reason', 'quiet')})",
-                sequence_ready=len(self._seq_buffer) >= self.seq_len,
-                feature_hash=feature_hash,
-                event_gate_passed=False,
-                event_gate_reason=gate_result.get('reason', 'quiet'),
-            )
-            result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
-            self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
-            return result
+        if self.skip_event_gate:
+            gate_result = {'passed': True, 'reason': 'gate_skipped'}
+        else:
+            gate_result = self.event_gate.evaluate(stat_features or {})
+            if not gate_result.get('passed', False):
+                result = self._neutral_result(
+                    reason=f"Event gate blocked ({gate_result.get('reason', 'quiet')})",
+                    sequence_ready=len(self._seq_buffer) >= self.seq_len,
+                    feature_hash=feature_hash,
+                    event_gate_passed=False,
+                    event_gate_reason=gate_result.get('reason', 'quiet'),
+                )
+                result['latency_ms'] = (time.perf_counter() - t0) * 1000.0
+                self.pred_logger.log_prediction(result, features=stat_features or {}, ts=ts, input_source='predict_step', latency_ms=result['latency_ms'])
+                return result
 
         if visual_embedding is not None:
             visual_emb = self.factory.prepare_visual_embeddings(visual_embedding, n_rows=len(stat_df))
@@ -818,6 +805,8 @@ class V19PredictionEngine:
             structure_bucket=structure_bucket,
             uncertainty=float(result.get('uncertainty', 0.0) or 0.0),
             runtime_penalty=self._runtime_penalty(runtime_mode),
+            require_positive_ev=self.policy_require_positive_ev,
+            edge_prob_override=self.policy_edge_prob_override,
         )
         if decision is not None:
             for key, value in decision.items():

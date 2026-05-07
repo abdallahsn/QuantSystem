@@ -95,7 +95,7 @@ def main():
     p.add_argument('--use_soft_labels', action=argparse.BooleanOptionalAction, default=bool(soft_defaults.get('enabled', True)),
                    help='enable/disable soft labels in the label refinery')
     p.add_argument('--soft_label_mode', choices=['analytical', 'monte_carlo'],
-                   default=str(soft_defaults.get('mode', 'analytical')))
+                   default=str(soft_defaults.get('mode', 'monte_carlo')))
     p.add_argument('--soft_label_n_scenarios', '--soft_label_scenarios', dest='soft_label_n_scenarios', type=int,
                    default=int(soft_defaults.get('n_scenarios', 50)))
     p.add_argument('--soft_label_random_seed', '--soft_label_seed', dest='soft_label_random_seed', type=int,
@@ -119,6 +119,14 @@ def main():
     p.add_argument('--regime_progress_every', type=int, default=int(defaults.get('regime_progress_every', 25000)))
     p.add_argument('--merge_tolerance_ms', type=int, default=int(defaults.get('merge_tolerance_ms', 500)))
     p.add_argument('--step4_min_parallel_rows', type=int, default=int(defaults.get('step4_min_parallel_rows', 250000)))
+
+    p.add_argument(
+        '--enforce-economic-tp-floor',
+        dest='enforce_economic_tp_floor',
+        action=argparse.BooleanOptionalAction,
+        default=bool(defaults.get('enforce_economic_tp_floor', True)),
+        help='TP floor ≥ SL floor + cost ticks (aligns soft_label / MC weights with execution economics; default on).',
+    )
 
     args = p.parse_args()
 
@@ -166,6 +174,7 @@ def main():
         merge_tolerance_ms=args.merge_tolerance_ms,
         step4_min_parallel_rows=args.step4_min_parallel_rows,
         config_path=args.config,
+        enforce_economic_tp_floor=args.enforce_economic_tp_floor,
     )
 
 
