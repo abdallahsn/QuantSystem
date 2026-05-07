@@ -121,6 +121,8 @@ VISUAL_COVERAGE_FAIL_FAST = True
 TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 DEFAULT_LOB_MAX_AGE = '500ms'
 TREE_CLASS_WEIGHT_MAX = 2.5
+SOFT_TARGET_DEGENERATE_ATOL = 1e-6
+SOFT_TARGET_ROUND_DECIMALS = 6
 FORBIDDEN_MODEL_INPUT_COLS = {
     'forward_return',
     'label_end_ts',
@@ -1048,6 +1050,119 @@ def _pseudo_probs_two_col(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
+def _soft_target_summary(
+    target: np.ndarray,
+    *,
+    round_decimals: int = SOFT_TARGET_ROUND_DECIMALS,
+) -> dict:
+    arr = np.asarray(target, dtype=np.float64).reshape(-1)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {
+            'count': 0,
+            'mean': None,
+            'std': None,
+            'min': None,
+            'max': None,
+            'range': None,
+            'rounded_unique_count': 0,
+            'rounded_unique_sample': [],
+        }
+    rounded = np.round(finite, int(round_decimals))
+    unique_vals = np.unique(rounded)
+    return {
+        'count': int(finite.size),
+        'mean': float(np.mean(finite)),
+        'std': float(np.std(finite)),
+        'min': float(np.min(finite)),
+        'max': float(np.max(finite)),
+        'range': float(np.max(finite) - np.min(finite)),
+        'rounded_unique_count': int(unique_vals.size),
+        'rounded_unique_sample': [float(x) for x in unique_vals[:8].tolist()],
+    }
+
+
+def _is_degenerate_soft_target(
+    target: np.ndarray,
+    *,
+    atol: float = SOFT_TARGET_DEGENERATE_ATOL,
+    round_decimals: int = SOFT_TARGET_ROUND_DECIMALS,
+) -> tuple[bool, dict]:
+    summary = _soft_target_summary(target, round_decimals=round_decimals)
+    is_degenerate = (
+        summary['count'] <= 1
+        or summary['rounded_unique_count'] <= 1
+        or (summary['range'] is not None and float(summary['range']) <= float(atol))
+        or (summary['std'] is not None and float(summary['std']) <= float(atol))
+    )
+    summary['degenerate'] = bool(is_degenerate)
+    summary['degenerate_atol'] = float(atol)
+    return bool(is_degenerate), summary
+
+
+def _constant_soft_prediction_from_target(
+    target: np.ndarray | float,
+    *,
+    fallback: float = 0.5,
+) -> tuple[float, dict]:
+    arr = np.asarray(target, dtype=np.float64).reshape(-1)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        p = float(np.clip(fallback, 1e-6, 1.0 - 1e-6))
+        summary = _soft_target_summary(np.array([], dtype=np.float64))
+    else:
+        p = float(np.clip(np.mean(finite), 1e-6, 1.0 - 1e-6))
+        summary = _soft_target_summary(finite)
+    return p, summary
+
+
+def _constant_soft_prob_block(
+    n_rows: int,
+    target: np.ndarray | float,
+    *,
+    fallback: float = 0.5,
+) -> tuple[np.ndarray, dict]:
+    p, summary = _constant_soft_prediction_from_target(target, fallback=fallback)
+    block = np.repeat(_pseudo_probs_two_col(np.array([p], dtype=np.float32)), max(int(n_rows), 0), axis=0)
+    return block.astype(np.float32), {
+        'constant_prediction': float(p),
+        'constant_probs': [float(block[0, 0]), float(block[0, 1])] if len(block) else [float(p), float(1.0 - p)],
+        'soft_target_summary': summary,
+    }
+
+
+def _remove_stale_artifact(path: str) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _write_constant_soft_model_metadata(
+    metadata_path: str,
+    *,
+    model_family: str,
+    target: np.ndarray,
+    reason: str,
+) -> dict:
+    _, payload = _constant_soft_prob_block(1, target, fallback=0.5)
+    meta = {
+        'classes': [0, 1],
+        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
+        'artifact_mode': 'constant_soft_baseline',
+        'model_family': str(model_family),
+        'reason': str(reason),
+        'constant_prediction': float(payload['constant_prediction']),
+        'constant_probs': [float(x) for x in payload['constant_probs']],
+        'train_soft_target_summary': payload['soft_target_summary'],
+        'pseudo_prob_head': '[p, 1-p] from constant soft-label fallback',
+    }
+    with open(metadata_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    return meta
+
+
 def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
     primary = None
     if col in df.columns:
@@ -1559,14 +1674,27 @@ def stage1_oof_meta(
     cb_task_type, cb_devices = _resolve_catboost_device(catboost_device)
     print(f"  CatBoost device: {cb_task_type}")
     if use_soft_target:
+        soft_global_degenerate, soft_global_summary = _is_degenerate_soft_target(y_soft)
         print(
             f"  stage1_target: soft_label (CatBoostRegressor+XGBRegressor) | "
             f"soft mean={float(np.mean(y_soft)):.3f} std={float(np.std(y_soft)):.3f} | "
             f"sample_weight = mc_sample_weight × label_stability only"
         )
         print(f"  bias_label distribution (context only): {pd.Series(y).value_counts().sort_index().to_dict()}")
+        print(
+            "  soft_label support: "
+            f"min={soft_global_summary['min']:.6f} max={soft_global_summary['max']:.6f} "
+            f"| rounded_unique={soft_global_summary['rounded_unique_count']}"
+        )
+        if soft_global_degenerate:
+            print(
+                "  ⚠️ soft_label collapsed across the Stage-1 event view; "
+                f"base learners will emit constant soft predictions at p={float(soft_global_summary['mean']):.6f}"
+            )
         priors = np.asarray([0.5, 0.5], dtype=np.float32)
     else:
+        soft_global_degenerate = False
+        soft_global_summary = {}
         print(f"  Class distribution: {pd.Series(y).value_counts().sort_index().to_dict()}")
         priors = np.bincount(y, minlength=N_CB_PROBS).astype(np.float32)
         priors = priors / max(priors.sum(), 1.0)
@@ -1626,34 +1754,48 @@ def stage1_oof_meta(
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
         early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
+        fit_soft = y_soft[fit_idx]
+        fit_soft_degenerate, fit_soft_summary = _is_degenerate_soft_target(fit_soft)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         print(
             f"    Fold {fold_no} [soft RMSE]: fit={len(fit_idx):,} test={len(test_idx):,} "
             f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
             f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-            f"| y_soft_fit mean={float(np.mean(y_soft[fit_idx])):.3f} std={float(np.std(y_soft[fit_idx])):.3f}"
+            f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f} std={float(np.std(fit_soft)):.3f}"
         )
-        if float(np.std(y_soft[fit_idx])) < 1e-8:
-            print(f"      CatBoost Fold {fold_no}: degenerate soft_label (constant train) → priors")
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+        if fit_soft_degenerate:
+            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            print(
+                f"      CatBoost Fold {fold_no}: degenerate soft_label "
+                f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
+                f"→ constant p={const_info['constant_prediction']:.6f}"
+            )
+            return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'priors_only_constant_soft_target',
+                'mode': 'constant_soft_target_fallback',
+                'constant_prediction': float(const_info['constant_prediction']),
+                'constant_probs': const_info['constant_probs'],
+                'soft_target_summary': fit_soft_summary,
             }
         fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
         fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
         if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
             print(
                 f"      CatBoost Fold {fold_no}: degraded scaler "
-                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using priors"
+                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
             )
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'priors_only_degraded_scaler',
+                'mode': 'constant_soft_target_degraded_scaler',
+                'constant_prediction': float(const_info['constant_prediction']),
+                'constant_probs': const_info['constant_probs'],
+                'soft_target_summary': fit_soft_summary,
                 'fold_scaler_diagnostics': scaler_diag,
             }
         X_fit = _apply_scaler_to_stat_frame(
@@ -1881,34 +2023,48 @@ def stage1_oof_meta(
         inner_train, inner_val = _build_inner_time_split(train_idx, t0, t1, embargo_pct)
         fit_idx = inner_train if inner_train is not None else train_idx
         early_stopping_rounds = _adaptive_tree_early_stopping_rounds(len(fit_idx), inner_val is not None)
+        fit_soft = y_soft[fit_idx]
+        fit_soft_degenerate, fit_soft_summary = _is_degenerate_soft_target(fit_soft)
         fit_ts = _time_series(df.iloc[fit_idx].reset_index(drop=True), 'ts_event')
         test_ts = _time_series(df.iloc[test_idx].reset_index(drop=True), 'ts_event')
         print(
             f"    XGB Fold {fold_no} [soft RMSE]: fit={len(fit_idx):,} test={len(test_idx):,} "
             f"| fit_ts=[{fit_ts.iloc[0]} → {fit_ts.iloc[-1]}] "
             f"| test_ts=[{test_ts.iloc[0]} → {test_ts.iloc[-1]}] "
-            f"| y_soft_fit mean={float(np.mean(y_soft[fit_idx])):.3f}"
+            f"| y_soft_fit mean={float(np.mean(fit_soft)):.3f}"
         )
-        if float(np.std(y_soft[fit_idx])) < 1e-8:
-            print(f"      XGBoost Fold {fold_no}: degenerate soft_label (constant train) → priors")
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+        if fit_soft_degenerate:
+            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            print(
+                f"      XGBoost Fold {fold_no}: degenerate soft_label "
+                f"(rounded_unique={fit_soft_summary['rounded_unique_count']}) "
+                f"→ constant p={const_info['constant_prediction']:.6f}"
+            )
+            return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'priors_only_constant_soft_target',
+                'mode': 'constant_soft_target_fallback',
+                'constant_prediction': float(const_info['constant_prediction']),
+                'constant_probs': const_info['constant_probs'],
+                'soft_target_summary': fit_soft_summary,
             }
         fold_scaler_raw = _fit_scaler_params_from_frame(raw_stat.iloc[fit_idx])
         fold_scaler, scaler_diag = _stabilize_fold_scaler(fold_scaler_raw, inference_scaler_params)
         if float(scaler_diag.get('zero_pct', 0.0)) > 0.30:
             print(
                 f"      XGBoost Fold {fold_no}: degraded scaler "
-                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using priors"
+                f"(zero_pct={float(scaler_diag.get('zero_pct', 0.0)):.1%}) | using constant soft fallback"
             )
-            return np.repeat(priors.reshape(1, -1), len(test_idx), axis=0).astype(np.float32), {
+            const_preds, const_info = _constant_soft_prob_block(len(test_idx), fit_soft, fallback=0.5)
+            return const_preds, {
                 'directional_precision': None,
                 'directional_recall': None,
                 'directional_f1': None,
-                'mode': 'priors_only_degraded_scaler',
+                'mode': 'constant_soft_target_degraded_scaler',
+                'constant_prediction': float(const_info['constant_prediction']),
+                'constant_probs': const_info['constant_probs'],
+                'soft_target_summary': fit_soft_summary,
                 'fold_scaler_diagnostics': scaler_diag,
             }
         X_fit = _apply_scaler_to_stat_frame(
@@ -2180,94 +2336,148 @@ def stage1_oof_meta(
     if use_soft_target:
         y_train_final = y_soft[final_train_idx]
         y_holdout_final = y_soft[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.float32)
-        final_cb = CatBoostRegressor(
-            iterations=1000,
-            depth=tree_depth,
-            learning_rate=0.01,
-            l2_leaf_reg=3.0,
-            bootstrap_type='Bernoulli',
-            subsample=0.80,
-            rsm=0.70,
-            loss_function='RMSE',
-            eval_metric='RMSE',
-            use_best_model=len(final_holdout_idx) > 0,
-            early_stopping_rounds=50 if len(final_holdout_idx) > 0 else None,
-            verbose=50,
-            random_seed=42,
-            task_type=cb_task_type,
-            devices=cb_devices,
-        )
-        tr_pool_final = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
-        ev_pool_final = (
-            Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES)
-            if len(final_holdout_idx)
-            else None
-        )
-        final_cb.fit(tr_pool_final, eval_set=ev_pool_final, plot=False)
-        final_cb.save_model(os.path.join(output_dir, 'catboost_advisor_v19.cbm'))
-        with open(os.path.join(output_dir, 'catboost_classes_v19.json'), 'w') as f:
-            json.dump(
-                {
-                    'classes': [0, 1],
-                    'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                    'pseudo_prob_head': '[p, 1-p] from CatBoostRegressor.predict on soft_label',
-                },
-                f,
-                indent=2,
+        final_soft_degenerate, final_soft_summary = _is_degenerate_soft_target(y_train_final)
+        cb_model_path = os.path.join(output_dir, 'catboost_advisor_v19.cbm')
+        cb_meta_path = os.path.join(output_dir, 'catboost_classes_v19.json')
+        xgb_model_path = os.path.join(output_dir, 'xgboost_advisor_v19.json')
+        xgb_meta_path = os.path.join(output_dir, 'xgboost_classes_v19.json')
+        if final_soft_degenerate:
+            cb_meta = _write_constant_soft_model_metadata(
+                cb_meta_path,
+                model_family='catboost',
+                target=y_train_final,
+                reason='final_train_soft_target_degenerate',
             )
-        print("  ✅ CatBoost final: regress soft_label → stack [p, 1-p] for meta layer")
-
-        final_cb_calibrator = None
-        final_cb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
-        if len(final_holdout_idx):
-            hold_p = np.asarray(final_cb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
+            xgb_meta = _write_constant_soft_model_metadata(
+                xgb_meta_path,
+                model_family='xgboost',
+                target=y_train_final,
+                reason='final_train_soft_target_degenerate',
+            )
+            for stale_path in (cb_model_path, xgb_model_path, cb_calibrator_path, xgb_calibrator_path):
+                _remove_stale_artifact(stale_path)
+            live_probs = np.repeat(
+                np.asarray(cb_meta['constant_probs'], dtype=np.float32).reshape(1, -1),
+                len(df),
+                axis=0,
+            )
+            live_xgb_probs = np.repeat(
+                np.asarray(xgb_meta['constant_probs'], dtype=np.float32).reshape(1, -1),
+                len(df),
+                axis=0,
+            )
+            final_cb_calibrator = None
+            final_xgb_calibrator = None
             final_cb_cal_report = {
                 'enabled': False,
-                'reason': 'soft_regression',
-                'holdout_mae_vs_soft': float(np.mean(np.abs(hold_p - y_holdout_final))),
+                'reason': 'constant_soft_baseline',
+                'constant_prediction': float(cb_meta['constant_prediction']),
+                'train_soft_target_summary': final_soft_summary,
             }
-        live_probs = _pseudo_probs_two_col(np.asarray(final_cb.predict(X_final), dtype=np.float32))
-
-        final_xgb = XGBRegressor(
-            n_estimators=800,
-            max_depth=tree_depth,
-            learning_rate=0.03,
-            subsample=0.80,
-            colsample_bytree=0.70,
-            reg_lambda=3.0,
-            objective='reg:squarederror',
-            eval_metric='rmse',
-            early_stopping_rounds=50 if len(final_holdout_idx) else None,
-            random_state=84,
-            tree_method='hist',
-        )
-        xgb_fit_kw: dict[str, object] = {'sample_weight': final_train_sw, 'verbose': False}
-        if len(final_holdout_idx):
-            xgb_fit_kw['eval_set'] = [(X_holdout_final, y_holdout_final)]
-        final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kw)
-        final_xgb.save_model(os.path.join(output_dir, 'xgboost_advisor_v19.json'))
-        with open(os.path.join(output_dir, 'xgboost_classes_v19.json'), 'w') as f:
-            json.dump(
-                {
-                    'classes': [0, 1],
-                    'stage1_target': STAGE1_TARGET_SOFT_LABEL,
-                    'pseudo_prob_head': '[p, 1-p] from XGBRegressor.predict on soft_label',
-                },
-                f,
-                indent=2,
-            )
-        print("  ✅ XGBoost final: regress soft_label → stack [p, 1-p] for meta layer")
-
-        final_xgb_calibrator = None
-        final_xgb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
-        if len(final_holdout_idx):
-            hx = np.asarray(final_xgb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
             final_xgb_cal_report = {
                 'enabled': False,
-                'reason': 'soft_regression',
-                'holdout_mae_vs_soft': float(np.mean(np.abs(hx - y_holdout_final))),
+                'reason': 'constant_soft_baseline',
+                'constant_prediction': float(xgb_meta['constant_prediction']),
+                'train_soft_target_summary': final_soft_summary,
             }
-        live_xgb_probs = _pseudo_probs_two_col(np.asarray(final_xgb.predict(X_final), dtype=np.float32))
+            if len(final_holdout_idx):
+                hold_p = np.full(len(final_holdout_idx), float(cb_meta['constant_prediction']), dtype=np.float32)
+                hold_x = np.full(len(final_holdout_idx), float(xgb_meta['constant_prediction']), dtype=np.float32)
+                final_cb_cal_report['holdout_mae_vs_soft'] = float(np.mean(np.abs(hold_p - y_holdout_final)))
+                final_xgb_cal_report['holdout_mae_vs_soft'] = float(np.mean(np.abs(hold_x - y_holdout_final)))
+            print(
+                "  ⚠️ Final Stage-1 soft target is degenerate; "
+                f"saved constant CatBoost/XGBoost baselines at p={float(cb_meta['constant_prediction']):.6f}"
+            )
+        else:
+            final_cb = CatBoostRegressor(
+                iterations=1000,
+                depth=tree_depth,
+                learning_rate=0.01,
+                l2_leaf_reg=3.0,
+                bootstrap_type='Bernoulli',
+                subsample=0.80,
+                rsm=0.70,
+                loss_function='RMSE',
+                eval_metric='RMSE',
+                use_best_model=len(final_holdout_idx) > 0,
+                early_stopping_rounds=50 if len(final_holdout_idx) > 0 else None,
+                verbose=50,
+                random_seed=42,
+                task_type=cb_task_type,
+                devices=cb_devices,
+            )
+            tr_pool_final = Pool(X_train_final, y_train_final, weight=final_train_sw, feature_names=CATBOOST_ADVISOR_FEATURES)
+            ev_pool_final = (
+                Pool(X_holdout_final, y_holdout_final, feature_names=CATBOOST_ADVISOR_FEATURES)
+                if len(final_holdout_idx)
+                else None
+            )
+            final_cb.fit(tr_pool_final, eval_set=ev_pool_final, plot=False)
+            final_cb.save_model(cb_model_path)
+            with open(cb_meta_path, 'w') as f:
+                json.dump(
+                    {
+                        'classes': [0, 1],
+                        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
+                        'pseudo_prob_head': '[p, 1-p] from CatBoostRegressor.predict on soft_label',
+                    },
+                    f,
+                    indent=2,
+                )
+            print("  ✅ CatBoost final: regress soft_label → stack [p, 1-p] for meta layer")
+
+            final_cb_calibrator = None
+            final_cb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
+            if len(final_holdout_idx):
+                hold_p = np.asarray(final_cb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
+                final_cb_cal_report = {
+                    'enabled': False,
+                    'reason': 'soft_regression',
+                    'holdout_mae_vs_soft': float(np.mean(np.abs(hold_p - y_holdout_final))),
+                }
+            live_probs = _pseudo_probs_two_col(np.asarray(final_cb.predict(X_final), dtype=np.float32))
+
+            final_xgb = XGBRegressor(
+                n_estimators=800,
+                max_depth=tree_depth,
+                learning_rate=0.03,
+                subsample=0.80,
+                colsample_bytree=0.70,
+                reg_lambda=3.0,
+                objective='reg:squarederror',
+                eval_metric='rmse',
+                early_stopping_rounds=50 if len(final_holdout_idx) else None,
+                random_state=84,
+                tree_method='hist',
+            )
+            xgb_fit_kw: dict[str, object] = {'sample_weight': final_train_sw, 'verbose': False}
+            if len(final_holdout_idx):
+                xgb_fit_kw['eval_set'] = [(X_holdout_final, y_holdout_final)]
+            final_xgb.fit(X_train_final, y_train_final, **xgb_fit_kw)
+            final_xgb.save_model(xgb_model_path)
+            with open(xgb_meta_path, 'w') as f:
+                json.dump(
+                    {
+                        'classes': [0, 1],
+                        'stage1_target': STAGE1_TARGET_SOFT_LABEL,
+                        'pseudo_prob_head': '[p, 1-p] from XGBRegressor.predict on soft_label',
+                    },
+                    f,
+                    indent=2,
+                )
+            print("  ✅ XGBoost final: regress soft_label → stack [p, 1-p] for meta layer")
+
+            final_xgb_calibrator = None
+            final_xgb_cal_report = {'enabled': False, 'reason': 'soft_regression'}
+            if len(final_holdout_idx):
+                hx = np.asarray(final_xgb.predict(X_holdout_final), dtype=np.float32).reshape(-1)
+                final_xgb_cal_report = {
+                    'enabled': False,
+                    'reason': 'soft_regression',
+                    'holdout_mae_vs_soft': float(np.mean(np.abs(hx - y_holdout_final))),
+                }
+            live_xgb_probs = _pseudo_probs_two_col(np.asarray(final_xgb.predict(X_final), dtype=np.float32))
     else:
         y_train_final = y[final_train_idx]
         y_holdout_final = y[final_holdout_idx] if len(final_holdout_idx) else np.zeros(0, dtype=np.int32)
@@ -2389,6 +2599,8 @@ def stage1_oof_meta(
 
     fold_metrics = {
         'stage1_target': STAGE1_TARGET_SOFT_LABEL if use_soft_target else STAGE1_TARGET_BIAS,
+        'soft_target_global_summary': soft_global_summary if use_soft_target else None,
+        'soft_target_global_degenerate': bool(soft_global_degenerate) if use_soft_target else False,
         'catboost_folds': prob_reports,
         'xgboost_folds': xgb_reports,
         'regime_folds': regime_reports,
@@ -3202,6 +3414,20 @@ def stage3_meta_learner_v19(
     return stage3_summary
 
 
+def _has_constant_soft_baseline_metadata(metadata_path: str) -> bool:
+    if not metadata_path or not os.path.exists(metadata_path):
+        return False
+    try:
+        with open(metadata_path, 'r') as f:
+            payload = json.load(f)
+    except Exception:
+        return False
+    if str(payload.get('artifact_mode', '')).strip().lower() != 'constant_soft_baseline':
+        return False
+    probs = payload.get('constant_probs')
+    return isinstance(probs, list) and len(probs) >= 2
+
+
 def _load_required_stage1_artifacts(
     output_dir: str,
     n_rows: int | None = None,
@@ -3215,21 +3441,25 @@ def _load_required_stage1_artifacts(
         raise ValueError(f'❌ Stage1 cached meta surface must be 2D, got {meta_arr.shape}')
     meta_feature_names = _load_stage1_meta_feature_names(output_dir, meta_dim=int(meta_arr.shape[1]))
     layout = infer_meta_feature_layout(meta_feature_names)
+    cb_model_path = os.path.join(output_dir, 'catboost_advisor_v19.cbm')
+    cb_classes_path = os.path.join(output_dir, 'catboost_classes_v19.json')
+    xgb_model_path = os.path.join(output_dir, 'xgboost_advisor_v19.json')
+    xgb_classes_path = os.path.join(output_dir, 'xgboost_classes_v19.json')
     required_files = [
         meta_path,
         coverage_path,
-        os.path.join(output_dir, 'catboost_advisor_v19.cbm'),
-        os.path.join(output_dir, 'catboost_classes_v19.json'),
+        cb_classes_path,
         os.path.join(output_dir, 'regime_classifier.pkl'),
     ]
-    if any(spec.get('name') == 'xgboost' for spec in layout.get('base_models', [])):
-        required_files.extend(
-            [
-                os.path.join(output_dir, 'xgboost_advisor_v19.json'),
-                os.path.join(output_dir, 'xgboost_classes_v19.json'),
-            ]
-        )
     missing = [path for path in required_files if not os.path.exists(path)]
+    if not (os.path.exists(cb_model_path) or _has_constant_soft_baseline_metadata(cb_classes_path)):
+        missing.append(cb_model_path)
+    if any(spec.get('name') == 'xgboost' for spec in layout.get('base_models', [])):
+        required_files.append(xgb_classes_path)
+        if not os.path.exists(xgb_classes_path):
+            missing.append(xgb_classes_path)
+        if not (os.path.exists(xgb_model_path) or _has_constant_soft_baseline_metadata(xgb_classes_path)):
+            missing.append(xgb_model_path)
     if missing:
         raise FileNotFoundError(
             '❌ CatBoost/XGBoost stage artifacts missing. '

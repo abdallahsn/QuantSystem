@@ -77,6 +77,21 @@ def _pseudo_prob_head(pred: np.ndarray) -> np.ndarray:
     return np.column_stack([p, (1.0 - p.astype(np.float64)).astype(np.float32)])
 
 
+def _constant_prob_vector_from_meta(payload: dict | None, n_outputs: int) -> np.ndarray | None:
+    if not isinstance(payload, dict):
+        return None
+    probs = payload.get('constant_probs')
+    if isinstance(probs, list) and len(probs) >= 2:
+        arr = np.asarray(probs[:n_outputs], dtype=np.float32).reshape(1, -1)
+        return align_probability_columns(arr, n_outputs).reshape(-1).astype(np.float32)
+    constant_prediction = payload.get('constant_prediction')
+    is_soft = str(payload.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
+    if constant_prediction is None or not is_soft:
+        return None
+    arr = _pseudo_prob_head(np.array([constant_prediction], dtype=np.float32))
+    return align_probability_columns(arr, n_outputs).reshape(-1).astype(np.float32)
+
+
 def _directional_metrics_from_rows(rows: list[dict]) -> dict:
     if not rows:
         return {
@@ -171,6 +186,7 @@ class V19PredictionEngine:
         self.cb_advisor = None
         self.cb_calibrator = None
         self._cb_soft_regression = False
+        self._cb_constant_probs = None
         cb_path = os.path.join(models_dir, artifacts.get('catboost_model', 'catboost_advisor_v19.cbm'))
         self.cb_classes = None
         cb_classes_path = os.path.join(models_dir, artifacts.get('catboost_classes', 'catboost_classes_v19.json'))
@@ -181,9 +197,11 @@ class V19PredictionEngine:
                     _cbc = json.load(f)
                     self.cb_classes = _cbc.get('classes')
                     self._cb_soft_regression = str(_cbc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
+                    self._cb_constant_probs = _constant_prob_vector_from_meta(_cbc, N_CB_PROBS)
             except Exception:
                 self.cb_classes = None
                 self._cb_soft_regression = False
+                self._cb_constant_probs = None
         if CB_AVAILABLE and os.path.exists(cb_path):
             self.cb_advisor = (
                 CatBoostRegressor()
@@ -192,9 +210,16 @@ class V19PredictionEngine:
             )
             self.cb_advisor.load_model(cb_path)
             print(f"  ✅ CatBoost V19: {cb_path} ({'regress-soft' if self._cb_soft_regression else 'classify'})")
+        elif self._cb_constant_probs is not None:
+            print(f"  ✅ CatBoost V19: constant soft baseline from {cb_classes_path}")
         else:
             print(f"  ⚠️ CatBoost V19 missing: {cb_path}")
-        if run_mode != 'backtest' and 'catboost' in required_base_models and self.cb_advisor is None:
+        if (
+            run_mode != 'backtest'
+            and 'catboost' in required_base_models
+            and self.cb_advisor is None
+            and self._cb_constant_probs is None
+        ):
             raise FileNotFoundError(
                 "❌ CatBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -212,6 +237,7 @@ class V19PredictionEngine:
         self.xgb_calibrator = None
         self.xgb_classes = None
         self._xgb_soft_regression = False
+        self._xgb_constant_probs = None
         xgb_path = os.path.join(models_dir, artifacts.get('xgboost_model', 'xgboost_advisor_v19.json'))
         xgb_classes_path = os.path.join(models_dir, artifacts.get('xgboost_classes', 'xgboost_classes_v19.json'))
         if os.path.exists(xgb_classes_path):
@@ -220,16 +246,25 @@ class V19PredictionEngine:
                     _xjc = json.load(f)
                     self.xgb_classes = _xjc.get('classes')
                     self._xgb_soft_regression = str(_xjc.get('stage1_target', '')).strip().lower() == STAGE1_TARGET_SOFT_LABEL
+                    self._xgb_constant_probs = _constant_prob_vector_from_meta(_xjc, N_XGB_PROBS)
             except Exception:
                 self.xgb_classes = None
                 self._xgb_soft_regression = False
+                self._xgb_constant_probs = None
         if XGB_AVAILABLE and os.path.exists(xgb_path):
             self.xgb_advisor = XGBRegressor() if self._xgb_soft_regression else XGBClassifier()
             self.xgb_advisor.load_model(xgb_path)
             print(f"  ✅ XGBoost V19: {xgb_path} ({'regress-soft' if self._xgb_soft_regression else 'classify'})")
+        elif self._xgb_constant_probs is not None:
+            print(f"  ✅ XGBoost V19: constant soft baseline from {xgb_classes_path}")
         else:
             print(f"  ⚠️ XGBoost V19 missing: {xgb_path}")
-        if run_mode != 'backtest' and 'xgboost' in required_base_models and self.xgb_advisor is None:
+        if (
+            run_mode != 'backtest'
+            and 'xgboost' in required_base_models
+            and self.xgb_advisor is None
+            and self._xgb_constant_probs is None
+        ):
             raise FileNotFoundError(
                 "❌ XGBoost artifact/runtime required by the feature schema but was not found."
             )
@@ -385,6 +420,8 @@ class V19PredictionEngine:
 
     def _get_cb_probs(self, X_stat: np.ndarray) -> np.ndarray:
         n = X_stat.shape[0]
+        if self.cb_advisor is None and self._cb_constant_probs is not None:
+            return np.repeat(self._cb_constant_probs.reshape(1, -1), n, axis=0).astype(np.float32)
         if self.cb_advisor is None:
             return np.ones((n, N_CB_PROBS), dtype=np.float32) / N_CB_PROBS
         try:
@@ -404,6 +441,8 @@ class V19PredictionEngine:
 
     def _get_xgb_probs(self, X_stat: np.ndarray) -> np.ndarray:
         n = X_stat.shape[0]
+        if self.xgb_advisor is None and self._xgb_constant_probs is not None:
+            return np.repeat(self._xgb_constant_probs.reshape(1, -1), n, axis=0).astype(np.float32)
         if self.xgb_advisor is None:
             return np.ones((n, N_XGB_PROBS), dtype=np.float32) / N_XGB_PROBS
         try:
