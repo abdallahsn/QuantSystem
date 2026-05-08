@@ -1344,6 +1344,10 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
         'refinery_split.json',
         'lob_build_meta.json',
         'final_feature_shards.json',
+        'data_integrity_report.json',
+        'data_integrity_gate_report.json',
+        'contract_consistency_report.json',
+        'label_quality_report.json',
     ):
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
@@ -1354,6 +1358,40 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
             shutil.copy2(src, dst)
             copied[name] = dst
     return copied
+
+
+def _read_json_if_exists(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _enforce_source_refinery_gates(csv_path: str, config_snapshot: dict | None = None) -> dict:
+    cfg = config_snapshot or {}
+    profile = str(cfg.get('profile', 'research')).strip().lower() or 'research'
+    src_dir = resolve_artifact_root(csv_path)
+    gate_path = os.path.join(src_dir, 'data_integrity_gate_report.json')
+    gate_report = _read_json_if_exists(gate_path)
+    if profile != 'production':
+        return gate_report
+    if not gate_report:
+        raise RuntimeError(
+            "❌ Production training requires data_integrity_gate_report.json from the refinery stage. "
+            f"Missing under: {src_dir}"
+        )
+    if not bool(gate_report.get('passed', False)):
+        failure_count = int(gate_report.get('blocking_failure_count', 0) or 0)
+        reasons = [str(item.get('metric')) for item in (gate_report.get('failures') or [])[:5] if isinstance(item, dict)]
+        raise RuntimeError(
+            "❌ Refusing production training because source refinery integrity gates failed. "
+            f"blocking_failures={failure_count} | sample_failures={reasons} | report={gate_path}"
+        )
+    return gate_report
 
 
 def _resolve_default_lob_paths(csv_path: str) -> tuple[str | None, str | None]:
@@ -3629,6 +3667,14 @@ def run_training_pipeline(
         st1_tgt_cfg = STAGE1_TARGET_BIAS
     print(f"  stage1_target: {st1_tgt_cfg}")
 
+    source_gate_report = _enforce_source_refinery_gates(csv_path, config_snapshot)
+    if source_gate_report:
+        print(
+            "  🧱 Source refinery gates: "
+            f"passed={bool(source_gate_report.get('passed', False))} "
+            f"| failures={int(source_gate_report.get('blocking_failure_count', 0) or 0)}"
+        )
+
     df_loaded = load_training_csv(csv_path)
     source_contract = _load_source_refinery_contract(csv_path)
     effective_split_time = split_time if split_time is not None else source_contract.get('split_time')
@@ -3918,6 +3964,7 @@ def run_training_pipeline(
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
                 'event_training_gate_report': event_gate_report_path,
+                'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
                 'seed_manifest': seed_manifest,
             },
         )
@@ -3934,6 +3981,7 @@ def run_training_pipeline(
             'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
             'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
             'event_training_gate_report': event_gate_report_path,
+            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
             'seed_manifest': seed_manifest,
         }
 
@@ -4025,6 +4073,7 @@ def run_training_pipeline(
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
                 'event_training_gate_report': event_gate_report_path,
+                'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
                 'seed_manifest': seed_manifest,
             },
         )
@@ -4041,6 +4090,7 @@ def run_training_pipeline(
             'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
             'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
             'event_training_gate_report': event_gate_report_path,
+            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
             'seed_manifest': seed_manifest,
         }
 
@@ -4129,6 +4179,7 @@ def run_training_pipeline(
             'meta_learner_profile': stage3_summary,
             'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
             'event_training_gate_report': event_gate_report_path,
+            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
             'seed_manifest': seed_manifest,
         },
     )
@@ -4147,6 +4198,7 @@ def run_training_pipeline(
         'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
         'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
         'event_training_gate_report': event_gate_report_path,
+        'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
         'seed_manifest': seed_manifest,
     }
 

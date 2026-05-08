@@ -4164,6 +4164,15 @@ def run_refinery(
     label_quality_report_path = _write_label_quality_report(df_final, output_dir)
     print(f"  ✅ Label quality report: {label_quality_report_path}")
     if bool(integrity_gate_report.get('enabled', False)) and not bool(integrity_gate_report.get('would_pass', True)):
+        print("  ❌ Production integrity gate failures:")
+        for item in (integrity_gate_report.get('failures') or [])[:12]:
+            if not isinstance(item, dict):
+                continue
+            print(
+                "     - "
+                f"{item.get('metric')} | value={item.get('value')} | "
+                f"threshold={item.get('threshold')} | reason={item.get('reason')}"
+            )
         raise RuntimeError(
             "❌ Production data integrity gates failed. "
             f"راجع {integrity_gate_report_path} before training/backtesting."
