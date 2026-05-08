@@ -223,6 +223,7 @@ def build_replay_dataset(
     mbo_path: str,
     mbp_path: str,
     output_dir: str,
+    config_path: str | None = None,
     start_ts=None,
     end_ts=None,
     label_mode: str = 'v19',
@@ -309,6 +310,7 @@ def build_replay_dataset(
         merge_tolerance_ms=merge_tolerance_ms,
         external_scaler_path=external_scaler_path,
         fit_aux_models=fit_aux_models,
+        config_path=config_path,
     )
 
     trim_meta = None

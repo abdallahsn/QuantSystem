@@ -46,6 +46,7 @@ def run_shadow(csv_path: str, models_dir: str, output_dir: str, input_scaled: bo
         event_writer=writer,
         manifest_path=os.path.join(models_dir, 'manifest.json'),
         failsafe_policy=failsafe_cfg,
+        config=cfg,
     )
     df = load_feature_artifact(csv_path)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)

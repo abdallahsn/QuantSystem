@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from backtest_v19 import _load_csv, run_causal_backtest
-from modules.config_v19 import load_release_gates, load_v19_config
+from modules.config_v19 import default_release_gates_path_for_profile, load_release_gates, load_v19_config
 from modules.manifest_v19 import write_manifest
 from modules.raw_replay_v19 import build_replay_dataset, normalize_ts, read_market_data
 from modules.release_gates_v19 import evaluate_release_gates, save_gate_report
@@ -186,6 +186,9 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
             'max_drawdown_pct': 0.0,
             'total_trades': 0,
             'total_pnl_dollars': 0.0,
+            'fold_pass_rate': 0.0,
+            'monthly_positive_rate': 0.0,
+            'contract_pass_rate': 0.0,
         }
 
     def _backtest_block(report: dict) -> dict:
@@ -198,6 +201,23 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
         return {}
 
     blocks = [_backtest_block(report) for report in fold_reports]
+    fold_passes = [len(report.get('release_blockers', []) or []) == 0 for report in fold_reports]
+    positive_folds = [
+        (float(block.get('total_pnl_dollars', 0.0) or 0.0) > 0.0) and (int(block.get('trades', 0) or 0) > 0)
+        for block in blocks
+    ]
+    contract_buckets: dict[str, dict[str, float]] = {}
+    for report, block in zip(fold_reports, blocks):
+        contract_id = str(report.get('contract_id') or 'UNKNOWN')
+        bucket = contract_buckets.setdefault(contract_id, {'pnl': 0.0, 'trades': 0.0, 'failures': 0.0})
+        bucket['pnl'] += float(block.get('total_pnl_dollars', 0.0) or 0.0)
+        bucket['trades'] += float(block.get('trades', 0) or 0)
+        if len(report.get('release_blockers', []) or []) > 0:
+            bucket['failures'] += 1.0
+    contract_passes = [
+        (payload.get('pnl', 0.0) > 0.0) and (payload.get('trades', 0.0) > 0.0) and (payload.get('failures', 0.0) == 0.0)
+        for payload in contract_buckets.values()
+    ]
 
     return {
         'n_folds': int(len(fold_reports)),
@@ -215,6 +235,9 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
         'max_drawdown_pct': float(np.max([block.get('max_drawdown_pct', 0.0) for block in blocks])),
         'total_trades': int(np.sum([block.get('trades', 0) for block in blocks])),
         'total_pnl_dollars': float(np.sum([block.get('total_pnl_dollars', 0.0) for block in blocks])),
+        'fold_pass_rate': float(np.mean(fold_passes)) if fold_passes else 0.0,
+        'monthly_positive_rate': float(np.mean(positive_folds)) if positive_folds else 0.0,
+        'contract_pass_rate': float(np.mean(contract_passes)) if contract_passes else 0.0,
     }
 
 
@@ -224,6 +247,7 @@ def run_walkforward(
     output_dir: str,
     config: dict,
     gates: dict,
+    config_path: str | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     walk_cfg = config.get('walkforward', {})
@@ -260,6 +284,7 @@ def run_walkforward(
             mbo_path=mbo_path,
             mbp_path=mbp_path,
             output_dir=train_dir,
+            config_path=config_path,
             start_ts=None,
             end_ts=window['test_start'],
             label_mode=ref_cfg.get('label_mode', 'v19'),
@@ -307,6 +332,7 @@ def run_walkforward(
             mbo_path=mbo_path,
             mbp_path=mbp_path,
             output_dir=test_dir,
+            config_path=config_path,
             start_ts=window['test_start'],
             end_ts=window['test_end'],
             label_mode=ref_cfg.get('label_mode', 'v19'),
@@ -389,6 +415,13 @@ def run_walkforward(
             'SHORT': int((pd.to_numeric(test_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8) == 1).sum()),
             'NEUTRAL': int((pd.to_numeric(test_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8) == 2).sum()),
         }
+        if 'symbol' in test_df.columns:
+            contract_counts = test_df['symbol'].fillna('UNKNOWN').astype(str).value_counts()
+        elif 'instrument_id' in test_df.columns:
+            contract_counts = test_df['instrument_id'].fillna('UNKNOWN').astype(str).value_counts()
+        else:
+            contract_counts = pd.Series(dtype='int64')
+        contract_id = str(contract_counts.index[0]) if len(contract_counts) else 'UNKNOWN'
         blockers = []
         if int(backtest_base.get('trades', 0)) <= 0:
             blockers.append('zero_directional_trades')
@@ -401,6 +434,9 @@ def run_walkforward(
 
         fold_report = {
             'fold': window['fold'],
+            'mode': window.get('mode'),
+            'test_month': window.get('test_month'),
+            'contract_id': contract_id,
             'window': {
                 'train_start': str(window['train_start']),
                 'train_end': str(window['train_end']),
@@ -473,13 +509,15 @@ def main():
     args = p.parse_args()
 
     config = load_v19_config(args.config)
-    gates = load_release_gates(args.gates)
+    gates_path = args.gates or default_release_gates_path_for_profile(config.get('profile'))
+    gates = load_release_gates(gates_path)
     summary = run_walkforward(
         mbo_path=args.mbo,
         mbp_path=args.mbp,
         output_dir=args.output,
         config=config,
         gates=gates,
+        config_path=args.config,
     )
     print("\n✅ Walk-forward complete")
     print(json.dumps(summary['aggregate'], indent=2))

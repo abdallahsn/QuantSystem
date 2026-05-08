@@ -1,0 +1,14 @@
+{
+  "metrics": {
+    "mean_directional_f1": { "min": 0.42 },
+    "mean_profit_factor": { "min": 1.10 },
+    "mean_win_rate": { "min": 0.47 },
+    "total_trades": { "min": 100 },
+    "max_drawdown_pct": { "max": 0.15 },
+    "mean_brier_score": { "max": 0.25 },
+    "mean_ece": { "max": 0.08 },
+    "fold_pass_rate": { "min": 0.67 },
+    "monthly_positive_rate": { "min": 0.60 },
+    "contract_pass_rate": { "min": 0.67 }
+  }
+}

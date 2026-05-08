@@ -1,4 +1,6 @@
 {
+  "profile": "research",
+  "release_gates_profile": "default",
   "training": {
     "output_dir": "outputs_v19",
     "epochs": 100,
@@ -16,7 +18,9 @@
     "quality_weight_strong": 2.0,
     "quality_weight_weak": 1.0,
     "sample_weight_mode": "combined",
-    "stage1_target": "bias"
+    "stage1_target": "bias",
+    "event_fallback_mode": "directional_rows",
+    "require_decision_policy_version": ""
   },
   "refinery": {
     "label_mode": "v19",
@@ -46,7 +50,19 @@
     "lob_event_sample": 100000,
     "merge_tolerance_ms": 500,
     "step4_min_parallel_rows": 250000,
-    "enforce_economic_tp_floor": true
+    "enforce_economic_tp_floor": true,
+    "integrity_gates": {
+      "enabled": false,
+      "block_on_missing_timestamps": true,
+      "block_on_duplicate_timestamps": true,
+      "block_on_non_monotonic_timestamps": true,
+      "block_on_nonpositive_prices": true,
+      "block_on_negative_sizes": true,
+      "block_on_final_timestamp_issues": true,
+      "block_on_contract_mismatch": true,
+      "max_merge_lag_ratio": 0.10,
+      "max_matched_mbp_lag_ms": 250.0
+    }
   },
   "backtest": {
     "tick_size": 0.0001,
@@ -142,6 +158,12 @@
     "max_latency_ms": 500.0,
     "kill_switch_file": "outputs_v19/kill_switch.flag",
     "manual_override_state": "auto"
+  },
+  "reproducibility": {
+    "enabled": true,
+    "seed": 42,
+    "enable_deterministic_tf_ops": false,
+    "write_seed_manifest": true
   },
   "soft_labels": {
     "enabled": true,

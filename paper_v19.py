@@ -89,6 +89,7 @@ def run_paper(
         event_writer=writer,
         manifest_path=os.path.join(models_dir, 'manifest.json'),
         failsafe_policy={**failsafe_cfg, **rollout_cfg},
+        config=cfg,
     )
     df = load_feature_artifact(csv_path)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)

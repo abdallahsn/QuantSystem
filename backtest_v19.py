@@ -43,6 +43,10 @@ from modules.feature_artifact_v19 import (
     load_feature_artifact,
     resolve_artifact_root,
 )
+from modules.execution_replay_v19 import (
+    realized_fill_pricing as _shared_realized_fill_pricing,
+    simulate_trade_path as _shared_simulate_trade_path,
+)
 from modules.slippage_model import SlippageModel, position_size_from_prediction
 from predict_v19 import V19PredictionEngine
 
@@ -343,6 +347,10 @@ def _simulate_trade_path(
         'sl_pips':     round(abs(sl_level - entry_price) / max(tick_size, 1e-8), 1),
         'rr_ratio':    round(abs(tp_level - entry_price) / max(abs(sl_level - entry_price), tick_size), 2),
     }
+
+
+_realized_fill_pricing = _shared_realized_fill_pricing
+_simulate_trade_path = _shared_simulate_trade_path
 
 
 def _load_csv(path: str) -> pd.DataFrame:
