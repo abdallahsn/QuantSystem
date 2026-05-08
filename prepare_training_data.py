@@ -826,6 +826,24 @@ def _shard_ts_bounds(df: pd.DataFrame, ts_col: str = 'ts_event') -> tuple[str | 
     return str(ts.min()), str(ts.max())
 
 
+def _record_temporal_sort_key(record: dict) -> tuple[pd.Timestamp, pd.Timestamp, int]:
+    ts_min = pd.to_datetime(record.get('ts_min'), errors='coerce')
+    ts_max = pd.to_datetime(record.get('ts_max'), errors='coerce')
+    if pd.isna(ts_min):
+        ts_min = pd.Timestamp.max
+    if pd.isna(ts_max):
+        ts_max = ts_min
+    return (
+        ts_min,
+        ts_max,
+        int(record.get('shard_idx', 0)),
+    )
+
+
+def _records_in_temporal_order(records: list[dict]) -> list[dict]:
+    return sorted(records or [], key=_record_temporal_sort_key)
+
+
 def _frame_integrity_snapshot(
     df: pd.DataFrame,
     *,
@@ -839,6 +857,9 @@ def _frame_integrity_snapshot(
     ts = pd.to_datetime(ts_source, utc=True, errors='coerce').dt.tz_localize(None)
     valid_ts = ts.dropna()
     diffs = valid_ts.diff().dropna() if len(valid_ts) else pd.Series(dtype='timedelta64[ns]')
+    duplicate_ts_rows = int(valid_ts.duplicated().sum())
+    valid_ts_rows = int(len(valid_ts))
+    duplicate_ts_ratio = float(duplicate_ts_rows / valid_ts_rows) if valid_ts_rows > 0 else 0.0
 
     price_source = df[price_col] if price_col in df.columns else pd.Series(index=df.index, dtype='float64')
     price = pd.to_numeric(price_source, errors='coerce')
@@ -859,8 +880,10 @@ def _frame_integrity_snapshot(
 
     return {
         'rows': rows,
+        'valid_ts_rows': valid_ts_rows,
         'missing_ts_rows': int(ts.isna().sum()),
-        'duplicate_ts_rows': int(valid_ts.duplicated().sum()),
+        'duplicate_ts_rows': duplicate_ts_rows,
+        'duplicate_ts_ratio': duplicate_ts_ratio,
         'non_monotonic_ts_steps': int((diffs < pd.Timedelta(0)).sum()) if len(diffs) else 0,
         'gap_rows_over_1s': int((diffs > pd.Timedelta(seconds=1)).sum()) if len(diffs) else 0,
         'max_gap_ms': float(max(diffs.max().total_seconds() * 1000.0, 0.0)) if len(diffs) else 0.0,
@@ -882,6 +905,7 @@ def _new_integrity_accumulator(kind: str) -> dict:
         'kind': str(kind),
         'raw': {
             'rows': 0,
+            'valid_ts_rows': 0,
             'missing_ts_rows': 0,
             'duplicate_ts_rows': 0,
             'non_monotonic_ts_steps': 0,
@@ -900,6 +924,7 @@ def _new_integrity_accumulator(kind: str) -> dict:
         },
         'normalized': {
             'rows': 0,
+            'valid_ts_rows': 0,
             'missing_ts_rows': 0,
             'duplicate_ts_rows': 0,
             'non_monotonic_ts_steps': 0,
@@ -937,6 +962,7 @@ def _merge_symbol_counts(target: dict, frame: pd.DataFrame) -> None:
 def _accumulate_integrity_snapshot(target: dict, snapshot: dict) -> None:
     for key in [
         'rows',
+        'valid_ts_rows',
         'missing_ts_rows',
         'duplicate_ts_rows',
         'non_monotonic_ts_steps',
@@ -1009,6 +1035,11 @@ def _finalize_integrity_accumulator(acc: dict) -> dict:
         key: int(value)
         for key, value in sorted(normalized_symbols.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
     }
+    for key in ('raw', 'normalized'):
+        snapshot = out.get(key, {}) or {}
+        valid_ts_rows = int(snapshot.get('valid_ts_rows', 0))
+        duplicate_ts_rows = int(snapshot.get('duplicate_ts_rows', 0))
+        snapshot['duplicate_ts_ratio'] = float(duplicate_ts_rows / valid_ts_rows) if valid_ts_rows > 0 else 0.0
     return out
 
 
@@ -1025,20 +1056,40 @@ def _build_data_integrity_warnings(report: dict) -> list[str]:
             warnings.append(f"{key}: dropped {dropped:,} rows during normalization")
         if int(raw.get('missing_ts_rows', 0)) > 0:
             warnings.append(f"{key}: raw input contains missing timestamps")
-        if int(raw.get('duplicate_ts_rows', 0)) > 0 or int(raw.get('non_monotonic_ts_steps', 0)) > 0:
-            warnings.append(f"{key}: raw input contains duplicate or non-monotonic timestamps")
+        if int(raw.get('duplicate_ts_rows', 0)) > 0:
+            warnings.append(
+                f"{key}: raw input contains repeated ts_event values "
+                f"(ratio={float(raw.get('duplicate_ts_ratio', 0.0)):.2%}; often normal for event-level feeds)"
+            )
+        if int(raw.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: raw input contains non-monotonic timestamp steps")
         if int(raw.get('price_nonpositive_rows', 0)) > 0 or int(raw.get('size_negative_rows', 0)) > 0:
             warnings.append(f"{key}: raw input contains abnormal price/size values")
-        if int(normalized.get('duplicate_ts_rows', 0)) > 0 or int(normalized.get('non_monotonic_ts_steps', 0)) > 0:
-            warnings.append(f"{key}: normalized shards still contain duplicate or non-monotonic timestamps")
+        if int(normalized.get('duplicate_ts_rows', 0)) > 0:
+            warnings.append(
+                f"{key}: normalized shards still contain repeated ts_event values "
+                f"(ratio={float(normalized.get('duplicate_ts_ratio', 0.0)):.2%})"
+            )
+        if int(normalized.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: normalized shard ordering still contains non-monotonic timestamp steps")
 
     merged = ((report.get('intermediate') or {}).get('merged') or {})
     if int(merged.get('missing_ts_rows', 0)) > 0:
         warnings.append("merged: missing timestamps remain after MBO/MBP alignment")
     if int(merged.get('price_nonpositive_rows', 0)) > 0:
         warnings.append("merged: non-positive prices remain after alignment")
+    if int(merged.get('duplicate_ts_rows', 0)) > 0:
+        warnings.append(
+            "merged: multiple aligned rows share the same ts_event "
+            f"(ratio={float(merged.get('duplicate_ts_ratio', 0.0)):.2%}; expected for dense event streams)"
+        )
 
     final = report.get('final', {}) or {}
+    if int(final.get('duplicate_ts_rows', 0)) > 0:
+        warnings.append(
+            "final: output artifact contains repeated ts_event values "
+            f"(ratio={float(final.get('duplicate_ts_ratio', 0.0)):.2%}; not a blocker by itself for event-level data)"
+        )
     if int(final.get('missing_ts_rows', 0)) > 0 or int(final.get('non_monotonic_ts_steps', 0)) > 0:
         warnings.append("final: training artifact still has timestamp integrity issues")
     return warnings
@@ -1099,6 +1150,9 @@ def _evaluate_data_integrity_gates(
     cfg = dict(gates_cfg or {})
     enabled = bool(cfg.get('enabled', False))
     failures: list[dict] = []
+    max_duplicate_ts_ratio_raw = cfg.get('max_duplicate_ts_ratio', None)
+    max_duplicate_ts_ratio = None if max_duplicate_ts_ratio_raw in (None, '', False) else float(max_duplicate_ts_ratio_raw)
+    block_intermediate_non_monotonic = bool(cfg.get('block_on_intermediate_non_monotonic_timestamps', False))
 
     def _record(metric: str, value, threshold, reason: str) -> None:
         failures.append({
@@ -1125,10 +1179,27 @@ def _evaluate_data_integrity_gates(
             continue
         if bool(cfg.get('block_on_missing_timestamps', True)) and int(snapshot.get('missing_ts_rows', 0)) > 0:
             _record(f'{label}.missing_ts_rows', int(snapshot.get('missing_ts_rows', 0)), 0, 'missing timestamps detected')
-        if bool(cfg.get('block_on_duplicate_timestamps', True)) and int(snapshot.get('duplicate_ts_rows', 0)) > 0:
-            _record(f'{label}.duplicate_ts_rows', int(snapshot.get('duplicate_ts_rows', 0)), 0, 'duplicate timestamps detected')
-        if bool(cfg.get('block_on_non_monotonic_timestamps', True)) and int(snapshot.get('non_monotonic_ts_steps', 0)) > 0:
-            _record(f'{label}.non_monotonic_ts_steps', int(snapshot.get('non_monotonic_ts_steps', 0)), 0, 'non-monotonic timestamps detected')
+        if (
+            bool(cfg.get('block_on_duplicate_timestamps', False))
+            and max_duplicate_ts_ratio is not None
+            and float(snapshot.get('duplicate_ts_ratio', 0.0) or 0.0) > max_duplicate_ts_ratio
+        ):
+            _record(
+                f'{label}.duplicate_ts_ratio',
+                float(snapshot.get('duplicate_ts_ratio', 0.0) or 0.0),
+                max_duplicate_ts_ratio,
+                'duplicate timestamp ratio exceeded threshold',
+            )
+        if label == 'final':
+            if bool(cfg.get('block_on_non_monotonic_timestamps', True)) and int(snapshot.get('non_monotonic_ts_steps', 0)) > 0:
+                _record(f'{label}.non_monotonic_ts_steps', int(snapshot.get('non_monotonic_ts_steps', 0)), 0, 'non-monotonic timestamps detected')
+        elif block_intermediate_non_monotonic and int(snapshot.get('non_monotonic_ts_steps', 0)) > 0:
+            _record(
+                f'{label}.non_monotonic_ts_steps',
+                int(snapshot.get('non_monotonic_ts_steps', 0)),
+                0,
+                'intermediate non-monotonic timestamps detected',
+            )
         if bool(cfg.get('block_on_nonpositive_prices', True)) and int(snapshot.get('price_nonpositive_rows', 0)) > 0:
             _record(f'{label}.price_nonpositive_rows', int(snapshot.get('price_nonpositive_rows', 0)), 0, 'non-positive prices detected')
         if bool(cfg.get('block_on_negative_sizes', True)) and int(snapshot.get('size_negative_rows', 0)) > 0:
@@ -1138,9 +1209,14 @@ def _evaluate_data_integrity_gates(
     if bool(cfg.get('block_on_final_timestamp_issues', True)):
         final_ts_issue_count = (
             int(final_snapshot.get('missing_ts_rows', 0))
-            + int(final_snapshot.get('duplicate_ts_rows', 0))
             + int(final_snapshot.get('non_monotonic_ts_steps', 0))
         )
+        if (
+            bool(cfg.get('block_on_duplicate_timestamps', False))
+            and max_duplicate_ts_ratio is not None
+            and float(final_snapshot.get('duplicate_ts_ratio', 0.0) or 0.0) > max_duplicate_ts_ratio
+        ):
+            final_ts_issue_count += 1
         if final_ts_issue_count > 0:
             _record('final.timestamp_issues', final_ts_issue_count, 0, 'final artifact retains timestamp integrity issues')
 
@@ -1164,6 +1240,7 @@ def _evaluate_data_integrity_gates(
         'blocking_failure_count': int(len(failures)),
         'failures': failures,
         'thresholds': {
+            'max_duplicate_ts_ratio': max_duplicate_ts_ratio,
             'max_merge_lag_ratio': max_lag_ratio,
             'max_matched_mbp_lag_ms': max_lag_ms,
         },
@@ -1427,7 +1504,7 @@ def _canonicalize_input_file(
             f'canonical_{kind}',
             {'kind': kind, 'processed_shards': int(shard_idx + 1), 'last_shard': record},
         )
-    return records, _finalize_integrity_accumulator(integrity)
+    return _records_in_temporal_order(records), _finalize_integrity_accumulator(integrity)
 
 
 def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
@@ -1473,7 +1550,7 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     if workers <= 1:
         for task in tasks:
             _collect(worker_fn(task))
-        return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
+        return _records_in_temporal_order(results)
     available_methods = set(multiprocessing.get_all_start_methods())
     preferred_method = 'fork' if sys.platform != 'win32' and 'fork' in available_methods else 'spawn'
     ctx_mp = multiprocessing.get_context(preferred_method)
@@ -1483,7 +1560,7 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     ) as pool:
         for result in pool.imap_unordered(worker_fn, tasks):
             _collect(result)
-    return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
+    return _records_in_temporal_order(results)
 
 
 def _process_mbo_shard_task(task: dict) -> dict:
@@ -1587,14 +1664,14 @@ def _merge_shard_task(task: dict) -> dict:
 
 
 def _load_records_frame(records: list[dict]) -> pd.DataFrame:
-    frames = [read_table(record['path']) for record in sorted(records, key=lambda item: int(item.get('shard_idx', 0)))]
+    frames = [read_table(record['path']) for record in _records_in_temporal_order(records)]
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
 
 def _load_records_columns(records: list[dict], columns: list[str]) -> pd.DataFrame:
-    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    ordered = _records_in_temporal_order(records)
     frames: list[pd.DataFrame] = []
     for record in ordered:
         frame = read_table(record['path'])
@@ -1612,7 +1689,7 @@ def _load_records_columns(records: list[dict], columns: list[str]) -> pd.DataFra
 
 
 def _load_lob_source_from_records(records: list[dict], kind: str) -> pd.DataFrame:
-    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    ordered = _records_in_temporal_order(records)
     frames: list[pd.DataFrame] = []
     for record in ordered:
         frame = _lob_source_frame(read_table(record['path']), kind)
@@ -1636,7 +1713,7 @@ def _rewrite_records_from_frame(
 ) -> list[dict]:
     out_dir = _artifact_phase_dir(output_dir, 'features', phase_name)
     updated: list[dict] = []
-    ordered_records = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
+    ordered_records = _records_in_temporal_order(records)
     start = 0
     for record in ordered_records:
         shard_rows = int(record.get('rows', 0))
@@ -3572,8 +3649,9 @@ def run_refinery(
     if mbp_records:
         mbp_feature_dir = _artifact_phase_dir(output_dir, 'features', 'mbp')
         mbp_tasks = []
-        for idx, record in enumerate(sorted(mbp_records, key=lambda item: int(item['shard_idx']))):
-            prev_record = mbp_records[idx - 1] if idx > 0 else None
+        ordered_mbp_records = _records_in_temporal_order(mbp_records)
+        for idx, record in enumerate(ordered_mbp_records):
+            prev_record = ordered_mbp_records[idx - 1] if idx > 0 else None
             mbp_tasks.append({
                 'current': record,
                 'prev': prev_record,
@@ -3606,8 +3684,9 @@ def run_refinery(
     )
     mbo_pass1_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_pass1')
     mbo_tasks = []
-    for idx, record in enumerate(sorted(mbo_records, key=lambda item: int(item['shard_idx']))):
-        prev_record = mbo_records[idx - 1] if idx > 0 else None
+    ordered_mbo_records = _records_in_temporal_order(mbo_records)
+    for idx, record in enumerate(ordered_mbo_records):
+        prev_record = ordered_mbo_records[idx - 1] if idx > 0 else None
         mbo_tasks.append({
             'current': record,
             'prev': prev_record,
@@ -3633,7 +3712,7 @@ def run_refinery(
     mbo_final_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_final')
     reusable_mbo_final_records: list[dict] = []
     if resume:
-        ordered_pass1 = sorted(mbo_pass1_records, key=lambda item: int(item['shard_idx']))
+        ordered_pass1 = _records_in_temporal_order(mbo_pass1_records)
         reusable_mbo_final_records = []
         for record in ordered_pass1:
             shard_idx = int(record['shard_idx'])
@@ -3682,7 +3761,7 @@ def run_refinery(
         mbp_feature_shards=int(len(mbp_feature_records)),
     )
     merged_dir = _artifact_phase_dir(output_dir, 'features', 'merged')
-    ordered_mbo_final = sorted(mbo_final_records, key=lambda item: int(item['shard_idx']))
+    ordered_mbo_final = _records_in_temporal_order(mbo_final_records)
     merge_tasks = []
     for record in ordered_mbo_final:
         shard_idx = int(record['shard_idx'])
