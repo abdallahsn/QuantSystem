@@ -1,0 +1,791 @@
+# QuantSystem V19 - Commands Reference
+
+هذا الملف يجمع أوامر التشغيل المهمة في المشروع مع شرح بسيط لكل أمر وأهم الخيارات.
+
+ملاحظات سريعة:
+- شغل الأوامر من جذر المشروع: `/Users/abdallah/Downloads/QS_FINAL`
+- استخدم `python SCRIPT.py --help` لرؤية help الرسمي لأي سكربت.
+- لا تعتمد على أي نتيجة تداول قبل فحص زمني، walk-forward، وتكاليف تنفيذ واقعية.
+- الخيارات الخطرة مثل `--allow_in_sample_data_override` و `--allow_oracle_forward_return` للتشخيص فقط وليست لتقييم نهائي.
+
+---
+
+## 1) تجهيز البيئة
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+ينشئ بيئة Python محلية ويثبت المتطلبات.
+
+الخيارات/الأجزاء:
+- `python -m venv .venv`: إنشاء virtual environment.
+- `source .venv/bin/activate`: تفعيل البيئة.
+- `pip install -r requirements.txt`: تثبيت مكتبات المشروع.
+
+```bash
+bash install_tf_gpu_cu12.sh
+```
+
+يثبت TensorFlow مع CUDA 12 داخل البيئة المحلية ويحاول إصلاح روابط GPU إذا لم تظهر.
+
+```bash
+bash diagnose_tf_gpu_libs.sh
+```
+
+يشخص TensorFlow/GPU ويعرض المكتبات الناقصة وروابط CUDA الحالية.
+
+```bash
+bash fix_tf_gpu_symlinks.sh
+```
+
+يعيد بناء symlinks لمكتبات NVIDIA داخل TensorFlow package directory.
+
+```bash
+bash repair_tf215_cuda12_env.sh
+```
+
+يعيد تثبيت TensorFlow 2.15 وحزم CUDA 12.2 المتوافقة ثم يتحقق من GPU.
+
+```bash
+python server_sanity_check.py
+```
+
+يفحص نسخة Python، المتطلبات، TensorFlow، GPU، وبعض أدوات النظام.
+
+---
+
+## 2) Stage 1 - بناء بيانات التدريب من MBO/MBP
+
+```bash
+python stage1_refinery.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19 \
+  --label_mode v19 \
+  --chunk_rows 2000000 \
+  --mbo_workers 8 \
+  --mbp_workers 8
+```
+
+يبني artifact تدريبي من بيانات MBO/MBP: normalized parquet, merged features, labels, scaler params, LOB tensors, manifest.
+
+أهم الخيارات:
+- `--config`: ملف YAML لتغيير الإعدادات.
+- `--mbo`: مسار ملف/مجلد MBO. مطلوب.
+- `--mbp`: مسار ملف/مجلد MBP10. مطلوب.
+- `--symbol`: رمز العقد/الأداة عند الحاجة.
+- `--output`: مجلد المخرجات.
+- `--chunk_rows` أو `--chunksize`: حجم دفعات قراءة CSV.
+- `--label_mode {v19}`: نظام labels.
+- `--n_workers`, `--mbo_workers`, `--mbp_workers`: عدد العمال للمعالجة.
+- `--resume`: استكمال من checkpoints.
+- `--target_bars`: عدد volume bars لكل session.
+- `--label_horizon`: أفق label الأساسي.
+- `--event_roll_window`: نافذة event filter.
+- `--feature_roll_window`: نافذة ميزات labels.
+- `--direction_threshold_ticks`: حد الحركة الاتجاهية بالـ ticks.
+- `--causal_threshold_mode {expanding,fixed}`: طريقة اختيار threshold بدون تسرب.
+- `--raw_event_target_rate`: نسبة أحداث عامة مستهدفة.
+- `--training_event_target_rate`: نسبة أحداث تدريب مستهدفة.
+- `--training_event_score_threshold`: threshold ثابت اختياري لأحداث التدريب.
+- `--lob_event_sample`: الحد الأقصى لمواضع LOB tensors.
+- `--tp_mult`, `--sl_mult`: مضاعفات TP/SL.
+- `--tp_sl_threshold_mode {fixed,atr}`: طريقة حساب TP/SL.
+- `--adaptive_horizon` / `--no_adaptive_horizon`: تشغيل/تعطيل horizon متكيف مع ATR.
+- `--trend_filter` / `--no_trend_filter`: فلتر Kalman للترند.
+- `--trend_filter_strict` / `--no_trend_filter_strict`: تشديد فلتر الترند.
+- `--emit_meta_labels` / `--no_emit_meta_labels`: إخراج meta/context labels.
+- `--use_soft_labels` / `--no-use_soft_labels`: تشغيل/تعطيل soft labels.
+- `--soft_label_mode {analytical,monte_carlo}`: طريقة soft labels.
+- `--soft_label_n_scenarios`: عدد سيناريوهات Monte Carlo.
+- `--soft_label_random_seed`: seed لتكرارية Monte Carlo.
+- `--soft_label_horizon_std`, `--soft_label_tp_std`, `--soft_label_sl_std`: jitter للـ horizon/TP/SL في Monte Carlo.
+- `--kalman_slope_threshold`: حد ميل Kalman.
+- `--trend_strength_min`: أقل قوة ترند لعكس/رفض label.
+- `--regime_mode {rules,wasserstein,off}`: طريقة regime detection.
+- `--regime_stride`, `--regime_window`, `--regime_progress_every`: إعدادات regime.
+- `--merge_tolerance_ms`: سماحية merge بين MBO و MBP.
+- `--step4_min_parallel_rows`: أقل عدد rows لتفعيل parallel forward scan.
+- `--enforce-economic-tp-floor` / `--no-enforce-economic-tp-floor`: ربط TP بتكاليف التنفيذ.
+
+---
+
+## 3) بديل Stage 1 الكامل
+
+```bash
+python prepare_training_data.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19 \
+  --label_mode v19
+```
+
+ينفذ Data Refinery الكامل. خياراته قريبة جدًا من `stage1_refinery.py`، ويقبل أيضًا:
+- `--config`: إعدادات من YAML.
+- `--chunk_rows` أو `--chunksize`: حجم chunks.
+- `--resume`: استكمال تشغيل سابق.
+- `--use_soft_labels` / `--no-use_soft_labels`: التحكم بالـ soft labels.
+- `--enforce-economic-tp-floor` / `--no-enforce-economic-tp-floor`: ضبط labels حسب التكلفة.
+
+استخدم `stage1_refinery.py` عندما تريد Stage 1 فقط بشكل أوضح، واستخدم هذا السكربت عند الحاجة لمسار refinery الكامل القديم.
+
+---
+
+## 4) Day-Trading Hybrid Refinery
+
+```bash
+python prepare_day_trading.py \
+  --mbo /path/to/mbo_parquet_or_dir \
+  --mbp /path/to/mbp10_file_or_dir \
+  --output pipeline_day_trading/features \
+  --freq 5min \
+  --horizon 6 \
+  --tp_mult 1.5 \
+  --sl_mult 1.0
+```
+
+يحول بيانات tick/order-book إلى شموع 5m/15m/30m مع ميزات intrabar وlabels وLOB tensors.
+
+الخيارات:
+- `--mbo`: مسار MBO parquet/csv أو مجلد. مطلوب.
+- `--mbp`: مسار MBP10 اختياري لتحسين ميزات order book.
+- `--output`: مجلد المخرجات.
+- `--freq {5min,15min,30min}`: فريم الشموع.
+- `--horizon`: عدد الشموع في أفق label.
+- `--tp_mult`: TP = المضاعف × ATR.
+- `--sl_mult`: SL = المضاعف × ATR.
+- `--no_lob`: تخطي بناء LOB tensors.
+- `--strict_train_pool`: تضييق train_event_flag لجلسات نشطة وATR كاف.
+
+```bash
+python verify_day_trading_dataset.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy \
+  --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy
+```
+
+يفحص artifact day-trading قبل التدريب.
+
+الخيارات:
+- `--data`: ملف `day_trading_features.parquet`. مطلوب.
+- `--lob`: ملف `lob_tensors.npy` اختياري.
+- `--lob_ts`: timestamps للـ LOB؛ إذا لم يمرر يحاول بجانب `--lob`.
+
+---
+
+## 5) تدريب النموذج الرئيسي
+
+```bash
+python train_v19.py \
+  --data outputs_v19 \
+  --output outputs_v19_train \
+  --phase full \
+  --catboost_device cpu
+```
+
+مدخل التدريب الرئيسي leakage-safe. يقبل artifact root أو manifest أو parquet.
+
+أهم الخيارات:
+- `--data` أو `--csv`: artifact dir/manifest/parquet. مطلوب.
+- `--lob`: ملف `lob_tensors.npy` اختياري.
+- `--lob_ts`: ملف `lob_tensor_timestamps.npy` اختياري.
+- `--output`: مجلد مخرجات التدريب.
+- `--epochs`: epochs للطبقات العصبية.
+- `--batch`: batch size.
+- `--n_folds`: عدد folds للـ OOF/stacking.
+- `--test_size`: نسبة holdout زمنية.
+- `--embargo_pct`: embargo بين train/test لتقليل leakage مع horizons متداخلة.
+- `--min_train_pct`: أقل نسبة تدريب مقبولة.
+- `--train_frac`: نسبة train الزمنية.
+- `--min_seq_coverage`: أقل تغطية sequence للـ LOB/Meta.
+- `--stage`: `0=all`, `1=stage1`, `2=stage2`, `3=stage3`.
+- `--phase {full,all,catboost,cb,visual,deeplob,train,training,meta}`: اختيار مرحلة بالاسم.
+- `--catboost_device {auto,cpu,gpu}`: جهاز CatBoost.
+- `--training_mode`: نمط التدريب.
+- `--quality_weight_strong`, `--quality_weight_weak`: أوزان جودة labels.
+- `--sample_weight_mode {combined,geometric}`: طريقة sample weights للـ bias target.
+- `--stage1_target {bias,soft_label}`: classifier على bias أو regression على soft_label.
+- `--split_time`: بداية holdout timestamp صريحة.
+- `--train_days`: تدريب على آخر N أيام قبل split_time.
+- `--backtest_days`: اختبار آخر N أيام.
+- `--window_end`: نهاية النافذة الزمنية.
+- `--config`: ملف إعدادات.
+- `--seq_len`: طول sequence للـ MetaLearner/safe split.
+
+أمثلة:
+
+```bash
+python train_v19.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy \
+  --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy \
+  --output outputs_day_trading_train \
+  --phase full \
+  --catboost_device cpu
+```
+
+```bash
+python train_v19.py \
+  --data outputs_v19 \
+  --output outputs_v19_soft \
+  --phase catboost \
+  --stage1_target soft_label \
+  --sample_weight_mode geometric \
+  --catboost_device cpu
+```
+
+---
+
+## 6) تدريب مراحل منفصلة
+
+```bash
+python stage2_catboost.py \
+  --csv outputs_v19/final/training_features_ready.csv \
+  --output outputs_v19_train \
+  --catboost_device cpu
+```
+
+يشغل مرحلة CatBoost/XGBoost stacking فقط.
+
+الخيارات:
+- `--csv`: ملف features من Stage 1. مطلوب.
+- `--lob`, `--lob_ts`: LOB اختياري.
+- `--output`: مجلد المخرجات.
+- `--n_folds`, `--test_size`, `--embargo_pct`: إعدادات validation زمنية.
+- `--min_train_pct`, `--train_frac`, `--min_seq_coverage`: شروط حجم وتغطية التدريب.
+- `--catboost_device {auto,cpu,gpu}`: جهاز CatBoost.
+- `--training_mode`: نمط التدريب.
+- `--quality_weight_strong`, `--quality_weight_weak`: أوزان جودة labels.
+- `--split_time`, `--train_days`, `--backtest_days`, `--window_end`: تحكم زمني.
+- `--config`: إعدادات YAML.
+
+```bash
+python stage3_train.py \
+  --csv outputs_v19/final/training_features_ready.csv \
+  --lob outputs_v19/lob_tensors.npy \
+  --lob_ts outputs_v19/lob_tensor_timestamps.npy \
+  --output outputs_v19_train
+```
+
+يشغل التدريب النهائي/MetaLearner فقط.
+
+الخيارات:
+- `--csv`: ملف features. مطلوب.
+- `--lob`, `--lob_ts`: LOB اختياري.
+- `--output`: مجلد المخرجات.
+- `--epochs`, `--batch`: إعدادات التدريب العصبي.
+- `--min_train_pct`, `--train_frac`, `--min_seq_coverage`: شروط training window.
+- `--training_mode`: نمط التدريب.
+- `--quality_weight_strong`, `--quality_weight_weak`: أوزان جودة labels.
+- `--split_time`, `--train_days`, `--backtest_days`, `--window_end`: تحكم زمني.
+- `--config`: إعدادات YAML.
+
+```bash
+python build_lean_model.py \
+  --data outputs_v19 \
+  --output outputs_v19_lean \
+  --label-col bias_label \
+  --event-col train_event_flag
+```
+
+يبني CatBoost lean أبسط وأسرع.
+
+الخيارات:
+- `--data`: artifact root/manifest/final dir/parquet. مطلوب.
+- `--output`: مجلد المخرجات.
+- `--label-col`: عمود الهدف.
+- `--event-col`: عمود event gate.
+- `--train-frac`: نسبة تدريب زمنية.
+- `--features`: قائمة features مباشرة.
+- `--features-file`: ملف features، feature في كل سطر.
+- `--rel-vol-window`: نافذة rel_vol.
+- `--iterations`, `--depth`, `--learning-rate`, `--l2-leaf-reg`, `--od-wait`: إعدادات CatBoost.
+- `--seed`: seed للتكرارية.
+- `--device {cpu}`: الجهاز المدعوم حاليًا.
+- `--verbose-every`: تكرار الطباعة أثناء التدريب.
+
+---
+
+## 7) Prediction / Shadow / Paper / Monitoring
+
+```bash
+python predict_v19.py \
+  --models outputs_v19_train \
+  --data outputs_v19 \
+  --mode backtest \
+  --output outputs_v19_predictions \
+  --input_scaled
+```
+
+يشغل prediction engine في backtest أو live mode.
+
+الخيارات:
+- `--models`: مجلد models/artifacts.
+- `--data` أو `--csv`: artifact/parquet في backtest mode.
+- `--mode {backtest,live}`: وضع التشغيل.
+- `--output`: مجلد المخرجات.
+- `--visual_npy`: visual embeddings جاهزة ومطابقة للصفوف.
+- `--input_scaled`: استخدمه إذا كانت features scaled مسبقًا.
+
+```bash
+python shadow_v19.py \
+  --csv outputs_v19 \
+  --models outputs_v19_train \
+  --output outputs_v19_shadow \
+  --input_scaled
+```
+
+يشغل shadow mode على بيانات جاهزة بدون تنفيذ أوامر حقيقية.
+
+الخيارات:
+- `--csv`: artifact أو features. مطلوب.
+- `--models`: مجلد النماذج.
+- `--output`: مجلد المخرجات.
+- `--visual_npy`: embeddings اختيارية.
+- `--input_scaled`: البيانات scaled مسبقًا.
+- `--config`: إعدادات YAML.
+
+```bash
+python paper_v19.py \
+  --csv outputs_v19 \
+  --models outputs_v19_train \
+  --output outputs_v19_paper \
+  --input_scaled \
+  --mode paper
+```
+
+يشغل paper/rollout runner.
+
+الخيارات:
+- `--csv`: artifact أو features. مطلوب.
+- `--models`: مجلد النماذج.
+- `--output`: مجلد المخرجات.
+- `--visual_npy`: embeddings اختيارية.
+- `--input_scaled`: البيانات scaled مسبقًا.
+- `--config`: إعدادات YAML.
+- `--mode {paper,rollout}`: وضع paper أو rollout.
+
+```bash
+python monitor_v19.py \
+  --events /path/to/events.csv \
+  --models outputs_v19_train \
+  --output outputs_v19_monitoring
+```
+
+يشغل monitoring runner على ملف events.
+
+الخيارات:
+- `--events`: ملف events. مطلوب.
+- `--models`: مجلد النماذج.
+- `--output`: مجلد المخرجات.
+- `--config`: إعدادات YAML.
+
+---
+
+## 8) Backtesting
+
+```bash
+python backtest_v19.py \
+  --data outputs_v19 \
+  --models outputs_v19_train \
+  --output outputs_v19_backtest \
+  --input_scaled \
+  --visual_npy outputs_v19_train/visual_embeddings_v19.npy
+```
+
+يشغل causal replay backtest مع تكاليف، spread/slippage، latency، وقيود risk.
+
+أهم الخيارات:
+- `--data` أو `--csv`: artifact dir/manifest/parquet. مطلوب.
+- `--models`: مجلد النماذج.
+- `--output`: مجلد المخرجات.
+- `--visual_npy`: embeddings مطابقة للصفوف.
+- `--meta_npy`: meta features stage-1 مطابقة للصفوف.
+- `--input_scaled`: البيانات scaled مسبقًا.
+- `--tick_size`: حجم tick.
+- `--tick_value`: قيمة tick.
+- `--round_trip_cost_pips`: تكلفة round-trip بالـ pips.
+- `--commission_per_side`: عمولة لكل جهة.
+- `--min_spread_ticks`: أقل spread بالـ ticks.
+- `--min_slippage_ticks`: أقل slippage بالـ ticks.
+- `--spread_multiplier`: مضاعف spread.
+- `--max_size`: أكبر حجم position.
+- `--starting_equity`: رأس المال الابتدائي.
+- `--latency_rows`: latency بعدد rows.
+- `--max_daily_loss_pct`: أقصى خسارة يومية.
+- `--direction_threshold_ticks`: حد الاتجاه.
+- `--tp_mult`, `--sl_mult`: مضاعفات TP/SL.
+- `--start_ts`, `--end_ts`: نافذة زمنية للباك تست.
+- `--max_horizon_steps`: سقف replay horizon بالصفوف.
+- `--fixed_horizon`: horizon بالدقائق بدل label horizon.
+- `--bar_minutes`: دقائق الشمعة مع `--fixed_horizon`.
+- `--disable_single_position_only`: السماح بصفقات متداخلة.
+- `--cooldown_rows`: عدد rows انتظار بعد إغلاق صفقة.
+- `--relax_policy_ev`: تخفيف شرط EV للتشخيص.
+- `--policy_min_edge`: override لحد الاحتمال.
+- `--skip_event_gate`: تعطيل EventGate للتشخيص.
+- `--long_only`: فتح LONG فقط، وتسجيل SHORT كإشارات متخطاة.
+- `--allow_in_sample_live_meta_override`: خطر، يسمح meta features داخل العينة.
+- `--allow_in_sample_data_override`: خطر، يسمح backtest على بيانات تدريب/غير holdout.
+- `--allow_oracle_forward_return`: خطر، يستخدم forward_return المخزن عند عدم توفر replay window.
+
+مثال Day-Trading:
+
+```bash
+python backtest_v19.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --models outputs_day_trading_train \
+  --output outputs_day_trading_backtest \
+  --input_scaled \
+  --fixed_horizon 30 \
+  --bar_minutes 5
+```
+
+```bash
+python raw_backtest_v19.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --models outputs_v19_train \
+  --output outputs_v19_raw_backtest
+```
+
+يبني dataset مؤقت من raw MBO/MBP ثم يشغل backtest.
+
+الخيارات:
+- `--mbo`: ملف MBO خام. مطلوب.
+- `--mbp`: ملف MBP خام. مطلوب.
+- `--models`: مجلد النماذج. مطلوب.
+- `--output`: مجلد المخرجات.
+- `--config`: إعدادات YAML.
+- `--start_ts`, `--end_ts`: نافذة زمنية.
+- `--tick_size`, `--tick_value`, `--round_trip_cost_pips`: إعدادات instrument/cost.
+- `--max_size`, `--starting_equity`: إدارة رأس المال.
+- `--direction_threshold_ticks`, `--tp_mult`, `--sl_mult`: إعدادات القرار/TP/SL.
+- `--max_horizon_steps`: سقف horizon بالصفوف.
+- `--disable_single_position_only`: السماح بالتداخل.
+- `--cooldown_rows`: انتظار بعد الصفقة.
+- `--allow_oracle_forward_return`: خطر، للتشخيص فقط.
+
+```bash
+python patch_backtest_v19_daytrade.py
+```
+
+يرقع `backtest_v19.py` لإضافة/تأكيد دعم day-trade LONG-only وhorizon CLI.
+
+الخيارات:
+- `--target`: مسار `backtest_v19.py` المستهدف.
+
+---
+
+## 9) Walk-Forward و Readiness
+
+```bash
+python walkforward_v19.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19_walkforward
+```
+
+يشغل تقييم walk-forward زمني من raw MBO/MBP مع release gates.
+
+الخيارات:
+- `--mbo`: ملف MBO. مطلوب.
+- `--mbp`: ملف MBP. مطلوب.
+- `--output`: مجلد المخرجات.
+- `--config`: إعدادات YAML.
+- `--gates`: ملف release gates.
+
+```bash
+python readiness_v19.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --models outputs_v19_train \
+  --output outputs_v19_readiness
+```
+
+يفحص جاهزية الإنتاج: data, models, gates, shadow/live checks عند توفر models.
+
+الخيارات:
+- `--mbo`: ملف MBO. مطلوب.
+- `--mbp`: ملف MBP. مطلوب.
+- `--output`: مجلد المخرجات.
+- `--config`: إعدادات YAML.
+- `--gates`: ملف release gates.
+- `--models`: مجلد نماذج اختياري.
+
+---
+
+## 10) Visualization / Reports
+
+```bash
+python label_visualizer_5m.py \
+  --features outputs_v19/final/training_features_ready.csv \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output label_viz_5m.html
+```
+
+يرسم labels أو قرارات CatBoost على شموع 5 دقائق.
+
+الخيارات:
+- `--features`: ملف training features. مطلوب.
+- `--mbo`: MBO خام اختياري.
+- `--mbp`: MBP خام اختياري.
+- `--models_dir`: إذا مررته يعرض قرارات CatBoost بدل labels.
+- `--output`: ملف HTML الناتج.
+- `--freq`: فريم التجميع.
+- `--bars`: عدد الشموع.
+- `--future_bars`: عدد شموع مستقبلية لفحص label quality بصريًا.
+
+```bash
+python plot_5m_catboost.py \
+  --csv outputs_v19/final/training_features_ready.csv \
+  --models_dir outputs_v19_train \
+  --output outputs_v19_plots \
+  --freq 5min
+```
+
+يرسم dashboard لقرارات CatBoost على 5 دقائق.
+
+الخيارات:
+- `--csv`: ملف features. مطلوب.
+- `--models_dir`: مجلد artifacts.
+- `--output`: مجلد HTML/CSV reports.
+- `--freq`: فريم resampling.
+- `--name`: prefix للملفات.
+- `--raw_only`: عرض raw CatBoost فقط بدون policy/RSM.
+
+```bash
+python plot_refinery_compare_5m.py \
+  --mbo /path/to/mbo.csv \
+  --refinery_csv outputs_v19/final/training_features_ready.csv \
+  --output outputs_v19/refinery_compare_5m
+```
+
+يقارن raw candles مع refinery features يوميًا.
+
+الخيارات:
+- `--mbo`: ملف MBO خام. مطلوب.
+- `--refinery_csv`: features من refinery. مطلوب.
+- `--output`: مجلد صفحات المقارنة.
+- `--mbp`: MBP اختياري إذا MBO فيه gaps.
+- `--freq`: فريم التجميع.
+- `--raw_chunksize`, `--refinery_chunksize`: أحجام القراءة.
+- `--start`, `--end`: نافذة زمنية.
+
+```bash
+python plot_best_soft_label_lob_heatmap.py \
+  --pipeline outputs_v19 \
+  --out outputs_v19/best_soft_label_lob.png
+```
+
+يرسم heatmap للـ LOB عند أعلى soft_label.
+
+الخيارات:
+- `--pipeline`: جذر refinery.
+- `--out`: ملف PNG الناتج؛ إذا فارغ يفتح نافذة.
+- `--price-window-minutes`: عرض مسار السعر حول الحدث.
+- `--price-out`: ملف PNG لمسار السعر.
+- `--no-price-path`: لا ترسم مسار السعر.
+
+```bash
+python plot_v19_power_dashboard.py \
+  --pipeline outputs_v19 \
+  --models-dir outputs_v19_train \
+  --out outputs_v19/power_dashboard.png \
+  --freq 5min
+```
+
+يرسم dashboard يجمع LOB + CatBoost + مؤشرات.
+
+الخيارات:
+- `--pipeline`: مجلد refinery.
+- `--models-dir`: مجلد النماذج.
+- `--out`: ملف PNG الناتج. مطلوب.
+- `--window-minutes`: عرض الزمن حول المركز.
+- `--freq`: فريم الشموع.
+- `--anchor {best-soft-label,ts}`: اختيار مركز الرسم.
+- `--ts-event`: timestamp عند `anchor=ts`.
+- `--signal-edge`: حد فارق احتمالات LONG/SHORT.
+- `--no-lob`: عدم رسم LOB heatmap.
+
+```bash
+python output_report.py
+```
+
+ينشئ/يطبع تقرير مخرجات حسب منطق السكربت. افحص الكود قبل الاعتماد لأنه لا يملك CLI options واضحة.
+
+---
+
+## 11) أدوات مساعدة
+
+```bash
+python find_training_artifacts.py /path/to/QS_FINAL --max-files 5000
+```
+
+يبحث عن ملفات training/artifacts داخل مجلد.
+
+الخيارات:
+- `root`: المجلد المراد فحصه، اختياري.
+- `--max-files`: أقصى عدد نتائج لكل اسم.
+
+```bash
+python extract_quarterly_contract.py /path/to/databento.csv \
+  --root ES \
+  --year 2025 \
+  --month 6 \
+  --output ES_2025_06.csv
+```
+
+يستخرج العقد الربع سنوي الصحيح من Databento CSV.
+
+الخيارات:
+- `input_file`: ملف Databento CSV. مطلوب.
+- `--month`: الشهر يدويًا.
+- `--year`: السنة يدويًا.
+- `--root`: رمز الأصل مثل ES/MES/6B.
+- `--output`: ملف CSV الناتج.
+- `--chunksize`: حجم القراءة streaming.
+
+```bash
+python deeplob_refinery_smoke.py \
+  --mbo sample_mbo.csv \
+  --mbp sample_mbp10.csv \
+  --output outputs_deeplob_smoke
+```
+
+اختبار سريع لمسار DeepLOB/refinery.
+
+الخيارات:
+- `--mbo`: ملف MBO.
+- `--mbp`: ملف MBP10.
+- `--output`: مجلد المخرجات.
+- `--time_steps`: طول نافذة DeepLOB.
+- `--max_tensors`: سقف عدد tensors.
+- `--max_train_samples`: سقف عينات التدريب للتجربة.
+- `--epochs`: epochs تدريب مساعد.
+- `--batch`: batch size.
+- `--expect_gpu`: يفشل إذا لم ير TensorFlow GPU.
+- `--keep_output`: لا يحذف المخرجات السابقة.
+
+```bash
+python regime_config.py
+```
+
+يطبع/يفحص إعدادات regimes حسب الكود الحالي. لا توجد CLI options.
+
+```bash
+python live_predictor.py
+```
+
+ملف pipeline للتنبؤ الحي، لكن الاستخدام الأساسي برمجي وليس CLI.
+
+مثال برمجي:
+
+```python
+from live_predictor import run_bar_pipeline
+
+signal, confidence, debug = run_bar_pipeline(
+    df_bar_row=bar,
+    models=regime_models,
+    ensemble=online_ensemble,
+)
+```
+
+```bash
+python online_learning.py
+```
+
+طبقة online learning/drift detection، والاستخدام الأساسي برمجي عبر classes داخل الملف.
+
+---
+
+## 12) فحوصات بعد أي تعديل
+
+```bash
+python -m py_compile \
+  prepare_training_data.py \
+  prepare_day_trading.py \
+  train_v19.py \
+  predict_v19.py \
+  backtest_v19.py \
+  walkforward_v19.py \
+  live_predictor.py \
+  online_learning.py \
+  verify_day_trading_dataset.py
+```
+
+يفحص syntax للملفات الأساسية.
+
+```bash
+python verify_day_trading_dataset.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy
+```
+
+يفحص day-trading artifact قبل التدريب.
+
+```bash
+python train_v19.py \
+  --data /path/to/artifact_or_parquet \
+  --output /path/to/train_out \
+  --phase catboost \
+  --catboost_device cpu
+```
+
+تدريب تشخيصي سريع نسبيًا.
+
+```bash
+python backtest_v19.py \
+  --data /path/to/artifact_or_parquet \
+  --models /path/to/train_out \
+  --output /path/to/backtest_out \
+  --input_scaled \
+  --relax_policy_ev
+```
+
+Backtest تشخيصي عندما لا تظهر صفقات بسبب policy صارمة.
+
+---
+
+## 13) أوامر Git مفيدة
+
+```bash
+git status --short
+```
+
+يعرض الملفات المعدلة أو الجديدة.
+
+```bash
+git diff -- path/to/file.py
+```
+
+يعرض الفرق في ملف محدد.
+
+```bash
+git log --oneline --decorate -20
+```
+
+يعرض آخر 20 commit.
+
+---
+
+## 14) أوامر Help السريعة
+
+```bash
+python stage1_refinery.py --help
+python prepare_training_data.py --help
+python prepare_day_trading.py --help
+python train_v19.py --help
+python predict_v19.py --help
+python backtest_v19.py --help
+python raw_backtest_v19.py --help
+python walkforward_v19.py --help
+python readiness_v19.py --help
+```
+
+استخدمها عندما تريد النص الرسمي للخيارات من السكربت نفسه.
