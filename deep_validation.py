@@ -1,8 +1,5 @@
 """
 deep_validation.py — 5 Scientific Tests for V16Pro-3
-
-LEGACY / NON-RELEASE:
-هذا السكربت مرجعي فقط ولا يدخل ضمن release path أو readiness لـ V19.
 """
 import sys, os, time, tempfile, warnings
 import numpy as np

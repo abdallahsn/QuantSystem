@@ -43,10 +43,6 @@ from modules.feature_artifact_v19 import (
     load_feature_artifact,
     resolve_artifact_root,
 )
-from modules.execution_replay_v19 import (
-    realized_fill_pricing as _shared_realized_fill_pricing,
-    simulate_trade_path as _shared_simulate_trade_path,
-)
 from modules.slippage_model import SlippageModel, position_size_from_prediction
 from predict_v19 import V19PredictionEngine
 
@@ -207,13 +203,16 @@ def _simulate_trade_path(
     entry_idx: int,
     direction: str,
     prices: np.ndarray,
+    highs: np.ndarray | None,
+    lows: np.ndarray | None,
     horizons: np.ndarray,
     micro_atr: np.ndarray,
     tick_size: float,
     direction_threshold_ticks: float = 1.0,
-    tp_mult: float = 1.2,
+    tp_mult: float = 1.5,
     sl_mult: float = 1.0,
     max_horizon_steps: int | None = None,
+    replay_horizon_steps: int | None = None,
     # ── Wall data (اللايف بيستخدمها — الباك تست كان يتجاهلها) ──
     row_data: dict | None = None,
 ) -> dict | None:
@@ -226,13 +225,19 @@ def _simulate_trade_path(
         return None
     if entry_idx < 0 or entry_idx >= len(prices):
         return None
+    highs = prices if highs is None else np.asarray(highs, dtype=np.float64)
+    lows = prices if lows is None else np.asarray(lows, dtype=np.float64)
+    if len(highs) != len(prices) or len(lows) != len(prices):
+        highs = lows = prices
 
     entry_price = float(prices[entry_idx])
     if not np.isfinite(entry_price) or entry_price <= 0:
         return None
 
     horizon_steps = int(horizons[entry_idx]) if entry_idx < len(horizons) else 0
-    if max_horizon_steps is not None and int(max_horizon_steps) > 0:
+    if replay_horizon_steps is not None and int(replay_horizon_steps) > 0:
+        horizon_steps = int(replay_horizon_steps)
+    elif max_horizon_steps is not None and int(max_horizon_steps) > 0:
         horizon_steps = min(horizon_steps, int(max_horizon_steps)) if horizon_steps > 0 else int(max_horizon_steps)
     if horizon_steps <= 0:
         return None
@@ -309,28 +314,49 @@ def _simulate_trade_path(
 
     # ── Replay المسار الزمني ───────────────────────────────────────────
     future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_highs = np.asarray(highs[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_lows = np.asarray(lows[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
     if future_prices.size == 0:
         return None
 
     exit_idx = exit_cap_idx
     exit_reason = 'horizon'
-    for offset, future_price in enumerate(future_prices, start=1):
-        if direction == 'LONG':
-            if future_price >= tp_level:
-                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
-            if future_price <= sl_level:
-                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
-        else:
-            if future_price <= tp_level:
-                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
-            if future_price >= sl_level:
-                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
-
     exit_price = float(prices[exit_idx])
+    for offset, (future_high, future_low) in enumerate(zip(future_highs, future_lows), start=1):
+        if direction == 'LONG':
+            hit_tp = float(future_high) >= float(tp_level)
+            hit_sl = float(future_low) <= float(sl_level)
+            if hit_tp or hit_sl:
+                exit_idx = entry_idx + offset
+                if hit_sl:
+                    exit_reason = 'sl'
+                    exit_price = float(sl_level)
+                else:
+                    exit_reason = 'tp'
+                    exit_price = float(tp_level)
+                break
+        else:
+            hit_tp = float(future_low) <= float(tp_level)
+            hit_sl = float(future_high) >= float(sl_level)
+            if hit_tp or hit_sl:
+                exit_idx = entry_idx + offset
+                if hit_sl:
+                    exit_reason = 'sl'
+                    exit_price = float(sl_level)
+                else:
+                    exit_reason = 'tp'
+                    exit_price = float(tp_level)
+                break
+
+    if exit_reason == 'horizon':
+        exit_price = float(prices[exit_idx])
     price_return   = (exit_price - entry_price) if direction == 'LONG' else (entry_price - exit_price)
-    path_moves     = (future_prices - entry_price) if direction == 'LONG' else (entry_price - future_prices)
-    favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
-    adverse_move    = float(np.min(path_moves)) if path_moves.size else 0.0
+    if direction == 'LONG':
+        favourable_move = float(np.nanmax(future_highs - entry_price)) if future_highs.size else 0.0
+        adverse_move = float(np.nanmin(future_lows - entry_price)) if future_lows.size else 0.0
+    else:
+        favourable_move = float(np.nanmax(entry_price - future_lows)) if future_lows.size else 0.0
+        adverse_move = float(np.nanmin(entry_price - future_highs)) if future_highs.size else 0.0
 
     return {
         'exit_idx':    int(exit_idx),
@@ -349,12 +375,85 @@ def _simulate_trade_path(
     }
 
 
-_realized_fill_pricing = _shared_realized_fill_pricing
-_simulate_trade_path = _shared_simulate_trade_path
-
-
 def _load_csv(path: str) -> pd.DataFrame:
     return load_feature_artifact(path)
+
+
+def _parse_freq_to_bar_minutes(freq: str | None) -> float | None:
+    """Parse prepare_day_trading freq like '5min', '15min', '1h' → minutes per bar."""
+    if freq is None:
+        return None
+    s = str(freq).strip().lower().replace(' ', '')
+    if not s:
+        return None
+    try:
+        if s.endswith('min'):
+            v = float(s[:-3] or 0)
+            return v if v > 0 else None
+        if s.endswith('h'):
+            v = float(s[:-1] or 0) * 60.0
+            return v if v > 0 else None
+        if s.endswith('d'):
+            v = float(s[:-1] or 0) * 1440.0
+            return v if v > 0 else None
+    except ValueError:
+        return None
+    return None
+
+
+def _day_trading_manifest_path(data_arg: str) -> str | None:
+    """path/to/day_trading_features.parquet → path/to/day_trading_manifest.json"""
+    try:
+        p = os.path.abspath(str(data_arg))
+        root = os.path.dirname(p) if os.path.isfile(p) else p
+        cand = os.path.join(root, 'day_trading_manifest.json')
+        return cand if os.path.isfile(cand) else None
+    except Exception:
+        return None
+
+
+def _read_day_trading_manifest_meta(manifest_path: str | None) -> tuple[int | None, float | None, str | None]:
+    """Returns (horizon_bars, bar_minutes, freq_str) from day_trading_manifest.json."""
+    payload = _load_json_if_exists(manifest_path or '')
+    if not payload or str(payload.get('mode', '')).strip().lower() != 'day_trading':
+        return None, None, None
+    hb = payload.get('horizon_bars')
+    try:
+        hb_i = int(hb) if hb is not None else None
+    except (TypeError, ValueError):
+        hb_i = None
+    if hb_i is not None and hb_i <= 0:
+        hb_i = None
+    fq = payload.get('freq')
+    fq_s = str(fq).strip() if fq is not None else None
+    bm = _parse_freq_to_bar_minutes(fq_s)
+    return hb_i, bm, fq_s
+
+
+def _ensure_trade_price_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    شموع الـ day trading تخرج عادةً بـ OHLC (`close`) فقط، بينما `feature_schema_v19`
+    يمرّر `price` للباك تست. إن غاب `price` أو كان صفرًا، يُعبَّأ من `close` حتى تعمل
+    محاكاة المسار (وإلا trade_path=None و skipped_trade_replays يرتفع بدون صفقات).
+    """
+    if df is None or df.empty:
+        return df
+    out = df
+    use_close = False
+    if 'close' not in out.columns:
+        return out
+    close = pd.to_numeric(out['close'], errors='coerce')
+    if 'price' not in out.columns:
+        use_close = True
+    else:
+        pr = pd.to_numeric(out['price'], errors='coerce')
+        if (not np.isfinite(pr.to_numpy(dtype=np.float64)).any()) or float(pr.fillna(0.0).abs().max()) < 1e-12:
+            use_close = True
+    if use_close:
+        out = out.copy()
+        out['price'] = close
+        print('  [backtest] price column: filled from `close` (day-trading OHLC artifact)', flush=True)
+    return out
 
 
 def _load_json_if_exists(path: str) -> dict | None:
@@ -981,9 +1080,10 @@ def run_causal_backtest(
     latency_rows: int = 1,
     max_daily_loss_pct: float = 0.02,
     direction_threshold_ticks: float = 1.0,
-    tp_mult: float = 1.2,
+    tp_mult: float = 1.5,
     sl_mult: float = 1.0,
     max_horizon_steps: int | None = None,
+    replay_horizon_steps: int | None = None,
     allow_oracle_forward_return: bool = False,
     single_position_only: bool = True,
     cooldown_rows: int = 0,
@@ -994,7 +1094,13 @@ def run_causal_backtest(
     relax_policy_ev: bool = False,
     policy_min_edge: float | None = None,
     skip_event_gate: bool = False,
+    long_only: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    if allow_oracle_forward_return:
+        raise ValueError(
+            '❌ Oracle forward_return replay is disabled for production/research metrics. '
+            'Run a separate diagnostic-only script if you need label sanity checks.'
+        )
     engine = V19PredictionEngine(
         models_dir,
         run_mode='backtest',
@@ -1011,8 +1117,25 @@ def run_causal_backtest(
     print(f"  [backtest] Building replay feature frame ({len(df):,} rows, input_scaled={input_scaled})...", flush=True)
     t_pf0 = time.perf_counter()
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
+    for ohlc_col in ('open', 'high', 'low', 'close'):
+        if ohlc_col not in replay_df.columns and ohlc_col in df.columns:
+            replay_df[ohlc_col] = pd.to_numeric(df[ohlc_col], errors='coerce').to_numpy(dtype=np.float64)
     print(f"  [backtest] replay_df ready: {replay_df.shape[0]:,} x {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
     price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
+    high_arr = _series_or_default(
+        replay_df,
+        'raw__high' if 'raw__high' in replay_df.columns else ('high' if 'high' in replay_df.columns else 'price'),
+        0.0,
+        dtype=np.float64,
+    ).values
+    low_arr = _series_or_default(
+        replay_df,
+        'raw__low' if 'raw__low' in replay_df.columns else ('low' if 'low' in replay_df.columns else 'price'),
+        0.0,
+        dtype=np.float64,
+    ).values
+    high_arr = np.where(np.isfinite(high_arr) & (high_arr > 0), high_arr, price_arr)
+    low_arr = np.where(np.isfinite(low_arr) & (low_arr > 0), low_arr, price_arr)
     horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
     if 'raw__micro_atr' in replay_df.columns:
         micro_atr_arr = _series_or_default(replay_df, 'raw__micro_atr', 0.0, dtype=np.float64).values
@@ -1032,9 +1155,19 @@ def run_causal_backtest(
         raise ValueError('❌ نافذة التقييم المطلوبة لا تحتوي أي صفوف داخل replay_df.')
 
     n_replay = len(replay_df)
+    _rh = f" | replay_horizon_steps={int(replay_horizon_steps)}" if replay_horizon_steps else ""
     print(
         f"  [backtest] Causal replay: {n_replay:,} rows | "
-        f"scoring_mask={int(scoring_mask.sum()):,}",
+        f"scoring_mask={int(scoring_mask.sum()):,}"
+        f"{_rh}"
+        f"{' | long_only=True (SHORT signals not executed)' if long_only else ''}",
+        flush=True,
+    )
+    progress_every = min(250, max(50, n_replay // 30))
+    sl = int(getattr(engine, 'seq_len', 0) or 0)
+    print(
+        f"  [backtest] Replay log every {progress_every} rows "
+        f"(after sequence warm-up rows 0 .. {max(sl - 1, 0)} each step carries full inference; wait for first '{progress_every}' line).",
         flush=True,
     )
 
@@ -1053,7 +1186,7 @@ def run_causal_backtest(
 
     for i in range(n_replay):
         row = replay_df.iloc[i].to_dict()
-        if i > 0 and i % 5000 == 0:
+        if i > 0 and i % progress_every == 0:
             print(f"  [backtest] progress: {i:,}/{n_replay:,}", flush=True)
         ts = row.get('ts_event', None)
         if active_trade is not None and i >= int(active_trade['exit_idx']):
@@ -1119,6 +1252,10 @@ def run_causal_backtest(
             continue
 
         if tradeable and direction in ('LONG', 'SHORT'):
+            if long_only and direction == 'SHORT':
+                pred['trade_skip_reason'] = 'long_only_backtest'
+                results.append(pred)
+                continue
             size = int(position_size_from_prediction(
                 pred,
                 base_size=1,
@@ -1136,6 +1273,8 @@ def run_causal_backtest(
                 entry_idx=entry_idx,
                 direction=direction,
                 prices=price_arr,
+                highs=high_arr,
+                lows=low_arr,
                 horizons=horizon_arr,
                 micro_atr=micro_atr_arr,
                 tick_size=tick_size,
@@ -1143,24 +1282,11 @@ def run_causal_backtest(
                 tp_mult=tp_mult,
                 sl_mult=sl_mult,
                 max_horizon_steps=max_horizon_steps,
+                replay_horizon_steps=replay_horizon_steps,
                 row_data=entry_row_data,  # FIX: تمرير بيانات الجدران للـ DynamicTargetManager
             )
 
             pnl_source = 'path_replay'
-            if trade_path is None and allow_oracle_forward_return and source_has_fwd:
-                forward_return = _safe_float(row.get('forward_return', 0.0))
-                trade_path = {
-                    'exit_idx': min(i + max(_safe_int(row.get('label_horizon_steps', 1), 1), 1), len(replay_df) - 1),
-                    'exit_price': _safe_float(row.get('price', 0.0)) + (forward_return if direction == 'LONG' else -forward_return),
-                    'exit_reason': 'oracle_forward_return',
-                    'hold_steps': max(_safe_int(row.get('label_horizon_steps', 1), 1), 1),
-                    'price_return': forward_return if direction == 'LONG' else -forward_return,
-                    'raw_pnl_pips': (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size),
-                    'mfe_pips': 0.0,
-                    'mae_pips': 0.0,
-                }
-                pnl_source = 'oracle_forward_return'
-
             if trade_path is None:
                 skipped_trade_replays += 1
                 pred['trade_skip_reason'] = 'missing_exit_path'
@@ -1306,6 +1432,9 @@ def run_causal_backtest(
         'score_end_ts': None if score_end_ts is None else str(score_end_ts),
         'visual_coverage': float(visual_diag.get('coverage_ratio', 0.0)),
         'visual_diagnostics': visual_diag,
+        'long_only': bool(long_only),
+        'max_horizon_steps': None if max_horizon_steps is None else int(max_horizon_steps),
+        'replay_horizon_steps': None if replay_horizon_steps is None else int(replay_horizon_steps),
     }
     if 'true_bias' in results_df.columns and 'direction_probs' in results_df.columns and len(results_df):
         directional = results_df[results_df['true_bias'].isin([0, 1])].copy()
@@ -1399,12 +1528,30 @@ def main():
     p.add_argument('--latency_rows', type=int, default=1)
     p.add_argument('--max_daily_loss_pct', type=float, default=0.02)
     p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
-    p.add_argument('--tp_mult', type=float, default=1.2)
+    p.add_argument('--tp_mult', type=float, default=1.5)
     p.add_argument('--sl_mult', type=float, default=1.0)
     p.add_argument('--start_ts', default=None, help='optional inclusive start timestamp for the backtest window')
     p.add_argument('--end_ts', default=None, help='optional exclusive end timestamp for the backtest window')
     p.add_argument('--max_horizon_steps', type=int, default=0,
-                   help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
+                   help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is (cannot extend below label)')
+    p.add_argument(
+        '--fixed_horizon',
+        type=float,
+        default=None,
+        help=(
+            'override path-replay holding window in minutes (day bars: set --bar_minutes, e.g. 60 min / 5 min bar => 12 steps). '
+            'Replaces label_horizon_steps for TP/SL path replay.'
+        ),
+    )
+    p.add_argument(
+        '--bar_minutes',
+        type=float,
+        default=None,
+        help=(
+            'minutes per bar when using --fixed_horizon; '
+            'default: read from day_trading_manifest.json freq next to --data, else 5'
+        ),
+    )
     p.add_argument('--allow_oracle_forward_return', action='store_true',
                    help='dangerous: fall back to stored forward_return when no causal replay window is available')
     p.add_argument('--disable_single_position_only', action='store_true',
@@ -1420,6 +1567,11 @@ def main():
                    ))
     p.add_argument('--skip_event_gate', action='store_true',
                    help='disable EventGate for this run (diagnostic only)')
+    p.add_argument(
+        '--long_only',
+        action='store_true',
+        help='open only LONG positions; SHORT signals stay in logs (trade_skip_reason=long_only_backtest)',
+    )
     args = p.parse_args()
 
     inferred_policy_edge = _infer_soft_bundle_default_policy_min_edge(args.models)
@@ -1437,7 +1589,59 @@ def main():
                 flush=True,
             )
 
-    df_raw = _load_csv(args.data)
+    manifest_path = _day_trading_manifest_path(args.data)
+    mt_h, mt_bm_manifest, mt_freq = _read_day_trading_manifest_meta(manifest_path)
+    bar_minutes_eff = float(args.bar_minutes) if args.bar_minutes is not None else None
+    if bar_minutes_eff is None:
+        bar_minutes_eff = float(mt_bm_manifest) if mt_bm_manifest is not None else 5.0
+        if mt_bm_manifest is not None:
+            print(
+                f"  [backtest] bar_minutes={bar_minutes_eff:g} (from day_trading_manifest freq={mt_freq!r})",
+                flush=True,
+            )
+        else:
+            print(f"  [backtest] bar_minutes={bar_minutes_eff:g} (default; no day_trading_manifest freq)", flush=True)
+
+    replay_horizon_steps = None
+    if args.fixed_horizon is not None and float(args.fixed_horizon) > 0:
+        bm = max(float(bar_minutes_eff), 1e-6)
+        replay_horizon_steps = max(1, int(round(float(args.fixed_horizon) / bm)))
+        print(
+            f"  [backtest] fixed_horizon: {float(args.fixed_horizon)} min / {bm} min per bar "
+            f"=> replay_horizon_steps={replay_horizon_steps}",
+            flush=True,
+        )
+        if mt_h is not None and int(replay_horizon_steps) != int(mt_h):
+            print(
+                f"  [backtest] WARNING: replay_horizon_steps={replay_horizon_steps} != manifest horizon_bars={mt_h} "
+                f"(labels trained at {mt_h} bars × ~{bar_minutes_eff:g} min ≈ {int(mt_h) * bar_minutes_eff:g} min). "
+                f"For aligned train/backtest: omit --fixed_horizon or set "
+                f"--fixed_horizon {int(mt_h) * bar_minutes_eff:g} with this bar size, or regenerate data with "
+                f"prepare_day_trading --horizon {replay_horizon_steps}.",
+                flush=True,
+            )
+    else:
+        if mt_h is not None:
+            approx_min = float(mt_h) * float(bar_minutes_eff)
+            print(
+                f"  [backtest] day_trading manifest: horizon_bars={mt_h}, freq={mt_freq!r} "
+                f"(~{bar_minutes_eff:g} min/bar, ~{approx_min:g} min label horizon). "
+                f"Path replay uses per-row label_horizon_steps (override with --fixed_horizon minutes).",
+                flush=True,
+            )
+
+    df_raw = _ensure_trade_price_column(_load_csv(args.data))
+    if mt_h is not None and 'label_horizon_steps' in df_raw.columns:
+        med = pd.to_numeric(df_raw['label_horizon_steps'], errors='coerce').dropna()
+        if len(med):
+            med_v = int(round(float(med.median())))
+            if med_v != int(mt_h):
+                print(
+                    f"  [backtest] WARNING: data label_horizon_steps median={med_v} != manifest horizon_bars={mt_h} "
+                    f"— use matching prepare_day_trading output or --fixed_horizon.",
+                    flush=True,
+                )
+
     model_window = _load_model_training_window(args.models)
     align_start_ts = model_window.get('train_start_time')
     align_end_ts = model_window.get('holdout_end_time_exclusive')
@@ -1521,6 +1725,7 @@ def main():
         tp_mult=args.tp_mult,
         sl_mult=args.sl_mult,
         max_horizon_steps=(args.max_horizon_steps if args.max_horizon_steps > 0 else None),
+        replay_horizon_steps=replay_horizon_steps,
         allow_oracle_forward_return=args.allow_oracle_forward_return,
         single_position_only=(not args.disable_single_position_only),
         cooldown_rows=args.cooldown_rows,
@@ -1529,6 +1734,7 @@ def main():
         relax_policy_ev=args.relax_policy_ev,
         policy_min_edge=args.policy_min_edge,
         skip_event_gate=args.skip_event_gate,
+        long_only=args.long_only,
     )
     summary['oos_guard'] = oos_guard
     summary['backtest_window'] = {
@@ -1537,6 +1743,18 @@ def main():
         'start_ts': start_ts,
         'end_ts': end_ts,
         'rows': int(len(df_score)),
+    }
+    summary['horizon_alignment'] = {
+        'day_trading_manifest_path': manifest_path,
+        'manifest_horizon_bars': mt_h,
+        'manifest_freq': mt_freq,
+        'bar_minutes_effective': float(bar_minutes_eff),
+        'fixed_horizon_minutes': None if args.fixed_horizon is None else float(args.fixed_horizon),
+        'replay_horizon_steps': summary.get('replay_horizon_steps'),
+        'note': (
+            'replay uses label_horizon_steps per row when replay_horizon_steps is null; '
+            'else --fixed_horizon overrides. Align minutes: horizon_bars * bar_minutes.'
+        ),
     }
 
     print("\n[backtest] V19 causal backtest complete")

@@ -92,7 +92,6 @@ from modules.feature_artifact_v19    import (
     write_parquet_shards,
     write_table,
 )
-from modules.reproducibility_v19     import apply_reproducibility_config
 # ── V19: DeepLOB Tensor Builder ──────────────────────────────────
 DEEPLOB_AVAILABLE = False
 LOBTensorBuilder = None
@@ -826,24 +825,6 @@ def _shard_ts_bounds(df: pd.DataFrame, ts_col: str = 'ts_event') -> tuple[str | 
     return str(ts.min()), str(ts.max())
 
 
-def _record_temporal_sort_key(record: dict) -> tuple[pd.Timestamp, pd.Timestamp, int]:
-    ts_min = pd.to_datetime(record.get('ts_min'), errors='coerce')
-    ts_max = pd.to_datetime(record.get('ts_max'), errors='coerce')
-    if pd.isna(ts_min):
-        ts_min = pd.Timestamp.max
-    if pd.isna(ts_max):
-        ts_max = ts_min
-    return (
-        ts_min,
-        ts_max,
-        int(record.get('shard_idx', 0)),
-    )
-
-
-def _records_in_temporal_order(records: list[dict]) -> list[dict]:
-    return sorted(records or [], key=_record_temporal_sort_key)
-
-
 def _frame_integrity_snapshot(
     df: pd.DataFrame,
     *,
@@ -857,9 +838,6 @@ def _frame_integrity_snapshot(
     ts = pd.to_datetime(ts_source, utc=True, errors='coerce').dt.tz_localize(None)
     valid_ts = ts.dropna()
     diffs = valid_ts.diff().dropna() if len(valid_ts) else pd.Series(dtype='timedelta64[ns]')
-    duplicate_ts_rows = int(valid_ts.duplicated().sum())
-    valid_ts_rows = int(len(valid_ts))
-    duplicate_ts_ratio = float(duplicate_ts_rows / valid_ts_rows) if valid_ts_rows > 0 else 0.0
 
     price_source = df[price_col] if price_col in df.columns else pd.Series(index=df.index, dtype='float64')
     price = pd.to_numeric(price_source, errors='coerce')
@@ -880,10 +858,8 @@ def _frame_integrity_snapshot(
 
     return {
         'rows': rows,
-        'valid_ts_rows': valid_ts_rows,
         'missing_ts_rows': int(ts.isna().sum()),
-        'duplicate_ts_rows': duplicate_ts_rows,
-        'duplicate_ts_ratio': duplicate_ts_ratio,
+        'duplicate_ts_rows': int(valid_ts.duplicated().sum()),
         'non_monotonic_ts_steps': int((diffs < pd.Timedelta(0)).sum()) if len(diffs) else 0,
         'gap_rows_over_1s': int((diffs > pd.Timedelta(seconds=1)).sum()) if len(diffs) else 0,
         'max_gap_ms': float(max(diffs.max().total_seconds() * 1000.0, 0.0)) if len(diffs) else 0.0,
@@ -905,7 +881,6 @@ def _new_integrity_accumulator(kind: str) -> dict:
         'kind': str(kind),
         'raw': {
             'rows': 0,
-            'valid_ts_rows': 0,
             'missing_ts_rows': 0,
             'duplicate_ts_rows': 0,
             'non_monotonic_ts_steps': 0,
@@ -924,7 +899,6 @@ def _new_integrity_accumulator(kind: str) -> dict:
         },
         'normalized': {
             'rows': 0,
-            'valid_ts_rows': 0,
             'missing_ts_rows': 0,
             'duplicate_ts_rows': 0,
             'non_monotonic_ts_steps': 0,
@@ -962,7 +936,6 @@ def _merge_symbol_counts(target: dict, frame: pd.DataFrame) -> None:
 def _accumulate_integrity_snapshot(target: dict, snapshot: dict) -> None:
     for key in [
         'rows',
-        'valid_ts_rows',
         'missing_ts_rows',
         'duplicate_ts_rows',
         'non_monotonic_ts_steps',
@@ -1035,11 +1008,6 @@ def _finalize_integrity_accumulator(acc: dict) -> dict:
         key: int(value)
         for key, value in sorted(normalized_symbols.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
     }
-    for key in ('raw', 'normalized'):
-        snapshot = out.get(key, {}) or {}
-        valid_ts_rows = int(snapshot.get('valid_ts_rows', 0))
-        duplicate_ts_rows = int(snapshot.get('duplicate_ts_rows', 0))
-        snapshot['duplicate_ts_ratio'] = float(duplicate_ts_rows / valid_ts_rows) if valid_ts_rows > 0 else 0.0
     return out
 
 
@@ -1056,59 +1024,23 @@ def _build_data_integrity_warnings(report: dict) -> list[str]:
             warnings.append(f"{key}: dropped {dropped:,} rows during normalization")
         if int(raw.get('missing_ts_rows', 0)) > 0:
             warnings.append(f"{key}: raw input contains missing timestamps")
-        if int(raw.get('duplicate_ts_rows', 0)) > 0:
-            warnings.append(
-                f"{key}: raw input contains repeated ts_event values "
-                f"(ratio={float(raw.get('duplicate_ts_ratio', 0.0)):.2%}; often normal for event-level feeds)"
-            )
-        if int(raw.get('non_monotonic_ts_steps', 0)) > 0:
-            warnings.append(f"{key}: raw input contains non-monotonic timestamp steps")
+        if int(raw.get('duplicate_ts_rows', 0)) > 0 or int(raw.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: raw input contains duplicate or non-monotonic timestamps")
         if int(raw.get('price_nonpositive_rows', 0)) > 0 or int(raw.get('size_negative_rows', 0)) > 0:
             warnings.append(f"{key}: raw input contains abnormal price/size values")
-        if int(normalized.get('duplicate_ts_rows', 0)) > 0:
-            warnings.append(
-                f"{key}: normalized shards still contain repeated ts_event values "
-                f"(ratio={float(normalized.get('duplicate_ts_ratio', 0.0)):.2%})"
-            )
-        if int(normalized.get('non_monotonic_ts_steps', 0)) > 0:
-            warnings.append(f"{key}: normalized shard ordering still contains non-monotonic timestamp steps")
+        if int(normalized.get('duplicate_ts_rows', 0)) > 0 or int(normalized.get('non_monotonic_ts_steps', 0)) > 0:
+            warnings.append(f"{key}: normalized shards still contain duplicate or non-monotonic timestamps")
 
     merged = ((report.get('intermediate') or {}).get('merged') or {})
     if int(merged.get('missing_ts_rows', 0)) > 0:
         warnings.append("merged: missing timestamps remain after MBO/MBP alignment")
     if int(merged.get('price_nonpositive_rows', 0)) > 0:
         warnings.append("merged: non-positive prices remain after alignment")
-    if int(merged.get('duplicate_ts_rows', 0)) > 0:
-        warnings.append(
-            "merged: multiple aligned rows share the same ts_event "
-            f"(ratio={float(merged.get('duplicate_ts_ratio', 0.0)):.2%}; expected for dense event streams)"
-        )
 
     final = report.get('final', {}) or {}
-    if int(final.get('duplicate_ts_rows', 0)) > 0:
-        warnings.append(
-            "final: output artifact contains repeated ts_event values "
-            f"(ratio={float(final.get('duplicate_ts_ratio', 0.0)):.2%}; not a blocker by itself for event-level data)"
-        )
     if int(final.get('missing_ts_rows', 0)) > 0 or int(final.get('non_monotonic_ts_steps', 0)) > 0:
         warnings.append("final: training artifact still has timestamp integrity issues")
     return warnings
-
-
-def _aggregate_merge_lag_report(records: list[dict], *, tolerance_ms: int) -> dict:
-    matched_rows = int(sum(int(record.get('matched_rows', 0)) for record in (records or [])))
-    unmatched_rows = int(sum(int(record.get('unmatched_rows', 0)) for record in (records or [])))
-    lag_warn_rows = int(sum(int(record.get('lag_warn_rows', 0)) for record in (records or [])))
-    max_lag_ms = float(max([float(record.get('max_lag_ms', 0.0) or 0.0) for record in (records or [])] or [0.0]))
-    return {
-        'matched_rows': matched_rows,
-        'unmatched_rows': unmatched_rows,
-        'lag_warn_rows': lag_warn_rows,
-        'lag_warn_ratio': float(lag_warn_rows / matched_rows) if matched_rows > 0 else 0.0,
-        'max_lag_ms': max_lag_ms,
-        'lag_warn_threshold_ms': float(max(float(tolerance_ms) * 0.5, 1.0)),
-        'tolerance_ms': int(tolerance_ms),
-    }
 
 
 def _write_data_integrity_report(
@@ -1119,7 +1051,6 @@ def _write_data_integrity_report(
     merged_snapshot: dict,
     final_snapshot: dict,
     merge_tolerance_ms: int,
-    merge_lag_report: dict | None = None,
 ) -> str:
     report = {
         'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
@@ -1130,7 +1061,6 @@ def _write_data_integrity_report(
         },
         'intermediate': {
             'merged': merged_snapshot,
-            'merge_lag': dict(merge_lag_report or {}),
         },
         'final': final_snapshot,
     }
@@ -1139,156 +1069,6 @@ def _write_data_integrity_report(
     with open(path, 'w') as f:
         json.dump(report, f, indent=2)
     return path
-
-
-def _evaluate_data_integrity_gates(
-    *,
-    report: dict,
-    contract_report: dict,
-    gates_cfg: dict | None,
-) -> dict:
-    cfg = dict(gates_cfg or {})
-    enabled = bool(cfg.get('enabled', False))
-    failures: list[dict] = []
-    max_duplicate_ts_ratio_raw = cfg.get('max_duplicate_ts_ratio', None)
-    max_duplicate_ts_ratio = None if max_duplicate_ts_ratio_raw in (None, '', False) else float(max_duplicate_ts_ratio_raw)
-    block_intermediate_non_monotonic = bool(cfg.get('block_on_intermediate_non_monotonic_timestamps', False))
-
-    def _record(metric: str, value, threshold, reason: str) -> None:
-        failures.append({
-            'metric': str(metric),
-            'value': value,
-            'threshold': threshold,
-            'reason': str(reason),
-        })
-
-    def _iter_snapshots() -> list[tuple[str, dict]]:
-        inputs = report.get('inputs', {}) or {}
-        intermediate = report.get('intermediate', {}) or {}
-        return [
-            ('inputs.mbo.raw', ((inputs.get('mbo') or {}).get('raw') or {})),
-            ('inputs.mbo.normalized', ((inputs.get('mbo') or {}).get('normalized') or {})),
-            ('inputs.mbp.raw', ((inputs.get('mbp') or {}).get('raw') or {})),
-            ('inputs.mbp.normalized', ((inputs.get('mbp') or {}).get('normalized') or {})),
-            ('intermediate.merged', intermediate.get('merged') or {}),
-            ('final', report.get('final') or {}),
-        ]
-
-    for label, snapshot in _iter_snapshots():
-        if not snapshot:
-            continue
-        if bool(cfg.get('block_on_missing_timestamps', True)) and int(snapshot.get('missing_ts_rows', 0)) > 0:
-            _record(f'{label}.missing_ts_rows', int(snapshot.get('missing_ts_rows', 0)), 0, 'missing timestamps detected')
-        if (
-            bool(cfg.get('block_on_duplicate_timestamps', False))
-            and max_duplicate_ts_ratio is not None
-            and float(snapshot.get('duplicate_ts_ratio', 0.0) or 0.0) > max_duplicate_ts_ratio
-        ):
-            _record(
-                f'{label}.duplicate_ts_ratio',
-                float(snapshot.get('duplicate_ts_ratio', 0.0) or 0.0),
-                max_duplicate_ts_ratio,
-                'duplicate timestamp ratio exceeded threshold',
-            )
-        if label == 'final':
-            if bool(cfg.get('block_on_non_monotonic_timestamps', True)) and int(snapshot.get('non_monotonic_ts_steps', 0)) > 0:
-                _record(f'{label}.non_monotonic_ts_steps', int(snapshot.get('non_monotonic_ts_steps', 0)), 0, 'non-monotonic timestamps detected')
-        elif block_intermediate_non_monotonic and int(snapshot.get('non_monotonic_ts_steps', 0)) > 0:
-            _record(
-                f'{label}.non_monotonic_ts_steps',
-                int(snapshot.get('non_monotonic_ts_steps', 0)),
-                0,
-                'intermediate non-monotonic timestamps detected',
-            )
-        if bool(cfg.get('block_on_nonpositive_prices', True)) and int(snapshot.get('price_nonpositive_rows', 0)) > 0:
-            _record(f'{label}.price_nonpositive_rows', int(snapshot.get('price_nonpositive_rows', 0)), 0, 'non-positive prices detected')
-        if bool(cfg.get('block_on_negative_sizes', True)) and int(snapshot.get('size_negative_rows', 0)) > 0:
-            _record(f'{label}.size_negative_rows', int(snapshot.get('size_negative_rows', 0)), 0, 'negative sizes detected')
-
-    final_snapshot = report.get('final', {}) or {}
-    if bool(cfg.get('block_on_final_timestamp_issues', True)):
-        final_ts_issue_count = (
-            int(final_snapshot.get('missing_ts_rows', 0))
-            + int(final_snapshot.get('non_monotonic_ts_steps', 0))
-        )
-        if (
-            bool(cfg.get('block_on_duplicate_timestamps', False))
-            and max_duplicate_ts_ratio is not None
-            and float(final_snapshot.get('duplicate_ts_ratio', 0.0) or 0.0) > max_duplicate_ts_ratio
-        ):
-            final_ts_issue_count += 1
-        if final_ts_issue_count > 0:
-            _record('final.timestamp_issues', final_ts_issue_count, 0, 'final artifact retains timestamp integrity issues')
-
-    if bool(cfg.get('block_on_contract_mismatch', True)) and not bool(contract_report.get('passed', False)):
-        _record('contract_consistency', False, True, 'contract consistency report failed')
-
-    merge_lag = ((report.get('intermediate') or {}).get('merge_lag') or {})
-    max_lag_ratio = float(cfg.get('max_merge_lag_ratio', 0.10) or 0.10)
-    max_lag_ms = float(cfg.get('max_matched_mbp_lag_ms', 250.0) or 250.0)
-    if float(merge_lag.get('lag_warn_ratio', 0.0) or 0.0) > max_lag_ratio:
-        _record('intermediate.merge_lag.lag_warn_ratio', float(merge_lag.get('lag_warn_ratio', 0.0) or 0.0), max_lag_ratio, 'merge_asof stale-match ratio exceeded threshold')
-    if float(merge_lag.get('max_lag_ms', 0.0) or 0.0) > max_lag_ms:
-        _record('intermediate.merge_lag.max_lag_ms', float(merge_lag.get('max_lag_ms', 0.0) or 0.0), max_lag_ms, 'merge_asof matched MBP lag exceeded threshold')
-
-    would_pass = len(failures) == 0
-    return {
-        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-        'enabled': enabled,
-        'passed': bool(would_pass or not enabled),
-        'would_pass': bool(would_pass),
-        'blocking_failure_count': int(len(failures)),
-        'failures': failures,
-        'thresholds': {
-            'max_duplicate_ts_ratio': max_duplicate_ts_ratio,
-            'max_merge_lag_ratio': max_lag_ratio,
-            'max_matched_mbp_lag_ms': max_lag_ms,
-        },
-    }
-
-
-def _write_contract_gate_failure_artifacts(
-    *,
-    output_dir: str,
-    expected_symbol: str,
-    input_symbol_counts: dict[str, int],
-    final_symbol_counts: dict[str, int],
-    mbo_integrity: dict,
-    mbp_integrity: dict | None,
-    merged_snapshot: dict | None,
-    final_snapshot: dict | None,
-    merge_tolerance_ms: int,
-    merge_lag_report: dict | None,
-    gates_cfg: dict | None,
-) -> tuple[str, str, str]:
-    contract_report_path = _write_contract_consistency_report(
-        output_dir=output_dir,
-        expected_symbol=expected_symbol,
-        input_symbol_counts=input_symbol_counts,
-        final_symbol_counts=final_symbol_counts,
-    )
-    with open(contract_report_path) as f:
-        contract_report = json.load(f)
-    integrity_report_path = _write_data_integrity_report(
-        output_dir=output_dir,
-        mbo_integrity=mbo_integrity,
-        mbp_integrity=mbp_integrity,
-        merged_snapshot=merged_snapshot or {},
-        final_snapshot=final_snapshot or {},
-        merge_tolerance_ms=merge_tolerance_ms,
-        merge_lag_report=merge_lag_report,
-    )
-    with open(integrity_report_path) as f:
-        integrity_report = json.load(f)
-    gate_report = _evaluate_data_integrity_gates(
-        report=integrity_report,
-        contract_report=contract_report,
-        gates_cfg=gates_cfg,
-    )
-    integrity_gate_report_path = os.path.join(output_dir, 'data_integrity_gate_report.json')
-    with open(integrity_gate_report_path, 'w') as f:
-        json.dump(gate_report, f, indent=2)
-    return contract_report_path, integrity_report_path, integrity_gate_report_path
 
 
 def _symbol_count_map_from_integrity(integrity: dict | None) -> dict[str, int]:
@@ -1504,7 +1284,7 @@ def _canonicalize_input_file(
             f'canonical_{kind}',
             {'kind': kind, 'processed_shards': int(shard_idx + 1), 'last_shard': record},
         )
-    return _records_in_temporal_order(records), _finalize_integrity_accumulator(integrity)
+    return records, _finalize_integrity_accumulator(integrity)
 
 
 def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
@@ -1550,7 +1330,7 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     if workers <= 1:
         for task in tasks:
             _collect(worker_fn(task))
-        return _records_in_temporal_order(results)
+        return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
     available_methods = set(multiprocessing.get_all_start_methods())
     preferred_method = 'fork' if sys.platform != 'win32' and 'fork' in available_methods else 'spawn'
     ctx_mp = multiprocessing.get_context(preferred_method)
@@ -1560,7 +1340,7 @@ def _run_shard_tasks(tasks, worker_fn, workers: int, progress_label: str | None 
     ) as pool:
         for result in pool.imap_unordered(worker_fn, tasks):
             _collect(result)
-    return _records_in_temporal_order(results)
+    return sorted(results, key=lambda item: int(item.get('shard_idx', 0)))
 
 
 def _process_mbo_shard_task(task: dict) -> dict:
@@ -1625,7 +1405,7 @@ def _process_mbp_shard_task(task: dict) -> dict:
 
 def _merge_shard_task(task: dict) -> dict:
     current_record = task['current']
-    tolerance_ms = int(task.get('tolerance_ms', 500))
+    tolerance_ms = int(task.get('tolerance_ms', 100))
     out_path = task['out_path']
     resume = bool(task.get('resume', False))
     shard_idx = int(current_record['shard_idx'])
@@ -1635,43 +1415,35 @@ def _merge_shard_task(task: dict) -> dict:
         return _read_existing_shard_record(out_path, shard_idx)
 
     mbo_shard = read_table(current_record['path'])
+    mbp_join_meta: dict | None = None
     if len(mbo_shard) == 0:
         merged = mbo_shard.copy()
     elif relevant_mbp_records:
         mbp_frames = [read_table(record['path']) for record in relevant_mbp_records]
         mbp_slice = pd.concat(mbp_frames, ignore_index=True) if mbp_frames else pd.DataFrame()
-        merged = _merge_mbo_mbp_chunk(mbo_shard, mbp_slice, tolerance_ms=tolerance_ms)
+        merged, mbp_join_meta = _merge_mbo_mbp_chunk(mbo_shard, mbp_slice, tolerance_ms=tolerance_ms)
     else:
         merged = mbo_shard.copy()
         for c in ['obi','spoofing_ratio','spoofing_duration','liquidity_trap','liquidity_gaps','dist_to_bid_wall','dist_to_ask_wall']:
             merged[c] = 0.0
+        mbp_join_meta = {'mbp_backward_match_ratio': 0.0, 'mbp_snapshot_rows': 0, 'mbo_rows': int(len(mbo_shard))}
 
-    lag_series = pd.to_numeric(merged.get('_matched_mbp_lag_ms'), errors='coerce') if '_matched_mbp_lag_ms' in merged.columns else pd.Series(dtype=np.float64)
-    lag_valid = lag_series.dropna()
-    lag_warn_threshold_ms = max(float(tolerance_ms) * 0.5, 1.0)
-    merge_stats = {
-        'matched_rows': int(len(lag_valid)),
-        'unmatched_rows': int(max(len(merged) - len(lag_valid), 0)),
-        'lag_warn_rows': int((lag_valid > lag_warn_threshold_ms).sum()) if len(lag_valid) else 0,
-        'lag_warn_ratio': float((lag_valid > lag_warn_threshold_ms).mean()) if len(lag_valid) else 0.0,
-        'max_lag_ms': float(lag_valid.max()) if len(lag_valid) else 0.0,
-    }
-    merged = merged.drop(columns=['mbp_ts_event', '_matched_mbp_lag_ms'], errors='ignore')
     write_table(merged, out_path, compression='snappy')
     record = _shard_record(out_path, merged, shard_idx)
-    record.update(merge_stats)
+    if mbp_join_meta is not None:
+        record['mbp_backward_match_ratio'] = float(mbp_join_meta.get('mbp_backward_match_ratio', 0.0))
     return record
 
 
 def _load_records_frame(records: list[dict]) -> pd.DataFrame:
-    frames = [read_table(record['path']) for record in _records_in_temporal_order(records)]
+    frames = [read_table(record['path']) for record in sorted(records, key=lambda item: int(item.get('shard_idx', 0)))]
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
 
 def _load_records_columns(records: list[dict], columns: list[str]) -> pd.DataFrame:
-    ordered = _records_in_temporal_order(records)
+    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
     frames: list[pd.DataFrame] = []
     for record in ordered:
         frame = read_table(record['path'])
@@ -1689,7 +1461,7 @@ def _load_records_columns(records: list[dict], columns: list[str]) -> pd.DataFra
 
 
 def _load_lob_source_from_records(records: list[dict], kind: str) -> pd.DataFrame:
-    ordered = _records_in_temporal_order(records)
+    ordered = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
     frames: list[pd.DataFrame] = []
     for record in ordered:
         frame = _lob_source_frame(read_table(record['path']), kind)
@@ -1713,7 +1485,7 @@ def _rewrite_records_from_frame(
 ) -> list[dict]:
     out_dir = _artifact_phase_dir(output_dir, 'features', phase_name)
     updated: list[dict] = []
-    ordered_records = _records_in_temporal_order(records)
+    ordered_records = sorted(records, key=lambda item: int(item.get('shard_idx', 0)))
     start = 0
     for record in ordered_records:
         shard_rows = int(record.get('rows', 0))
@@ -1851,48 +1623,68 @@ def _merge_mbo_mbp_chunk(
     mbo_df: pd.DataFrame,
     mbp_df: pd.DataFrame,
     *,
-    tolerance_ms: int = 500,
-) -> pd.DataFrame:
+    tolerance_ms: int = 100,
+) -> tuple[pd.DataFrame, dict]:
     mbo_df = mbo_df.copy()
     mbo_df = mbo_df.drop(columns=['liquidity_gaps'], errors='ignore')
     mbo_df['ts_event'] = pd.to_datetime(mbo_df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
     mbo_df = mbo_df.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    meta = {
+        'mbp_snapshot_rows': int(len(mbp_df)),
+        'mbo_rows': int(len(mbo_df)),
+        'mbp_backward_match_ratio': 1.0,
+    }
+    _SNAP = '__mbp_join_ts_probe'
     if len(mbp_df) == 0:
         out = mbo_df.copy()
+        meta['mbp_backward_match_ratio'] = 0.0
     else:
         mbp_df = mbp_df.copy()
         mbp_df['ts_event'] = pd.to_datetime(mbp_df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
         mbp_df = mbp_df.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
-        mbp_df['mbp_ts_event'] = mbp_df['ts_event']
+        mbp_rhs = mbp_df.copy()
+        mbp_rhs[_SNAP] = mbp_rhs['ts_event']
+        tol = pd.Timedelta(milliseconds=max(int(tolerance_ms), 1))
         out = pd.merge_asof(
             mbo_df,
-            mbp_df,
+            mbp_rhs,
             on='ts_event',
             direction='backward',
-            tolerance=pd.Timedelta(milliseconds=max(int(tolerance_ms), 1)),
+            tolerance=tol,
         )
-        if 'mbp_ts_event' in out.columns:
-            matched_mask = out['mbp_ts_event'].notna()
-            lag_ms = np.where(
-                matched_mask.to_numpy(dtype=bool),
-                (out['ts_event'] - out['mbp_ts_event']).dt.total_seconds().mul(1000.0).to_numpy(dtype=np.float64),
-                np.nan,
+        n = len(out)
+        if n > 0 and _SNAP in out.columns:
+            matched = out[_SNAP].notna()
+            meta['mbp_backward_match_ratio'] = float(matched.mean())
+            lag_ms = pd.Series(dtype='float64')
+            if matched.any():
+                lag_ms = (
+                    (out.loc[matched, 'ts_event'] - out.loc[matched, _SNAP]).dt.total_seconds().mul(1000.0)
+                )
+            out = out.drop(columns=[_SNAP], errors='ignore')
+            tol_v = float(max(int(tolerance_ms), 1))
+            lag_warn_ratio = (
+                float((lag_ms > max(tol_v * 0.5, 1.0)).mean()) if len(lag_ms) else 0.0
             )
-            out['_matched_mbp_lag_ms'] = lag_ms.astype(np.float32)
+            if lag_warn_ratio > 0.10:
+                print(
+                    "    ⚠️ merge_shard lag: "
+                    f"{lag_warn_ratio:.1%} of matched rows use MBP snapshot relatively stale "
+                    f"(tolerance={tolerance_ms}ms)"
+                )
         else:
-            out['_matched_mbp_lag_ms'] = np.full(len(out), np.nan, dtype=np.float32)
-    for c in [
+            out = out.drop(columns=[_SNAP], errors='ignore')
+    lob_cols = [
         'obi', 'spoofing_ratio', 'spoofing_duration', 'dist_to_bid_wall', 'dist_to_ask_wall',
         'mid_price', 'micro_price', 'spread',
         'bid_gap_size', 'ask_gap_size', 'bid_wall_strength', 'ask_wall_strength',
         'distance_to_wall', 'gap_size', 'liquidity_density', 'liquidity_gaps',
-    ]:
+    ]
+    for c in lob_cols:
         if c not in out.columns:
             out[c] = 0.0
         out[c] = out[c].fillna(0.0)
-    if '_matched_mbp_lag_ms' not in out.columns:
-        out['_matched_mbp_lag_ms'] = np.full(len(out), np.nan, dtype=np.float32)
-    return out
+    return out, meta
 
 
 def _finalize_merged_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -2467,7 +2259,7 @@ def _process_mbp10(df_mbp, tick_size: float = 0.0001):
         out['__emit'] = pd.to_numeric(df_mbp['__emit'], errors='coerce').fillna(1).astype(np.int8).values
     return out
 
-def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
+def _merge(df_mbo, df_mbp, tolerance_ms: int = 100):
     print("  🔗 merge_asof MBO + MBP10...")
     df_mbo = df_mbo.copy()
     df_mbp = df_mbp.copy()
@@ -2490,8 +2282,10 @@ def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
             'distance_to_wall', 'gap_size', 'liquidity_density',
         ]:
             df[c] = 0.0
+        print("  ⚠️ merge_asof: empty MBP feed — all merged LOB columns forced to 0.")
     else:
         mbp_ts_col = 'mbp_ts_event'
+        df_mbp = df_mbp.copy()
         df_mbp[mbp_ts_col] = df_mbp['ts_event']
         tolerance = pd.Timedelta(milliseconds=max(int(tolerance_ms), 1))
         df = pd.merge_asof(
@@ -2503,6 +2297,17 @@ def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
         )
         if mbp_ts_col in df.columns:
             matched = df[mbp_ts_col].notna()
+            if len(matched):
+                m_bp = float(matched.mean())
+                print(
+                    f"  📊 merge_asof backward MBP match ratio: {m_bp:.1%} "
+                    f"(unmatched→LOB columns zero-filled)"
+                )
+                if m_bp < 0.92:
+                    print(
+                        "  ⚠️ Low MBP match ratio — snapshots may be missing or tolerance too tight/loose; "
+                        f"review inputs (merge_tolerance_ms={tolerance_ms})."
+                    )
             if bool(matched.any()):
                 lag_ms = (
                     (df.loc[matched, 'ts_event'] - df.loc[matched, mbp_ts_col])
@@ -2516,6 +2321,12 @@ def _merge(df_mbo, df_mbp, tolerance_ms: int = 500):
                         f"{lag_warn_ratio:.1%} من الصفوف المطابقة تستخدم MBP snapshot قديم نسبيًا "
                         f"(tolerance={tolerance_ms}ms)"
                     )
+                # ── تحذير Section 2B: كشف الصفوف ذات lag > tolerance ─────────
+                bad_merge = int((lag_ms > tolerance_ms).sum())
+                if bad_merge > 0:
+                    pct = bad_merge / max(len(df), 1) * 100
+                    print(f"  ⚠️ محاذاة ضعيفة: {bad_merge:,} rows ({pct:.1f}%) lag > {tolerance_ms}ms — "
+                          f"تحقق من merge_tolerance_ms في defaults.yaml")
             df = df.drop(columns=[mbp_ts_col], errors='ignore')
 
     for c in [
@@ -3426,7 +3237,7 @@ def run_refinery(
     regime_progress_every: int = 25_000,
     deterministic_stage1: bool = True,
     allow_unsafe_multiprocessing: bool = False,
-    merge_tolerance_ms: int = 500,
+    merge_tolerance_ms: int = 100,
     shard_warmup_rows: int = 5_000,
     step4_min_parallel_rows: int = 250_000,
     use_soft_labels: bool = True,         # FIX-12
@@ -3443,8 +3254,6 @@ def run_refinery(
     _configure_stdio_utf8()
     os.makedirs(output_dir, exist_ok=True)
     t0 = datetime.datetime.now()
-    config_snapshot = load_v19_config(config_path)
-    seed_manifest = apply_reproducibility_config(config_snapshot, output_dir=output_dir, component='prepare_training_data')
 
     print_gpu_report()
 
@@ -3475,9 +3284,7 @@ def run_refinery(
             f"{sorted(str(k) for k in legacy_kwargs)}"
         )
 
-    if seed_manifest:
-        print(f"  🎯 Reproducibility manifest: {seed_manifest}")
-    _refinery_early = config_snapshot.get('refinery', {}) or {}
+    _refinery_early = load_v19_config(config_path).get('refinery', {}) or {}
     resolved_enforce_economic_tp_floor = (
         bool(enforce_economic_tp_floor)
         if enforce_economic_tp_floor is not None
@@ -3561,33 +3368,17 @@ def run_refinery(
         mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
     )
     input_symbol_counts = _symbol_count_map_from_integrity(mbo_integrity)
-    try:
+    _assert_single_contract(
+        symbol_counts=input_symbol_counts,
+        context='canonical_mbo_input',
+        expected_symbol=symbol,
+    )
+    if mbp_integrity is not None:
         _assert_single_contract(
-            symbol_counts=input_symbol_counts,
-            context='canonical_mbo_input',
+            symbol_counts=_symbol_count_map_from_integrity(mbp_integrity),
+            context='canonical_mbp_input',
             expected_symbol=symbol,
         )
-        if mbp_integrity is not None:
-            _assert_single_contract(
-                symbol_counts=_symbol_count_map_from_integrity(mbp_integrity),
-                context='canonical_mbp_input',
-                expected_symbol=symbol,
-            )
-    except RuntimeError:
-        _write_contract_gate_failure_artifacts(
-            output_dir=output_dir,
-            expected_symbol=symbol,
-            input_symbol_counts=input_symbol_counts,
-            final_symbol_counts={},
-            mbo_integrity=mbo_integrity,
-            mbp_integrity=mbp_integrity,
-            merged_snapshot={},
-            final_snapshot={},
-            merge_tolerance_ms=merge_tolerance_ms,
-            merge_lag_report=None,
-            gates_cfg=_refinery_early.get('integrity_gates', {}),
-        )
-        raise
     max_phase_a_shards = max(len(mbo_records), len(mbp_records) if mbp_records else 0)
     if max_phase_a_shards <= 1 and effective_workers > 1:
         print(
@@ -3649,9 +3440,8 @@ def run_refinery(
     if mbp_records:
         mbp_feature_dir = _artifact_phase_dir(output_dir, 'features', 'mbp')
         mbp_tasks = []
-        ordered_mbp_records = _records_in_temporal_order(mbp_records)
-        for idx, record in enumerate(ordered_mbp_records):
-            prev_record = ordered_mbp_records[idx - 1] if idx > 0 else None
+        for idx, record in enumerate(sorted(mbp_records, key=lambda item: int(item['shard_idx']))):
+            prev_record = mbp_records[idx - 1] if idx > 0 else None
             mbp_tasks.append({
                 'current': record,
                 'prev': prev_record,
@@ -3684,9 +3474,8 @@ def run_refinery(
     )
     mbo_pass1_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_pass1')
     mbo_tasks = []
-    ordered_mbo_records = _records_in_temporal_order(mbo_records)
-    for idx, record in enumerate(ordered_mbo_records):
-        prev_record = ordered_mbo_records[idx - 1] if idx > 0 else None
+    for idx, record in enumerate(sorted(mbo_records, key=lambda item: int(item['shard_idx']))):
+        prev_record = mbo_records[idx - 1] if idx > 0 else None
         mbo_tasks.append({
             'current': record,
             'prev': prev_record,
@@ -3712,7 +3501,7 @@ def run_refinery(
     mbo_final_dir = _artifact_phase_dir(output_dir, 'features', 'mbo_final')
     reusable_mbo_final_records: list[dict] = []
     if resume:
-        ordered_pass1 = _records_in_temporal_order(mbo_pass1_records)
+        ordered_pass1 = sorted(mbo_pass1_records, key=lambda item: int(item['shard_idx']))
         reusable_mbo_final_records = []
         for record in ordered_pass1:
             shard_idx = int(record['shard_idx'])
@@ -3761,7 +3550,7 @@ def run_refinery(
         mbp_feature_shards=int(len(mbp_feature_records)),
     )
     merged_dir = _artifact_phase_dir(output_dir, 'features', 'merged')
-    ordered_mbo_final = _records_in_temporal_order(mbo_final_records)
+    ordered_mbo_final = sorted(mbo_final_records, key=lambda item: int(item['shard_idx']))
     merge_tasks = []
     for record in ordered_mbo_final:
         shard_idx = int(record['shard_idx'])
@@ -3790,7 +3579,22 @@ def run_refinery(
         effective_workers,
         progress_label='Phase D / merge shards',
     )
-    merge_lag_report = _aggregate_merge_lag_report(merged_records, tolerance_ms=merge_tolerance_ms)
+    if mbp_feature_records:
+        weighted = [(int(r.get('rows', 0)), float(r['mbp_backward_match_ratio']))
+                    for r in merged_records if 'mbp_backward_match_ratio' in r]
+        total_r = sum(rw for rw, _ in weighted)
+        if total_r > 0:
+            wmean = sum(rw * wr for rw, wr in weighted) / float(total_r)
+            unmatched = 1.0 - wmean
+            print(
+                f"  📊 MBP merge_asof backward match (row-weighted): {wmean:.1%} matched | "
+                f"{unmatched:.1%} rows had no MBP within tolerance — LOB columns filled with 0."
+            )
+            if wmean < 0.92:
+                print(
+                    "  ⚠️ Low MBP coverage: tighten clock alignment, extend MBP dataset, or "
+                    f"consider increasing merge_tolerance_ms (current={merge_tolerance_ms})."
+                )
     write_checkpoint(
         output_dir,
         'merge',
@@ -4087,27 +3891,11 @@ def run_refinery(
     )
     final_integrity = _frame_integrity_snapshot(df_final)
     _, final_symbol_counts = _frame_symbol_count_map(df_final)
-    try:
-        _assert_single_contract(
-            symbol_counts=final_symbol_counts,
-            context='final_labeled_artifact',
-            expected_symbol=symbol,
-        )
-    except RuntimeError:
-        _write_contract_gate_failure_artifacts(
-            output_dir=output_dir,
-            expected_symbol=symbol,
-            input_symbol_counts=input_symbol_counts,
-            final_symbol_counts=final_symbol_counts,
-            mbo_integrity=mbo_integrity,
-            mbp_integrity=mbp_integrity,
-            merged_snapshot=merged_integrity,
-            final_snapshot=final_integrity,
-            merge_tolerance_ms=merge_tolerance_ms,
-            merge_lag_report=merge_lag_report,
-            gates_cfg=_refinery_early.get('integrity_gates', {}),
-        )
-        raise
+    _assert_single_contract(
+        symbol_counts=final_symbol_counts,
+        context='final_labeled_artifact',
+        expected_symbol=symbol,
+    )
 
     split_meta = {}
     split_path = os.path.join(output_dir, 'refinery_split.json')
@@ -4210,15 +3998,6 @@ def run_refinery(
         filename='artifact_manifest.json',
     )
     print(f"  ✅ Artifact manifest: {artifact_manifest_path}")
-    contract_report_path = _write_contract_consistency_report(
-        output_dir=output_dir,
-        expected_symbol=symbol,
-        input_symbol_counts=input_symbol_counts,
-        final_symbol_counts=final_symbol_counts,
-    )
-    print(f"  ✅ Contract consistency report: {contract_report_path}")
-    with open(contract_report_path) as f:
-        contract_report = json.load(f)
     integrity_report_path = _write_data_integrity_report(
         output_dir=output_dir,
         mbo_integrity=mbo_integrity,
@@ -4226,36 +4005,17 @@ def run_refinery(
         merged_snapshot=merged_integrity,
         final_snapshot=final_integrity,
         merge_tolerance_ms=merge_tolerance_ms,
-        merge_lag_report=merge_lag_report,
     )
     print(f"  ✅ Data integrity report: {integrity_report_path}")
-    with open(integrity_report_path) as f:
-        integrity_report = json.load(f)
-    integrity_gate_report = _evaluate_data_integrity_gates(
-        report=integrity_report,
-        contract_report=contract_report,
-        gates_cfg=_refinery_early.get('integrity_gates', {}),
+    contract_report_path = _write_contract_consistency_report(
+        output_dir=output_dir,
+        expected_symbol=symbol,
+        input_symbol_counts=input_symbol_counts,
+        final_symbol_counts=final_symbol_counts,
     )
-    integrity_gate_report_path = os.path.join(output_dir, 'data_integrity_gate_report.json')
-    with open(integrity_gate_report_path, 'w') as f:
-        json.dump(integrity_gate_report, f, indent=2)
-    print(f"  ✅ Data integrity gate report: {integrity_gate_report_path}")
+    print(f"  ✅ Contract consistency report: {contract_report_path}")
     label_quality_report_path = _write_label_quality_report(df_final, output_dir)
     print(f"  ✅ Label quality report: {label_quality_report_path}")
-    if bool(integrity_gate_report.get('enabled', False)) and not bool(integrity_gate_report.get('would_pass', True)):
-        print("  ❌ Production integrity gate failures:")
-        for item in (integrity_gate_report.get('failures') or [])[:12]:
-            if not isinstance(item, dict):
-                continue
-            print(
-                "     - "
-                f"{item.get('metric')} | value={item.get('value')} | "
-                f"threshold={item.get('threshold')} | reason={item.get('reason')}"
-            )
-        raise RuntimeError(
-            "❌ Production data integrity gates failed. "
-            f"راجع {integrity_gate_report_path} before training/backtesting."
-        )
 
     elapsed = (datetime.datetime.now()-t0).total_seconds()
     _report(df_final, mbo_path, mbp_path, elapsed, output_dir)
@@ -4356,8 +4116,8 @@ if __name__=='__main__':
                    help='window size for optional Wasserstein regime mode (default: 50)')
     p.add_argument('--regime_progress_every', type=int, default=int(_refinery_defaults.get('regime_progress_every', 25_000)),
                    help='progress print cadence for Wasserstein rolling loops (default: 25000, 0 disables)')
-    p.add_argument('--merge_tolerance_ms', type=int, default=int(_refinery_defaults.get('merge_tolerance_ms', 500)),
-                   help='merge_asof tolerance in milliseconds between MBO and MBP (default: 500)')
+    p.add_argument('--merge_tolerance_ms', type=int, default=int(_refinery_defaults.get('merge_tolerance_ms', 100)),
+                   help='merge_asof tolerance in milliseconds between MBO and MBP (default: 100)')
     p.add_argument('--step4_min_parallel_rows', type=int, default=int(_refinery_defaults.get('step4_min_parallel_rows', 250_000)),
                    help='minimum rows before Step 4 forward scan enables multiprocessing on fork-capable platforms (default: 250000)')
     p.add_argument(

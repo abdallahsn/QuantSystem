@@ -202,9 +202,12 @@ class SoftLabelEngine:
         timeout_mask = (path == PATH_TIMEOUT)
         if timeout_mask.any():
             safe_dyn = np.where(dyn_thr > 1e-10, dyn_thr, 1e-10)
-            norm_ret = fwd_ret / safe_dyn   # ∈ [-sl_mult, tp_mult] تقريباً
-            # sigmoid: 1/(1+e^{-scale*x}), ثم نُخفف النطاق
-            sigmoid_val = 1.0 / (1.0 + np.exp(-cfg.timeout_sigmoid_scale * norm_ret))
+            norm_ret = (fwd_ret / safe_dyn).astype(np.float64, copy=False)
+            norm_ret = np.nan_to_num(norm_ret, nan=0.0, posinf=0.0, neginf=0.0)
+            # sigmoid: 1/(1+e^{-scale*x}); قص مدخل exp لتفادي overflow (norm_ret شديد ضد dyn_thr ضئيل)
+            x = np.asarray(cfg.timeout_sigmoid_scale * norm_ret, dtype=np.float64)
+            x = np.clip(x, -60.0, 60.0)
+            sigmoid_val = (1.0 / (1.0 + np.exp(-x))).astype(np.float32)
             ranged = 0.5 + cfg.timeout_soft_label_range * (sigmoid_val - 0.5)
             ranged_f = ranged.astype(np.float32)
             soft_long[timeout_mask]  = ranged_f[timeout_mask]
@@ -430,35 +433,63 @@ class SoftLabelEngine:
         sw     = df["soft_sample_weight"].to_numpy()
 
         near_half = float(((sl > 0.45) & (sl < 0.55)).mean())
-        avg_conf  = float(np.nanmean(conf))
-        clarity   = float(np.nanmean(np.abs(sl - 0.5) * 2.0))
         bias      = df["bias_label"].to_numpy(dtype=np.int8)
+        dir_ok = bias != DIR_NEUTRAL
+        near_half_dir = (
+            float(((sl[dir_ok] > 0.45) & (sl[dir_ok] < 0.55)).mean())
+            if np.any(dir_ok)
+            else 0.0
+        )
+        avg_conf = float(np.nanmean(conf))
+        clarity_all = float(np.nanmean(np.abs(sl - 0.5) * 2.0))
+        clarity_dir = (
+            float(np.nanmean(np.abs(sl[dir_ok] - 0.5) * 2.0))
+            if np.any(dir_ok)
+            else clarity_all
+        )
+        neutral_share = float((bias == DIR_NEUTRAL).mean())
 
         print("─" * 60)
         print("📊  Soft Labels — تقرير التشخيص")
         print("─" * 60)
         print(f"  الوضع          : {self.config.mode.upper()}")
-        print(f"  قرب 0.5        : {near_half:.1%}  (يجب < 30%)")
+        print(f"  قرب 0.5 (الكل): {near_half:.1%}  (NEUTRAL=0.5 ثابتة ترفع هذا الرقم)")
+        print(f"  قرب 0.5 (اتجاهي فقط): {near_half_dir:.1%}  (مؤشر الغموض في LONG/SHORT)")
         print(f"  متوسط الثقة    : {avg_conf:.3f}  (يجب > 0.50)")
-        print(f"  متوسط الوضوح   : {clarity:.3f}  (كلما ارتفع كلما كانت الإشارات أوضح)")
+        print(f"  متوسط الوضوح (الكل): {clarity_all:.3f}")
+        print(
+            f"  متوسط الوضوح (اتجاهي فقط): {clarity_dir:.3f}  "
+            f"(كلما ارتفع كلما كانت إشارات LONG/SHORT أوضح — الأفضل لقراءة جودة soft)"
+        )
         print(f"  LONG share     : {float((bias == DIR_LONG).mean()):.1%}")
         print(f"  SHORT share    : {float((bias == DIR_SHORT).mean()):.1%}")
-        print(f"  NEUTRAL share  : {float((bias == DIR_NEUTRAL).mean()):.1%}")
+        print(f"  NEUTRAL share  : {neutral_share:.1%}")
         print(f"  وزن max/mean   : {float(sw.max()):.2f}/{float(sw.mean()):.2f}")
 
         # تحذيرات
-        if near_half > 0.30:
+        if near_half_dir > 0.30 and np.any(dir_ok):
             hint = ""
             if str(self.config.mode).lower() == "analytical":
                 hint = (
                     " اعتمد monte_carlo في المصفاة (مثال: "
                     "--soft_label_mode monte_carlo --soft_label_n_scenarios 200)."
                 )
-            print(f"  ⚠️  نسبة عالية من الصفوف قرب 0.5 ({near_half:.1%}) — "
-                  f"قد تعني غموضًا في الإشارات.{hint}")
-        elif str(self.config.mode).lower() == "analytical" and clarity < 0.20:
             print(
-                "  ⚠️  وضوح منخفض مع الوضع التحليلي — للتمايز أنصح monte_carlo "
+                f"  ⚠️  نسبة عالية من صفوف LONG/SHORT قرب 0.5 ({near_half_dir:.1%}) — "
+                f"غموض في الإشارات الاتجاهية.{hint}"
+            )
+        elif near_half > 0.30 and neutral_share > 0.35:
+            print(
+                "  💡  «قرب 0.5 (الكل)» مرتفع لأن غالبية الصفوف NEUTRAL (soft_label=0.5) — "
+                "ليس بالضرورة مشكلة في الصفوف الاتجاهية."
+            )
+        if (
+            str(self.config.mode).lower() == "analytical"
+            and clarity_dir < 0.20
+            and np.any(dir_ok)
+        ):
+            print(
+                "  ⚠️  وضوح منخفض في صفوف LONG/SHORT فقط مع الوضع التحليلي — للتمايز أنصح monte_carlo "
                 "(انظر configs/v19/defaults.yaml أو --soft_label_mode monte_carlo)."
             )
         if avg_conf < 0.50:

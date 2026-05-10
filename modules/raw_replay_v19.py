@@ -223,7 +223,6 @@ def build_replay_dataset(
     mbo_path: str,
     mbp_path: str,
     output_dir: str,
-    config_path: str | None = None,
     start_ts=None,
     end_ts=None,
     label_mode: str = 'v19',
@@ -243,13 +242,19 @@ def build_replay_dataset(
     regime_window: int = 50,
     regime_progress_every: int = 25_000,
     lob_event_sample: int = 100000,
-    merge_tolerance_ms: int = 500,
+    merge_tolerance_ms: int = 100,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
     warmup_rows: int = 0,
     tail_rows: int = 0,
-    trim_to_score_window: bool = False,
+    trim_to_score_window: bool = True,
 ) -> dict:
+    """Build replay artifact.
+
+    Warmup rows are prepended before refinery only for causal feature context.
+    ``trim_to_score_window=True`` (default) trims the finalized feature parquet
+    shards back to ``[start_ts, end_ts)`` so warmup/tail rows never leak into train.
+    """
     os.makedirs(output_dir, exist_ok=True)
     raw_dir = os.path.join(output_dir, 'raw_slice')
     mbo_df, mbo_window = _slice_timerange_with_row_context(
@@ -310,15 +315,25 @@ def build_replay_dataset(
         merge_tolerance_ms=merge_tolerance_ms,
         external_scaler_path=external_scaler_path,
         fit_aux_models=fit_aux_models,
-        config_path=config_path,
     )
 
     trim_meta = None
     if trim_to_score_window:
-        trim_meta = _rewrite_trimmed_feature_artifact(
-            output_dir,
-            start_ts=start_ts,
-            end_ts=end_ts,
+        if start_ts is None and end_ts is None:
+            print(
+                "  ℹ️ trim_to_score_window=True but start_ts/end_ts unset — "
+                "no time-based trim applied (full refinery output kept)."
+            )
+        else:
+            trim_meta = _rewrite_trimmed_feature_artifact(
+                output_dir,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+    elif int(max(warmup_rows, 0)) > 0 or int(max(tail_rows, 0)) > 0:
+        print(
+            "  ⚠️ warmup_rows/tail_rows were used but trim_to_score_window=False — "
+            "context rows may remain in training shards. Prefer trim_to_score_window=True."
         )
 
     return {

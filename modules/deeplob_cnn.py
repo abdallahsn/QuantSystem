@@ -492,7 +492,7 @@ def build_lob_tensor_dataset(
         max_tensors: int | None = None,
         emit_positions=None) -> dict:
     """
-    يبني مصفوفة من الـ 3D Tensors بشكل streaming وآمن للذاكرة.
+    يبني مصفوفة من الـ 3D Tensors؛ يحمّل أعمدة MBP بالكامل في الذاكرة (مناسب لسيرفر RAM كبيرة).
 
     Returns:
         dict يحتوي metadata عن الملفات الناتجة والتخطيط المستخدم.

@@ -89,12 +89,24 @@ def run_paper(
         event_writer=writer,
         manifest_path=os.path.join(models_dir, 'manifest.json'),
         failsafe_policy={**failsafe_cfg, **rollout_cfg},
-        config=cfg,
     )
     df = load_feature_artifact(csv_path)
     canonical_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
+    for ohlc_col in ('open', 'high', 'low', 'close'):
+        if ohlc_col not in canonical_df.columns and ohlc_col in df.columns:
+            canonical_df[ohlc_col] = pd.to_numeric(df[ohlc_col], errors='coerce').to_numpy(dtype=np.float64)
     visual_embeddings = _visual_embeddings(visual_npy, len(canonical_df), len(engine.visual_features))
     prices = pd.to_numeric(canonical_df.get('price', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    highs = pd.to_numeric(
+        canonical_df.get('raw__high', canonical_df.get('high', canonical_df.get('price', 0.0))),
+        errors='coerce',
+    ).fillna(pd.Series(prices, index=canonical_df.index)).to_numpy(dtype=np.float64)
+    lows = pd.to_numeric(
+        canonical_df.get('raw__low', canonical_df.get('low', canonical_df.get('price', 0.0))),
+        errors='coerce',
+    ).fillna(pd.Series(prices, index=canonical_df.index)).to_numpy(dtype=np.float64)
+    highs = np.where(np.isfinite(highs) & (highs > 0), highs, prices)
+    lows = np.where(np.isfinite(lows) & (lows > 0), lows, prices)
     horizons = pd.to_numeric(canonical_df.get('label_horizon_steps', 0), errors='coerce').fillna(0).astype(np.int32).to_numpy()
     micro_atr = pd.to_numeric(canonical_df.get('micro_atr', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
     tick_size = float(bt_cfg.get('tick_size', 0.0001))
@@ -309,6 +321,8 @@ def run_paper(
                 entry_idx=i,
                 direction=pred['bias'],
                 prices=prices,
+                highs=highs,
+                lows=lows,
                 horizons=horizons,
                 micro_atr=micro_atr,
                 tick_size=tick_size,

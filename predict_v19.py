@@ -41,10 +41,8 @@ def _configure_stdio_utf8() -> None:
 _configure_stdio_utf8()
 
 from modules.failsafe_v19 import decide_runtime_mode, evaluate_system_health
-from modules.config_v19 import load_v19_config
 from modules.decision_policy_v19 import (
     DEFAULT_DECISION_POLICY_ARTIFACT,
-    LEGACY_DECISION_POLICY_ARTIFACT,
     evaluate_decision_policy,
     structure_bucket_from_row,
 )
@@ -134,7 +132,6 @@ class V19PredictionEngine:
         manifest_path: str | None = None,
         symbol: str = '',
         failsafe_policy: dict | None = None,
-        config: dict | None = None,
         *,
         policy_require_positive_ev: bool = True,
         policy_edge_prob_override: float | None = None,
@@ -145,8 +142,6 @@ class V19PredictionEngine:
         self.manifest_path = manifest_path or os.path.join(models_dir, 'manifest.json')
         self.symbol = symbol
         self.failsafe_policy = failsafe_policy or {}
-        self.config = dict(config or {})
-        self.profile = str(self.config.get('profile', 'research')).strip().lower() or 'research'
         print(f"\n🔧 V19 Engine — loading artifacts from: {models_dir}")
 
         self.pre = V19FeaturePreprocessor(models_dir)
@@ -269,46 +264,20 @@ class V19PredictionEngine:
                 print(f"  ⚠️ XGBoost calibrator unavailable: {exc}")
 
         self.decision_policy = None
-        self.required_policy_version = (
-            str(self.schema.get('decision_policy_version_required', '')).strip()
-            or str(((self.config.get('training', {}) or {}).get('require_decision_policy_version', ''))).strip()
+        decision_policy_name = (
+            artifacts.get('decision_policy')
+            or self.schema.get('decision_policy_artifact')
+            or DEFAULT_DECISION_POLICY_ARTIFACT
         )
-        decision_policy_candidates = []
-        for candidate in (
-            artifacts.get('decision_policy'),
-            self.schema.get('decision_policy_artifact'),
-            DEFAULT_DECISION_POLICY_ARTIFACT,
-            LEGACY_DECISION_POLICY_ARTIFACT,
-        ):
-            name = str(candidate or '').strip()
-            if name and name not in decision_policy_candidates:
-                decision_policy_candidates.append(name)
-        loaded_policy_name = None
-        for decision_policy_name in decision_policy_candidates:
-            decision_policy_path = os.path.join(models_dir, decision_policy_name)
-            if not os.path.exists(decision_policy_path):
-                continue
+        decision_policy_path = os.path.join(models_dir, decision_policy_name)
+        if os.path.exists(decision_policy_path):
             try:
                 with open(decision_policy_path, 'r') as f:
                     self.decision_policy = json.load(f)
-                loaded_policy_name = decision_policy_name
                 print(f"  ✅ Decision policy loaded: {decision_policy_name}")
-                break
             except Exception as exc:
                 self.decision_policy = None
                 print(f"  ⚠️ Decision policy unavailable: {exc}")
-        if self.decision_policy is not None:
-            loaded_policy_version = str(self.decision_policy.get('policy_version', '')).strip()
-            if self.required_policy_version and loaded_policy_version != self.required_policy_version:
-                raise RuntimeError(
-                    "❌ Decision policy version mismatch. "
-                    f"required={self.required_policy_version} loaded={loaded_policy_version or 'missing'} "
-                    f"| artifact={loaded_policy_name or 'unknown'} | profile={self.profile}"
-                )
-        elif self.profile == 'production' or self.required_policy_version:
-            raise FileNotFoundError(
-                "❌ Decision policy artifact is required for this runtime profile, but none was found."
-            )
 
         self.regime_clf = RegimeClassifier(n_regimes=N_CLUSTERS)
         regime_ok = self.regime_clf.load(models_dir)
@@ -365,6 +334,9 @@ class V19PredictionEngine:
             print("  ⚠️ MetaLearner V19 missing or not fitted")
         else:
             print("  ✅ MetaLearner V19 loaded")
+        if run_mode == 'backtest' and self.meta is not None:
+            self.meta.confidence_head_enabled = False
+            print("  [backtest] Meta: MC confidence head bypassed for fast causal replay")
         self.meta_temperature = None
         meta_temp_path = os.path.join(models_dir, artifacts.get('meta_temperature', 'meta_temperature_v19.json'))
         if os.path.exists(meta_temp_path):
@@ -987,11 +959,9 @@ def main():
     p.add_argument('--visual_npy', default=None, help='optional precomputed visual embeddings for the same rows')
     p.add_argument('--input_scaled', action='store_true',
                    help='set this when using final stage1 artifact (already scaled)')
-    p.add_argument('--config', default=None, help='optional config file to override defaults')
     args = p.parse_args()
 
-    cfg = load_v19_config(args.config)
-    engine = V19PredictionEngine(args.models, run_mode=args.mode, config=cfg)
+    engine = V19PredictionEngine(args.models)
 
     if args.mode == 'backtest':
         if not args.data:

@@ -278,7 +278,9 @@ class MetaLearnerLSTM:
             self.confidence_head_enabled = self.current_conf_loss_weight > 0.0
         if auxiliary_phase:
             self.aux_loss_phase = str(auxiliary_phase)
-        lr = WarmupCosineDecay(d_model=self.lstm2, warmup_steps=500)
+        # FIX-3: رفع warmup_steps من 500 إلى 2000 — مع 7 أيام داتا (467 batch/epoch)
+        # الـ LR كان يرتفع بسرعة فيسبب overfitting من Epoch 2
+        lr = WarmupCosineDecay(d_model=self.lstm2, warmup_steps=2000)
         losses: dict = {
             'bias_out': 'sparse_categorical_crossentropy',
             'conf_out': 'binary_crossentropy',
@@ -546,19 +548,22 @@ class MetaLearnerLSTM:
         n_short = max(int((yb_arr == 1).sum()), 1)
         n_total = n_tr
 
-        w_long = n_total / (2.0 * n_long)
-        w_short = n_total / (2.0 * n_short)
+        # FIX-2: cap الأوزان عند 3.0 — بدون cap تتضاعف مع Stage 1 وتحيّز النموذج
+        w_long  = min(n_total / (2.0 * n_long),  3.0)
+        w_short = min(n_total / (2.0 * n_short), 3.0)
 
         quality_boost = np.where(yc_arr > 0.5, 2.0, 1.0).astype(np.float32)
         class_w_arr = np.where(yb_arr == 0, w_long, w_short).astype(np.float32)
         sample_w = (class_w_arr * quality_boost).astype(np.float32)
         conf_w = quality_boost.copy()
         self.confidence_target_std = float(np.std(yc_arr)) if len(yc_arr) else 0.0
-        if self.confidence_target_std < 1e-4:
+        # FIX-1: رفع الحد من 1e-4 إلى 0.05 — conf_target شبه ثابت (std < 0.05)
+        # يجمّد الـ gradient ويعطّل bias_out بشكل غير مباشر
+        if self.confidence_target_std < 0.05:
             self._recompile(conf_loss_weight=0.0)
             print(
                 "   Confidence head   → disabled "
-                f"(std(conf_target)={self.confidence_target_std:.6f})"
+                f"(std(conf_target)={self.confidence_target_std:.6f} < 0.05)"
             )
         else:
             self._recompile(conf_loss_weight=self.base_conf_loss_weight)

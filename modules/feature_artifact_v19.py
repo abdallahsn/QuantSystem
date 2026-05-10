@@ -42,10 +42,7 @@ def _write_json(path: str, payload: dict) -> str:
 def read_table(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext in {".parquet", ".pq", ".snappy"}:
-        try:
-            return pd.read_parquet(path)
-        except Exception:
-            return pd.read_pickle(path)
+        return pd.read_parquet(path)
     if ext in {".zst", ".gz"}:
         return pd.read_csv(path, low_memory=False, compression="infer")
     if ext in {".pkl", ".pickle"}:

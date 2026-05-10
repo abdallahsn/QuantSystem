@@ -57,7 +57,6 @@ def run_raw_backtest(
         mbo_path=mbo_path,
         mbp_path=mbp_path,
         output_dir=dataset_dir,
-        config_path=config_path,
         start_ts=start_ts,
         end_ts=end_ts,
         label_mode=str(ref_cfg.get('label_mode', 'v19')),

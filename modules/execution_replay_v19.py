@@ -112,11 +112,17 @@ def simulate_trade_path(
     sl_mult: float = 1.0,
     max_horizon_steps: int | None = None,
     row_data: dict | None = None,
+    highs: np.ndarray | None = None,
+    lows: np.ndarray | None = None,
 ) -> dict | None:
     if direction not in ("LONG", "SHORT"):
         return None
     if entry_idx < 0 or entry_idx >= len(prices):
         return None
+    highs = prices if highs is None else np.asarray(highs, dtype=np.float64)
+    lows = prices if lows is None else np.asarray(lows, dtype=np.float64)
+    if len(highs) != len(prices) or len(lows) != len(prices):
+        highs = lows = prices
 
     entry_price = float(prices[entry_idx])
     if not np.isfinite(entry_price) or entry_price <= 0:
@@ -184,36 +190,49 @@ def simulate_trade_path(
             sl_level = entry_price + sl_distance
 
     future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_highs = np.asarray(highs[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_lows = np.asarray(lows[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
     if future_prices.size == 0:
         return None
 
     exit_idx = exit_cap_idx
     exit_reason = "horizon"
-    for offset, future_price in enumerate(future_prices, start=1):
+    exit_price = float(prices[exit_idx])
+    for offset, (future_high, future_low) in enumerate(zip(future_highs, future_lows), start=1):
         if direction == "LONG":
-            if future_price >= tp_level:
+            hit_tp = float(future_high) >= float(tp_level)
+            hit_sl = float(future_low) <= float(sl_level)
+            if hit_tp or hit_sl:
                 exit_idx = entry_idx + offset
-                exit_reason = "tp"
-                break
-            if future_price <= sl_level:
-                exit_idx = entry_idx + offset
-                exit_reason = "sl"
+                if hit_sl:
+                    exit_reason = "sl"
+                    exit_price = float(sl_level)
+                else:
+                    exit_reason = "tp"
+                    exit_price = float(tp_level)
                 break
         else:
-            if future_price <= tp_level:
+            hit_tp = float(future_low) <= float(tp_level)
+            hit_sl = float(future_high) >= float(sl_level)
+            if hit_tp or hit_sl:
                 exit_idx = entry_idx + offset
-                exit_reason = "tp"
-                break
-            if future_price >= sl_level:
-                exit_idx = entry_idx + offset
-                exit_reason = "sl"
+                if hit_sl:
+                    exit_reason = "sl"
+                    exit_price = float(sl_level)
+                else:
+                    exit_reason = "tp"
+                    exit_price = float(tp_level)
                 break
 
-    exit_price = float(prices[exit_idx])
+    if exit_reason == "horizon":
+        exit_price = float(prices[exit_idx])
     price_return = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
-    path_moves = (future_prices - entry_price) if direction == "LONG" else (entry_price - future_prices)
-    favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
-    adverse_move = float(np.min(path_moves)) if path_moves.size else 0.0
+    if direction == "LONG":
+        favourable_move = float(np.nanmax(future_highs - entry_price)) if future_highs.size else 0.0
+        adverse_move = float(np.nanmin(future_lows - entry_price)) if future_lows.size else 0.0
+    else:
+        favourable_move = float(np.nanmax(entry_price - future_lows)) if future_lows.size else 0.0
+        adverse_move = float(np.nanmin(entry_price - future_highs)) if future_highs.size else 0.0
 
     return {
         "exit_idx": int(exit_idx),
@@ -260,6 +279,12 @@ def build_realized_policy_frame(
     max_horizon_steps = int(cfg_replay.get("max_horizon_steps", 0) or 0) or None
 
     prices = pd.to_numeric(frame.get("price", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    high_source = frame.get("raw__high", frame.get("high", frame.get("price", 0.0)))
+    low_source = frame.get("raw__low", frame.get("low", frame.get("price", 0.0)))
+    highs = pd.to_numeric(high_source, errors="coerce").fillna(pd.Series(prices, index=frame.index)).to_numpy(dtype=np.float64)
+    lows = pd.to_numeric(low_source, errors="coerce").fillna(pd.Series(prices, index=frame.index)).to_numpy(dtype=np.float64)
+    highs = np.where(np.isfinite(highs) & (highs > 0), highs, prices)
+    lows = np.where(np.isfinite(lows) & (lows > 0), lows, prices)
     horizons = pd.to_numeric(frame.get("label_horizon_steps", 0), errors="coerce").fillna(0).astype(np.int32).to_numpy()
     micro_atr_source = frame.get("raw__micro_atr", frame.get("micro_atr", 0.0))
     micro_atr = pd.to_numeric(micro_atr_source, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
@@ -292,6 +317,8 @@ def build_realized_policy_frame(
                 sl_mult=sl_mult,
                 max_horizon_steps=max_horizon_steps,
                 row_data=row_dict,
+                highs=highs,
+                lows=lows,
             )
             if trade is None:
                 continue

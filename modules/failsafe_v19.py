@@ -10,6 +10,9 @@ from typing import Any
 import pandas as pd
 import json
 
+# Cache shadow-approval reads: predict_step calls health checks every row; avoid reopening JSON O(n_rows) times.
+_SHADOW_APPROVAL_CACHE: dict[str, tuple[float | None, dict]] = {}
+
 
 def _manifest_exists(path: str | None) -> bool:
     return bool(path) and os.path.exists(path)
@@ -22,20 +25,33 @@ def _schema_manifest_match(models_dir: str) -> bool:
 def _load_shadow_approval(models_dir: str, policy: dict) -> dict:
     file_name = str(policy.get('shadow_approval_file', 'shadow_approval.json') or 'shadow_approval.json')
     path = file_name if os.path.isabs(file_name) else os.path.join(models_dir, file_name)
+    key = path
+    try:
+        mtime_val = os.path.getmtime(path) if os.path.exists(path) else None
+    except OSError:
+        mtime_val = None
+    cached = _SHADOW_APPROVAL_CACHE.get(key)
+    if cached is not None and cached[0] == mtime_val:
+        return cached[1]
+
     if not os.path.exists(path):
-        return {'available': False, 'passed': False, 'reason': 'shadow_approval_missing', 'path': path}
+        result = {'available': False, 'passed': False, 'reason': 'shadow_approval_missing', 'path': path}
+        _SHADOW_APPROVAL_CACHE[key] = (mtime_val, result)
+        return result
     try:
         with open(path) as f:
             payload = json.load(f)
     except Exception as exc:
-        return {'available': False, 'passed': False, 'reason': f'shadow_approval_unreadable:{exc}', 'path': path}
+        result = {'available': False, 'passed': False, 'reason': f'shadow_approval_unreadable:{exc}', 'path': path}
+        _SHADOW_APPROVAL_CACHE[key] = (mtime_val, result)
+        return result
 
     generated_at = pd.to_datetime(payload.get('generated_at'), utc=True, errors='coerce')
     max_age_days = float(policy.get('shadow_approval_max_age_days', 14))
     stale = False
     if not pd.isna(generated_at):
         stale = (pd.Timestamp.utcnow() - generated_at).total_seconds() > max_age_days * 86400.0
-    return {
+    result = {
         'available': True,
         'passed': bool(payload.get('passed', False)),
         'stale': bool(stale),
@@ -43,6 +59,8 @@ def _load_shadow_approval(models_dir: str, policy: dict) -> dict:
         'payload': payload,
         'reason': 'shadow_approval_stale' if stale else ('shadow_approval_failed' if not bool(payload.get('passed', False)) else 'ok'),
     }
+    _SHADOW_APPROVAL_CACHE[key] = (mtime_val, result)
+    return result
 
 
 def evaluate_system_health(

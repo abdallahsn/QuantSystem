@@ -1,174 +1,126 @@
 # QuantSystem V19
 
-QuantSystem V19 هو مشروع **quantitative AI trading system** مبني حول:
+QuantSystem V19 هو نظام بحثي/إنتاجي لتجارب التداول الكمي بالذكاء الاصطناعي. الهدف الأساسي ليس إطلاق وعود ربح، بل بناء pipeline قابل للقياس والتحقق يركز على:
 
-1. `prepare_training_data.py`
-  - يحول بيانات السوق الخام `MBO/MBP` إلى dataset جاهز للتدريب
-  - يبني features
-  - يبني labels
-  - يحفظ `LOB tensors`
-2. `train_v19.py`
-  - يدرب pipeline ثلاثي المراحل بشكل آمن ضد الـ leakage
-  - Stage 1: `CatBoost + Regime meta-features`
-  - Stage 2: `OOF DeepLOB visual embeddings`
-  - Stage 3: `MetaLearner LSTM`
+- منع تسرب البيانات المستقبلية إلى الميزات أو التدريب.
+- بناء labels قابلة للمراجعة زمنياً.
+- تدريب نماذج أكثر تعميماً عبر split زمني وwalk-forward.
+- تشغيل backtest واقعي قدر الإمكان مع تكلفة، spread، slippage، latency، وقيود تنفيذ.
+- تجهيز طبقات shadow/paper/live diagnostics قبل أي broker integration حقيقي.
 
-### Recommended Operational Phases
+> ملاحظة مهمة: أي نتيجة تدريب أو backtest داخل هذا المشروع تعتبر نتيجة بحثية حتى تثبت عبر out-of-sample وwalk-forward وقياس حساسية التكاليف. لا تعتمد على accuracy وحدها.
 
-للتشغيل العملي المبسط، يُفضّل تقسيم المشروع إلى 3 مراحل واضحة:
+## الصورة العامة
 
-1. `stage1_refinery.py`
-  - يبني dataset التدريب من الخام
-  - يحفظ artifact جديدًا مبنيًا على `sharded parquet + manifest + checkpoints`
-  - يعمل افتراضيًا على streaming/shards بدل full-load
-  - يستخدم `rules` كـ default للـ regime metadata مع coarse sampling لتقليل زمن الـ stage1
-2. `stage2_catboost.py`
-  - يدرب `CatBoost + Regime`
-  - يحفظ `meta_features_oof_v19.npy`
-  - يحفظ `catboost_advisor_v19.cbm`
-3. `stage3_train.py`
-  - يدرب `MetaLearner`
-  - يعتمد على نواتج المرحلة الثانية
-  - يستخدم الـ visual embeddings من الكاش إن وُجدت، وإلا يكمل بأصفار
-4. `backtest_v19.py`
-  - يشغل causal replay backtest على dataset V19 الجاهز
-5. `walkforward_v19.py`
-  - ينفذ walk-forward evaluation من raw market data
-  - يعيد بناء train/test folds
-  - يطبق release gates
-6. `shadow_v19.py` و `paper_v19.py`
-  - لتشغيل طبقات التشغيل غير الحي:
-  - shadow mode
-  - paper mode
-  - rollout control logic بدون broker integration
+المشروع يحتوي حالياً على مسارين رئيسيين:
 
-## Architecture
+1. **Event/Tick Refinery Path**
+   - يستخدم `stage1_refinery.py` أو `prepare_training_data.py`.
+   - يعالج بيانات MBO/MBP الخام إلى features وlabels وLOB tensors.
+   - مناسب لتجارب microstructure/event-level الأصلية.
 
-### 1. Raw Data Layer
+2. **Day-Trading Hybrid Path**
+   - يستخدم `prepare_day_trading.py`.
+   - يحول التكات وMBP إلى شموع `5min/15min/30min` مع ميزات intrabar وLOB tensor لكل شمعة.
+   - يحافظ قدر الإمكان على نفس واجهة `train_v19.py` حتى يمكن تدريب CatBoost/DeepLOB/MetaLearner على artifact الشموع.
 
-- `MBO`: market-by-order / trades / add / cancel
-- `MBP10`: top-10 order book snapshots
-
-### 2. Feature Layer
-
-يتم استخراج:
-
-- microstructure features
-- order book features
-- context / rolling / session features
-- autoencoder embeddings
-- `LOB tensors` للـ CNN
-
-### 3. Model Layer
-
-- `CatBoost advisor`
-- `Regime classifier`
-- `DeepLOB CNN`
-- `MetaLearner LSTM`
-
-### Regime Defaults In This Version
-
-- `stage1_refinery.py` لم يعد يستخدم `Wasserstein` كمسار افتراضي على كل الصفوف.
-- الافتراضي الآن:
-  - `regime_mode=rules`
-  - `regime_stride=50`
-  - `deterministic_stage1=true`
-- هذا يعني أن stage1 يبني `regime metadata` على surface أخف، ثم يوسعها على كامل الصفوف بدل تشغيل مصنف regime ثقيل على كل trade row.
-- إذا أردت `Wasserstein`, شغّله يدويًا فقط كـ `research mode` وليس كمسار إنتاج افتراضي.
-
-### 4. Evaluation Layer
-
-- causal backtest
-- walk-forward validation
-- monitoring + drift
-- release gates
-
-## Project Structure
+بعد تجهيز البيانات، المسار التدريبي المشترك هو:
 
 ```text
-QuantSystem V19/
+Raw MBO/MBP
+  -> refinery / day-trading artifact
+  -> train_v19.py
+  -> predict_v19.py / backtest_v19.py
+  -> walkforward_v19.py / shadow_v19.py / paper_v19.py
+```
+
+## بنية المشروع
+
+```text
+QS_FINAL/
 ├── README.md
 ├── requirements.txt
+├── configs/
+│   └── v19/
+├── stage1_refinery.py
 ├── prepare_training_data.py
+├── prepare_day_trading.py
+├── verify_day_trading_dataset.py
 ├── train_v19.py
+├── stage2_catboost.py
+├── stage3_train.py
 ├── predict_v19.py
 ├── backtest_v19.py
+├── raw_backtest_v19.py
 ├── walkforward_v19.py
 ├── shadow_v19.py
 ├── paper_v19.py
-├── monitor_v19.py
-├── configs/
-│   └── v19/
-│       ├── defaults.yaml
-│       └── release_gates.yaml
+├── live_predictor.py
+├── online_learning.py
+├── find_training_artifacts.py
+├── plot_v19_power_dashboard.py
+├── plot_best_soft_label_lob_heatmap.py
+├── readiness_v19.py
 └── modules/
-    ├── labels_v19.py
+    ├── feature_artifact_v19.py
     ├── feature_factory_v19.py
-    ├── preprocessing_v19.py
-    ├── oof_stacking.py
-    ├── logging_v19.py
-    ├── monitoring_v19.py
+    ├── labels_v19.py
+    ├── soft_label_engine.py
+    ├── mc_label_weights.py
+    ├── structural_context_labels_v19.py
+    ├── tick_intrabar_slices.py
+    ├── intrabar_microstructure.py
+    ├── intrabar_mbp_microstructure.py
+    ├── catboost_brain.py
+    ├── deeplob_cnn.py
+    ├── meta_learner.py
+    ├── decision_policy_v19.py
+    ├── slippage_model.py
     ├── failsafe_v19.py
-    ├── manifest_v19.py
+    ├── raw_replay_v19.py
     └── ...
 ```
 
-## Recommended Environment
+## البيئة والمتطلبات
 
-### Python
-
-- يوصى بـ `Python 3.10` أو `Python 3.11`
-- `Python 3.12` مدعوم أيضًا إذا كنت ستثبّت TensorFlow الحديث عبر `pip`
-- بيئة `venv` كافية ومفضّلة؛ `conda` اختياري وليس مطلوبًا
-
-### Base Dependencies
-
-الموجودة في [requirements.txt](/Users/abdallah/Downloads/QS_FINAL/requirements.txt):
-
-- `numpy`
-- `pandas`
-- `scikit-learn`
-- `scipy`
-- `matplotlib`
-- `plotly`
-- `openpyxl`
-- `pyyaml`
-- `pyarrow`
-- `catboost`
-- `tensorflow`
-- `tqdm`
-
-### Common Optional Dependencies
-
-بعض أجزاء المشروع تستخدم أو تستفيد من:
-
-- `jupyterlab`
-- `ipykernel`
-- `hmmlearn`
-
-إذا كنت ستعمل على سيرفر خارجي مع Jupyter Notebook فالأفضل تثبيت:
+يفضل استخدام Python 3.10 أو 3.11. يمكن تشغيل أجزاء كثيرة على CPU، أما DeepLOB/MetaLearner فيحتاج TensorFlow، وGPU اختياري حسب البيئة.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install jupyterlab ipykernel hmmlearn
 ```
 
-## Quick Start
+المتطلبات الأساسية موجودة في `requirements.txt` وتشمل:
 
-### 1. تجهيز البيانات
+- `numpy`, `pandas`, `scikit-learn`, `scipy`
+- `pyarrow`, `pyyaml`, `tqdm`
+- `catboost`, `xgboost`
+- `tensorflow`
+- `matplotlib`, `plotly`, `openpyxl`
+
+لـ Jupyter على سيرفر:
 
 ```bash
-python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --label_mode v19 --chunk_rows 2000000 --mbo_workers 32 --mbp_workers 32
+pip install jupyterlab ipykernel
+python -m ipykernel install --user --name quantsystem-v19 --display-name "Python (QuantSystem V19)"
 ```
 
-السلوك الافتراضي المهم في النسخة الحالية:
+## المسار الأول: Event/Tick Refinery
 
-- `stage1` صار pipeline sharded/resumable بدل `CSV` واحد في النهاية
-- `MBO` و`MBP` يُعالجان على shards مع warmup boundaries وcheckpoints
-- `regime` يعمل افتراضيًا بـ `rules` بدل `Wasserstein`
-- `regime` يُحسب على coarse sample ثم يُوسَّع على كامل الصفوف
+هذا هو المسار الأصلي لبناء artifact من MBO/MBP مع shards وmanifest وLOB tensors.
 
-للتشغيل الكبير يفضّل ترك هذه الافتراضيات كما هي واستخدام `--resume` إذا انقطع التشغيل.
+```bash
+python stage1_refinery.py \
+  --mbo /path/to/mbo.csv \
+  --mbp /path/to/mbp.csv \
+  --output outputs_v19 \
+  --label_mode v19 \
+  --chunk_rows 2000000 \
+  --mbo_workers 8 \
+  --mbp_workers 8
+```
 
 النواتج المهمة:
 
@@ -183,189 +135,200 @@ python stage1_refinery.py --mbo mbo2.csv --mbp mbp2.csv --output outputs_v19 --l
 - `outputs_v19/lob_tensor_timestamps.npy`
 - `outputs_v19/refinery_report.txt`
 
-ملاحظة:
+الافتراضات الحالية في Stage 1:
 
-- `lob_tensors.npy` و`lob_tensor_timestamps.npy` يُبنيان من الـ shards نفسها إذا كان `MBP` موجودًا و`DeepLOB runtime` متاحًا.
-- إذا قررت Stage1 تخطي `Step 3e` بسبب الميزانية أو غياب runtime، ستجد السبب في `outputs_v19/lob_build_meta.json`.
-- على Windows native، TensorFlow سيعمل غالبًا على `CPU` فقط؛ إذا أردت `GPU` للـ DeepLOB فشغّل التدريب على Linux/WSL2.
+- `regime_mode=rules` هو الافتراضي الإنتاجي الأسرع.
+- `Wasserstein` يبقى research mode لأنه أبطأ على datasets كبيرة.
+- `regime_stride` يقلل تكلفة بناء regime surface ثم يوسعها على كامل الصفوف.
+- soft labels يمكن تشغيلها عبر Monte Carlo عند الحاجة، مع `mc_sample_weight` و`label_stability`.
 
-### 1b. دمج الأوامر «القوية» مع النظام الحالي (Soft + Monte Carlo + FIX-13)
-
-- **الافتراضي في `configs/v19/defaults.yaml`**: `soft_labels.mode = monte_carlo` مع `n_scenarios: 200` وتمريرات jitter أقوى؛ تشغيل المصفاة بدون إعداد مخالف ينتج soft labels أوضح ويحدّ تجمع احتمالات حول 0.5 مقارنة بالوضع التحليلي. للاختبار السريع فقط: `--soft_label_mode analytical`.
-
-النسخة الحالية تدمج أيضًا افتراضيًا:
-
-- **أرضية TP الاقتصادية**: `enforce_economic_tp_floor` في `configs/v19/defaults.yaml` (ومفتاح `--enforce-economic-tp-floor` في المصفاة) حتى لا تُبنى صفقات TP أصغر من وقف التكلفة + التنفيذ؛ هذا يتوافق مع أوزان Gambler وأهداف الهيكل (رينج/جدار) لأن مسافات TP/SL تصبح أكثر واقعية.
-- **`range_ctx` / `bid_wall_delta_fwd_k` / `ask_wall_delta_fwd_k`**: تُولَّد من المصفاة عند تشغيل `labels_v19` كامل؛ مرحلة الـ Meta تستخدمها للتعلم متعدد المهام عند توفر شروط القناع الكافية.
-- **`--stage1_target soft_label`**: CatBoost/XGBoost ينزلان إلى **انحدار** على `soft_label`؛ أوزان التدريب في هذا المسار هي **`mc_sample_weight × label_stability`** فقط؛ علَم **`--sample_weight_mode geometric`** يُسجَّل للتمييز عن مسار التصنيف؛ على مسار **`soft_label`** يُستخدم دائمًا وزن **`mc_sample_weight × label_stability`** (مكافئ نيًّا للسياسة الهندسية).
-
-**1) نفس إعداد Monte Carlo صراحةً (اختياري إن خالفته في config):**
-
-```powershell
-$root = "E:\QuantSystem-master (3) (2)\QuantSystem-master"
-Set-Location -LiteralPath $root
-py -3.13 stage1_refinery.py `
-  --mbo "mbo2.csv" --mbp "mbp2.csv" `
-  --output "pipeline_deep_mc_200" `
-  --chunk_rows 2000000 --mbo_workers 8 --mbp_workers 8 `
-  --use_soft_labels --soft_label_mode monte_carlo `
-  --soft_label_n_scenarios 200 `
-  --soft_label_horizon_std 0.30 --soft_label_tp_std 0.20 --soft_label_sl_std 0.20
-```
-
-**2) CatBoost-only (قوة Soft كما وثّقت؛ CPU يتفادى تعارضات GPU مع `rsm`):**
-
-```powershell
-$root = "E:\QuantSystem-master (3) (2)\QuantSystem-master"
-Set-Location -LiteralPath $root
-py -3.13 train_v19.py `
-  --data "$root\pipeline_deep_mc_200" `
-  --output "$root\pipeline_deep_mc_200\train_catboost_soft_geom" `
-  --phase catboost `
-  --catboost_device cpu `
-  --stage1_target soft_label `
-  --sample_weight_mode geometric
-```
-
-يمكن أيضًا استخدام `--data "... \final"`؛ دالة تحميل البيانات تتعرّف على جذر الـ `artifact_manifest.json` تلقائيًا عندما يُمرَّر مجلد `final`.
-
-**3) تشغيل الـ pipeline كاملًا (CatBoost + DeepLOB + Meta) بعد المصفاة نفسها:**
-
-```powershell
-py -3.13 train_v19.py `
-  --data "$root\pipeline_deep_mc_200" `
-  --output "$root\pipeline_deep_mc_200\train_full_soft_geom" `
-  --phase full `
-  --catboost_device cpu `
-  --stage1_target soft_label `
-  --sample_weight_mode geometric
-```
-
-`train_v19` يحمّل `lob_tensors.npy` من مجلد الـ artifact نفسه عند وجوده. للتحكم في تدريب رؤوس الرينج/الجدار على الـ Meta يمكن ضبط `META_MULTITASK_MIN_WALL_TR` و`META_RANGE_PHASE1_FRAC` في البيئة قبل التشغيل.
-
-### 1c. Regime Research Mode
-
-إذا أردت اختبار `Wasserstein` يدويًا على dataset أصغر أو في تجربة بحثية:
+تشغيل research mode للـ Wasserstein:
 
 ```bash
-python3 stage1_refinery.py \
+python stage1_refinery.py \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
   --output outputs_v19_research \
   --label_mode v19 \
   --regime_mode wasserstein \
   --regime_stride 25 \
-  --regime_window 50 \
-  --regime_progress_every 25000
+  --regime_window 50
 ```
 
-ملاحظات مهمة:
+## المسار الثاني: Day-Trading Hybrid Refinery
 
-- `Wasserstein` لم يعد default لأنه أبطأ بكثير على datasets ضخمة.
-- `regime_stride` يتحكم بعدد الصفوف المستخدمة لبناء `regime surface` قبل توسيعها على كامل dataset.
-- كلما زاد `regime_stride` أصبح stage1 أسرع، لكن surface أدقّتها الزمنية تصبح أخشن.
+`prepare_day_trading.py` هو المسار الجديد لتجميع التكات إلى شموع تداول يومي مع ميزات ميكروية داخل الشمعة. الفكرة ليست فقدان معلومات التكات بالكامل، بل تجميعها داخل كل bar:
 
-### 2. CatBoost Stage
+- OHLCV.
+- CVD وorder-flow imbalance.
+- absorption/cancel/spoof intrabar slices.
+- MBP intrabar telemetry عند توفر MBP10.
+- day/session/context features.
+- LOB tensors rolling لكل شمعة.
+- labels بنظام Event Gate ثم First Barrier Hit.
+
+مثال تشغيل:
 
 ```bash
-python stage2_catboost.py --data outputs_v19 --output outputs_v19
+python prepare_day_trading.py \
+  --mbo /path/to/mbo_parquet_or_dir \
+  --mbp /path/to/mbp10_file_or_dir \
+  --output pipeline_day_trading/features \
+  --freq 5min \
+  --horizon 6 \
+  --tp_mult 1.5 \
+  --sl_mult 1.0
 ```
 
-النواتج المهمة:
+خيارات مهمة:
 
-- `catboost_advisor_v19.cbm`
-- `catboost_classes_v19.json`
-- `regime_classifier.pkl`
-- `meta_features_oof_v19.npy`
-- `meta_coverage_v19.npy`
+- `--freq`: يدعم `5min`, `15min`, `30min`.
+- `--horizon`: عدد الشموع المستخدمة في label horizon.
+- `--tp_mult` و`--sl_mult`: TP/SL كنسبة من ATR.
+- `--no_lob`: تخطي LOB tensors إذا أردت تجربة جدولية سريعة.
+- `--strict_train_pool`: يضيق `train_event_flag` إلى جلسات نشطة وATR كاف.
 
-### 3. Final Training Stage
+النواتج المتوقعة:
+
+- `day_trading_features.parquet`
+- `day_trading_manifest.json`
+- `lob_tensors.npy` إذا لم تستخدم `--no_lob`
+- `lob_tensor_timestamps.npy` إذا تم بناء LOB
+
+فحص artifact الشموع قبل التدريب:
 
 ```bash
-python3 stage3_train.py \
-  --data outputs_v19 \
-  --output outputs_v19
+python verify_day_trading_dataset.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy
 ```
 
-النواتج المهمة:
+## التدريب
 
-- `meta_learner_v19.keras`
-- `feature_schema_v19.json`
-- `manifest.json`
+`train_v19.py` هو مدخل التدريب الرئيسي. يقبل إما artifact كامل، manifest، folder فيه `final/`، أو ملف parquet مثل `day_trading_features.parquet`.
 
-### 4. Full Pipeline Shortcut
-
-إذا أردت تشغيل كل شيء دفعة واحدة كما في السلوك القديم:
-
-```bash
-python3 train_v19.py \
-  --data outputs_v19 \
-  --output outputs_v19 \
-  --phase full
-```
-
-`train_v19.py --data outputs_v19` يبحث تلقائيًا عن `lob_tensors.npy` داخل نفس artifact dir، وليس في مجلد الأب.
-
-يمكن أيضًا تشغيل CatBoost فقط أو التدريب فقط من نفس الملف:
-
-```bash
-python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase catboost
-python3 train_v19.py --data outputs_v19 --output outputs_v19 --phase train
-```
-
-### 4b. Diagnostic Verification Commands
-
-هذه الأوامر مفيدة بعد أي تعديل في `train_v19.py` أو `predict_v19.py` أو طبقات
-الـ backtest / paper / regime / schema contracts:
-
-```bash
-python -m py_compile \
-  train_v19.py \
-  predict_v19.py \
-  backtest_v19.py \
-  paper_v19.py \
-  modules/decision_policy_v19.py \
-  modules/regime_classifier.py \
-  modules/slippage_model.py
-```
-
-للتحقق التشغيلي النهائي على artifact حقيقي:
+### تدريب كامل
 
 ```bash
 python train_v19.py \
-  --data /path/to/artifact_dir \
-  --output /path/to/output_dir \
+  --data outputs_v19 \
+  --output outputs_v19_train \
+  --phase full \
+  --catboost_device cpu
+```
+
+### تدريب Day-Trading
+
+```bash
+python train_v19.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy \
+  --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy \
+  --output outputs_day_trading_train \
+  --phase full \
+  --catboost_device cpu
+```
+
+### تدريب CatBoost فقط
+
+```bash
+python train_v19.py \
+  --data outputs_v19 \
+  --output outputs_v19_train \
   --phase catboost \
   --catboost_device cpu
 ```
 
+### تدريب soft label
+
 ```bash
-python backtest_v19.py \
-  --data /path/to/artifact_dir \
-  --models /path/to/output_dir \
-  --output /path/to/backtest_output \
-  --input_scaled \
-  --visual_npy /path/to/output_dir/visual_embeddings_v19.npy
+python train_v19.py \
+  --data outputs_v19 \
+  --output outputs_v19_soft \
+  --phase catboost \
+  --stage1_target soft_label \
+  --sample_weight_mode geometric \
+  --catboost_device cpu
 ```
 
-إذا كان هدفك التحقق من إصلاحات التقرير الأخيرة بالتحديد، راقب هذه الملفات بعد التشغيل:
+ملاحظات تدريب مهمة:
 
+- split التدريب زمني وليس random.
+- يمكن تحديد holdout صريح عبر `--split_time`.
+- يمكن تضييق نافذة التدريب والاختبار عبر `--train_days`, `--backtest_days`, `--window_end`.
+- `--seq_len` يغير طول تسلسل MetaLearner؛ في day-trading يمكن ضبطه من config أو CLI.
+- عند `stage1_target=soft_label` يتعامل CatBoost/XGBoost كـ regression على `soft_label`، ثم يحول الاحتمال إلى `[p, 1-p]` للـ Meta layer.
+
+النواتج المهمة من التدريب:
+
+- `manifest.json`
+- `feature_schema_v19.json`
+- `catboost_advisor_v19.cbm`
+- `catboost_classes_v19.json`
+- `meta_features_oof_v19.npy`
+- `visual_embeddings_v19.npy`
+- `meta_learner_v19.keras`
+- `meta_learner_v19_history.json`
 - `stage1_v19_metrics.json`
 - `calibration_report.json`
-- `feature_schema_v19.json`
-- `meta_learner_v19_history.json`
-- `manifest.json`
 
-### 5. Backtest
+## التنبؤ
+
+تشغيل prediction engine في backtest mode:
 
 ```bash
-python3 backtest_v19.py \
+python predict_v19.py \
+  --models outputs_v19_train \
   --data outputs_v19 \
-  --models outputs_v19 \
+  --mode backtest \
+  --output outputs_v19_predictions \
+  --input_scaled
+```
+
+`predict_v19.py` يستخدم artifacts التدريب، preprocessor، policy، CatBoost/XGB، DeepLOB embeddings، وMetaLearner عند توفرها. في backtest mode يتم تعطيل confidence head الخاص بالـ Meta لتسريع replay السببي.
+
+## الباك تست السببي
+
+`backtest_v19.py` ينفذ causal replay على نافذة holdout، ويطبق:
+
+- latency rows.
+- spread/slippage/cost.
+- single-position mode افتراضياً.
+- max daily loss.
+- Event Gate وDecision Policy.
+- OOS guard لمنع اختبار نفس بيانات التدريب دون تصريح واضح.
+
+تشغيل قياسي:
+
+```bash
+python backtest_v19.py \
+  --data outputs_v19 \
+  --models outputs_v19_train \
   --output outputs_v19_backtest \
   --input_scaled \
-  --visual_npy outputs_v19/visual_embeddings_v19.npy
+  --visual_npy outputs_v19_train/visual_embeddings_v19.npy
 ```
+
+تشغيل Day-Trading مع horizon بالدقائق:
+
+```bash
+python backtest_v19.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --models outputs_day_trading_train \
+  --output outputs_day_trading_backtest \
+  --input_scaled \
+  --fixed_horizon 30 \
+  --bar_minutes 5
+```
+
+خيارات جديدة مهمة:
+
+- `--fixed_horizon`: يبدل replay horizon بالدقائق، مثلاً `30` دقيقة.
+- `--bar_minutes`: مدة الشمعة، وإذا لم تمررها يحاول قراءتها من `day_trading_manifest.json`.
+- `--long_only`: لا يفتح صفقات SHORT، لكنه يبقي إشاراتها في اللوج مع `trade_skip_reason=long_only_backtest`.
+- `--relax_policy_ev`: مفيد للتشخيص إذا كانت policy تمنع كل الصفقات.
+- `--policy_min_edge`: override لحد edge الاحتمالي.
+- `--skip_event_gate`: للتشخيص فقط، وليس مسار تقييم نهائي.
 
 النواتج:
 
@@ -373,10 +336,23 @@ python3 backtest_v19.py \
 - `backtest_v19_trades.csv`
 - `backtest_v19_summary.json`
 
-### 6. Walk-Forward
+راقب في summary:
+
+- `profit_factor`
+- `max_drawdown`
+- `win_rate`
+- `expectancy`
+- `number_of_trades`
+- `long_only`
+- `horizon_alignment`
+- `oos_guard`
+
+## Walk-Forward
+
+`walkforward_v19.py` يعيد بناء folds زمنية من raw MBO/MBP، يدرب ويختبر حسب الزمن، ثم يطبق release gates.
 
 ```bash
-python3 walkforward_v19.py \
+python walkforward_v19.py \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
   --output outputs_v19_walkforward
@@ -389,411 +365,261 @@ python3 walkforward_v19.py \
 - `release_gates_report.json`
 - `manifest.json`
 
-## Stage1 Performance Notes
+لا تعتمد على نموذج قبل أن ينجح في walk-forward أو على الأقل out-of-sample زمني واضح.
 
-- `stage1` لم يعد ينتظر حتى النهاية ليكتب dataset واحدًا؛ ستظهر shards وcheckpoints أثناء التشغيل.
-- أكبر عنق زجاجة تاريخيًا كان `Regime Classification` على كل الصفوف في loop Python. الآن:
-  - الإنتاج الافتراضي يستخدم `rules`
-  - `Wasserstein` بقي مسارًا بحثيًا فقط
-- إذا كنت تتعامل مع عشرات الملايين من الصفوف:
-  - ابدأ بـ `chunk_rows=2_000_000`
-  - اضبط `mbo_workers` و`mbp_workers` حسب عدد الأنوية الفعلية
-  - فعّل `--resume` في السيرفرات الرخيصة أو المعرضة للانقطاع
+## Live / Shadow / Paper Layers
 
-## Running On Jupyter Notebook On A Remote Server
-
-هذا هو السيناريو المقترح إذا كنت ستشتغل من لابتوبك لكن التشغيل الفعلي على سيرفر خارجي.
-
-### 1. ادخل إلى السيرفر
-
-```bash
-ssh user@your-server-ip
-```
-
-### 2. انسخ المشروع أو ارفع الملفات
-
-مثلاً:
-
-```bash
-git clone <your-repo-url>
-cd QS_FINAL
-```
-
-أو ارفع المجلد يدوياً ثم:
-
-```bash
-cd /path/to/QS_FINAL
-```
-
-### 3. أنشئ بيئة افتراضية
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-```
-
-### 4. ثبّت المتطلبات
-
-```bash
-pip install -r requirements.txt
-pip install jupyterlab ipykernel hmmlearn
-```
-
-إذا كان السيرفر Linux وفيه NVIDIA GPU وتريد تشغيل `TensorFlow/DeepLOB` على الـ GPU:
-
-```bash
-bash install_tf_gpu_cu12.sh
-```
-
-### 5. أضف kernel خاص بالمشروع
-
-```bash
-python -m ipykernel install --user --name quantsystem-v19 --display-name "Python (QuantSystem V19)"
-```
-
-### 6. شغّل Jupyter Lab على السيرفر
-
-```bash
-jupyter lab --no-browser --ip=0.0.0.0 --port=8888
-```
-
-إذا أردت طريقة أكثر أماناً، استخدم:
-
-```bash
-jupyter lab --no-browser --ip=127.0.0.1 --port=8888
-```
-
-### 7. اعمل SSH tunnel من جهازك المحلي
-
-من جهازك المحلي:
-
-```bash
-ssh -L 8888:127.0.0.1:8888 user@your-server-ip
-```
-
-ثم افتح في المتصفح:
-
-```text
-http://127.0.0.1:8888
-```
-
-### 8. اختر Kernel الصحيح
-
-داخل Jupyter اختر:
-
-```text
-Python (QuantSystem V19)
-```
-
-## Recommended Notebook Workflow
-
-داخل Jupyter Notebook، يفضّل تقسيم العمل إلى 4 notebooks:
-
-### 1. `01_prepare_data.ipynb`
-
-يشغل:
-
-- قراءة raw data paths
-- `prepare_training_data.py`
-- مراجعة التقارير والـ CSV
-
-مثال:
-
-```python
-!python3 prepare_training_data.py \
-  --mbo /data/mbo.csv \
-  --mbp /data/mbp.csv \
-  --output outputs_v19 \
-  --label_mode v19 \
-  --chunk_rows 2000000
-```
-
-### 2. `02_train_v19.ipynb`
-
-يشغل:
-
-```python
-!python3 train_v19.py \
-  --data outputs_v19 \
-  --output outputs_v19
-```
-
-### 3. `03_backtest_v19.ipynb`
-
-يشغل:
-
-```python
-!python3 backtest_v19.py \
-  --data outputs_v19 \
-  --models outputs_v19 \
-  --output outputs_v19_backtest \
-  --input_scaled \
-  --visual_npy outputs_v19/visual_embeddings_v19.npy
-```
-
-ثم:
-
-```python
-import json
-with open("outputs_v19_backtest/backtest_v19_summary.json") as f:
-    summary = json.load(f)
-summary
-```
-
-### 4. `04_walkforward_v19.ipynb`
-
-يشغل:
-
-```python
-!python3 walkforward_v19.py \
-  --mbo /data/mbo.csv \
-  --mbp /data/mbp.csv \
-  --output outputs_v19_walkforward
-```
-
-## Direct Python Usage Inside Notebook
-
-إذا كنت لا تريد تشغيل scripts عبر `!python3`، يمكنك استدعاء بعض الدوال مباشرة.
-
-### Training
-
-```python
-from train_v19 import run_training_pipeline
-
-summary = run_training_pipeline(
-    csv_path="outputs_v19",
-    output_dir="outputs_v19",
-)
-summary
-```
+هذه الطبقات ليست broker integration كامل، لكنها تساعد في التحضير التشغيلي.
 
 ### Shadow
 
-```python
-from shadow_v19 import run_shadow
-
-summary = run_shadow(
-    csv_path="outputs_v19",
-    models_dir="outputs_v19",
-    output_dir="outputs_v19_shadow",
-    input_scaled=True,
-)
-summary
+```bash
+python shadow_v19.py \
+  --data outputs_v19 \
+  --models outputs_v19_train \
+  --output outputs_v19_shadow \
+  --input_scaled
 ```
 
 ### Paper
 
+```bash
+python paper_v19.py \
+  --data outputs_v19 \
+  --models outputs_v19_train \
+  --output outputs_v19_paper \
+  --input_scaled
+```
+
+### Live predictor module
+
+`live_predictor.py` يوفر pipeline لكل bar:
+
+1. Event Gate.
+2. Regime Gate.
+3. Feature Select.
+4. Predict.
+5. Confidence threshold.
+
+الاستخدام البرمجي:
+
 ```python
-from paper_v19 import run_paper
+from live_predictor import run_bar_pipeline
 
-summary = run_paper(
-    csv_path="outputs_v19",
-    models_dir="outputs_v19",
-    output_dir="outputs_v19_paper",
-    input_scaled=True,
-    run_mode="paper",
+signal, confidence, debug = run_bar_pipeline(
+    df_bar_row=bar,
+    models=regime_models,
+    ensemble=online_ensemble,
 )
-summary
 ```
 
-## Outputs You Should Track
+### Online learning module
 
-### Training
+`online_learning.py` يحتوي:
 
-- `feature_schema_v19.json`
-- `manifest.json`
-- `meta_learner_v19_history.json`
-- `stage1_v19_metrics.json`
-- `visual_metrics_v19.json`
+- `DriftDetector` باستخدام Page-Hinkley.
+- `SlidingWindowTrainer` لإعادة تدريب نافذة متحركة.
+- `RegimeConditionalEnsemble` لكل regime.
 
-### Backtest
+هذا ما زال طبقة تشغيلية/بحثية ويحتاج حوكمة قوية قبل الإنتاج الحقيقي.
 
-- `backtest_v19_summary.json`
-- `backtest_v19_trades.csv`
+## أدوات مساعدة
 
-### Walk-Forward
-
-- `walkforward_summary.json`
-- `release_gates_report.json`
-
-### Monitoring / Shadow / Paper
-
-- `shadow_predictions.jsonl`
-- `shadow_outcomes.jsonl`
-- `paper_orders.jsonl`
-- `paper_fills.jsonl`
-- `paper_trades.jsonl`
-- `monitoring_summary.json`
-- `drift_report.json`
-- `alerts.jsonl`
-
-## Recommended Server Specs
-
-الحد الأدنى العملي:
-
-- CPU: 8 vCPU
-- RAM: 32 GB
-- Disk: SSD
-
-أفضلية للتدريب المريح:
-
-- CPU: 16+ vCPU
-- RAM: 64 GB
-- GPU: اختياري لكنه مفيد إذا كان `TensorFlow` و`DeepLOB` سيُستخدمان فعلاً
-
-## Common Issues
-
-### 1. TensorFlow غير مثبت
-
-سترى تحذيرات مثل:
-
-```text
-TensorFlow غير مثبّت — MetaLearner غير متاح
-```
-
-الحل:
+البحث عن artifacts داخل المشروع:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-bash install_tf_gpu_cu12.sh
+python find_training_artifacts.py /path/to/QS_FINAL
 ```
 
-إذا كنت تريد CPU فقط:
+رسم dashboard لقوة الإشارة وLOB:
+
+```bash
+python plot_v19_power_dashboard.py \
+  --pipeline outputs_v19 \
+  --out outputs_v19/power_dashboard.png \
+  --freq 5min
+```
+
+رسم heatmap حول أفضل soft label:
+
+```bash
+python plot_best_soft_label_lob_heatmap.py \
+  --pipeline outputs_v19 \
+  --out outputs_v19/best_soft_label_lob.png
+```
+
+فحص readiness:
+
+```bash
+python readiness_v19.py
+```
+
+## فحوصات سريعة بعد أي تعديل
+
+فحص syntax:
+
+```bash
+python -m py_compile \
+  prepare_training_data.py \
+  prepare_day_trading.py \
+  train_v19.py \
+  predict_v19.py \
+  backtest_v19.py \
+  walkforward_v19.py \
+  live_predictor.py \
+  online_learning.py \
+  verify_day_trading_dataset.py
+```
+
+فحص artifact day-trading:
+
+```bash
+python verify_day_trading_dataset.py \
+  --data pipeline_day_trading/features/day_trading_features.parquet \
+  --lob pipeline_day_trading/features/lob_tensors.npy
+```
+
+تدريب تشخيصي سريع:
+
+```bash
+python train_v19.py \
+  --data /path/to/artifact_or_parquet \
+  --output /path/to/train_out \
+  --phase catboost \
+  --catboost_device cpu
+```
+
+Backtest تشخيصي:
+
+```bash
+python backtest_v19.py \
+  --data /path/to/artifact_or_parquet \
+  --models /path/to/train_out \
+  --output /path/to/backtest_out \
+  --input_scaled \
+  --relax_policy_ev
+```
+
+## قواعد السلامة البحثية
+
+قبل اعتبار أي تجربة ناجحة، تحقق من التالي:
+
+- `ts_event` مرتب زمنياً ولا يحتوي duplicates غير مفسرة.
+- features لا تستخدم بيانات مستقبلية.
+- labels فقط تستخدم future path بعد وقت القرار.
+- scaling يتم fit على train فقط ثم يطبق على validation/test.
+- split زمني مع embargo عند وجود horizons متداخلة.
+- backtest لا يدخل على أسعار مستحيلة ولا يستخدم future candles/order book states.
+- النتائج تعرض trading metrics وليس ML metrics فقط.
+- يوجد تقرير حساسية للتكاليف: fees/spread/slippage.
+- الاختبار يغطي شهور/عقود مختلفة عند توفر البيانات.
+
+## مشاكل شائعة
+
+### TensorFlow غير مثبت
 
 ```bash
 pip install tensorflow
 ```
 
-### 2. CatBoost غير مثبت
+على Linux مع NVIDIA GPU يمكن تجربة سكربتات CUDA الموجودة:
+
+```bash
+bash install_tf_gpu_cu12.sh
+```
+
+### CatBoost أو XGBoost غير مثبت
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. مشاكل `OpenMP SHM`
-
-قد تظهر أحياناً على بعض السيرفرات أو الحاويات.
-
-جرّب:
-
-```bash
-export OMP_NUM_THREADS=1
-export KMP_INIT_AT_FORK=FALSE
-```
-
-ثم أعد تشغيل الـ notebook kernel أو الـ shell.
-
-### 4. ملفات Parquet لا تُقرأ
+### Parquet لا يقرأ
 
 ```bash
 pip install pyarrow
 ```
 
-## Current Focus
+### backtest لا يفتح صفقات
 
-حالياً المشروع مهيأ بشكل ممتاز لـ:
+افحص بالتتابع:
 
-- offline training
-- backtesting
-- walk-forward evaluation
-- shadow/paper operational layers
+- هل Event Gate يمنع كل الصفوف؟
+- هل Decision Policy تتطلب EV موجباً بتكاليف عالية؟
+- هل `feature_schema_v19.json` مطابق للأعمدة؟
+- هل `price` موجود؟ في day-trading يتم ملؤه من `close` إذا كان ناقصاً.
+- هل horizon متوافق مع `day_trading_manifest.json`؟
 
-وما زلنا **مؤجلين broker/live data integration** لمرحلة لاحقة.
+للتشخيص فقط:
 
-## Suggested First Session On A Remote Server
+```bash
+python backtest_v19.py \
+  --data /path/to/day_trading_features.parquet \
+  --models /path/to/models \
+  --output /path/to/backtest_debug \
+  --input_scaled \
+  --relax_policy_ev \
+  --skip_event_gate
+```
 
-إذا هذه أول مرة تشغل المشروع على سيرفر خارجي، اتبع هذا الترتيب:
+## مواصفات سيرفر مقترحة
 
-1. فعّل البيئة الافتراضية
-2. افتح Jupyter Lab
-3. شغّل `01_prepare_data.ipynb`
-4. تأكد من وجود `artifact_manifest.json` و`final/features_*.parquet`
-5. شغّل `02_train_v19.ipynb`
-6. راجع `manifest.json` و`feature_schema_v19.json`
-7. شغّل `03_backtest_v19.ipynb`
-8. فقط بعد ذلك انتقل إلى `walkforward_v19.py`
+الحد الأدنى العملي:
 
-## Notes
+- 8 vCPU
+- 32 GB RAM
+- SSD
 
-- المرجع الأحدث والوحيد للمشروع الحالي هو هذا الملف: [README.md](/Users/abdallah/Downloads/QS_FINAL/README.md)
+للتدريب المريح:
 
-## 🔍 Codex Evaluation Instructions
+- 16+ vCPU
+- 64 GB RAM
+- GPU اختياري إذا كان DeepLOB/MetaLearner جزءاً من التجربة.
 
-If you are an AI system reviewing this project (e.g. OpenAI Codex), follow these strict rules:
+## ترتيب تشغيل مقترح
 
-### 1. Do NOT assume profitability
+للمسار الأصلي:
 
-This is a research system. Any performance must be verified via:
+1. شغل `stage1_refinery.py`.
+2. راجع `artifact_manifest.json` و`refinery_report.txt`.
+3. شغل `train_v19.py --phase catboost`.
+4. إذا النتائج مستقرة، شغل `train_v19.py --phase full`.
+5. شغل `backtest_v19.py` على holdout.
+6. شغل `walkforward_v19.py`.
+7. انتقل إلى shadow/paper فقط بعد نجاح الفحوصات.
 
-- walk-forward validation
-- out-of-sample testing
-- realistic backtesting
+لمسار day-trading:
 
-### 2. Prioritize detecting data leakage
+1. شغل `prepare_day_trading.py`.
+2. شغل `verify_day_trading_dataset.py`.
+3. درب بـ `train_v19.py` مع `--lob` و`--lob_ts` إذا كانت موجودة.
+4. شغل `backtest_v19.py` مع horizon متوافق مع manifest.
+5. اختبر `--long_only` أو `--fixed_horizon` فقط كتجارب واضحة وموسومة في النتائج.
+6. قارن شهرياً، وليس على فترة واحدة فقط.
 
-Check:
+## مخرجات يجب حفظها مع كل تجربة
 
-- feature construction
-- label generation
-- scaling
-- temporal alignment
+- أمر التشغيل الكامل.
+- commit أو نسخة الملفات.
+- `manifest.json`.
+- `feature_schema_v19.json`.
+- `stage1_v19_metrics.json`.
+- `calibration_report.json`.
+- `backtest_v19_summary.json`.
+- `backtest_v19_trades.csv`.
+- `walkforward_summary.json` إذا توفر.
+- ملاحظات عن fees/slippage/spread والـ horizon.
 
-Any leakage invalidates results.
+## تعليمات مراجعة AI/Codex
 
-### 3. Validate labeling logic
+عند مراجعة هذا المشروع:
 
-Ensure:
-
-- labels use future price path only
-- features use only past/current data
-- no overlap contamination
-- TP / SL / horizon are consistent
-
-### 4. Reject invalid validation
-
-Do NOT accept:
-
-- random train_test_split
-- shuffled data
-- mixing future with past
-
-Only accept:
-
-- chronological split
-- walk-forward
-- purged validation
-
-### 5. Evaluate trading metrics, not just ML metrics
-
-Must include:
-
-- profit factor
-- max drawdown
-- win rate
-- expectancy
-- number of trades
-- stability across time
-
-### 6. Check backtesting realism
-
-Ensure:
-
-- slippage
-- fees
-- execution constraints
-- no impossible fills
-
-### 7. Prefer robustness over performance
-
-A slightly worse but stable model is better than an unstable high-performing one.
-
-### 8. All improvements must be verifiable
-
-Every suggested change must include:
-
-- why
-- expected effect
-- how to test it
+1. لا تفترض الربحية.
+2. ابحث أولاً عن leakage.
+3. تحقق من labels وhorizon وTP/SL.
+4. ارفض random split في time-series.
+5. اطلب walk-forward أو out-of-sample زمني.
+6. قيم trading metrics مع الحساسية للتكاليف.
+7. فضل تحسينات صغيرة قابلة للتحقق.
+8. اربط كل تغيير بأمر verification واضح.
 

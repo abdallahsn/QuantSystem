@@ -143,7 +143,14 @@ def compute_policy_cost_model_hash(cost_config: dict | None = None, replay_confi
     return _cost_model_hash(cost_config, replay_config)
 
 
-def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_probs: np.ndarray | None = None) -> dict:
+def _side_stats(
+    frame: pd.DataFrame,
+    side_label: int,
+    cost_pips: float,
+    side_probs: np.ndarray | None = None,
+    *,
+    allow_forward_return_fallback: bool = False,
+) -> dict:
     if frame.empty:
         baseline = max(float(cost_pips), 1.0)
         threshold = (baseline + float(cost_pips)) / max(2.0 * baseline + float(cost_pips), 1e-8)
@@ -185,6 +192,22 @@ def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_pro
         avg_loss = _weighted_mean(np.abs(realized_pnl[loss_mask]), weights[loss_mask]) if np.any(loss_mask) else 0.0
         realized_prior = _weighted_mean(win_mask.astype(np.float32), weights) if np.any(valid_mask) else 0.5
     else:
+        if not bool(allow_forward_return_fallback):
+            baseline = max(float(cost_pips), 1.0)
+            threshold = (baseline + float(cost_pips)) / max(2.0 * baseline + float(cost_pips), 1e-8)
+            return {
+                "support": int(len(frame)),
+                "weighted_support": float(np.sum(weights)),
+                "win_support": 0,
+                "loss_support": 0,
+                "coverage_ratio": float(np.mean(covered.astype(np.float32))) if len(covered) else 0.0,
+                "avg_win_pips": float(baseline),
+                "avg_loss_pips": float(baseline),
+                "threshold_from_cost": float(np.clip(threshold, 0.0, 1.0)),
+                "realized_prior": 0.5,
+                "avg_abs_return_pips": float(baseline),
+                "stats_source": "cost_floor_no_realized_replay",
+            }
         if "_abs_forward_pips" in frame.columns:
             abs_pips = pd.to_numeric(frame["_abs_forward_pips"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
         else:
@@ -213,6 +236,7 @@ def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_pro
         "threshold_from_cost": float(np.clip(threshold, 0.0, 1.0)),
         "realized_prior": float(realized_prior),
         "avg_abs_return_pips": _weighted_mean(abs_pips, weights) if len(abs_pips) else float(baseline),
+        "stats_source": "realized_execution" if realized_col in frame.columns else "forward_return_diagnostic",
     }
 
 
@@ -226,7 +250,7 @@ def build_decision_policy(
     source: str = "stage1_oof",
     min_support: int = MIN_POLICY_SUPPORT,
     min_coverage_ratio: float = MIN_POLICY_COVERAGE_RATIO,
-    calibration_source: str = "forward_return_labels",
+    calibration_source: str = "realized_execution_oof",
     cost_model_hash: str | None = None,
     policy_build_window: dict | None = None,
 ) -> dict:
@@ -269,15 +293,32 @@ def build_decision_policy(
     frame["dominant_regime"] = np.argmax(regime_arr[:, :4], axis=1).astype(np.int32)
     frame["prob_long"] = np.clip(probs[:, 0], 0.0, 1.0)
     frame["prob_short"] = np.clip(probs[:, 1], 0.0, 1.0)
-    tick_size = max(_safe_float((cost_config or {}).get("tick_size", 1.0), 1.0), 1e-8)
-    frame["_abs_forward_pips"] = (
-        np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
-        / tick_size
-    )
+    allow_forward_return_fallback = str(calibration_source).strip().lower() in {
+        "forward_return_labels",
+        "diagnostic_forward_return",
+    }
+    if allow_forward_return_fallback:
+        tick_size = max(_safe_float((cost_config or {}).get("tick_size", 1.0), 1.0), 1e-8)
+        frame["_abs_forward_pips"] = (
+            np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+            / tick_size
+        )
 
     global_block = {
-        "LONG": _side_stats(frame, 0, cost_model["effective_cost_pips"], frame["prob_long"].to_numpy(dtype=np.float64)),
-        "SHORT": _side_stats(frame, 1, cost_model["effective_cost_pips"], frame["prob_short"].to_numpy(dtype=np.float64)),
+        "LONG": _side_stats(
+            frame,
+            0,
+            cost_model["effective_cost_pips"],
+            frame["prob_long"].to_numpy(dtype=np.float64),
+            allow_forward_return_fallback=allow_forward_return_fallback,
+        ),
+        "SHORT": _side_stats(
+            frame,
+            1,
+            cost_model["effective_cost_pips"],
+            frame["prob_short"].to_numpy(dtype=np.float64),
+            allow_forward_return_fallback=allow_forward_return_fallback,
+        ),
     }
 
     structures: dict[str, dict[str, Any]] = {}
@@ -286,8 +327,20 @@ def build_decision_policy(
             "support": int(len(bucket_df)),
             "coverage_ratio": float(bucket_df["policy_covered"].mean()) if len(bucket_df) else 0.0,
             "global": {
-                "LONG": _side_stats(bucket_df, 0, cost_model["effective_cost_pips"], bucket_df["prob_long"].to_numpy(dtype=np.float64)),
-                "SHORT": _side_stats(bucket_df, 1, cost_model["effective_cost_pips"], bucket_df["prob_short"].to_numpy(dtype=np.float64)),
+                "LONG": _side_stats(
+                    bucket_df,
+                    0,
+                    cost_model["effective_cost_pips"],
+                    bucket_df["prob_long"].to_numpy(dtype=np.float64),
+                    allow_forward_return_fallback=allow_forward_return_fallback,
+                ),
+                "SHORT": _side_stats(
+                    bucket_df,
+                    1,
+                    cost_model["effective_cost_pips"],
+                    bucket_df["prob_short"].to_numpy(dtype=np.float64),
+                    allow_forward_return_fallback=allow_forward_return_fallback,
+                ),
             },
             "by_regime": {},
         }

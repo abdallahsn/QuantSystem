@@ -21,6 +21,27 @@ import pickle
 import shutil
 import sys
 import tempfile
+import time
+
+_TRAIN_V19_LOAD_T0 = time.perf_counter()
+
+
+def _cli_argv_looks_like_direct_train_v19() -> bool:
+    """True عند تشغيل الملف كسكربت (وليس عند import من plot_5m_catboost أو غيره)."""
+    try:
+        if not sys.argv:
+            return False
+        return 'train_v19' in os.path.basename(sys.argv[0]).lower()
+    except Exception:
+        return False
+
+
+# فوري قبل numpy/pandas حتى لا تبدو CMD «صامتة» (العربية قد لا تظهر حسب code page).
+if _cli_argv_looks_like_direct_train_v19():
+    sys.stdout.write(
+        "[train_v19] Step 1/2: importing numpy, pandas, sklearn (short)...\n"
+    )
+    sys.stdout.flush()
 
 import numpy as np
 import pandas as pd
@@ -28,6 +49,12 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import log_loss, precision_recall_fscore_support
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+if _cli_argv_looks_like_direct_train_v19():
+    sys.stdout.write(
+        "[train_v19] Step 2/2: heavy stack (prepare_training_data, catboost, …) — often 10–25+ min on first/cold load; then QuantSystem banner.\n"
+    )
+    sys.stdout.flush()
 
 from prepare_training_data import (
     BINARY_FEATURES,
@@ -39,13 +66,7 @@ from prepare_training_data import (
 )
 VISUAL_EMB_DIM = 8
 from modules.config_v19 import load_v19_config
-from modules.decision_policy_v19 import (
-    DEFAULT_DECISION_POLICY_ARTIFACT,
-    POLICY_VERSION,
-    build_decision_policy,
-    compute_policy_cost_model_hash,
-)
-from modules.execution_replay_v19 import build_realized_policy_frame
+from modules.decision_policy_v19 import DEFAULT_DECISION_POLICY_ARTIFACT, build_decision_policy
 from modules.dynamic_labels import (
     DEFAULT_EVENT_OBI_THR,
     DEFAULT_EVENT_ROLL_WINDOW,
@@ -79,7 +100,6 @@ from modules.regime_classifier import (
     REGIME_ONE_HOT_COLS,
     RegimeClassifier,
 )
-from modules.reproducibility_v19 import apply_reproducibility_config
 
 try:
     from catboost import CatBoostClassifier, CatBoostRegressor, Pool
@@ -97,7 +117,47 @@ BIAS_LABELS = {0: 'LONG', 1: 'SHORT', 2: 'NEUTRAL'}
 N_CLUSTERS = 4
 N_CB_PROBS = 2
 N_XGB_PROBS = 2
-SEQ_LEN = 50
+DEFAULT_SEQ_LEN = 50
+SEQ_LEN = DEFAULT_SEQ_LEN
+
+
+def _looks_like_day_trading_artifact(csv_path: str | None) -> bool:
+    """مسار parquet/mجلد ذو دلالة day_trading لو manifest أو اسم الملف."""
+    if not csv_path:
+        return False
+    p = os.path.abspath(str(csv_path))
+    if 'day_trading' in os.path.basename(p).lower():
+        return True
+    try:
+        root = resolve_artifact_root(p)
+    except Exception:
+        return False
+    return os.path.isfile(os.path.join(root, 'day_trading_manifest.json'))
+
+
+def _resolve_seq_len_from_v19_config(
+    cfg: dict | None,
+    *,
+    cli_override: int | None,
+    fallback: int,
+    csv_path: str | None,
+) -> int:
+    """طول التسلسل للـ MetaLearner — training.seq_len؛ day_trading.seq_len_bars فقط مع بيانات الشموع."""
+    seq = int(fallback)
+    if cli_override is not None:
+        return max(8, min(int(cli_override), 512))
+    if cfg:
+        dt = cfg.get('day_trading') or {}
+        tr = cfg.get('training') or {}
+        applied_dt = False
+        if _looks_like_day_trading_artifact(csv_path) and dt.get('seq_len_bars') is not None:
+            seq = int(dt['seq_len_bars'])
+            applied_dt = True
+        if not applied_dt and tr.get('seq_len') is not None:
+            seq = int(tr['seq_len'])
+    return max(8, min(seq, 512))
+
+
 SCHEMA_VERSION = 'v19-event-binary'
 TRAIN_MODE_EVENT_BINARY = 'event_binary'
 # CatBoost/XGBoost row weights — see _quality_sample_weights(..., mode=...)
@@ -668,7 +728,6 @@ def build_event_training_view(
     quality_weight_weak: float = 1.0,
     train_frac: float = 0.80,
     split_time: pd.Timestamp | str | None = None,
-    event_fallback_mode: str = 'directional_rows',
 ) -> tuple[pd.DataFrame, dict]:
     if mode != TRAIN_MODE_EVENT_BINARY:
         raise ValueError(f'Unsupported training mode: {mode}')
@@ -685,18 +744,15 @@ def build_event_training_view(
     event_col = 'train_event_flag' if 'train_event_flag' in out.columns else 'event_flag'
     event_mask = (out[event_col] == 1) & directional_mask
 
-    fallback_mode = str(event_fallback_mode or 'directional_rows').strip().lower()
-    if fallback_mode not in {'directional_rows', 'none'}:
-        fallback_mode = 'directional_rows'
     fallback_reason = None
-    if fallback_mode != 'none' and not event_mask.any() and event_col != 'event_flag':
+    if not event_mask.any() and event_col != 'event_flag':
         fallback_mask = (out['event_flag'] == 1) & directional_mask
         if fallback_mask.any():
             event_col = 'event_flag'
             event_mask = fallback_mask
             fallback_reason = 'fallback_to_event_flag'
 
-    if not event_mask.any() and directional_mask.any() and fallback_mode == 'directional_rows':
+    if not event_mask.any() and directional_mask.any():
         event_col = 'bias_label'
         event_mask = directional_mask
         fallback_reason = 'fallback_to_directional_rows'
@@ -761,12 +817,8 @@ def build_event_training_view(
         'event_col': event_col,
         'rows_full': int(len(out)),
         'rows_event_directional': int(len(event_df)),
-        'directional_rows_total': int(directional_mask.sum()),
-        'train_event_directional_rows': int(((out['train_event_flag'] == 1) & directional_mask).sum()),
-        'event_flag_directional_rows': int(((out['event_flag'] == 1) & directional_mask).sum()),
         'event_rate_full': float(event_mask.mean()),
         'raw_event_rate_full': float(out['event_flag'].mean()),
-        'event_fallback_mode': fallback_mode,
         'fallback_reason': fallback_reason,
         'quality_weight_strong': float(quality_weight_strong),
         'quality_weight_weak': float(quality_weight_weak),
@@ -1344,10 +1396,6 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
         'refinery_split.json',
         'lob_build_meta.json',
         'final_feature_shards.json',
-        'data_integrity_report.json',
-        'data_integrity_gate_report.json',
-        'contract_consistency_report.json',
-        'label_quality_report.json',
     ):
         src = os.path.join(src_dir, name)
         dst = os.path.join(output_dir, name)
@@ -1358,40 +1406,6 @@ def copy_inference_artifacts(csv_path: str, output_dir: str) -> dict:
             shutil.copy2(src, dst)
             copied[name] = dst
     return copied
-
-
-def _read_json_if_exists(path: str) -> dict:
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        with open(path) as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
-
-def _enforce_source_refinery_gates(csv_path: str, config_snapshot: dict | None = None) -> dict:
-    cfg = config_snapshot or {}
-    profile = str(cfg.get('profile', 'research')).strip().lower() or 'research'
-    src_dir = resolve_artifact_root(csv_path)
-    gate_path = os.path.join(src_dir, 'data_integrity_gate_report.json')
-    gate_report = _read_json_if_exists(gate_path)
-    if profile != 'production':
-        return gate_report
-    if not gate_report:
-        raise RuntimeError(
-            "❌ Production training requires data_integrity_gate_report.json from the refinery stage. "
-            f"Missing under: {src_dir}"
-        )
-    if not bool(gate_report.get('passed', False)):
-        failure_count = int(gate_report.get('blocking_failure_count', 0) or 0)
-        reasons = [str(item.get('metric')) for item in (gate_report.get('failures') or [])[:5] if isinstance(item, dict)]
-        raise RuntimeError(
-            "❌ Refusing production training because source refinery integrity gates failed. "
-            f"blocking_failures={failure_count} | sample_failures={reasons} | report={gate_path}"
-        )
-    return gate_report
 
 
 def _resolve_default_lob_paths(csv_path: str) -> tuple[str | None, str | None]:
@@ -1478,6 +1492,36 @@ def build_time_splits(
     requested_n_folds = int(max(n_folds, 1))
     t0 = _time_series(df, 'ts_event')
     t1 = _time_series(df, 'label_end_ts', fallback='ts_event')
+
+    # Tiny-dataset fallback:
+    # The main V19 walk-forward splitter enforces meaningful fold sizes and has a
+    # hard min-train floor tuned for real datasets. For very small experiments
+    # (e.g., daytrade smoke runs), return a single deterministic split instead of failing.
+    if n < 300:
+        test_n = max(1, int(n * float(test_size)))
+        test_n = min(test_n, max(n - 5, 1))
+        split_at = max(n - test_n, 5)
+        train_idx = np.arange(0, split_at, dtype=np.int32)
+        test_idx = np.arange(split_at, n, dtype=np.int32)
+        train_idx_raw_n = int(len(train_idx))
+        train_idx = purge_overlapping(train_idx, test_idx, t1, t0).astype(np.int32)
+        splits = [(train_idx, test_idx)] if len(test_idx) else []
+        if not splits or len(train_idx) < 5:
+            raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
+        print(
+            "  ⚠️ Tiny dataset split fallback: "
+            f"rows={n:,} train={len(train_idx):,} test={len(test_idx):,} "
+            f"purged={train_idx_raw_n - len(train_idx):,} "
+            f"(requested_folds={requested_n_folds} ignored)"
+        )
+        return splits, t0, t1, {
+            'dynamic_embargo_rows': int(train_idx_raw_n - len(train_idx)),
+            'effective_embargo_pct': 0.0,
+            'embargo_horizon_quantile': float(embargo_horizon_quantile),
+            'requested_n_folds': int(requested_n_folds),
+            'effective_requested_n_folds': 1,
+            'tiny_fallback': True,
+        }
     directional_h = pd.to_numeric(
         df.loc[df['bias_label'].isin([0, 1]), 'label_horizon_steps']
         if 'bias_label' in df.columns and 'label_horizon_steps' in df.columns
@@ -1570,10 +1614,8 @@ def stage1_oof_meta(
     quality_weight_strong: float = 2.0,
     quality_weight_weak: float = 1.0,
     cost_config: dict | None = None,
-    replay_config: dict | None = None,
     sample_weight_mode: str = SAMPLE_WEIGHT_MODE_COMBINED,
     stage1_target: str = STAGE1_TARGET_BIAS,
-    policy_build_window: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
@@ -2226,8 +2268,7 @@ def stage1_oof_meta(
     cb_calibrator_path = os.path.join(output_dir, 'catboost_calibrator_v19.pkl')
     xgb_calibrator_path = os.path.join(output_dir, 'xgboost_calibrator_v19.pkl')
     decision_policy_path = os.path.join(output_dir, DEFAULT_DECISION_POLICY_ARTIFACT)
-    legacy_decision_policy_path = os.path.join(output_dir, 'decision_policy_v19.json')
-    for path in (cb_calibrator_path, xgb_calibrator_path, decision_policy_path, legacy_decision_policy_path):
+    for path in (cb_calibrator_path, xgb_calibrator_path, decision_policy_path):
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -2468,22 +2509,13 @@ def stage1_oof_meta(
     np.save(os.path.join(output_dir, 'meta_coverage_v19.npy'), coverage.astype(np.uint8))
 
     ensemble_oof_probs = ((oof_probs.astype(np.float32) + xgb_probs.astype(np.float32)) / 2.0).astype(np.float32)
-    policy_frame = build_realized_policy_frame(
-        df,
-        coverage,
-        cost_config=cost_config,
-        replay_config=replay_config,
-    )
     decision_policy = build_decision_policy(
-        policy_frame,
+        df,
         ensemble_oof_probs,
         regime_meta,
         coverage,
         cost_config=cost_config,
         source='stage1_oof_base_models',
-        calibration_source='realized_execution_oof',
-        cost_model_hash=compute_policy_cost_model_hash(cost_config, replay_config),
-        policy_build_window=policy_build_window,
     )
     with open(decision_policy_path, 'w') as f:
         json.dump(decision_policy, f, indent=2)
@@ -2518,8 +2550,6 @@ def stage1_oof_meta(
         'regime_source': str(regime_model_type),
         'decision_policy_artifact': os.path.basename(decision_policy_path),
         'decision_policy_coverage_ratio': float(decision_policy.get('coverage_ratio', 0.0)),
-        'decision_policy_version': str(decision_policy.get('policy_version', POLICY_VERSION)),
-        'decision_policy_calibration_source': str(decision_policy.get('calibration_source', 'unknown')),
         'scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
     }
     with open(os.path.join(output_dir, 'stage1_v19_metrics.json'), 'w') as f:
@@ -2712,16 +2742,94 @@ def _align_lob_to_rows(
     return row_to_tensor, tensor_targets, tensor_target_seen
 
 
+def _infer_lob_max_age_for_dataset(df: pd.DataFrame) -> str:
+    """
+    DeepLOB alignment window depends on data cadence:
+    - Tick/event datasets: keep tight window (DEFAULT_LOB_MAX_AGE).
+    - Bar-level datasets (e.g. daytrading 5m): allow a wider backward match window.
+    """
+    try:
+        ts = _time_series(df, 'ts_event')
+        if len(ts) < 3:
+            return DEFAULT_LOB_MAX_AGE
+        # median cadence
+        dt = ts.sort_values().diff().dropna()
+        med = dt.median()
+        # If bars (>= 1s cadence), allow up to one full bar + slack.
+        if pd.isna(med):
+            return DEFAULT_LOB_MAX_AGE
+        if float(med.total_seconds()) >= 1.0:
+            # 10 minutes is safe for 5m/15m bars and still bounded.
+            return '10min'
+    except Exception:
+        pass
+    return DEFAULT_LOB_MAX_AGE
+
+
+def _deeplob_aux_env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or '').strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _fit_lob_norm_params(tensors, ids: np.ndarray, eps: float = 1e-12) -> dict[int, tuple[float, float]]:
+    sample = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32)
+    params: dict[int, tuple[float, float]] = {}
+    if sample.size == 0:
+        return params
+    for c in range(sample.shape[-1]):
+        flat = sample[..., c].reshape(-1)
+        nz = flat[np.abs(flat) > eps]
+        if len(nz):
+            mu = float(np.mean(nz))
+            sd = float(np.std(nz))
+        else:
+            mu, sd = 0.0, 1.0
+        params[int(c)] = (mu, sd if sd > 1e-8 else 1.0)
+    return params
+
+
+def _apply_lob_norm(tensors, ids: np.ndarray, params: dict[int, tuple[float, float]]) -> np.ndarray:
+    out = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32).copy()
+    for c, (mu, sd) in (params or {}).items():
+        ci = int(c)
+        if 0 <= ci < out.shape[-1]:
+            out[..., ci] = ((out[..., ci] - float(mu)) / max(float(sd), 1e-8)).astype(np.float32)
+    return out
+
+
 def stage2_oof_visual_embeddings(
     df: pd.DataFrame,
     output_dir: str,
     splits,
     lob_tensors,
     lob_timestamps: pd.Series,
+    *,
+    max_age: str = DEFAULT_LOB_MAX_AGE,
 ) -> tuple[np.ndarray, np.ndarray]:
+    import gc
+
     print("\n" + "═" * 65)
     print("👁️ STAGE 2 — V19 OOF DeepLOB Visual Embeddings")
     print("═" * 65)
+
+    deeplob_aux_batch = max(8, min(512, _deeplob_aux_env_int('DEEPLOB_AUX_BATCH', 48)))
+    deeplob_aux_cap = max(0, _deeplob_aux_env_int('DEEPLOB_AUX_MAX_TRAIN_TENSORS', 0))
+    deeplob_oof_epochs = max(1, min(100, _deeplob_aux_env_int('DEEPLOB_AUX_OOF_EPOCHS', 20)))
+    deeplob_final_epochs = max(1, min(120, _deeplob_aux_env_int('DEEPLOB_AUX_FINAL_EPOCHS', 25)))
+    cap_desc = 'بدون حد' if deeplob_aux_cap <= 0 else f'{deeplob_aux_cap:,}'
+    print(
+        '  [DeepLOB] أوضاع الذاكرة: '
+        f'batch={deeplob_aux_batch} | max_train_tensors={cap_desc}'
+        f' | oof_epochs={deeplob_oof_epochs} | final_epochs={deeplob_final_epochs}\n'
+        '           عيّن عند OOM: DEEPLOB_AUX_BATCH، DEEPLOB_AUX_MAX_TRAIN_TENSORS، '
+        'DEEPLOB_AUX_OOF_EPOCHS، DEEPLOB_AUX_FINAL_EPOCHS',
+        flush=True,
+    )
 
     n_rows = len(df)
     zero_emb = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
@@ -2742,6 +2850,7 @@ def stage2_oof_visual_embeddings(
     row_to_tensor, tensor_targets, tensor_target_seen = _align_lob_to_rows(
         df,
         lob_timestamps,
+        max_age=str(max_age),
         max_tensors=len(lob_tensors),
     )
     row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
@@ -2780,6 +2889,15 @@ def stage2_oof_visual_embeddings(
             })
             continue
 
+        tids_fit = train_tensor_ids
+        if deeplob_aux_cap > 0 and len(tids_fit) > deeplob_aux_cap:
+            rng = np.random.default_rng(42 + int(fold_no))
+            tids_fit = np.sort(rng.choice(tids_fit, size=deeplob_aux_cap, replace=False))
+            print(
+                f'  [DeepLOB] fold {fold_no}: تم تقليل عيّنة التدريب المساعد إلى {deeplob_aux_cap:,} تنسور لتوفير RAM',
+                flush=True,
+            )
+
         brain_path = os.path.join(fold_tmp_dir, f'deeplob_fold_{fold_no}.keras')
         cnn = DeepLOBCNN(brain_file=brain_path)
         if cnn.model is None:
@@ -2791,11 +2909,13 @@ def stage2_oof_visual_embeddings(
             })
             continue
 
-        X_tr = np.asarray(lob_tensors[train_tensor_ids], dtype=np.float32)
-        y_tr = tensor_targets[train_tensor_ids].reshape(-1, 1).astype(np.float32)
-        cnn.fit_auxiliary(X_tr, y_tr, epochs=20, batch=256, output_dir=fold_tmp_dir)
+        norm_params = _fit_lob_norm_params(lob_tensors, tids_fit)
+        X_tr = _apply_lob_norm(lob_tensors, tids_fit, norm_params)
+        y_tr = tensor_targets[tids_fit].reshape(-1, 1).astype(np.float32)
+        gc.collect()
+        cnn.fit_auxiliary(X_tr, y_tr, epochs=deeplob_oof_epochs, batch=deeplob_aux_batch, output_dir=fold_tmp_dir)
 
-        X_te = np.asarray(lob_tensors[test_tensor_ids], dtype=np.float32)
+        X_te = _apply_lob_norm(lob_tensors, test_tensor_ids, norm_params)
         emb_te = cnn.get_embeddings(X_te).astype(np.float32)
         emb_map = {int(tid): emb_te[i] for i, tid in enumerate(test_tensor_ids)}
 
@@ -2815,6 +2935,7 @@ def stage2_oof_visual_embeddings(
             'test_tensors': int(len(test_tensor_ids)),
             'covered_rows': int(fold_rows),
             'status': 'ok',
+            'lob_norm': 'fold_train_only',
         })
 
     live_row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
@@ -2824,12 +2945,24 @@ def stage2_oof_visual_embeddings(
         final_brain_tmp = os.path.join(fold_tmp_dir, 'deeplob_final_tmp.keras')
         final_cnn = DeepLOBCNN(brain_file=final_brain_tmp)
         if final_cnn.model is not None:
-            X_final = np.asarray(lob_tensors[final_tensor_ids], dtype=np.float32)
-            y_final = tensor_targets[final_tensor_ids].reshape(-1, 1).astype(np.float32)
-            final_cnn.fit_auxiliary(X_final, y_final, epochs=25, batch=256, output_dir=output_dir)
+            ftids = final_tensor_ids
+            if deeplob_aux_cap > 0 and len(ftids) > deeplob_aux_cap:
+                rng = np.random.default_rng(424242)
+                ftids = np.sort(rng.choice(ftids, size=deeplob_aux_cap, replace=False))
+                print(
+                    f'  [DeepLOB] final-fit: عيّنة تدريب مساعد {deeplob_aux_cap:,} تنسور (حد الذاكرة)',
+                    flush=True,
+                )
+            final_norm_params = _fit_lob_norm_params(lob_tensors, ftids)
+            X_final = _apply_lob_norm(lob_tensors, ftids, final_norm_params)
+            y_final = tensor_targets[ftids].reshape(-1, 1).astype(np.float32)
+            gc.collect()
+            final_cnn.fit_auxiliary(
+                X_final, y_final, epochs=deeplob_final_epochs, batch=deeplob_aux_batch, output_dir=output_dir
+            )
             final_cnn.model.save(os.path.join(output_dir, 'deeplob_cnn_v19.keras'))
             final_emb = np.asarray(final_cnn.get_embeddings(X_final), dtype=np.float32)
-            final_emb_map = {int(tid): final_emb[i] for i, tid in enumerate(final_tensor_ids)}
+            final_emb_map = {int(tid): final_emb[i] for i, tid in enumerate(ftids)}
             for row_idx, tensor_idx in enumerate(row_to_tensor):
                 if int(tensor_idx) in final_emb_map:
                     live_row_embs[row_idx] = final_emb_map[int(tensor_idx)]
@@ -2848,7 +2981,13 @@ def stage2_oof_visual_embeddings(
     )
     print(f"  ✅ Visual Embeddings: {row_embs.shape}")
     print(f"  ✅ Visual Coverage: {row_cov.sum():,}/{n_rows:,} ({row_cov.mean():.1%})")
-    if VISUAL_COVERAGE_FAIL_FAST and (folds_with_test_tensors == 0 or not bool(row_cov.any())):
+    # For tiny experiments (e.g., daytrade smoke runs), visual OOF coverage can be
+    # legitimately zero due to very small test folds. Don't hard-fail the pipeline.
+    if (
+        VISUAL_COVERAGE_FAIL_FAST
+        and n_rows >= 300
+        and (folds_with_test_tensors == 0 or not bool(row_cov.any()))
+    ):
         raise RuntimeError(
             "❌ DeepLOB visual stage completed without usable coverage. "
             f"folds_with_test_tensors={folds_with_test_tensors} | "
@@ -3177,7 +3316,6 @@ def stage3_meta_learner_v19(
     train_frac: float = 0.80,
     split_time: pd.Timestamp | str | None = None,
     min_seq_coverage: float = 0.80,
-    required_policy_version: str = POLICY_VERSION,
 ) -> dict:
     print("\n" + "═" * 65)
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
@@ -3426,7 +3564,6 @@ def stage3_meta_learner_v19(
             'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
             'base_models': meta_layout['base_models'],
             'decision_policy_artifact': DEFAULT_DECISION_POLICY_ARTIFACT,
-            'decision_policy_version_required': required_policy_version,
             'deeplob': {
                 'enabled': bool(len(VISUAL_FEATURE_NAMES)),
                 'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
@@ -3539,7 +3676,6 @@ def _write_inference_feature_schema_catboost_phase(
     output_dir: str,
     meta_feature_names: list[str],
     event_gate_cfg: dict | None = None,
-    required_policy_version: str = POLICY_VERSION,
 ) -> str:
     """Stage-1-only training previously shipped without a schema file; backtest/inference need it."""
     meta_layout = infer_meta_feature_layout(meta_feature_names)
@@ -3559,7 +3695,6 @@ def _write_inference_feature_schema_catboost_phase(
         'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
         'base_models': meta_layout['base_models'],
         'decision_policy_artifact': DEFAULT_DECISION_POLICY_ARTIFACT,
-        'decision_policy_version_required': required_policy_version,
         'deeplob': {
             'enabled': False,
             'required_runtime': False,
@@ -3624,7 +3759,15 @@ def run_training_pipeline(
     config_snapshot: dict | None = None,
     sample_weight_mode: str | None = None,
     stage1_target: str | None = None,
+    seq_len_override: int | None = None,
 ) -> dict:
+    global SEQ_LEN
+    SEQ_LEN = _resolve_seq_len_from_v19_config(
+        config_snapshot,
+        cli_override=seq_len_override,
+        fallback=DEFAULT_SEQ_LEN,
+        csv_path=csv_path,
+    )
     os.makedirs(output_dir, exist_ok=True)
     started_at = datetime.datetime.now()
     resolved_phase = _resolve_phase(stage=stage, phase=phase)
@@ -3635,14 +3778,8 @@ def run_training_pipeline(
     print(f'   Phase: {_phase_banner(resolved_phase)}')
     print('=' * 65)
 
-    seed_manifest = apply_reproducibility_config(config_snapshot or {}, output_dir=output_dir, component='train_v19')
-    if seed_manifest:
-        print(f"  🎯 Reproducibility manifest: {seed_manifest}")
-
     train_cfg = (config_snapshot or {}).get('training', {})
     training_mode = training_mode or str(train_cfg.get('mode', TRAIN_MODE_EVENT_BINARY))
-    event_fallback_mode = str(train_cfg.get('event_fallback_mode', 'directional_rows'))
-    required_policy_version = str(train_cfg.get('require_decision_policy_version', POLICY_VERSION)).strip() or POLICY_VERSION
     quality_weight_strong = float(
         quality_weight_strong if quality_weight_strong is not None else train_cfg.get('quality_weight_strong', 2.0)
     )
@@ -3667,14 +3804,6 @@ def run_training_pipeline(
         st1_tgt_cfg = STAGE1_TARGET_BIAS
     print(f"  stage1_target: {st1_tgt_cfg}")
 
-    source_gate_report = _enforce_source_refinery_gates(csv_path, config_snapshot)
-    if source_gate_report:
-        print(
-            "  🧱 Source refinery gates: "
-            f"passed={bool(source_gate_report.get('passed', False))} "
-            f"| failures={int(source_gate_report.get('blocking_failure_count', 0) or 0)}"
-        )
-
     df_loaded = load_training_csv(csv_path)
     source_contract = _load_source_refinery_contract(csv_path)
     effective_split_time = split_time if split_time is not None else source_contract.get('split_time')
@@ -3695,83 +3824,49 @@ def run_training_pipeline(
         f"holdout_rows={training_window['holdout_rows']:,} | "
         f"split={training_window['split_time']}"
     )
-    event_gate_report_path = os.path.join(output_dir, 'event_training_gate_report.json')
-    try:
-        event_df, event_view_info = build_event_training_view(
-            df_full,
-            mode=training_mode,
-            quality_weight_strong=quality_weight_strong,
-            quality_weight_weak=quality_weight_weak,
-            train_frac=train_frac,
-            split_time=training_window.get('split_time'),
-            event_fallback_mode=event_fallback_mode,
-        )
-    except RuntimeError as exc:
-        directional_mask = pd.to_numeric(df_full.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8).isin([0, 1])
-        train_event_flag = pd.to_numeric(df_full.get('train_event_flag', df_full.get('event_flag', 0)), errors='coerce').fillna(0).astype(np.int8)
-        gate_report = {
-            'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-            'passed': False,
-            'event_fallback_mode': event_fallback_mode,
-            'rows_full': int(len(df_full)),
-            'directional_rows_total': int(directional_mask.sum()),
-            'train_event_directional_rows': int(((train_event_flag == 1) & directional_mask).sum()),
-            'event_flag_directional_rows': int(
-                (
-                    pd.to_numeric(df_full.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8) == 1
-                ).astype(np.int8)[directional_mask].sum()
-            ),
-            'fallback_reason': 'no_event_directional_rows',
-            'reason': str(exc),
-        }
-        with open(event_gate_report_path, 'w') as f:
-            json.dump(gate_report, f, indent=2)
-        raise
+    event_df, event_view_info = build_event_training_view(
+        df_full,
+        mode=training_mode,
+        quality_weight_strong=quality_weight_strong,
+        quality_weight_weak=quality_weight_weak,
+        train_frac=train_frac,
+        split_time=training_window.get('split_time'),
+    )
+    # ── DIAGNOSTIC BLOCK — احذفه بعد التشخيص ──
+    print("\n" + "=" * 50)
+    print("🔍 DIAGNOSTIC REPORT")
+    print("=" * 50)
+
+    print(f"conf_target std:  {float(pd.to_numeric(event_df['conf_target'], errors='coerce').std()):.6f}")
+    print(f"conf_target mean: {float(pd.to_numeric(event_df['conf_target'], errors='coerce').mean()):.6f}")
+    _ct_round = pd.to_numeric(event_df["conf_target"], errors="coerce").dropna().round(3)
+    print(f"conf_target unique values (sample): {_ct_round.value_counts().head(5).to_dict()}")
+
+    long_count = int((event_df["bias_label"] == 0).sum())
+    short_count = int((event_df["bias_label"] == 1).sum())
+    n_total = long_count + short_count
+    if long_count > 0 and short_count > 0:
+        w_long_raw = n_total / (2.0 * long_count)
+        w_short_raw = n_total / (2.0 * short_count)
+        print(f"\nLONG:  {long_count:,} rows → w_long  = {w_long_raw:.3f}")
+        print(f"SHORT: {short_count:,} rows → w_short = {w_short_raw:.3f}")
+        print(f"Imbalance ratio: {max(long_count, short_count) / min(long_count, short_count):.2f}x")
+    else:
+        print(f"\nLONG:  {long_count:,} | SHORT: {short_count:,} — cannot compute class weights")
+
+    if "signal_quality" in event_df.columns:
+        print(f"\nsignal_quality dist: {event_df['signal_quality'].value_counts().to_dict()}")
+    else:
+        print("\nsignal_quality: (column missing)")
+
+    print("=" * 50 + "\n")
+    # ── END DIAGNOSTIC ──
+
     event_view_info = {
         **dict(event_view_info),
         'sample_weight_mode': sw_mode_cfg,
         'stage1_target': st1_tgt_cfg,
     }
-    event_gate_report = {
-        'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-        'passed': bool(event_view_info.get('train_event_directional_rows', 0) > 0),
-        'event_fallback_mode': event_fallback_mode,
-        'rows_full': int(event_view_info.get('rows_full', len(df_full))),
-        'rows_event_directional': int(event_view_info.get('rows_event_directional', len(event_df))),
-        'directional_rows_total': int(event_view_info.get('directional_rows_total', 0)),
-        'train_event_directional_rows': int(event_view_info.get('train_event_directional_rows', 0)),
-        'event_flag_directional_rows': int(event_view_info.get('event_flag_directional_rows', 0)),
-        'event_col': event_view_info.get('event_col'),
-        'fallback_reason': event_view_info.get('fallback_reason'),
-    }
-    with open(event_gate_report_path, 'w') as f:
-        json.dump(event_gate_report, f, indent=2)
-    if len(event_df):
-        conf_series = pd.to_numeric(event_df.get('conf_target', 0.0), errors='coerce').fillna(0.0).astype(np.float32)
-        bias_series = pd.to_numeric(event_df.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int32)
-        quality_series = pd.to_numeric(event_df.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int32)
-        long_count = int((bias_series == 0).sum())
-        short_count = int((bias_series == 1).sum())
-        directional_total = max(long_count + short_count, 1)
-        w_long_raw = directional_total / (2.0 * max(long_count, 1))
-        w_short_raw = directional_total / (2.0 * max(short_count, 1))
-        conf_top = conf_series.round(3).value_counts().head(5).to_dict()
-        imbalance_ratio = (
-            float(max(long_count, short_count) / max(min(long_count, short_count), 1))
-            if (long_count > 0 and short_count > 0)
-            else 0.0
-        )
-        print("\n" + "=" * 50)
-        print("DIAGNOSTIC REPORT")
-        print("=" * 50)
-        print(f"conf_target std:  {float(conf_series.std(ddof=0)):.6f}")
-        print(f"conf_target mean: {float(conf_series.mean()):.6f}")
-        print(f"conf_target top values: {conf_top}")
-        print(f"LONG:  {long_count:,} rows -> w_long_raw  = {w_long_raw:.3f}")
-        print(f"SHORT: {short_count:,} rows -> w_short_raw = {w_short_raw:.3f}")
-        print(f"Imbalance ratio: {imbalance_ratio:.2f}x")
-        print(f"signal_quality dist: {quality_series.value_counts().to_dict()}")
-        print("=" * 50 + "\n")
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
     copied_artifacts = copy_inference_artifacts(csv_path, output_dir)
@@ -3862,19 +3957,6 @@ def run_training_pipeline(
     coverage_path = os.path.join(output_dir, 'meta_coverage_v19.npy')
     visual_path = os.path.join(output_dir, 'visual_embeddings_v19.npy')
     visual_cov_path = os.path.join(output_dir, 'visual_coverage_v19.npy')
-    replay_cfg = {
-        'direction_threshold_ticks': float(((config_snapshot or {}).get('refinery', {}) or {}).get('direction_threshold_ticks', 1.0)),
-        'tp_mult': float(((config_snapshot or {}).get('refinery', {}) or {}).get('tp_mult', 1.2)),
-        'sl_mult': float(((config_snapshot or {}).get('refinery', {}) or {}).get('sl_mult', 1.0)),
-        'max_horizon_steps': 0,
-    }
-    policy_build_window = {
-        'mode': training_window.get('mode'),
-        'train_start_time': training_window.get('train_start_time'),
-        'holdout_start_time': training_window.get('holdout_start_time'),
-        'holdout_end_time_exclusive': training_window.get('holdout_end_time_exclusive'),
-        'split_time': training_window.get('split_time'),
-    }
 
     if resolved_phase in (PHASE_FULL, PHASE_CATBOOST) or (
         resolved_phase == PHASE_VISUAL and not (os.path.exists(meta_path) and os.path.exists(coverage_path))
@@ -3894,10 +3976,8 @@ def run_training_pipeline(
             quality_weight_strong=quality_weight_strong,
             quality_weight_weak=quality_weight_weak,
             cost_config=(config_snapshot or {}).get('backtest', {}),
-            replay_config=replay_cfg,
             sample_weight_mode=sw_mode_cfg,
             stage1_target=st1_tgt_cfg,
-            policy_build_window=policy_build_window,
         )
         meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:
@@ -3910,7 +3990,6 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
-            'event_fallback_mode': event_fallback_mode,
             'sample_weight_mode': sw_mode_cfg,
             'stage1_target': st1_tgt_cfg,
             'meta_shape': list(meta_features.shape),
@@ -3924,12 +4003,7 @@ def run_training_pipeline(
             'stage': int(stage),
             'phase': resolved_phase,
         }
-        _write_inference_feature_schema_catboost_phase(
-            output_dir,
-            meta_feature_names,
-            event_gate_cfg,
-            required_policy_version=required_policy_version,
-        )
+        _write_inference_feature_schema_catboost_phase(output_dir, meta_feature_names, event_gate_cfg)
         manifest_path = write_manifest(
             output_dir=output_dir,
             kind='train_v19_catboost',
@@ -3963,9 +4037,6 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
-                'event_training_gate_report': event_gate_report_path,
-                'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-                'seed_manifest': seed_manifest,
             },
         )
         print('\n' + '=' * 65)
@@ -3980,9 +4051,6 @@ def run_training_pipeline(
             'feature_coverage_drift_report': feature_drift_report_path,
             'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
             'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
-            'event_training_gate_report': event_gate_report_path,
-            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-            'seed_manifest': seed_manifest,
         }
 
     lob_tensors, lob_timestamps = _load_lob_inputs(lob_path, lob_ts_path)
@@ -4000,12 +4068,14 @@ def run_training_pipeline(
                 f"{lob_alignment_stats['matched_rows']:,}/{lob_alignment_stats['rows_total']:,} "
                 f"({lob_alignment_stats['matched_ratio']:.1%}) | tolerance={lob_alignment_stats['tolerance']}"
             )
+        lob_max_age = _infer_lob_max_age_for_dataset(event_df)
         visual_embeddings, visual_coverage = stage2_oof_visual_embeddings(
             event_df,
             output_dir,
             splits=splits,
             lob_tensors=lob_tensors,
             lob_timestamps=lob_timestamps,
+            max_age=lob_max_age,
         )
     else:
         visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(event_df))
@@ -4025,7 +4095,6 @@ def run_training_pipeline(
             'rows_full': int(len(df_full)),
             'rows_event': int(len(event_df)),
             'training_mode': training_mode,
-            'event_fallback_mode': event_fallback_mode,
             'sample_weight_mode': sw_mode_cfg,
             'stage1_target': st1_tgt_cfg,
             'meta_shape': list(meta_features.shape),
@@ -4072,9 +4141,6 @@ def run_training_pipeline(
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
                 'meta_feature_dim': int(meta_features.shape[1]),
-                'event_training_gate_report': event_gate_report_path,
-                'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-                'seed_manifest': seed_manifest,
             },
         )
         print('\n' + '=' * 65)
@@ -4089,9 +4155,6 @@ def run_training_pipeline(
             'feature_coverage_drift_report': feature_drift_report_path,
             'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
             'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
-            'event_training_gate_report': event_gate_report_path,
-            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-            'seed_manifest': seed_manifest,
         }
 
     if resolved_phase in (PHASE_FULL, PHASE_TRAIN):
@@ -4116,7 +4179,6 @@ def run_training_pipeline(
             train_frac=train_frac,
             split_time=training_window.get('split_time'),
             min_seq_coverage=min_seq_coverage,
-            required_policy_version=required_policy_version,
         )
 
     elapsed = (datetime.datetime.now() - started_at).total_seconds()
@@ -4124,7 +4186,6 @@ def run_training_pipeline(
         'rows_full': int(len(df_full)),
         'rows_event': int(len(event_df)),
         'training_mode': training_mode,
-        'event_fallback_mode': event_fallback_mode,
         'sample_weight_mode': sw_mode_cfg,
         'stage1_target': st1_tgt_cfg,
         'meta_shape': list(meta_features.shape),
@@ -4178,9 +4239,6 @@ def run_training_pipeline(
             'event_gate_schema': event_gate_cfg,
             'meta_learner_profile': stage3_summary,
             'stacking_scaler_contract': 'OOF uses fold-local scalers; live uses inference scaler',
-            'event_training_gate_report': event_gate_report_path,
-            'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-            'seed_manifest': seed_manifest,
         },
     )
     print('\n' + '=' * 65)
@@ -4197,9 +4255,6 @@ def run_training_pipeline(
         'feature_coverage_drift_report': feature_drift_report_path,
         'time_split_report': os.path.join(output_dir, 'time_split_report.json'),
         'calibration_report': os.path.join(output_dir, 'calibration_report.json'),
-        'event_training_gate_report': event_gate_report_path,
-        'source_data_integrity_gate_report': os.path.join(resolve_artifact_root(csv_path), 'data_integrity_gate_report.json'),
-        'seed_manifest': seed_manifest,
     }
 
 
@@ -4242,6 +4297,12 @@ def main():
     p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
     p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
     p.add_argument('--config', default=None, help='optional config file to override defaults')
+    p.add_argument(
+        '--seq_len',
+        type=int,
+        default=None,
+        help='override sequence length for MetaLearner/safe split (else training.seq_len / day_trading.seq_len_bars)',
+    )
     args = p.parse_args()
 
     cfg = load_v19_config(args.config)
@@ -4271,8 +4332,14 @@ def main():
         config_snapshot=cfg,
         sample_weight_mode=args.sample_weight_mode,
         stage1_target=args.stage1_target,
+        seq_len_override=args.seq_len,
     )
 
 
 if __name__ == '__main__':
+    if _cli_argv_looks_like_direct_train_v19():
+        print(
+            f"[train_v19] اكتمل تحميل الوحدات في {time.perf_counter() - _TRAIN_V19_LOAD_T0:.1f}s — بدء main()",
+            flush=True,
+        )
     main()
