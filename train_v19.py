@@ -65,6 +65,9 @@ from prepare_training_data import (
     _configure_stdio_utf8,
 )
 VISUAL_EMB_DIM = 8
+VISUAL_MODEL_DEEPLOB = 'deeplob'
+VISUAL_MODEL_LOB_TRANSFORMER = 'lob_transformer'
+SUPPORTED_VISUAL_MODELS = {VISUAL_MODEL_DEEPLOB, VISUAL_MODEL_LOB_TRANSFORMER}
 from modules.config_v19 import load_v19_config
 from modules.decision_policy_v19 import DEFAULT_DECISION_POLICY_ARTIFACT, build_decision_policy
 from modules.dynamic_labels import (
@@ -176,6 +179,27 @@ STAGE_TO_PHASE = {
     2: PHASE_VISUAL,
     3: PHASE_TRAIN,
 }
+TRAIN_PROFILE_MANUAL = 'manual'
+TRAIN_PROFILE_MONTH_PILOT_21_7 = 'month_pilot_21_7'
+TRAIN_PROFILE_FULL_HISTORY_6Y = 'full_history_6y'
+TRAINING_PROFILE_PRESETS = {
+    TRAIN_PROFILE_MONTH_PILOT_21_7: {
+        'train_days': 21.0,
+        'backtest_days': 7.0,
+        'window_end': None,
+        'split_time': None,
+        'use_source_split_time': False,
+        'description': 'Pilot context: 21-day train + 7-day holdout window',
+    },
+    TRAIN_PROFILE_FULL_HISTORY_6Y: {
+        'train_days': None,
+        'backtest_days': None,
+        'window_end': None,
+        'split_time': None,
+        'use_source_split_time': False,
+        'description': 'Full-history context: keep full dataset window for 6-year scale runs',
+    },
+}
 LEGACY_META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=False)
 META_FEATURE_NAMES = resolve_meta_feature_names(include_xgboost=True)
 VISUAL_FEATURE_NAMES = [f'vis_emb_{i}' for i in range(VISUAL_EMB_DIM)]
@@ -266,6 +290,51 @@ def _assert_no_forbidden_model_inputs(cols: list[str]) -> None:
         )
 
 
+def _resolve_training_profile_overrides(
+    profile: str | None,
+    *,
+    train_days: float | None,
+    backtest_days: float | None,
+    window_end: str | None,
+    split_time: str | None,
+) -> tuple[float | None, float | None, str | None, str | None, dict]:
+    requested = str(profile or TRAIN_PROFILE_MANUAL).strip().lower()
+    if requested in ('', TRAIN_PROFILE_MANUAL, 'none', 'off'):
+        info = {
+            'requested': requested or TRAIN_PROFILE_MANUAL,
+            'name': TRAIN_PROFILE_MANUAL,
+            'description': 'Manual window selection (no profile defaults applied)',
+            'applied': False,
+            'use_source_split_time': True,
+            'overrides_applied': {},
+        }
+        return train_days, backtest_days, window_end, split_time, info
+
+    if requested not in TRAINING_PROFILE_PRESETS:
+        allowed = ', '.join(sorted(TRAINING_PROFILE_PRESETS))
+        raise ValueError(f"Unknown training profile: {requested}. Allowed: {allowed}, manual")
+
+    preset = dict(TRAINING_PROFILE_PRESETS[requested])
+    resolved_train_days = train_days if train_days is not None else preset.get('train_days')
+    resolved_backtest_days = backtest_days if backtest_days is not None else preset.get('backtest_days')
+    resolved_window_end = window_end if window_end is not None else preset.get('window_end')
+    resolved_split_time = split_time if split_time is not None else preset.get('split_time')
+    info = {
+        'requested': requested,
+        'name': requested,
+        'description': str(preset.get('description', '')),
+        'applied': True,
+        'use_source_split_time': bool(preset.get('use_source_split_time', True)),
+        'overrides_applied': {
+            'train_days': bool(train_days is None and preset.get('train_days') is not None),
+            'backtest_days': bool(backtest_days is None and preset.get('backtest_days') is not None),
+            'window_end': bool(window_end is None and preset.get('window_end') is not None),
+            'split_time': bool(split_time is None and preset.get('split_time') is not None),
+        },
+    }
+    return resolved_train_days, resolved_backtest_days, resolved_window_end, resolved_split_time, info
+
+
 def _resolve_phase(stage: int = 0, phase: str | None = None) -> str:
     if phase is not None:
         phase = str(phase).strip().lower()
@@ -305,13 +374,33 @@ def _load_meta_learner_class():
         return MetaLearnerLSTM
 
 
-def _load_deeplob_runtime():
-    try:
-        from modules.deeplob_cnn import DeepLOBCNN
+def _resolve_visual_model_type(override: str | None = None) -> str:
+    raw = str(
+        override
+        or os.environ.get('QUANTSYSTEM_VISUAL_MODEL', VISUAL_MODEL_LOB_TRANSFORMER)
+    ).strip().lower()
+    if raw not in SUPPORTED_VISUAL_MODELS:
+        raw = VISUAL_MODEL_LOB_TRANSFORMER
+    return raw
 
-        return DeepLOBCNN, True
+
+def _visual_model_artifact_name(model_type: str) -> str:
+    model_type = _resolve_visual_model_type(model_type)
+    if model_type == VISUAL_MODEL_DEEPLOB:
+        return 'deeplob_cnn_v19.keras'
+    return 'lob_transformer_v19.keras'
+
+
+def _load_visual_runtime(model_type: str):
+    resolved = _resolve_visual_model_type(model_type)
+    try:
+        if resolved == VISUAL_MODEL_DEEPLOB:
+            from modules.deeplob_cnn import DeepLOBCNN
+            return DeepLOBCNN, True, resolved
+        from modules.lob_transformer import LOBTransformer
+        return LOBTransformer, True, VISUAL_MODEL_LOB_TRANSFORMER
     except ImportError:
-        return None, False
+        return None, False, resolved
 
 
 def _resolve_catboost_device(catboost_device: str = 'auto') -> tuple[str, str | None]:
@@ -735,6 +824,22 @@ def build_event_training_view(
     out = df.copy()
     if 'ts_event' in out.columns:
         out = out.sort_values('ts_event').reset_index(drop=True)
+    if 'mbp_bar_coverage' in out.columns:
+        mbp_cov = pd.to_numeric(out['mbp_bar_coverage'], errors='coerce').fillna(0.0)
+        cov_mask = mbp_cov >= 0.30
+        dropped = int((~cov_mask).sum())
+        if dropped > 0:
+            print(
+                "  🧹 MBP coverage filter: "
+                f"kept={int(cov_mask.sum()):,}/{len(out):,} rows "
+                f"(threshold=0.30, dropped={dropped:,})"
+            )
+        out = out.loc[cov_mask].copy().reset_index(drop=True)
+        if out.empty:
+            raise RuntimeError(
+                "❌ MBP coverage filter removed all rows "
+                "(mbp_bar_coverage < 0.30 across dataset)."
+            )
     out['event_flag'] = pd.to_numeric(out.get('event_flag', 0), errors='coerce').fillna(0).astype(np.int8)
     out['train_event_flag'] = pd.to_numeric(out.get('train_event_flag', out['event_flag']), errors='coerce').fillna(0).astype(np.int8)
     out['bias_label'] = pd.to_numeric(out.get('bias_label', 2), errors='coerce').fillna(2).astype(np.int8)
@@ -1503,19 +1608,16 @@ def build_time_splits(
         split_at = max(n - test_n, 5)
         train_idx = np.arange(0, split_at, dtype=np.int32)
         test_idx = np.arange(split_at, n, dtype=np.int32)
-        train_idx_raw_n = int(len(train_idx))
-        train_idx = purge_overlapping(train_idx, test_idx, t1, t0).astype(np.int32)
         splits = [(train_idx, test_idx)] if len(test_idx) else []
-        if not splits or len(train_idx) < 5:
+        if not splits:
             raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
         print(
             "  ⚠️ Tiny dataset split fallback: "
             f"rows={n:,} train={len(train_idx):,} test={len(test_idx):,} "
-            f"purged={train_idx_raw_n - len(train_idx):,} "
             f"(requested_folds={requested_n_folds} ignored)"
         )
         return splits, t0, t1, {
-            'dynamic_embargo_rows': int(train_idx_raw_n - len(train_idx)),
+            'dynamic_embargo_rows': 0,
             'effective_embargo_pct': 0.0,
             'embargo_horizon_quantile': float(embargo_horizon_quantile),
             'requested_n_folds': int(requested_n_folds),
@@ -2776,32 +2878,6 @@ def _deeplob_aux_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _fit_lob_norm_params(tensors, ids: np.ndarray, eps: float = 1e-12) -> dict[int, tuple[float, float]]:
-    sample = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32)
-    params: dict[int, tuple[float, float]] = {}
-    if sample.size == 0:
-        return params
-    for c in range(sample.shape[-1]):
-        flat = sample[..., c].reshape(-1)
-        nz = flat[np.abs(flat) > eps]
-        if len(nz):
-            mu = float(np.mean(nz))
-            sd = float(np.std(nz))
-        else:
-            mu, sd = 0.0, 1.0
-        params[int(c)] = (mu, sd if sd > 1e-8 else 1.0)
-    return params
-
-
-def _apply_lob_norm(tensors, ids: np.ndarray, params: dict[int, tuple[float, float]]) -> np.ndarray:
-    out = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32).copy()
-    for c, (mu, sd) in (params or {}).items():
-        ci = int(c)
-        if 0 <= ci < out.shape[-1]:
-            out[..., ci] = ((out[..., ci] - float(mu)) / max(float(sd), 1e-8)).astype(np.float32)
-    return out
-
-
 def stage2_oof_visual_embeddings(
     df: pd.DataFrame,
     output_dir: str,
@@ -2809,12 +2885,19 @@ def stage2_oof_visual_embeddings(
     lob_tensors,
     lob_timestamps: pd.Series,
     *,
+    visual_model_type: str = VISUAL_MODEL_LOB_TRANSFORMER,
     max_age: str = DEFAULT_LOB_MAX_AGE,
 ) -> tuple[np.ndarray, np.ndarray]:
     import gc
 
     print("\n" + "═" * 65)
-    print("👁️ STAGE 2 — V19 OOF DeepLOB Visual Embeddings")
+    visual_model_type = _resolve_visual_model_type(visual_model_type)
+    visual_model_label = (
+        "LOB-Transformer"
+        if visual_model_type == VISUAL_MODEL_LOB_TRANSFORMER
+        else "DeepLOB CNN"
+    )
+    print(f"👁️ STAGE 2 — V19 OOF Visual Embeddings ({visual_model_label})")
     print("═" * 65)
 
     deeplob_aux_batch = max(8, min(512, _deeplob_aux_env_int('DEEPLOB_AUX_BATCH', 48)))
@@ -2823,7 +2906,7 @@ def stage2_oof_visual_embeddings(
     deeplob_final_epochs = max(1, min(120, _deeplob_aux_env_int('DEEPLOB_AUX_FINAL_EPOCHS', 25)))
     cap_desc = 'بدون حد' if deeplob_aux_cap <= 0 else f'{deeplob_aux_cap:,}'
     print(
-        '  [DeepLOB] أوضاع الذاكرة: '
+        f'  [{visual_model_label}] أوضاع الذاكرة: '
         f'batch={deeplob_aux_batch} | max_train_tensors={cap_desc}'
         f' | oof_epochs={deeplob_oof_epochs} | final_epochs={deeplob_final_epochs}\n'
         '           عيّن عند OOM: DEEPLOB_AUX_BATCH، DEEPLOB_AUX_MAX_TRAIN_TENSORS، '
@@ -2841,10 +2924,10 @@ def stage2_oof_visual_embeddings(
             'Re-run stage1 with valid MBP inputs and Step 3e enabled.'
         )
 
-    DeepLOBCNN, DEEPLOB_IMPORT_OK = _load_deeplob_runtime()
-    if not DEEPLOB_IMPORT_OK:
+    VisualEncoder, visual_import_ok, resolved_type = _load_visual_runtime(visual_model_type)
+    if not visual_import_ok:
         raise RuntimeError(
-            '❌ DeepLOB runtime is required for the visual stage but TensorFlow/DeepLOB is unavailable.'
+            f'❌ Visual runtime ({resolved_type}) is required for stage2 but unavailable.'
         )
 
     row_to_tensor, tensor_targets, tensor_target_seen = _align_lob_to_rows(
@@ -2853,6 +2936,26 @@ def stage2_oof_visual_embeddings(
         max_age=str(max_age),
         max_tensors=len(lob_tensors),
     )
+    row_to_tensor = np.asarray(row_to_tensor, dtype=np.int32)
+    np.save(os.path.join(output_dir, 'row_to_lob_tensor_id_v19.npy'), row_to_tensor)
+    entry_cols = [
+        col for col in (
+            'ts_event',
+            'label_end_ts',
+            'price',
+            'bias_label',
+            'regime_label',
+            'event_score',
+            'train_event_flag',
+            'label_horizon_steps',
+        )
+        if col in df.columns
+    ]
+    entry_manifest = df[entry_cols].copy() if entry_cols else pd.DataFrame(index=df.index)
+    entry_manifest.insert(0, 'row_idx', np.arange(n_rows, dtype=np.int32))
+    entry_manifest['lob_tensor_id'] = row_to_tensor.astype(np.int32)
+    entry_manifest['has_lob_tensor'] = (row_to_tensor >= 0).astype(np.int8)
+    entry_manifest.to_csv(os.path.join(output_dir, 'entrydata_manifest_v19.csv'), index=False)
     row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
     row_cov = np.zeros(n_rows, dtype=bool)
 
@@ -2865,7 +2968,7 @@ def stage2_oof_visual_embeddings(
         'folds': [],
     }
 
-    fold_tmp_dir = tempfile.mkdtemp(prefix='_oof_cnn_tmp_', dir=output_dir)
+    fold_tmp_dir = tempfile.mkdtemp(prefix='_oof_visual_tmp_', dir=output_dir)
 
     for fold_no, (train_idx, test_idx) in enumerate(splits, start=1):
         test_tensor_ids = np.unique(row_to_tensor[test_idx][row_to_tensor[test_idx] >= 0]).astype(np.int32)
@@ -2894,29 +2997,39 @@ def stage2_oof_visual_embeddings(
             rng = np.random.default_rng(42 + int(fold_no))
             tids_fit = np.sort(rng.choice(tids_fit, size=deeplob_aux_cap, replace=False))
             print(
-                f'  [DeepLOB] fold {fold_no}: تم تقليل عيّنة التدريب المساعد إلى {deeplob_aux_cap:,} تنسور لتوفير RAM',
+                f'  [{visual_model_label}] fold {fold_no}: تم تقليل عيّنة التدريب المساعد إلى {deeplob_aux_cap:,} تنسور لتوفير RAM',
                 flush=True,
             )
 
-        brain_path = os.path.join(fold_tmp_dir, f'deeplob_fold_{fold_no}.keras')
-        cnn = DeepLOBCNN(brain_file=brain_path)
-        if cnn.model is None:
+        fold_model_name = (
+            f'lob_transformer_fold_{fold_no}.keras'
+            if resolved_type == VISUAL_MODEL_LOB_TRANSFORMER
+            else f'deeplob_fold_{fold_no}.keras'
+        )
+        brain_path = os.path.join(fold_tmp_dir, fold_model_name)
+        encoder = VisualEncoder(brain_file=brain_path)
+        if encoder.model is None:
             metrics['folds'].append({
                 'fold': fold_no,
                 'train_tensors': int(len(train_tensor_ids)),
                 'test_tensors': int(len(test_tensor_ids)),
-                'status': 'cnn_unavailable',
+                'status': f'{resolved_type}_unavailable',
             })
             continue
 
-        norm_params = _fit_lob_norm_params(lob_tensors, tids_fit)
-        X_tr = _apply_lob_norm(lob_tensors, tids_fit, norm_params)
+        X_tr = np.asarray(lob_tensors[tids_fit], dtype=np.float32)
         y_tr = tensor_targets[tids_fit].reshape(-1, 1).astype(np.float32)
         gc.collect()
-        cnn.fit_auxiliary(X_tr, y_tr, epochs=deeplob_oof_epochs, batch=deeplob_aux_batch, output_dir=fold_tmp_dir)
+        encoder.fit_auxiliary(
+            X_tr,
+            y_tr,
+            epochs=deeplob_oof_epochs,
+            batch=deeplob_aux_batch,
+            output_dir=fold_tmp_dir,
+        )
 
-        X_te = _apply_lob_norm(lob_tensors, test_tensor_ids, norm_params)
-        emb_te = cnn.get_embeddings(X_te).astype(np.float32)
+        X_te = np.asarray(lob_tensors[test_tensor_ids], dtype=np.float32)
+        emb_te = encoder.get_embeddings(X_te).astype(np.float32)
         emb_map = {int(tid): emb_te[i] for i, tid in enumerate(test_tensor_ids)}
 
         fold_rows = 0
@@ -2935,33 +3048,38 @@ def stage2_oof_visual_embeddings(
             'test_tensors': int(len(test_tensor_ids)),
             'covered_rows': int(fold_rows),
             'status': 'ok',
-            'lob_norm': 'fold_train_only',
         })
 
     live_row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
     final_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
     final_tensor_ids = final_tensor_ids[tensor_target_seen[final_tensor_ids]]
     if len(final_tensor_ids) >= 32:
-        final_brain_tmp = os.path.join(fold_tmp_dir, 'deeplob_final_tmp.keras')
-        final_cnn = DeepLOBCNN(brain_file=final_brain_tmp)
-        if final_cnn.model is not None:
+        final_model_name = (
+            'lob_transformer_final_tmp.keras'
+            if resolved_type == VISUAL_MODEL_LOB_TRANSFORMER
+            else 'deeplob_final_tmp.keras'
+        )
+        final_brain_tmp = os.path.join(fold_tmp_dir, final_model_name)
+        final_encoder = VisualEncoder(brain_file=final_brain_tmp)
+        if final_encoder.model is not None:
             ftids = final_tensor_ids
             if deeplob_aux_cap > 0 and len(ftids) > deeplob_aux_cap:
                 rng = np.random.default_rng(424242)
                 ftids = np.sort(rng.choice(ftids, size=deeplob_aux_cap, replace=False))
                 print(
-                    f'  [DeepLOB] final-fit: عيّنة تدريب مساعد {deeplob_aux_cap:,} تنسور (حد الذاكرة)',
+                    f'  [{visual_model_label}] final-fit: عيّنة تدريب مساعد {deeplob_aux_cap:,} تنسور (حد الذاكرة)',
                     flush=True,
                 )
-            final_norm_params = _fit_lob_norm_params(lob_tensors, ftids)
-            X_final = _apply_lob_norm(lob_tensors, ftids, final_norm_params)
+            X_final = np.asarray(lob_tensors[ftids], dtype=np.float32)
             y_final = tensor_targets[ftids].reshape(-1, 1).astype(np.float32)
             gc.collect()
-            final_cnn.fit_auxiliary(
+            final_encoder.fit_auxiliary(
                 X_final, y_final, epochs=deeplob_final_epochs, batch=deeplob_aux_batch, output_dir=output_dir
             )
-            final_cnn.model.save(os.path.join(output_dir, 'deeplob_cnn_v19.keras'))
-            final_emb = np.asarray(final_cnn.get_embeddings(X_final), dtype=np.float32)
+            final_encoder.model.save(
+                os.path.join(output_dir, _visual_model_artifact_name(resolved_type))
+            )
+            final_emb = np.asarray(final_encoder.get_embeddings(X_final), dtype=np.float32)
             final_emb_map = {int(tid): final_emb[i] for i, tid in enumerate(ftids)}
             for row_idx, tensor_idx in enumerate(row_to_tensor):
                 if int(tensor_idx) in final_emb_map:
@@ -2973,7 +3091,10 @@ def stage2_oof_visual_embeddings(
     with open(os.path.join(output_dir, 'visual_metrics_v19.json'), 'w') as f:
         json.dump({
             **metrics,
+            'visual_model_type': resolved_type,
             'coverage_ratio': float(row_cov.mean()),
+            'row_to_lob_tensor_id': 'row_to_lob_tensor_id_v19.npy',
+            'entrydata_manifest': 'entrydata_manifest_v19.csv',
         }, f, indent=2)
 
     folds_with_test_tensors = int(
@@ -2989,7 +3110,7 @@ def stage2_oof_visual_embeddings(
         and (folds_with_test_tensors == 0 or not bool(row_cov.any()))
     ):
         raise RuntimeError(
-            "❌ DeepLOB visual stage completed without usable coverage. "
+            "❌ Visual stage completed without usable coverage. "
             f"folds_with_test_tensors={folds_with_test_tensors} | "
             f"rows_with_visual={int(row_cov.sum()):,}/{n_rows:,}. "
             "Rebuild Stage1 LOB artifacts from the same run before training the MetaLearner."
@@ -3309,6 +3430,7 @@ def stage3_meta_learner_v19(
     coverage_mask: np.ndarray,
     inference_scaler_params: dict,
     output_dir: str,
+    visual_model_type: str = VISUAL_MODEL_LOB_TRANSFORMER,
     meta_feature_names: list[str] | None = None,
     event_gate_cfg: dict | None = None,
     epochs: int = 100,
@@ -3321,6 +3443,8 @@ def stage3_meta_learner_v19(
     print("🧠 STAGE 3 — V19 MetaLearner (Safe Sequence Split)")
     print("═" * 65)
     MetaLearnerLSTM = _load_meta_learner_class()
+    visual_model_type = _resolve_visual_model_type(visual_model_type)
+    visual_model_artifact = _visual_model_artifact_name(visual_model_type)
     meta_feature_names = list(meta_feature_names or resolve_meta_feature_names(meta_dim=int(meta_features.shape[1])))
     meta_layout = infer_meta_feature_layout(meta_feature_names)
     if int(meta_features.shape[1]) != len(meta_feature_names):
@@ -3531,10 +3655,13 @@ def stage3_meta_learner_v19(
             'meta_temperature': 'meta_temperature_v19.json',
             'regime_model': 'regime_classifier.pkl',
             'scaler_params': 'scaler_params.json',
-            'deeplob_model': 'deeplob_cnn_v19.keras',
+            'deeplob_model': visual_model_artifact,
+            'lob_transformer_model': 'lob_transformer_v19.keras',
             'visual_embeddings': 'visual_embeddings_live_v19.npy',
             'visual_embeddings_oof': 'visual_embeddings_v19.npy',
             'visual_embeddings_live': 'visual_embeddings_live_v19.npy',
+            'row_to_lob_tensor_id': 'row_to_lob_tensor_id_v19.npy',
+            'entrydata_manifest': 'entrydata_manifest_v19.csv',
             'meta_features_oof': 'meta_features_oof_v19.npy',
             'meta_features_live': 'meta_features_live_v19.npy',
             'meta_feature_names': 'meta_feature_names_v19.json',
@@ -3567,6 +3694,10 @@ def stage3_meta_learner_v19(
             'deeplob': {
                 'enabled': bool(len(VISUAL_FEATURE_NAMES)),
                 'required_runtime': bool(len(VISUAL_FEATURE_NAMES)),
+                'model_type': visual_model_type,
+                'model_artifact': visual_model_artifact,
+                'late_fusion': True,
+                'parallel_paths': ['order_flow', 'lob_depth'],
                 'aux_target_mode': 'directional_signed_quality_weighted',
             },
             'meta_learner': {
@@ -3675,10 +3806,13 @@ def _load_or_init_visual_artifacts(output_dir: str, n_rows: int) -> tuple[np.nda
 def _write_inference_feature_schema_catboost_phase(
     output_dir: str,
     meta_feature_names: list[str],
+    visual_model_type: str = VISUAL_MODEL_LOB_TRANSFORMER,
     event_gate_cfg: dict | None = None,
 ) -> str:
     """Stage-1-only training previously shipped without a schema file; backtest/inference need it."""
     meta_layout = infer_meta_feature_layout(meta_feature_names)
+    visual_model_type = _resolve_visual_model_type(visual_model_type)
+    visual_model_artifact = _visual_model_artifact_name(visual_model_type)
     schema = {
         'version': SCHEMA_VERSION,
         'seq_len': SEQ_LEN,
@@ -3698,6 +3832,10 @@ def _write_inference_feature_schema_catboost_phase(
         'deeplob': {
             'enabled': False,
             'required_runtime': False,
+            'model_type': visual_model_type,
+            'model_artifact': visual_model_artifact,
+            'late_fusion': True,
+            'parallel_paths': ['order_flow', 'lob_depth'],
             'aux_target_mode': 'directional_signed_quality_weighted',
         },
         'meta_learner': {
@@ -3718,9 +3856,12 @@ def _write_inference_feature_schema_catboost_phase(
             'meta_features_oof': 'meta_features_oof_v19.npy',
             'meta_feature_names': 'meta_feature_names_v19.json',
             'visual_embeddings_oof': 'visual_embeddings_v19.npy',
+            'row_to_lob_tensor_id': 'row_to_lob_tensor_id_v19.npy',
+            'entrydata_manifest': 'entrydata_manifest_v19.csv',
             'meta_model': 'meta_learner_v19.keras',
             'meta_temperature': 'meta_temperature_v19.json',
-            'deeplob_model': 'deeplob_cnn_v19.keras',
+            'deeplob_model': visual_model_artifact,
+            'lob_transformer_model': 'lob_transformer_v19.keras',
             'xgboost_model': 'xgboost_advisor_v19.json',
             'xgboost_classes': 'xgboost_classes_v19.json',
         },
@@ -3756,10 +3897,12 @@ def run_training_pipeline(
     train_days: float | None = None,
     backtest_days: float | None = None,
     window_end: str | None = None,
+    training_profile: str | None = None,
     config_snapshot: dict | None = None,
     sample_weight_mode: str | None = None,
     stage1_target: str | None = None,
     seq_len_override: int | None = None,
+    visual_model_type: str | None = None,
 ) -> dict:
     global SEQ_LEN
     SEQ_LEN = _resolve_seq_len_from_v19_config(
@@ -3771,11 +3914,18 @@ def run_training_pipeline(
     os.makedirs(output_dir, exist_ok=True)
     started_at = datetime.datetime.now()
     resolved_phase = _resolve_phase(stage=stage, phase=phase)
+    visual_model_type = _resolve_visual_model_type(
+        visual_model_type
+        if visual_model_type is not None
+        else ((config_snapshot or {}).get('training', {}) or {}).get('visual_model')
+    )
+    visual_model_artifact = _visual_model_artifact_name(visual_model_type)
 
     print('=' * 65)
     print('🚀 QuantSystem V19 — Leakage-Safe Training Foundation')
     print(f'   Output: {output_dir}')
     print(f'   Phase: {_phase_banner(resolved_phase)}')
+    print(f'   Visual model: {visual_model_type} ({visual_model_artifact})')
     print('=' * 65)
 
     train_cfg = (config_snapshot or {}).get('training', {})
@@ -3803,10 +3953,27 @@ def run_training_pipeline(
     if st1_tgt_cfg not in (STAGE1_TARGET_BIAS, STAGE1_TARGET_SOFT_LABEL):
         st1_tgt_cfg = STAGE1_TARGET_BIAS
     print(f"  stage1_target: {st1_tgt_cfg}")
+    profile_arg = training_profile if training_profile is not None else train_cfg.get('profile', TRAIN_PROFILE_MANUAL)
+    train_days, backtest_days, window_end, split_time, training_profile_info = _resolve_training_profile_overrides(
+        profile_arg,
+        train_days=train_days,
+        backtest_days=backtest_days,
+        window_end=window_end,
+        split_time=split_time,
+    )
+    print(
+        "  training_profile: "
+        f"{training_profile_info['name']} | "
+        f"applied={bool(training_profile_info.get('applied', False))} | "
+        f"train_days={train_days} | backtest_days={backtest_days}"
+    )
 
     df_loaded = load_training_csv(csv_path)
     source_contract = _load_source_refinery_contract(csv_path)
-    effective_split_time = split_time if split_time is not None else source_contract.get('split_time')
+    use_source_split_time = bool(training_profile_info.get('use_source_split_time', True))
+    effective_split_time = split_time if split_time is not None else (
+        source_contract.get('split_time') if use_source_split_time else None
+    )
     df_full, training_window = _resolve_training_window(
         df_loaded,
         train_frac=train_frac,
@@ -3824,6 +3991,17 @@ def run_training_pipeline(
         f"holdout_rows={training_window['holdout_rows']:,} | "
         f"split={training_window['split_time']}"
     )
+    training_profile_info = {
+        **dict(training_profile_info),
+        'resolved': {
+            'train_days': train_days,
+            'backtest_days': backtest_days,
+            'window_end': window_end,
+            'split_time': split_time,
+            'effective_split_time': training_window.get('split_time'),
+            'window_mode': training_window.get('mode'),
+        },
+    }
     event_df, event_view_info = build_event_training_view(
         df_full,
         mode=training_mode,
@@ -3866,6 +4044,7 @@ def run_training_pipeline(
         **dict(event_view_info),
         'sample_weight_mode': sw_mode_cfg,
         'stage1_target': st1_tgt_cfg,
+        'training_profile': dict(training_profile_info),
     }
     with open(os.path.join(output_dir, 'event_training_view.json'), 'w') as f:
         json.dump(event_view_info, f, indent=2)
@@ -3882,6 +4061,8 @@ def run_training_pipeline(
         'requested_train_days': training_window.get('requested_train_days'),
         'requested_backtest_days': training_window.get('requested_backtest_days'),
         'window_mode': training_window.get('mode'),
+        'training_profile_name': training_profile_info.get('name'),
+        'training_profile': dict(training_profile_info),
     })
 
     inference_scaler_params, scaler_info = build_inference_scaler_params(
@@ -3992,10 +4173,12 @@ def run_training_pipeline(
             'training_mode': training_mode,
             'sample_weight_mode': sw_mode_cfg,
             'stage1_target': st1_tgt_cfg,
+            'training_profile': training_profile_info,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': None,
             'visual_coverage_ratio': None,
+            'visual_model_type': visual_model_type,
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
             'training_window': training_window,
             'split_meta': split_meta,
@@ -4003,7 +4186,12 @@ def run_training_pipeline(
             'stage': int(stage),
             'phase': resolved_phase,
         }
-        _write_inference_feature_schema_catboost_phase(output_dir, meta_feature_names, event_gate_cfg)
+        _write_inference_feature_schema_catboost_phase(
+            output_dir,
+            meta_feature_names,
+            visual_model_type=visual_model_type,
+            event_gate_cfg=event_gate_cfg,
+        )
         manifest_path = write_manifest(
             output_dir=output_dir,
             kind='train_v19_catboost',
@@ -4022,10 +4210,12 @@ def run_training_pipeline(
                 'quality_weight_weak': quality_weight_weak,
                 'sample_weight_mode': sw_mode_cfg,
                 'stage1_target': st1_tgt_cfg,
+                'training_profile': training_profile_info,
                 'split_time': training_window.get('split_time'),
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
+                'visual_model': visual_model_type,
             },
             inputs={
                 'csv': csv_path,
@@ -4036,6 +4226,7 @@ def run_training_pipeline(
             extra={
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
+                'training_profile': training_profile_info,
                 'meta_feature_dim': int(meta_features.shape[1]),
             },
         )
@@ -4075,6 +4266,7 @@ def run_training_pipeline(
             splits=splits,
             lob_tensors=lob_tensors,
             lob_timestamps=lob_timestamps,
+            visual_model_type=visual_model_type,
             max_age=lob_max_age,
         )
     else:
@@ -4097,10 +4289,12 @@ def run_training_pipeline(
             'training_mode': training_mode,
             'sample_weight_mode': sw_mode_cfg,
             'stage1_target': st1_tgt_cfg,
+            'training_profile': training_profile_info,
             'meta_shape': list(meta_features.shape),
             'meta_coverage_ratio': float(np.mean(coverage)),
             'visual_shape': list(visual_embeddings.shape),
             'visual_coverage_ratio': float(np.mean(visual_coverage)),
+            'visual_model_type': visual_model_type,
             'scaler_train_rows': int(scaler_info['scaler_train_rows']),
             'training_window': training_window,
             'split_meta': split_meta,
@@ -4126,10 +4320,12 @@ def run_training_pipeline(
                 'quality_weight_weak': quality_weight_weak,
                 'sample_weight_mode': sw_mode_cfg,
                 'stage1_target': st1_tgt_cfg,
+                'training_profile': training_profile_info,
                 'split_time': training_window.get('split_time'),
                 'train_days': train_days,
                 'backtest_days': backtest_days,
                 'window_end': window_end,
+                'visual_model': visual_model_type,
             },
             inputs={
                 'csv': csv_path,
@@ -4140,6 +4336,7 @@ def run_training_pipeline(
             extra={
                 'source_contract': effective_source_contract,
                 'training_window': training_window,
+                'training_profile': training_profile_info,
                 'meta_feature_dim': int(meta_features.shape[1]),
             },
         )
@@ -4172,6 +4369,7 @@ def run_training_pipeline(
             coverage_mask=coverage,
             inference_scaler_params=inference_scaler_params,
             output_dir=output_dir,
+            visual_model_type=visual_model_type,
             meta_feature_names=meta_feature_names,
             event_gate_cfg=event_gate_cfg,
             epochs=epochs,
@@ -4188,10 +4386,12 @@ def run_training_pipeline(
         'training_mode': training_mode,
         'sample_weight_mode': sw_mode_cfg,
         'stage1_target': st1_tgt_cfg,
+        'training_profile': training_profile_info,
         'meta_shape': list(meta_features.shape),
         'meta_coverage_ratio': float(np.mean(coverage)),
         'visual_shape': list(visual_embeddings.shape),
         'visual_coverage_ratio': float(np.mean(visual_coverage)),
+        'visual_model_type': visual_model_type,
         'scaler_train_rows': int(scaler_info['scaler_train_rows']),
         'training_window': training_window,
         'split_meta': split_meta,
@@ -4221,10 +4421,12 @@ def run_training_pipeline(
             'quality_weight_weak': quality_weight_weak,
             'sample_weight_mode': sw_mode_cfg,
             'stage1_target': st1_tgt_cfg,
+            'training_profile': training_profile_info,
             'split_time': training_window.get('split_time'),
             'train_days': train_days,
             'backtest_days': backtest_days,
             'window_end': window_end,
+            'visual_model': visual_model_type,
         },
         inputs={
             'csv': csv_path,
@@ -4235,6 +4437,7 @@ def run_training_pipeline(
         extra={
             'source_contract': effective_source_contract,
             'training_window': training_window,
+            'training_profile': training_profile_info,
             'meta_feature_dim': int(meta_features.shape[1]),
             'event_gate_schema': event_gate_cfg,
             'meta_learner_profile': stage3_summary,
@@ -4276,6 +4479,12 @@ def main():
     p.add_argument('--min_seq_coverage', type=float, default=float(defaults.get('min_seq_coverage', 0.80)))
     p.add_argument('--stage', type=int, default=int(defaults.get('stage', 0)), help='0=all, 1=stage1 only, 2=stage2 only, 3=stage3 only')
     p.add_argument('--phase', default=None, choices=['full', 'all', 'catboost', 'cb', 'visual', 'deeplob', 'train', 'training', 'meta'], help='preferred named phase: catboost-only, visual-only, or train-only')
+    p.add_argument(
+        '--visual_model',
+        default=str(defaults.get('visual_model', VISUAL_MODEL_LOB_TRANSFORMER)),
+        choices=sorted(SUPPORTED_VISUAL_MODELS),
+        help='visual depth encoder for stage2/stage3: lob_transformer (late fusion) or deeplob',
+    )
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
     p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
@@ -4296,6 +4505,12 @@ def main():
     p.add_argument('--train_days', type=float, default=None, help='limit training window to N days immediately before split_time')
     p.add_argument('--backtest_days', type=float, default=None, help='limit holdout/backtest window to the last N days before window_end or dataset end')
     p.add_argument('--window_end', default=None, help='exclusive end timestamp for the train/backtest window')
+    p.add_argument(
+        '--profile',
+        default=defaults.get('profile', TRAIN_PROFILE_MANUAL),
+        choices=[TRAIN_PROFILE_MANUAL, TRAIN_PROFILE_MONTH_PILOT_21_7, TRAIN_PROFILE_FULL_HISTORY_6Y],
+        help='training window preset: month pilot (21/7), full history, or manual flags',
+    )
     p.add_argument('--config', default=None, help='optional config file to override defaults')
     p.add_argument(
         '--seq_len',
@@ -4329,10 +4544,12 @@ def main():
         train_days=args.train_days,
         backtest_days=args.backtest_days,
         window_end=args.window_end,
+        training_profile=args.profile,
         config_snapshot=cfg,
         sample_weight_mode=args.sample_weight_mode,
         stage1_target=args.stage1_target,
         seq_len_override=args.seq_len,
+        visual_model_type=args.visual_model,
     )
 
 

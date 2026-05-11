@@ -22,16 +22,8 @@ QuantSystem V19 | Section 10 من المرجع التقني
 
 from __future__ import annotations
 
-import json
-import os
-
 import numpy as np
 import pandas as pd
-
-try:
-    from modules.feature_factory_v19 import apply_scaler_params_to_frame
-except ImportError:
-    apply_scaler_params_to_frame = None
 
 try:
     from regime_config import REGIME_EXTRA_FEATURES, REGIME_PRED_THRESHOLD, REGIME_EVENT_THRESHOLD
@@ -90,47 +82,6 @@ def get_regime_features(regime: str, available_cols: list[str]) -> list[str]:
     return [f for f in ordered if f in available_cols]
 
 
-def load_live_feature_contract(models_dir: str) -> tuple[dict, dict]:
-    """Load the exact training feature schema and inference scaler."""
-    schema_path = os.path.join(str(models_dir), 'feature_schema_v19.json')
-    scaler_path = os.path.join(str(models_dir), 'scaler_params.json')
-    with open(schema_path, 'r', encoding='utf-8') as f:
-        feature_schema = json.load(f)
-    scaler_params: dict = {}
-    if os.path.exists(scaler_path):
-        with open(scaler_path, 'r', encoding='utf-8') as f:
-            scaler_params = json.load(f)
-    return feature_schema, scaler_params
-
-
-def build_live_vector(
-    bar: pd.Series,
-    feature_schema: dict,
-    scaler_params: dict | None = None,
-    *,
-    already_scaled: bool = False,
-) -> tuple[np.ndarray, list[str]]:
-    """Build a production inference vector from the saved training schema."""
-    features = list((feature_schema or {}).get('stat_features') or [])
-    if not features:
-        raise ValueError('Live feature schema is missing stat_features.')
-    missing = [c for c in features if c not in bar.index]
-    if missing:
-        raise ValueError(f'Live bar missing trained features: {missing[:10]}')
-
-    frame = pd.DataFrame([{c: bar[c] for c in features}])
-    for c in features:
-        frame[c] = pd.to_numeric(frame[c], errors='coerce')
-    if not already_scaled and scaler_params:
-        if apply_scaler_params_to_frame is None:
-            raise RuntimeError('Scaler params supplied but modules.feature_factory_v19 is unavailable.')
-        frame = apply_scaler_params_to_frame(frame, scaler_params)
-    x = frame[features].to_numpy(dtype=np.float32)
-    if not np.isfinite(x).all():
-        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    return x.reshape(1, -1), features
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Core Prediction Function
 # ══════════════════════════════════════════════════════════════════════════════
@@ -141,10 +92,6 @@ def predict_live(
     event_score    : float,
     models         : dict,
     ensemble       : object | None = None,
-    feature_schema : dict | None = None,
-    scaler_params  : dict | None = None,
-    already_scaled : bool = False,
-    allow_dynamic_features: bool = False,
 ) -> tuple[str, float, dict]:
     """
     Pipeline كامل للتنبؤ الحي — 5 خطوات.
@@ -179,18 +126,7 @@ def predict_live(
         return _SIGNAL_NEUTRAL, 0.0, debug
 
     # ── Step 2: Regime Model موجود؟ ────────────────────────────────────────
-    effective_models = {
-        k: v for k, v in dict(models or {}).items()
-        if k not in {'feature_schema', 'scaler_params'}
-    }
-    if feature_schema is None and isinstance(models, dict):
-        maybe_schema = models.get('feature_schema')
-        if isinstance(maybe_schema, dict):
-            feature_schema = maybe_schema
-    if scaler_params is None and isinstance(models, dict):
-        maybe_scaler = models.get('scaler_params')
-        if isinstance(maybe_scaler, dict):
-            scaler_params = maybe_scaler
+    effective_models = dict(models or {})
     if ensemble is not None:
         # Ensemble يُكمِّل الـ models الأساسية
         for r in _REGIMES:
@@ -201,32 +137,18 @@ def predict_live(
         debug['step_blocked'] = f'no_model_for_regime:{current_regime}'
         return _SIGNAL_NEUTRAL, 0.0, debug
 
-    # ── Step 3: Feature Contract ────────────────────────────────────────────
-    try:
-        if feature_schema is not None:
-            X, feats = build_live_vector(
-                bar_features,
-                feature_schema,
-                scaler_params,
-                already_scaled=already_scaled,
-            )
-            debug['schema_contract'] = 'feature_schema_v19'
-        elif allow_dynamic_features:
-            available_cols = list(bar_features.index)
-            feats = get_regime_features(current_regime, available_cols)
-            if not feats:
-                debug['step_blocked'] = 'no_features_available'
-                return _SIGNAL_NEUTRAL, 0.0, debug
-            X = bar_features[feats].to_numpy(dtype=np.float32).reshape(1, -1)
-            X = np.where(np.isfinite(X), X, 0.0)
-            debug['schema_contract'] = 'legacy_dynamic_features'
-        else:
-            debug['step_blocked'] = 'missing_feature_schema'
-            return _SIGNAL_NEUTRAL, 0.0, debug
-    except Exception as e:
-        debug['step_blocked'] = f'feature_contract_error:{e}'
-        return _SIGNAL_NEUTRAL, 0.0, debug
+    # ── Step 3: Feature Selection ───────────────────────────────────────────
+    available_cols = list(bar_features.index)
+    feats = get_regime_features(current_regime, available_cols)
     debug['n_features'] = len(feats)
+
+    if not feats:
+        debug['step_blocked'] = 'no_features_available'
+        return _SIGNAL_NEUTRAL, 0.0, debug
+
+    X = bar_features[feats].to_numpy(dtype=np.float64).reshape(1, -1)
+    # استبدال NaN/Inf بـ 0
+    X = np.where(np.isfinite(X), X, 0.0)
 
     # ── Step 4: Predict ─────────────────────────────────────────────────────
     try:
@@ -272,12 +194,6 @@ def run_bar_pipeline(
     df_bar_row: pd.Series,
     models    : dict,
     ensemble  : object | None = None,
-    *,
-    feature_schema: dict | None = None,
-    scaler_params: dict | None = None,
-    models_dir: str | None = None,
-    already_scaled: bool = False,
-    allow_dynamic_features: bool = False,
 ) -> tuple[str, float, dict]:
     """
     Entry point رئيسي — يُستدعى لكل bar جديد في التداول الحي.
@@ -297,10 +213,6 @@ def run_bar_pipeline(
     """
     regime      = str(df_bar_row.get('regime_label', 'ranging'))
     event_score = float(df_bar_row.get('event_score', 0.0))
-    if models_dir is not None and (feature_schema is None or scaler_params is None):
-        loaded_schema, loaded_scaler = load_live_feature_contract(models_dir)
-        feature_schema = loaded_schema if feature_schema is None else feature_schema
-        scaler_params = loaded_scaler if scaler_params is None else scaler_params
 
     return predict_live(
         bar_features   = df_bar_row,
@@ -308,10 +220,6 @@ def run_bar_pipeline(
         event_score    = event_score,
         models         = models,
         ensemble       = ensemble,
-        feature_schema = feature_schema,
-        scaler_params  = scaler_params,
-        already_scaled = already_scaled,
-        allow_dynamic_features = allow_dynamic_features,
     )
 
 
@@ -353,7 +261,7 @@ def evaluate_on_test_set(
             print(f"   {icon} {sig}: {pct:.1%}")
 
         if 'regime' in df_res.columns:
-            print("\n   По Regime:")
+            print("\n   By Regime:")
             for reg in _REGIMES:
                 sub = df_res[df_res['regime'] == reg]
                 if len(sub):

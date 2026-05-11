@@ -1519,6 +1519,7 @@ def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.D
     vwap_eng = SessionVWAPEngine()
 
     cvd = 0.0
+    last_day = None
     rebuilt = {key: [] for key in [
         'cvd', 'absorption_intensity', 'micro_atr', 'volume_burst', 'inter_event_time',
         'fisher_signal', 'anomaly', 'tape_speed', 'cvd_momentum', 'cvd_price_divergence',
@@ -1536,11 +1537,20 @@ def _rebuild_trade_stateful_features(df: pd.DataFrame, cal_params: dict) -> pd.D
         side = str(getattr(row, 'side', '')).strip().upper()
         action = str(getattr(row, 'action', 'T')).strip().upper()
         ts = pd.to_datetime(getattr(row, 'ts_event'))
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        day = ts.date()
+        if last_day is None:
+            last_day = day
+        elif day != last_day:
+            # Keep CVD session-local to avoid cross-day directional drift.
+            cvd = 0.0
+            last_day = day
         ts_ns = int(ts.value)
-        is_buy = side in ('B', 'BID')
+        is_buy = side in ('A', 'ASK', 'BUY', 'BOT')
         if is_buy:
             cvd += size
-        elif side in ('A', 'ASK', 'S', 'SELL'):
+        elif side in ('B', 'BID', 'S', 'SELL'):
             cvd -= size
 
         aii = absorb.update(price, cvd)
@@ -1794,7 +1804,10 @@ def _process_mbo_chunk(args):
     )
     vwap_eng   = SessionVWAPEngine()
 
-    cvd = 0; last_cancel_ratio = 0.0; out = []
+    cvd = 0.0
+    last_cancel_ratio = 0.0
+    last_day = None
+    out = []
     total_rows = int(len(df_chunk))
     chunk_id = int(df_chunk['__chunk_id'].iloc[0]) if '__chunk_id' in df_chunk.columns and total_rows > 0 else -1
     progress_every = 0 if total_rows < 10_000 else min(100_000, max(2_500, total_rows // 10))
@@ -1811,6 +1824,12 @@ def _process_mbo_chunk(args):
             raw_t,
             context=f'process_mbo_shard.chunk={chunk_id}.row={idx}',
         )
+        day = ts.date()
+        if last_day is None:
+            last_day = day
+        elif day != last_day:
+            cvd = 0.0
+            last_day = day
         ts_ns = int(ts.value)
 
         micro.process_mbo_tick(action, oid, side, size, price, ts_ns)
@@ -1828,10 +1847,10 @@ def _process_mbo_chunk(args):
 
         if action in TRADE_ACTIONS:
             is_buy = False
-            if side in ('B','BID'):
+            if side in ('A','ASK','BUY','BOT'):
                 cvd += size
                 is_buy = True
-            elif side in ('A','ASK'):
+            elif side in ('B','BID','S','SELL'):
                 cvd -= size
 
             aii                      = absorb.update(price, cvd)
@@ -1919,13 +1938,12 @@ def _process_mbo(df_mbo, n_workers: int = None, allow_unsafe_multiprocessing: bo
         df_out = df_out.sort_values('ts_event').reset_index(drop=True)
 
         # ══════════════════════════════════════════════════════════
-        # CVD FIX: إعادة حساب CVD الحقيقي من side/action مباشرة
-        # diff().cumsum() خاطئ لأن كل chunk بدأ من صفر
-        # الحل: true_delta = +size (Buy) أو -size (Sell) ثم cumsum
+        # CVD FIX: إعادة حساب CVD الحقيقي من side/action مباشرة.
+        # وبما أن CVD المطلوب هنا session/day-local، يتم cumsum داخل كل يوم.
         # ══════════════════════════════════════════════════════════
         is_trade = df_out['action'].astype(str).str.upper().isin({'T','F','TRADE','EXECUTE','0'})
-        is_buy   = df_out['side'].astype(str).str.upper().isin({'B','BID'})
-        is_sell  = df_out['side'].astype(str).str.upper().isin({'A','ASK','S','SELL'})
+        is_buy   = df_out['side'].astype(str).str.upper().isin({'A','ASK','BUY','BOT'})
+        is_sell  = df_out['side'].astype(str).str.upper().isin({'B','BID','S','SELL'})
 
         true_trade_vol = np.zeros(len(df_out), dtype=np.float64)
         buy_mask  = is_trade & is_buy
@@ -1933,7 +1951,16 @@ def _process_mbo(df_mbo, n_workers: int = None, allow_unsafe_multiprocessing: bo
         true_trade_vol[buy_mask.values]  =  df_out.loc[buy_mask,  'size'].values
         true_trade_vol[sell_mask.values] = -df_out.loc[sell_mask, 'size'].values
 
-        df_out['cvd'] = true_trade_vol.cumsum()
+        ts_series = pd.to_datetime(df_out['ts_event'], utc=True, errors='coerce')
+        day_key = ts_series.dt.tz_localize(None).dt.date
+        delta_series = pd.Series(true_trade_vol, index=df_out.index, dtype=np.float64)
+        if day_key.notna().any():
+            cvd_series = delta_series.groupby(day_key).cumsum()
+            if day_key.isna().any():
+                cvd_series = cvd_series.where(day_key.notna(), delta_series.cumsum())
+        else:
+            cvd_series = delta_series.cumsum()
+        df_out['cvd'] = cvd_series.to_numpy(dtype=np.float64)
 
         print(f"  ✅ Multiprocessing: {len(df_out):,} trades")
         return df_out
@@ -1963,7 +1990,10 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
     )
     vwap_eng   = SessionVWAPEngine()
 
-    cvd        = 0; last_cancel_ratio = 0.0; out = []
+    cvd = 0.0
+    last_cancel_ratio = 0.0
+    last_day = None
+    out = []
 
     for row_no, row in enumerate(_prog(df_mbo.itertuples(index=False), desc='MBO', total=len(df_mbo)), start=1):
         price  = float(getattr(row,'price',0) or 0)
@@ -1976,6 +2006,12 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
             raw_t,
             context=f'process_mbo_rows.row={row_no}',
         )
+        day = ts.date()
+        if last_day is None:
+            last_day = day
+        elif day != last_day:
+            cvd = 0.0
+            last_day = day
         ts_ns = int(ts.value)
 
         micro.process_mbo_tick(action, oid, side, size, price, ts_ns)
@@ -1992,10 +2028,10 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
 
         if action in TRADE_ACTIONS:
             is_buy = False
-            if side in ('B','BID'):
+            if side in ('A','ASK','BUY','BOT'):
                 cvd += size
                 is_buy = True
-            elif side in ('A','ASK'):
+            elif side in ('B','BID','S','SELL'):
                 cvd -= size
 
             aii                      = absorb.update(price, cvd)

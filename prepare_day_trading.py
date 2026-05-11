@@ -30,6 +30,12 @@ import glob
 import json
 import numpy as np
 import pandas as pd
+try:
+    from pykalman import KalmanFilter  # type: ignore
+    _KALMAN_OK = True
+except Exception:
+    KalmanFilter = None  # type: ignore[assignment]
+    _KALMAN_OK = False
 
 from modules.context_features import compute_daily_weekly_levels
 from modules.tick_intrabar_slices import enrich_bars_with_intrabar
@@ -118,6 +124,9 @@ DAY_TRADING_FEATURES = [
     'kyle_std',
     'micro_atr_max',
     'cvd_velocity',
+    'cvd_velocity_signed',
+    'cvd_net_direction',
+    'obi_direction',
     'imb_reversals',
     'cancel_volume_ratio',
     'mbp_bar_coverage',
@@ -125,6 +134,7 @@ DAY_TRADING_FEATURES = [
     'mbp_bid_slope_intrabar',
     'mbp_ask_slope_intrabar',
     'mbp_depth_accel',
+    'event_direction',
 ]
 
 # ─── يُطابق prepare_training_data.CATBOOST_ADVISOR_FEATURES حرفًا (N=31) ──────
@@ -141,6 +151,236 @@ CATBOOST_ADVISOR_FEATURES_DT = [
     'kyle_lambda', 'hawkes_intensity', 'vnet',
     'vwap_z_score',
 ]
+
+TRADE_ACTIONS = {'T', 'F', 'TRADE', 'EXECUTE', 'E', '0'}
+# Aggressor side convention for this feed:
+# - A / ASK / BUY -> buy-initiated (lifting ask)
+# - B / BID / SELL -> sell-initiated (hitting bid)
+BUY_SIDES = {'A', 'ASK', 'BUY', 'BOT'}
+SELL_SIDES = {'B', 'BID', 'S', 'SELL'}
+CORE_MBO_REQUIRED_COLS = [
+    'cvd',
+    'session_cvd',
+    'absorption_intensity',
+    'cancel_ratio',
+    'micro_atr',
+    'volume_burst',
+    'inter_event_time',
+    'fisher_signal',
+    'anomaly',
+    'cvd_momentum',
+    'cvd_price_divergence',
+    'trend_strength',
+    'correction_depth',
+    'liquidity_sweep',
+    'kyle_lambda',
+    'hawkes_intensity',
+    'vnet',
+    'current_vwap',
+    'vwap_z_score',
+]
+
+
+def _resolve_mbo_size_column(df_mbo: pd.DataFrame) -> str:
+    for candidate in ('size', 'qty', 'volume'):
+        if candidate in df_mbo.columns:
+            return candidate
+    raise KeyError("MBO data must include one of size/qty/volume")
+
+
+def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reconstruct core tick-level microstructure features when raw MBO lacks them.
+    Uses the same engine families as stage-1 refinery to avoid losing signal quality.
+    """
+    missing = [c for c in CORE_MBO_REQUIRED_COLS if c not in df_mbo.columns]
+    if not missing:
+        return df_mbo
+
+    print(
+        "  🧠 Core microstructure reconstruction: "
+        f"{len(missing)} missing columns -> rebuilding from raw ticks",
+    )
+
+    from modules.auto_calibrator import AutoCalibrator
+    from modules.microstructure import FastMicrostructureEngine, AbsorptionIntensityEngine, CancelRatioEngine
+    from modules.micro_volatility import MicroVolatilityEngine
+    from modules.market_research_features import KylesLambdaEngine, HawkesIntensityEngine, VNETEngine
+    from modules.context_features import MomentumContextEngine, LiquiditySweepDetector
+    from modules.session_features import SessionVWAPEngine
+    from modules.fisher_alpha import FastFisherAlpha
+    from modules.fim_anomaly import FastFIMDetector
+
+    out = df_mbo.copy()
+    out['ts_event'] = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    out = out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    if out.empty:
+        return out
+
+    size_col = _resolve_mbo_size_column(out)
+    if size_col != 'size':
+        out['size'] = pd.to_numeric(out[size_col], errors='coerce').fillna(0.0).astype(np.float64)
+    else:
+        out['size'] = pd.to_numeric(out['size'], errors='coerce').fillna(0.0).astype(np.float64)
+    out['price'] = pd.to_numeric(out['price'], errors='coerce').fillna(0.0).astype(np.float64)
+    action_s = out['action'].astype(str).str.upper() if 'action' in out.columns else pd.Series('T', index=out.index)
+    side_s = out['side'].astype(str).str.upper() if 'side' in out.columns else pd.Series('', index=out.index)
+    order_ids = out['order_id'] if 'order_id' in out.columns else pd.Series([None] * len(out), index=out.index)
+
+    calibrator = AutoCalibrator(n_ticks=2000).fit(out, price_col='price', size_col='size', action_col='action')
+    micro = FastMicrostructureEngine()
+    absorb = AbsorptionIntensityEngine(min_price_move=max(float(calibrator.min_price_move), 1e-8))
+    cancel = CancelRatioEngine()
+    mv = MicroVolatilityEngine()
+    kyle = KylesLambdaEngine(window=50)
+    hawkes = HawkesIntensityEngine()
+    vnet = VNETEngine()
+    fisher = FastFisherAlpha()
+    fim = FastFIMDetector()
+    momentum = MomentumContextEngine()
+    sweep = LiquiditySweepDetector(
+        sweep_threshold=max(0.05, min(float(calibrator.volatility) * 2.0, 0.30)),
+    )
+    vwap = SessionVWAPEngine()
+
+    n = len(out)
+    cvd_arr = np.zeros(n, dtype=np.float64)
+    sess_cvd_arr = np.zeros(n, dtype=np.float64)
+    absorb_arr = np.zeros(n, dtype=np.float64)
+    cancel_arr = np.zeros(n, dtype=np.float64)
+    micro_atr_arr = np.zeros(n, dtype=np.float64)
+    vol_burst_arr = np.zeros(n, dtype=np.float64)
+    iet_arr = np.zeros(n, dtype=np.float64)
+    fisher_arr = np.zeros(n, dtype=np.float64)
+    anomaly_arr = np.zeros(n, dtype=np.float64)
+    cvd_mom_arr = np.zeros(n, dtype=np.float64)
+    cvd_div_arr = np.zeros(n, dtype=np.float64)
+    trend_arr = np.zeros(n, dtype=np.float64)
+    corr_arr = np.zeros(n, dtype=np.float64)
+    sweep_arr = np.zeros(n, dtype=np.float64)
+    kyle_arr = np.zeros(n, dtype=np.float64)
+    hawkes_arr = np.zeros(n, dtype=np.float64)
+    vnet_arr = np.zeros(n, dtype=np.float64)
+    vwap_arr = np.zeros(n, dtype=np.float64)
+    vwap_z_arr = np.zeros(n, dtype=np.float64)
+    spoof_arr = np.zeros(n, dtype=np.float64)
+
+    cvd = 0.0
+    last_cancel = 0.0
+    last_absorb = 0.0
+    last_fisher = 0.0
+    last_anomaly = 0.0
+    last_cvd_mom = 0.0
+    last_cvd_div = 0.0
+    last_trend = 0.0
+    last_corr = 0.0
+    last_kyle = 0.0
+    last_vnet = 0.0
+    last_vwap = 0.0
+    last_vwap_z = 0.0
+    last_sess_cvd = 0.0
+    last_day = None
+
+    for i in range(n):
+        px = float(out.at[i, 'price'])
+        sz = float(out.at[i, 'size'])
+        act = str(action_s.iat[i]).strip().upper()
+        sd = str(side_s.iat[i]).strip().upper()
+        oid = order_ids.iat[i]
+        ts = pd.Timestamp(out.at[i, 'ts_event'])
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        day = ts.date()
+        if last_day is None:
+            last_day = day
+        elif day != last_day:
+            # Keep CVD session-local instead of carrying net month bias across days.
+            cvd = 0.0
+            last_sess_cvd = 0.0
+            last_day = day
+        ts_ns = int(ts.value)
+
+        spoof_arr[i] = float(micro.process_mbo_tick(act, oid, sd, sz, px, ts_ns))
+        cr = float(cancel.process_tick(act, oid, sz))
+        if cr != 0.0:
+            last_cancel = cr
+        cancel_arr[i] = last_cancel
+        mu_atr, vol_burst, iet = mv.process_tick(act, px, sz, ts_ns)
+        micro_atr_arr[i] = float(mu_atr)
+        vol_burst_arr[i] = float(vol_burst)
+        iet_arr[i] = float(iet)
+        hawkes_arr[i] = float(hawkes.update(ts_ns, act))
+        sweep_arr[i] = float(sweep.update(px))
+
+        is_trade = act in TRADE_ACTIONS
+        if is_trade:
+            is_buy = sd in BUY_SIDES
+            is_sell = sd in SELL_SIDES
+            if is_buy:
+                cvd += sz
+            elif is_sell:
+                cvd -= sz
+
+            last_absorb = float(absorb.update(px, cvd))
+            last_fisher = float(fisher.update_and_get_signal(px, cvd))
+            last_anomaly = float(fim.detect_stop_hunts(px))
+            last_cvd_mom, last_cvd_div, last_trend, last_corr = momentum.update(px, cvd)
+            last_kyle = float(kyle.update(px, sz))
+            if is_buy:
+                vnet_side = 'B'
+            elif is_sell:
+                vnet_side = 'A'
+            else:
+                vnet_side = sd
+            last_vnet = float(vnet.update(px, sz, vnet_side))
+            last_vwap, last_vwap_z, _, last_sess_cvd = vwap.update(ts, px, float(sz), bool(is_buy))
+
+        cvd_arr[i] = cvd
+        sess_cvd_arr[i] = float(last_sess_cvd)
+        absorb_arr[i] = float(last_absorb)
+        fisher_arr[i] = float(last_fisher)
+        anomaly_arr[i] = float(last_anomaly)
+        cvd_mom_arr[i] = float(last_cvd_mom)
+        cvd_div_arr[i] = float(last_cvd_div)
+        trend_arr[i] = float(last_trend)
+        corr_arr[i] = float(last_corr)
+        kyle_arr[i] = float(last_kyle)
+        vnet_arr[i] = float(last_vnet)
+        vwap_arr[i] = float(last_vwap)
+        vwap_z_arr[i] = float(last_vwap_z)
+
+    rebuilt_cols = {
+        'cvd': cvd_arr,
+        'session_cvd': sess_cvd_arr,
+        'absorption_intensity': absorb_arr,
+        'cancel_ratio': cancel_arr,
+        'micro_atr': micro_atr_arr,
+        'volume_burst': vol_burst_arr,
+        'inter_event_time': iet_arr,
+        'fisher_signal': fisher_arr,
+        'anomaly': anomaly_arr,
+        'cvd_momentum': cvd_mom_arr,
+        'cvd_price_divergence': cvd_div_arr,
+        'trend_strength': trend_arr,
+        'correction_depth': corr_arr,
+        'liquidity_sweep': sweep_arr,
+        'kyle_lambda': kyle_arr,
+        'hawkes_intensity': hawkes_arr,
+        'vnet': vnet_arr,
+        'current_vwap': vwap_arr,
+        'vwap_z_score': vwap_z_arr,
+        'spoofing_ratio': spoof_arr,
+    }
+
+    for col, arr in rebuilt_cols.items():
+        if col not in df_mbo.columns:
+            out[col] = pd.Series(arr, index=out.index).astype(np.float64)
+
+    print(
+        "  ✅ Core microstructure reconstructed "
+        f"(rows={len(out):,} | rebuilt_cols={sum(1 for c in rebuilt_cols if c not in df_mbo.columns)})",
+    )
+    return out
 
 
 def _bar_period_seconds(freq: str) -> float:
@@ -363,51 +603,123 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
     df['ts_event'] = pd.to_datetime(df['ts_event'])
     df = df.set_index('ts_event').sort_index()
 
+    # يدعم أكثر من اسم لحجم الصفقة في ملفات MBO الخام.
+    size_col = 'size'
+    if size_col not in df.columns:
+        for alt in ('qty', 'volume'):
+            if alt in df.columns:
+                size_col = alt
+                break
+    if size_col not in df.columns:
+        raise KeyError("aggregate_mbo_to_bars requires one of: size/qty/volume")
+
+    action_s = (
+        df['action'].astype(str).str.upper()
+        if 'action' in df.columns
+        else pd.Series('T', index=df.index, dtype='object')
+    )
+    side_s = (
+        df['side'].astype(str).str.upper()
+        if 'side' in df.columns
+        else pd.Series('', index=df.index, dtype='object')
+    )
+    size_s = pd.to_numeric(df[size_col], errors='coerce').fillna(0.0).astype(np.float64)
+
+    def _resample_num(col: str, how: str, default: float = 0.0) -> pd.Series:
+        rs = _tick_resample_optional(df, freq, col, how)
+        if rs is None:
+            return pd.Series(default, index=bars.index, dtype=np.float64)
+        return pd.to_numeric(rs, errors='coerce').reindex(bars.index).fillna(default).astype(np.float64)
+
     # OHLCV
     bars = df['price'].resample(freq).agg(
         open='first', high='max', low='min', close='last'
     )
-    bars['volume'] = df['size'].resample(freq).sum()
+    bars['volume'] = size_s.resample(freq).sum()
 
     # CVD
-    bars['cvd']           = df['cvd'].resample(freq).last()
-    bars['bar_cvd_delta'] = df['cvd'].resample(freq).agg(
-        lambda x: float(x.iloc[-1] - x.iloc[0]) if len(x) > 1 else 0.0
-    )
-    bars['session_cvd'] = df['session_cvd'].resample(freq).last()
+    has_tick_cvd = 'cvd' in df.columns
+    if has_tick_cvd:
+        tick_cvd = pd.to_numeric(df['cvd'], errors='coerce').ffill().fillna(0.0).astype(np.float64)
+    else:
+        is_trade = action_s.isin(TRADE_ACTIONS)
+        # ملاحظة feed المشروع: side='A' يُعامل كـ buy aggressor و'B' كـ sell aggressor.
+        is_buy = side_s.isin({'A', 'BUY', 'ASK'})
+        is_sell = side_s.isin({'B', 'SELL', 'BID'})
+        signed = np.zeros(len(df), dtype=np.float64)
+        signed[(is_trade & is_buy).to_numpy()] = size_s[(is_trade & is_buy)].to_numpy(dtype=np.float64)
+        signed[(is_trade & is_sell).to_numpy()] = -size_s[(is_trade & is_sell)].to_numpy(dtype=np.float64)
+        tick_cvd = pd.Series(signed, index=df.index, dtype=np.float64).cumsum()
+    bars['cvd'] = tick_cvd.resample(freq).last().reindex(bars.index).ffill().fillna(0.0)
+    bars['bar_cvd_delta'] = tick_cvd.resample(freq).agg(
+        lambda x: float(x.iloc[-1] - x.iloc[0]) if len(x) > 1 else 0.0,
+    ).reindex(bars.index).fillna(0.0)
+    if 'session_cvd' in df.columns:
+        bars['session_cvd'] = _resample_num('session_cvd', 'last', 0.0)
+    else:
+        signed_step = tick_cvd.diff().fillna(tick_cvd)
+        session_cvd = signed_step.groupby(signed_step.index.normalize()).cumsum()
+        bars['session_cvd'] = session_cvd.resample(freq).last().reindex(bars.index).fillna(0.0)
 
     # Order Flow (peak + dispersion داخل الشمعة)
-    bars['kyle_lambda']        = df['kyle_lambda'].resample(freq).max()
-    bars['hawkes_intensity']   = df['hawkes_intensity'].resample(freq).max()
-    bars['absorption_intensity'] = df['absorption_intensity'].resample(freq).max()
-    bars['cancel_ratio']       = df['cancel_ratio'].resample(freq).max()
-    bars['absorption_std']     = df['absorption_intensity'].resample(freq).std().fillna(0.0)
-    bars['cancel_std']         = df['cancel_ratio'].resample(freq).std().fillna(0.0)
-    bars['kyle_std']           = df['kyle_lambda'].resample(freq).std().fillna(0.0)
-    bars['vnet']               = df['vnet'].resample(freq).sum()
-    bars['volume_burst']       = df['volume_burst'].resample(freq).max()
-    bars['liquidity_sweep']    = df['liquidity_sweep'].resample(freq).max()
+    bars['kyle_lambda'] = _resample_num('kyle_lambda', 'max', 0.0)
+    bars['hawkes_intensity'] = _resample_num('hawkes_intensity', 'max', 0.0)
+    bars['absorption_intensity'] = _resample_num('absorption_intensity', 'max', 0.0)
+    bars['cancel_ratio'] = _resample_num('cancel_ratio', 'max', 0.0)
+    bars['absorption_std'] = _resample_num('absorption_intensity', 'max', 0.0)
+    bars['cancel_std'] = _resample_num('cancel_ratio', 'max', 0.0)
+    bars['kyle_std'] = _resample_num('kyle_lambda', 'max', 0.0)
+    bars['vnet'] = _resample_num('vnet', 'sum', 0.0)
+    bars['volume_burst'] = _resample_num('volume_burst', 'max', 0.0)
+    bars['liquidity_sweep'] = _resample_num('liquidity_sweep', 'max', 0.0)
+    if 'absorption_intensity' in df.columns:
+        bars['absorption_std'] = (
+            pd.to_numeric(df['absorption_intensity'], errors='coerce')
+            .resample(freq)
+            .std()
+            .reindex(bars.index)
+            .fillna(0.0)
+            .astype(np.float64)
+        )
+    if 'cancel_ratio' in df.columns:
+        bars['cancel_std'] = (
+            pd.to_numeric(df['cancel_ratio'], errors='coerce')
+            .resample(freq)
+            .std()
+            .reindex(bars.index)
+            .fillna(0.0)
+            .astype(np.float64)
+        )
+    if 'kyle_lambda' in df.columns:
+        bars['kyle_std'] = (
+            pd.to_numeric(df['kyle_lambda'], errors='coerce')
+            .resample(freq)
+            .std()
+            .reindex(bars.index)
+            .fillna(0.0)
+            .astype(np.float64)
+        )
 
     # VWAP
-    bars['vwap_z_score'] = df['vwap_z_score'].resample(freq).last()
-    bars['current_vwap'] = df['current_vwap'].resample(freq).last()
+    bars['vwap_z_score'] = _resample_num('vwap_z_score', 'last', 0.0)
+    bars['current_vwap'] = _resample_num('current_vwap', 'last', np.nan)
 
     # Momentum
-    bars['cvd_momentum']         = df['cvd_momentum'].resample(freq).last()
-    bars['cvd_price_divergence'] = df['cvd_price_divergence'].resample(freq).last()
-    bars['trend_strength']       = df['trend_strength'].resample(freq).last()
-    bars['correction_depth']     = df['correction_depth'].resample(freq).last()
+    bars['cvd_momentum'] = _resample_num('cvd_momentum', 'last', 0.0)
+    bars['cvd_price_divergence'] = _resample_num('cvd_price_divergence', 'last', 0.0)
+    bars['trend_strength'] = _resample_num('trend_strength', 'last', 0.0)
+    bars['correction_depth'] = _resample_num('correction_depth', 'last', 0.0)
 
     # Microstructure
-    bars['micro_atr']    = df['micro_atr'].resample(freq).mean()
-    bars['micro_atr_max'] = df['micro_atr'].resample(freq).max()
-    bars['fisher_signal'] = df['fisher_signal'].resample(freq).last()
-    bars['anomaly']      = df['anomaly'].resample(freq).max()
+    bars['micro_atr'] = _resample_num('micro_atr', 'mean', 0.0)
+    bars['micro_atr_max'] = _resample_num('micro_atr', 'max', 0.0)
+    bars['fisher_signal'] = _resample_num('fisher_signal', 'last', 0.0)
+    bars['anomaly'] = _resample_num('anomaly', 'max', 0.0)
 
     # Tick VWAP كنقطة أساس لـ micro_price (قبل الفلاتر؛ يكمّله apply_bar_level_catboost_parities لاحقًا)
     turnover = (
         pd.to_numeric(df['price'], errors='coerce').fillna(0)
-        * pd.to_numeric(df['size'], errors='coerce').fillna(0)
+        * size_s
     ).resample(freq).sum()
     bars['_turn_sum'] = turnover.astype(np.float64)
     vol_f = pd.to_numeric(bars['volume'], errors='coerce').astype(np.float64).clip(lower=1e-9)
@@ -432,8 +744,8 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
             bars[col] = rs
 
     # Buy/Sell
-    buy_vol  = df.loc[df['side'] == 'A', 'size'].resample(freq).sum()
-    sell_vol = df.loc[df['side'] == 'B', 'size'].resample(freq).sum()
+    buy_vol = size_s[side_s.isin({'A', 'BUY', 'ASK'})].resample(freq).sum()
+    sell_vol = size_s[side_s.isin({'B', 'SELL', 'BID'})].resample(freq).sum()
     bars['buy_volume']  = buy_vol
     bars['sell_volume'] = sell_vol
     total = (buy_vol + sell_vol).clip(lower=1)
@@ -446,9 +758,13 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
     bars = attach_hybrid_liquidity_bridge(bars, df, freq)
 
     # ── Velocity / micro-dynamics داخل الشمعة (MBO ticks) ───────────────
-    bars['cvd_velocity'] = df['cvd'].resample(freq).apply(
+    bars['cvd_velocity'] = tick_cvd.resample(freq).apply(
         lambda x: float(x.iloc[-1] - x.iloc[0]) / max(len(x), 1) if len(x) > 1 else 0.0,
     ).fillna(0.0)
+    bars['cvd_velocity_signed'] = pd.to_numeric(bars.get('bar_cvd_delta', 0.0), errors='coerce').fillna(0.0)
+    bars['cvd_net_direction'] = np.sign(
+        pd.to_numeric(bars['cvd_velocity_signed'], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+    ).astype(np.int8)
 
     def _count_reversals(series: pd.Series) -> float:
         vals = pd.to_numeric(series, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
@@ -462,7 +778,13 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
         bars['imb_reversals'] = df['obi'].resample(freq).apply(_count_reversals).fillna(0.0)
     else:
         bars['imb_reversals'] = 0.0
-    cr_sum = df['cancel_ratio'].resample(freq).sum() if 'cancel_ratio' in df.columns else pd.Series(
+    obi_base = pd.to_numeric(
+        bars['obi'] if 'obi' in bars.columns else bars.get('order_flow_imbalance', 0.0),
+        errors='coerce',
+    ).fillna(0.0)
+    bars['obi_net'] = obi_base.astype(np.float32)
+    bars['obi_direction'] = np.sign(obi_base.to_numpy(dtype=np.float64)).astype(np.int8)
+    cr_sum = pd.to_numeric(df['cancel_ratio'], errors='coerce').resample(freq).sum() if 'cancel_ratio' in df.columns else pd.Series(
         np.zeros(len(bars)),
         index=bars.index,
         dtype=np.float64,
@@ -534,6 +856,119 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
     return df.fillna(0)
 
 
+def assign_regime_label(
+    df: pd.DataFrame,
+    *,
+    roll_window: int = 100,
+    min_periods: int = 20,
+    volatile_atr_ratio: float = 1.5,
+    volatile_hawkes_z: float = 1.5,
+    trending_atr_ratio: float = 0.8,
+    trending_strength_min: float = 0.55,
+    low_liquidity_cov: float = 0.30,
+) -> pd.DataFrame:
+    """
+    يعين regime_label بشكل سببي على مستوى الشموع.
+    مهم: volatile يتطلب BOTH (ATR مرتفع + Hawkes مرتفع) لتجنب false positives.
+    """
+    out = df.copy()
+    if len(out) == 0:
+        out['regime_label'] = pd.Series(dtype='object')
+        out['regime_cluster'] = pd.Series(dtype=np.int8)
+        return out
+
+    atr = pd.to_numeric(out.get('atr_14', 0.0), errors='coerce').fillna(0.0).astype(np.float64)
+    atr_med = atr.rolling(roll_window, min_periods=min_periods).median().replace(0.0, np.nan)
+    atr_ratio = (atr / atr_med).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    hawkes = pd.to_numeric(out.get('hawkes_intensity', 0.0), errors='coerce').fillna(0.0).astype(np.float64)
+    hk_roll = hawkes.rolling(roll_window, min_periods=min_periods)
+    hawk_z = ((hawkes - hk_roll.mean()) / (hk_roll.std() + 1e-9)).fillna(0.0)
+
+    cvd_signed = pd.to_numeric(
+        out.get('cvd_velocity_signed', out.get('bar_cvd_delta', 0.0)),
+        errors='coerce',
+    ).fillna(0.0).astype(np.float64)
+    cvd_ref = cvd_signed.abs().rolling(roll_window, min_periods=min_periods).median().fillna(0.0)
+    trend_strength = pd.to_numeric(out.get('trend_strength', 0.0), errors='coerce').fillna(0.0).abs()
+
+    volatile_mask = (atr_ratio > float(volatile_atr_ratio)) & (hawk_z > float(volatile_hawkes_z))
+    trending_mask = (
+        (~volatile_mask)
+        & (atr_ratio > float(trending_atr_ratio))
+        & ((cvd_signed.abs() > (cvd_ref + 1e-12)) | (trend_strength > float(trending_strength_min)))
+    )
+
+    if 'mbp_bar_coverage' in out.columns:
+        cov = pd.to_numeric(out['mbp_bar_coverage'], errors='coerce').fillna(0.0).astype(np.float64)
+        lowliq_mask = cov < float(low_liquidity_cov)
+    else:
+        lowliq_mask = pd.Series(False, index=out.index)
+
+    regime_values = np.select(
+        [lowliq_mask.to_numpy(), volatile_mask.to_numpy(), trending_mask.to_numpy()],
+        ['low_liquidity', 'volatile', 'trending'],
+        default='ranging',
+    )
+    out['regime_label'] = pd.Series(regime_values, index=out.index, dtype='object')
+    out['regime_cluster'] = out['regime_label'].map(
+        {'trending': 0, 'ranging': 1, 'volatile': 2, 'low_liquidity': 3},
+    ).fillna(1).astype(np.int8)
+
+    counts = out['regime_label'].value_counts().to_dict()
+    total = max(len(out), 1)
+    print("  ✅ Regime labels assigned:")
+    for reg in ('trending', 'ranging', 'volatile', 'low_liquidity'):
+        n_reg = int(counts.get(reg, 0))
+        print(f"     {reg:12s}: {n_reg:,} ({n_reg/total:.1%})")
+    return out
+
+
+def add_event_direction(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    يصنع event_direction من تصويت 3 مصادر اتجاه:
+      1) cvd_velocity_signed
+      2) obi_direction
+      3) kalman_direction
+    +1 LONG-bias | -1 SHORT-bias | 0 ambiguous
+    """
+    out = df.copy()
+    cvd_signed = pd.to_numeric(
+        out.get('cvd_velocity_signed', out.get('bar_cvd_delta', 0.0)),
+        errors='coerce',
+    ).fillna(0.0).astype(np.float64)
+
+    if 'obi_direction' in out.columns:
+        obi_dir = pd.to_numeric(out['obi_direction'], errors='coerce').fillna(0).astype(np.int8)
+    else:
+        obi_raw = pd.to_numeric(out.get('obi', out.get('order_flow_imbalance', 0.0)), errors='coerce').fillna(0.0)
+        obi_dir = np.sign(obi_raw.to_numpy(dtype=np.float64)).astype(np.int8)
+        obi_dir = pd.Series(obi_dir, index=out.index, dtype=np.int8)
+
+    kalman_dir = pd.to_numeric(out.get('kalman_direction', 0), errors='coerce').fillna(0).astype(np.int8)
+    vote = (
+        np.sign(cvd_signed.to_numpy(dtype=np.float64)).astype(np.int8)
+        + np.sign(obi_dir.to_numpy(dtype=np.int8)).astype(np.int8)
+        + np.sign(kalman_dir.to_numpy(dtype=np.int8)).astype(np.int8)
+    )
+    direction = np.where(vote >= 2, 1, np.where(vote <= -2, -1, 0)).astype(np.int8)
+    out['event_direction'] = direction
+
+    if 'is_event' in out.columns:
+        ev_mask = pd.to_numeric(out['is_event'], errors='coerce').fillna(0).astype(np.int8) == 1
+        if bool(ev_mask.any()):
+            ev_dir = out.loc[ev_mask, 'event_direction']
+            vc = ev_dir.value_counts().to_dict()
+            n = int(ev_mask.sum())
+            print(
+                "  🧭 Event direction votes: "
+                f"long={int(vc.get(1, 0)):,} ({int(vc.get(1, 0))/max(n,1):.1%}) | "
+                f"short={int(vc.get(-1, 0)):,} ({int(vc.get(-1, 0))/max(n,1):.1%}) | "
+                f"amb={int(vc.get(0, 0)):,} ({int(vc.get(0, 0))/max(n,1):.1%})"
+            )
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2: DeepLOB tensors — نافذة 50 بار تاريخية (محاذاة DeepLOBCNN)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -589,32 +1024,25 @@ def _normalize_lob_tensor_nonflat(
     return out
 
 
-def fit_lob_norm_params(tensors: np.ndarray, ids: np.ndarray, eps: float = 1e-12) -> dict[int, tuple[float, float]]:
-    """Fit DeepLOB channel normalization on a caller-supplied train fold only."""
-    sample = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32)
-    params: dict[int, tuple[float, float]] = {}
-    if sample.size == 0:
-        return params
-    for c in range(sample.shape[-1]):
-        flat = sample[..., c].reshape(-1)
-        nz = flat[np.abs(flat) > eps]
-        if len(nz):
-            mu = float(np.mean(nz))
-            sd = float(np.std(nz))
-        else:
-            mu, sd = 0.0, 1.0
-        params[int(c)] = (mu, sd if sd > 1e-8 else 1.0)
-    return params
-
-
-def apply_lob_norm(tensors: np.ndarray, ids: np.ndarray, params: dict[int, tuple[float, float]]) -> np.ndarray:
-    """Apply previously fitted DeepLOB normalization to selected rows."""
-    out = np.asarray(tensors[np.asarray(ids, dtype=np.int64)], dtype=np.float32).copy()
-    for c, (mu, sd) in (params or {}).items():
-        ci = int(c)
-        if 0 <= ci < out.shape[-1]:
-            out[..., ci] = ((out[..., ci] - float(mu)) / max(float(sd), 1e-8)).astype(np.float32)
-    return out
+def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> dict:
+    vals = pd.to_numeric(pd.Series(series), errors='coerce').fillna(0.0).astype(np.float64).to_numpy()
+    if vals.size == 0:
+        return {
+            'mean': 0.0,
+            'median': 0.0,
+            'p25': 0.0,
+            'p75': 0.0,
+            'low_ratio': 0.0,
+            'threshold': float(low_threshold),
+        }
+    return {
+        'mean': float(np.mean(vals)),
+        'median': float(np.median(vals)),
+        'p25': float(np.percentile(vals, 25)),
+        'p75': float(np.percentile(vals, 75)),
+        'low_ratio': float(np.mean(vals < float(low_threshold))),
+        'threshold': float(low_threshold),
+    }
 
 
 def _trade_footprint_bar(
@@ -643,11 +1071,11 @@ def _trade_footprint_bar(
         px = float(mbo_price[k])
         if sz <= 0 or px <= 0:
             continue
-        if mbo_side[k] in ('A', 'BID', 'BUY'):
+        if mbo_side[k] in ('A', 'ASK', 'BUY', 'BOT'):
             dist = abs((px - ask0) / tick)
             lvl = max(0, min(levels - 1, int(round(dist))))
             buy_fp[lvl] += np.float32(sz / tick_med)
-        elif mbo_side[k] in ('B', 'ASK', 'SELL'):
+        elif mbo_side[k] in ('B', 'BID', 'S', 'SELL'):
             dist = abs((bid0 - px) / tick)
             lvl = max(0, min(levels - 1, int(round(dist))))
             sell_fp[lvl] += np.float32(sz / tick_med)
@@ -678,18 +1106,23 @@ def build_rolling_lob_tensors_from_mbp(
     bid_sz_cols = [f'bid_sz_{i:02d}' for i in range(levels)]
     ask_sz_cols = [f'ask_sz_{i:02d}' for i in range(levels)]
 
+    def _col_or_zeros(frame: pd.DataFrame, col: str) -> pd.Series:
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors='coerce').fillna(0.0)
+        return pd.Series(np.zeros(len(frame), dtype=np.float64), index=frame.index, dtype=np.float64)
+
     mbp_ts = df_mbp['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
     bid_px = np.vstack([
-        pd.to_numeric(df_mbp.get(c), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+        _col_or_zeros(df_mbp, c).to_numpy(dtype=np.float64, copy=False)
         for c in bid_px_cols]).T
     ask_px = np.vstack([
-        pd.to_numeric(df_mbp.get(c), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+        _col_or_zeros(df_mbp, c).to_numpy(dtype=np.float64, copy=False)
         for c in ask_px_cols]).T
     bid_sz = np.vstack([
-        pd.to_numeric(df_mbp.get(c), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+        _col_or_zeros(df_mbp, c).to_numpy(dtype=np.float64, copy=False)
         for c in bid_sz_cols]).T
     ask_sz = np.vstack([
-        pd.to_numeric(df_mbp.get(c), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+        _col_or_zeros(df_mbp, c).to_numpy(dtype=np.float64, copy=False)
         for c in ask_sz_cols]).T
 
     mbo_ts = df_mbo['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
@@ -711,6 +1144,7 @@ def build_rolling_lob_tensors_from_mbp(
     bar_snapshots: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
     ts_bar = bars['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
 
+    bars_with_snapshot = 0
     for bi in range(n_bars):
         t0 = ts_bar[bi]
         t1 = t0 + bar_ns
@@ -745,6 +1179,7 @@ def build_rolling_lob_tensors_from_mbp(
             tick_med=tick_med,
         )
         bar_snapshots.append((depth_feat, buy_fp, sell_fp))
+        bars_with_snapshot += 1
 
     tensors = np.zeros((n_bars, T, n_lv2, 3), dtype=np.float32)
     timestamps = np.zeros(n_bars, dtype='datetime64[ns]')
@@ -767,9 +1202,18 @@ def build_rolling_lob_tensors_from_mbp(
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
-    if float(np.mean(roll_cov)) < 0.5:
+    tensors = _normalize_lob_tensor_nonflat(tensors)
+    snap_ratio = float(bars_with_snapshot) / float(max(n_bars, 1))
+    mean_roll_cov = float(np.mean(roll_cov)) if len(roll_cov) else 0.0
+    low_roll_ratio = float(np.mean(roll_cov < 0.50)) if len(roll_cov) else 1.0
+    print(
+        "  📊 LOB coverage telemetry: "
+        f"bar_snapshots={bars_with_snapshot:,}/{n_bars:,} ({snap_ratio:.1%}) | "
+        f"roll_mean={mean_roll_cov:.1%} | roll_low(<50%)={low_roll_ratio:.1%}"
+    )
+    if mean_roll_cov < 0.5 or low_roll_ratio > 0.4:
         print(
-            '  ⚠️ rolling LOB: متوسط mbp_roll_lob_coverage منخفض — كثير من الشموع غير مكتملة في نافذة الـ 50 بار.'
+            "  ⚠️ rolling LOB coverage weak — CNN quality may degrade unless MBP density improves."
         )
     return tensors, timestamps, roll_cov
 
@@ -829,6 +1273,7 @@ def build_rolling_lob_tensors_mbo_only(
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
+    tensors = _normalize_lob_tensor_nonflat(tensors)
     return tensors, timestamps.copy(), roll_cov
 
 
@@ -836,7 +1281,12 @@ def build_rolling_lob_tensors_mbo_only(
 # STEP 3a: Event Gate — يكشف لحظات الـ Informed Flow الحقيقي (المشكلة F + I)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_microstructure_events(df: pd.DataFrame) -> pd.DataFrame:
+def detect_microstructure_events(
+    df: pd.DataFrame,
+    *,
+    threshold_scale: float = 1.0,
+    threshold_shift: float = 0.0,
+) -> pd.DataFrame:
     """
     يكشف اللحظات التي يكون فيها informed flow حقيقي ويُضيف:
         - is_event    (int8)   : 1 = حدث حقيقي، 0 = ضجيج
@@ -893,9 +1343,13 @@ def detect_microstructure_events(df: pd.DataFrame) -> pd.DataFrame:
     if 'regime_label' in df.columns:
         regime_s = df['regime_label'].astype(str)
         # عتبة ديناميكية: volatile يحتاج score أعلى
-        threshold = regime_s.map(REGIME_EVENT_THRESHOLD).fillna(0.60).astype(np.float32)
+        base_threshold = regime_s.map(REGIME_EVENT_THRESHOLD).fillna(0.60).astype(np.float32)
     else:
-        threshold = pd.Series(0.60, index=df.index, dtype=np.float32)
+        base_threshold = pd.Series(0.60, index=df.index, dtype=np.float32)
+
+    scale = float(max(threshold_scale, 0.01))
+    shift = float(threshold_shift)
+    threshold = (base_threshold.astype(np.float64) * scale + shift).clip(0.05, 0.95).astype(np.float32)
 
     df['event_score'] = event_score
     df['is_event'] = (event_score >= threshold.values).astype(np.int8)
@@ -903,7 +1357,10 @@ def detect_microstructure_events(df: pd.DataFrame) -> pd.DataFrame:
     # ── إحصاءات التشخيص ──────────────────────────────────────────────────────
     n_total = len(df)
     n_event = int(df['is_event'].sum())
-    print(f"  📊 Event Detection: {n_event:,}/{n_total:,} bars = {n_event/max(n_total,1):.1%} events")
+    print(
+        f"  📊 Event Detection: {n_event:,}/{n_total:,} bars = {n_event/max(n_total,1):.1%} events "
+        f"(threshold_scale={scale:.2f}, shift={shift:+.2f})"
+    )
     if 'regime_label' in df.columns:
         for reg in ['trending', 'ranging', 'volatile']:
             mask = df['regime_label'] == reg
@@ -927,6 +1384,51 @@ _SESSION_END_HOUR: dict[str, int] = {
     'ny'     : 21,
 }
 _FALLBACK_MAX_BARS: int = 20  # حد أقصى مطلق عند غياب معلومات الجلسة
+_KALMAN_EVENT_FLOOR: float = 0.70
+
+# neutral_reason parity with labels_v19
+NEUTRAL_REASON_NONE       = 0
+NEUTRAL_REASON_TIMEOUT    = 1
+NEUTRAL_REASON_LONG_SL    = 2
+NEUTRAL_REASON_SHORT_SL   = 3
+NEUTRAL_REASON_KALMAN     = 4
+NEUTRAL_REASON_WEAK_EVENT = 5
+
+
+def add_kalman_trend(
+    df: pd.DataFrame,
+    *,
+    obs_noise: float = 1e-3,
+    trans_noise: float = 1e-5,
+) -> pd.DataFrame:
+    """
+    يضيف kalman_trend / kalman_direction لفلترة الاتجاهات الضعيفة عكس الترند.
+    إذا pykalman غير متاح، نستخدم EWMA fallback للحفاظ على نفس العقد.
+    """
+    out = df.copy()
+    close_src = out['close'] if 'close' in out.columns else pd.Series(np.zeros(len(out), dtype=np.float64), index=out.index)
+    close = pd.to_numeric(close_src, errors='coerce').ffill().fillna(0.0).astype(np.float64)
+    if len(close) == 0:
+        out['kalman_trend'] = np.float32(0.0)
+        out['kalman_direction'] = np.int8(0)
+        return out
+    if _KALMAN_OK and KalmanFilter is not None:
+        kf = KalmanFilter(
+            transition_matrices=[[1.0]],
+            observation_matrices=[[1.0]],
+            initial_state_mean=[float(close.iloc[0])],
+            observation_covariance=[[float(max(obs_noise, 1e-9))]],
+            transition_covariance=[[float(max(trans_noise, 1e-12))]],
+        )
+        state_means, _ = kf.filter(close.to_numpy(dtype=np.float64).reshape(-1, 1))
+        trend = pd.Series(state_means[:, 0], index=out.index, dtype=np.float64)
+    else:
+        trend = close.ewm(span=12, adjust=False).mean()
+        print("  ⚠️ pykalman غير متاح — using EWMA trend fallback for kalman_direction.")
+    direction = np.sign(trend.diff().fillna(0.0)).astype(np.int8)
+    out['kalman_trend'] = trend.astype(np.float32)
+    out['kalman_direction'] = direction
+    return out
 
 
 def label_by_outcome(
@@ -936,6 +1438,11 @@ def label_by_outcome(
     default_sl_mult: float = 1.0,
     default_max_bars: int = 6,
     min_atr: float = 0.0003,
+    kalman_event_floor: float = _KALMAN_EVENT_FLOOR,
+    weak_event_to_directional: bool = False,
+    weak_event_min_move_atr: float = 0.35,
+    sl_to_opposite: bool = False,
+    include_weak_directional_in_train: bool = False,
 ) -> pd.DataFrame:
     """
     يلصق الليبل بناءً على أول حاجز يُضرب (First Barrier Hit).
@@ -949,7 +1456,8 @@ def label_by_outcome(
 
     الأعمدة المُضافة:
         bias_label     (int8):   0=LONG, 1=SHORT, 2=NEUTRAL
-        path_outcome   (int8):   0=long_tp, 1=short_tp, 2=long_sl, 3=short_sl, 4=timeout
+        path_outcome   (int8):   0=long_tp, 1=short_tp, 2=long_sl, 3=short_sl, 4=timeout, 5=weak_long, 6=weak_short
+        neutral_reason (int8):   0=none, 1=timeout, 2=long_sl, 3=short_sl, 4=kalman, 5=weak_event
         trade_duration (int16):  عدد bars لنهاية الحدث
         signal_quality (int8):   0=ضعيف, 1=جيد, 2=ممتاز (جلسة لندن/overlap)
         forward_return (float32): عائد نهاية الأفق (للتشخيص فقط)
@@ -960,11 +1468,10 @@ def label_by_outcome(
     # ── arrays الخروج ─────────────────────────────────────────────────────────
     bias_label     = np.full(n, 2, dtype=np.int8)
     path_outcome   = np.full(n, 4, dtype=np.int8)   # 4 = timeout
+    neutral_reason = np.full(n, NEUTRAL_REASON_NONE, dtype=np.int8)
     trade_duration = np.zeros(n, dtype=np.int16)
     signal_quality = np.zeros(n, dtype=np.int8)
     forward_return = np.zeros(n, dtype=np.float32)
-    label_end_ts = df['ts_event'].copy()
-    label_horizon_steps = np.zeros(n, dtype=np.int32)
 
     # ── arrays السعر ──────────────────────────────────────────────────────────
     close  = pd.to_numeric(df['close'], errors='coerce').to_numpy(dtype=np.float64)
@@ -981,6 +1488,12 @@ def label_by_outcome(
     regime_arr  = df['regime_label'].astype(str).to_numpy()  if has_regime  else None
     session_arr = df['session'].astype(str).to_numpy()       if has_session else None
     is_ev_arr   = df['is_event'].to_numpy(dtype=np.int8)     if has_event   else np.ones(n, dtype=np.int8)
+    ev_score_src = df['event_score'] if 'event_score' in df.columns else pd.Series(0.0, index=df.index)
+    kalman_src = df['kalman_direction'] if 'kalman_direction' in df.columns else pd.Series(0, index=df.index)
+    event_dir_src = df['event_direction'] if 'event_direction' in df.columns else pd.Series(0, index=df.index)
+    event_score_arr = pd.to_numeric(ev_score_src, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    kalman_dir_arr = pd.to_numeric(kalman_src, errors='coerce').fillna(0).to_numpy(dtype=np.int8)
+    event_dir_arr = pd.to_numeric(event_dir_src, errors='coerce').fillna(0).to_numpy(dtype=np.int8)
 
     # جلسات لندن/overlap → signal_quality = 2 (premium)
     london_ok = np.zeros(n, dtype=bool)
@@ -1012,32 +1525,60 @@ def label_by_outcome(
 
     # ── الحلقة الرئيسية ───────────────────────────────────────────────────────
     for i in range(n):
+        regime_i = str(regime_arr[i]) if has_regime else 'ranging'
+        max_bars_r = REGIME_MAX_BARS.get(regime_i, default_max_bars)
+        atr_i = max(float(atr[i]), min_atr)
+        entry = float(close[i])
+        sess_end = _session_end(i, max_bars_r)
+        fwd_idx = min(i + max_bars_r, n - 1)
+        forward_return[i] = float((close[fwd_idx] - entry) / max(entry, 1e-8))
+
         if not is_ev_arr[i]:
-            # ليس حدثاً → لا نُصنِّف (يبقى NEUTRAL افتراضياً)
+            # ليس حدثاً: افتراضياً NEUTRAL، ويمكن (اختياريًا) تحويله لاتجاه ضعيف إذا الحركة واضحة.
+            if weak_event_to_directional:
+                move_px = float(close[sess_end] - entry) if sess_end >= i else 0.0
+                move_thr = float(max(weak_event_min_move_atr, 0.0)) * atr_i
+                trade_duration[i] = max(0, sess_end - i)
+                if move_px >= move_thr:
+                    bias_label[i] = 0
+                    path_outcome[i] = 5  # weak_long
+                    signal_quality[i] = 1 if london_ok[i] else 0
+                    neutral_reason[i] = NEUTRAL_REASON_NONE
+                elif move_px <= -move_thr:
+                    bias_label[i] = 1
+                    path_outcome[i] = 6  # weak_short
+                    signal_quality[i] = 1 if london_ok[i] else 0
+                    neutral_reason[i] = NEUTRAL_REASON_NONE
+                else:
+                    neutral_reason[i] = NEUTRAL_REASON_WEAK_EVENT
+            else:
+                neutral_reason[i] = NEUTRAL_REASON_WEAK_EVENT
             continue
 
         # Regime-aware TP/SL
-        regime_i = str(regime_arr[i]) if has_regime else 'ranging'
+        event_score_i = float(event_score_arr[i])
+        kalman_dir_i = int(kalman_dir_arr[i])
+        event_dir_i = int(event_dir_arr[i])
         tp_mult, sl_mult = REGIME_TP_SL.get(regime_i, (default_tp_mult, default_sl_mult))
-        max_bars_r = REGIME_MAX_BARS.get(regime_i, default_max_bars)
+        allow_long = True
+        allow_short = True
+        if event_dir_i > 0:
+            allow_short = False
+        elif event_dir_i < 0:
+            allow_long = False
+        else:
+            if kalman_dir_i == 1 and event_score_i < float(kalman_event_floor):
+                allow_short = False
+            elif kalman_dir_i == -1 and event_score_i < float(kalman_event_floor):
+                allow_long = False
 
-        atr_i = max(float(atr[i]), min_atr)
         tp_dist = tp_mult * atr_i
         sl_dist = sl_mult * atr_i
 
-        entry   = float(close[i])
         tp_long  = entry + tp_dist
         sl_long  = entry - sl_dist
         tp_short = entry - tp_dist
         sl_short = entry + sl_dist
-
-        sess_end = _session_end(i, max_bars_r)
-        label_end_ts.iloc[i] = ts_arr[sess_end]
-        label_horizon_steps[i] = max(0, int(sess_end - i))
-
-        # forward return للتشخيص
-        fwd_idx = sess_end
-        forward_return[i] = float((close[fwd_idx] - entry) / max(entry, 1e-8))
 
         # ── امشِ bar بـ bar حتى أول ضربة ──────────────────────────────────────
         first_ev: tuple[str, int] | None = None
@@ -1051,6 +1592,13 @@ def label_by_outcome(
             ls = l <= sl_long
             st = l <= tp_short
             ss = h >= sl_short
+
+            if not allow_long:
+                lt = False
+                ls = False
+            if not allow_short:
+                st = False
+                ss = False
 
             picked: str | None = None
 
@@ -1077,8 +1625,6 @@ def label_by_outcome(
 
             if picked is not None:
                 first_ev = (picked, j)
-                label_end_ts.iloc[i] = ts_arr[j]
-                label_horizon_steps[i] = max(0, int(j - i))
                 break
 
         # ── تعيين الليبل ─────────────────────────────────────────────────────
@@ -1087,6 +1633,10 @@ def label_by_outcome(
             bias_label[i]     = 2
             path_outcome[i]   = 4
             trade_duration[i] = max(0, sess_end - i)
+            if (not allow_long) or (not allow_short):
+                neutral_reason[i] = NEUTRAL_REASON_KALMAN
+            else:
+                neutral_reason[i] = NEUTRAL_REASON_TIMEOUT
         else:
             ev_type, ev_j = first_ev
             trade_duration[i] = ev_j - i
@@ -1101,21 +1651,31 @@ def label_by_outcome(
                 path_outcome[i] = 1
                 signal_quality[i] = sq
             elif ev_type == 'long_sl':
-                bias_label[i]   = 2   # NEUTRAL (SL = إشارة خاطئة)
+                if sl_to_opposite:
+                    bias_label[i] = 1  # map loss to opposite direction (optional aggressive mode)
+                    signal_quality[i] = 1
+                else:
+                    bias_label[i] = 2   # NEUTRAL (SL = إشارة خاطئة)
                 path_outcome[i] = 2
+                if bias_label[i] == 2:
+                    neutral_reason[i] = NEUTRAL_REASON_LONG_SL
             elif ev_type == 'short_sl':
-                bias_label[i]   = 2   # NEUTRAL
+                if sl_to_opposite:
+                    bias_label[i] = 0
+                    signal_quality[i] = 1
+                else:
+                    bias_label[i] = 2   # NEUTRAL
                 path_outcome[i] = 3
+                if bias_label[i] == 2:
+                    neutral_reason[i] = NEUTRAL_REASON_SHORT_SL
 
     # ── كتابة النتائج ─────────────────────────────────────────────────────────
     df['bias_label']     = bias_label
     df['path_outcome']   = path_outcome
+    df['neutral_reason'] = neutral_reason
     df['trade_duration'] = trade_duration
     df['signal_quality'] = signal_quality
     df['forward_return'] = forward_return
-    df['label_end_ts'] = label_end_ts
-    df['label_horizon_steps'] = label_horizon_steps.astype(np.int32)
-    df['effective_horizon'] = label_horizon_steps.astype(np.int32)
 
     # event_flag: فاز بـ TP فقط (للتدريب الفعلي)
     df['event_flag'] = (
@@ -1124,11 +1684,14 @@ def label_by_outcome(
         (df['signal_quality'] > 0)
     ).astype(np.int8)
 
-    # train_event_flag: pool التدريب = events + label != NEUTRAL
-    df['train_event_flag'] = (
-        (df['is_event'] == 1) &
-        (df['bias_label'] != 2)
-    ).astype(np.int8)
+    # train_event_flag: افتراضيًا directional داخل events فقط.
+    if include_weak_directional_in_train:
+        df['train_event_flag'] = (df['bias_label'] != 2).astype(np.int8)
+    else:
+        df['train_event_flag'] = (
+            (df['is_event'] == 1) &
+            (df['bias_label'] != 2)
+        ).astype(np.int8)
 
     # إحصاءات التشخيص
     lbl_counts = {
@@ -1210,7 +1773,6 @@ def build_day_trading_labels(
     forward_return = np.zeros(n, dtype=np.float32)
     path_outcome = np.full(n, 4, dtype=np.int8)   # 4 = TIMEOUT
     label_end_ts = df['ts_event'].copy()
-    label_horizon_steps = np.zeros(n, dtype=np.int32)
 
     atr = df['atr_14'].to_numpy(dtype=np.float64)
     close = df['close'].to_numpy(dtype=np.float64)
@@ -1235,7 +1797,6 @@ def build_day_trading_labels(
 
         horizon_end = min(i + horizon_bars, n - 1)
         label_end_ts.iloc[i] = ts[horizon_end]
-        label_horizon_steps[i] = max(0, int(horizon_end - i))
         fwd_close = float(close[horizon_end])
         forward_return[i] = float((fwd_close - entry) / max(entry, 1e-8))
 
@@ -1273,7 +1834,6 @@ def build_day_trading_labels(
             if picked is not None:
                 first_ev = (picked, j)
                 label_end_ts.iloc[i] = ts[j]
-                label_horizon_steps[i] = max(0, int(j - i))
                 break
 
         london_ok = bool(df['is_london'].iloc[i] or df['is_overlap'].iloc[i])
@@ -1305,8 +1865,8 @@ def build_day_trading_labels(
     out['forward_return'] = forward_return
     out['path_outcome'] = path_outcome
     out['label_end_ts'] = label_end_ts
-    out['label_horizon_steps'] = label_horizon_steps.astype(np.int32)
-    out['effective_horizon'] = label_horizon_steps.astype(np.int32)
+    out['label_horizon_steps'] = horizon_bars
+    out['effective_horizon'] = np.full(n, int(horizon_bars), dtype=np.int32)
     out['timeout_move_exceeded_band'] = np.zeros(n, dtype=np.int8)
 
     out['event_flag'] = ((out['bias_label'] != 2) & (out['signal_quality'] > 0)).astype(np.int8)
@@ -1316,29 +1876,79 @@ def build_day_trading_labels(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4: Soft Labels (نفس المنطق الأصلي)
+# STEP 4: Soft Labels (Regime-aware + engine)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def add_soft_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Soft labels day-trading-aware:
+      LONG  -> [0.55 .. 1.00]
+      SHORT -> [0.00 .. 0.45]
+      NEUTRAL -> 0.50
+    القوة = 0.6*event_score + 0.4*speed (مدة أقصر = أقوى).
+    """
+    out = df.copy()
+    n = len(out)
+    soft = np.full(n, 0.5, dtype=np.float32)
+    labels_src = out['bias_label'] if 'bias_label' in out.columns else pd.Series(2, index=out.index)
+    events_src = out['is_event'] if 'is_event' in out.columns else pd.Series(0, index=out.index)
+    score_src = out['event_score'] if 'event_score' in out.columns else pd.Series(0.0, index=out.index)
+    duration_src = out['trade_duration'] if 'trade_duration' in out.columns else pd.Series(0, index=out.index)
+    labels = pd.to_numeric(labels_src, errors='coerce').fillna(2).to_numpy(dtype=np.int8)
+    events = pd.to_numeric(events_src, errors='coerce').fillna(0).to_numpy(dtype=np.int8)
+    ev_score = pd.to_numeric(score_src, errors='coerce').fillna(0.0).clip(0.0, 1.0).to_numpy(dtype=np.float64)
+    duration = pd.to_numeric(duration_src, errors='coerce').fillna(0).to_numpy(dtype=np.float64)
+    regime_s = out.get('regime_label', pd.Series('ranging', index=out.index)).astype(str).to_numpy()
+    for i in np.where(events == 1)[0]:
+        label_i = int(labels[i])
+        if label_i == 2:
+            continue
+        regime_i = str(regime_s[i]) if i < len(regime_s) else 'ranging'
+        max_dur = float(max(int(REGIME_MAX_BARS.get(regime_i, 6)), 1))
+        speed = float(np.clip(1.0 - (duration[i] / max_dur), 0.0, 1.0))
+        strength = float(np.clip(ev_score[i] * 0.6 + speed * 0.4, 0.0, 1.0))
+        if label_i == 0:
+            soft[i] = np.float32(0.55 + strength * 0.45)
+        elif label_i == 1:
+            soft[i] = np.float32(0.45 - strength * 0.45)
+    conf = np.clip(np.abs(soft - 0.5) * 2.0, 0.0, 1.0).astype(np.float32)
+    out['soft_label'] = soft
+    out['label_confidence'] = conf
+    out['soft_sample_weight'] = (1.0 + conf).astype(np.float32)
+    return out
+
 
 def attach_soft_labels_dt(df: pd.DataFrame) -> pd.DataFrame:
     """
-    يطبق soft labels على مستوى الـ bars.
-    نفس منطق soft_label_engine.py بدون تعديل.
+    يطبق soft labels على مستوى الـ bars:
+      1) day-trading regime-aware soft labels (مضمون دائماً)
+      2) enrich اختياري عبر soft_label_engine (إذا متاح) دون فقد soft_label الأساسي
     """
+    base = add_soft_labels(df)
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from modules.soft_label_engine import SoftLabelEngine, SoftLabelConfig
         config = SoftLabelConfig(mode='analytical')
         engine = SoftLabelEngine(config=config)
-        df = engine.attach_soft_labels(df)
-        print("  ✅ Soft Labels مُرفقة (analytical mode)")
+        enriched = engine.attach_soft_labels(base.copy())
+        enriched['soft_label'] = base['soft_label'].astype(np.float32)
+        base_conf = pd.to_numeric(base.get('label_confidence', 0.5), errors='coerce').fillna(0.5).astype(np.float32)
+        if 'label_confidence' in enriched.columns:
+            eng_conf = pd.to_numeric(enriched['label_confidence'], errors='coerce').fillna(0.5).astype(np.float32)
+            enriched['label_confidence'] = np.maximum(eng_conf, base_conf).astype(np.float32)
+        else:
+            enriched['label_confidence'] = base_conf
+        if 'soft_sample_weight' in enriched.columns:
+            eng_w = pd.to_numeric(enriched['soft_sample_weight'], errors='coerce').fillna(1.0).astype(np.float32)
+            scale = (0.75 + 0.5 * base_conf).astype(np.float32)
+            enriched['soft_sample_weight'] = (eng_w * scale).astype(np.float32)
+        else:
+            enriched['soft_sample_weight'] = base['soft_sample_weight'].astype(np.float32)
+        print("  ✅ Soft Labels مُرفقة (day-trading regime-aware + analytical enrich)")
+        return enriched
     except Exception as e:
-        print(f"  ⚠️ Soft Labels غير متاحة: {e} — يتم التدريب بـ hard labels")
-        bi = df['bias_label'].to_numpy()
-        df['soft_label'] = np.where(bi == 0, np.float32(0.75), np.where(bi == 1, np.float32(0.25), np.float32(0.50)))
-        df['label_confidence'] = 0.5
-        df['soft_sample_weight'] = 1.0
-
-    return df
+        print(f"  ⚠️ Soft label engine غير متاح: {e} — using day-trading regime-aware soft labels فقط.")
+        return base
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1356,6 +1966,13 @@ def run_day_trading_refinery(
     build_lob_tensors: bool = True,
     *,
     strict_train_pool: bool = False,
+    event_threshold_scale: float = 1.0,
+    event_threshold_shift: float = 0.0,
+    kalman_event_floor: float = _KALMAN_EVENT_FLOOR,
+    weak_event_to_directional: bool = False,
+    weak_event_min_move_atr: float = 0.35,
+    sl_to_opposite: bool = False,
+    include_weak_directional_in_train: bool = False,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -1366,6 +1983,19 @@ def run_day_trading_refinery(
     print("\n" + "="*65)
     print("📊 Day Trading Refinery — QuantSystem V19")
     print(f"   Timeframe: {freq} | Horizon: {horizon_bars} bars")
+    print(
+        "   EventGate tuning: "
+        f"threshold_scale={float(event_threshold_scale):.2f}, "
+        f"threshold_shift={float(event_threshold_shift):+.2f}, "
+        f"kalman_floor={float(kalman_event_floor):.2f}"
+    )
+    print(
+        "   Label policy: "
+        f"weak_to_dir={bool(weak_event_to_directional)} "
+        f"(min_move_atr={float(weak_event_min_move_atr):.2f}) | "
+        f"sl_to_opposite={bool(sl_to_opposite)} | "
+        f"include_weak_train={bool(include_weak_directional_in_train)}"
+    )
     print("="*65)
 
     # ── 1. تحميل MBO ──────────────────────────────────────────────
@@ -1389,6 +2019,7 @@ def run_day_trading_refinery(
         df_mbo = pd.concat(chunks, ignore_index=True)
     df_mbo['ts_event'] = pd.to_datetime(df_mbo['ts_event'])
     df_mbo = df_mbo.sort_values('ts_event').reset_index(drop=True)
+    df_mbo = enrich_mbo_with_core_microstructure(df_mbo)
     print(f"  ✅ {len(df_mbo):,} تيك | {df_mbo['ts_event'].min()} → {df_mbo['ts_event'].max()}")
 
     # ── 1b. تحميل MBP (اختياري) ─────────────────────────────────────────────
@@ -1430,11 +2061,21 @@ def run_day_trading_refinery(
     df_bars = enrich_bars_with_intrabar(df_bars, df_mbo, freq=freq, n_slices=12)
     if df_mbp is not None and len(df_mbp):
         df_bars = enrich_bars_with_intrabar_mbp(df_bars, df_mbp, freq=freq, n_slices=12, levels=10)
+    print("\n📈 Kalman Trend Filter...")
+    df_bars = add_kalman_trend(df_bars)
+    print("\n🧭 Regime assignment...")
+    df_bars = assign_regime_label(df_bars)
     print(f"  ✅ {len(df_bars.columns)} feature")
 
     # ── 4. Event Gate + Labels ────────────────────────────────────
     print(f"\n🔍 كشف Microstructure Events (Event Gate — المشكلة F+I)...")
-    df_bars = detect_microstructure_events(df_bars)
+    df_bars = detect_microstructure_events(
+        df_bars,
+        threshold_scale=event_threshold_scale,
+        threshold_shift=event_threshold_shift,
+    )
+    print("\n🧭 Directional voting (CVD + OBI + Kalman)...")
+    df_bars = add_event_direction(df_bars)
 
     print(f"\n🏷️  بناء Labels — First Barrier Hit — Regime-Aware (المشكلة G+H+J+K)...")
     print(f"   TP/SL per regime: {REGIME_TP_SL}")
@@ -1444,6 +2085,11 @@ def run_day_trading_refinery(
         default_tp_mult=tp_atr_mult,
         default_sl_mult=sl_atr_mult,
         default_max_bars=horizon_bars,
+        kalman_event_floor=kalman_event_floor,
+        weak_event_to_directional=weak_event_to_directional,
+        weak_event_min_move_atr=weak_event_min_move_atr,
+        sl_to_opposite=sl_to_opposite,
+        include_weak_directional_in_train=include_weak_directional_in_train,
     )
 
     # توافق backward: أضف label_end_ts إذا لم توجد
@@ -1516,7 +2162,8 @@ def run_day_trading_refinery(
     required_cols = ['ts_event', 'label_end_ts', 'bias_label', 'signal_quality',
                      'forward_return', 'event_flag', 'train_event_flag',
                      'soft_label', 'label_confidence', 'soft_sample_weight',
-                     'is_event', 'event_score', 'path_outcome', 'trade_duration']
+                     'is_event', 'event_score', 'event_direction', 'path_outcome', 'trade_duration',
+                     'neutral_reason', 'kalman_direction', 'regime_label', 'regime_cluster']
     for col in required_cols:
         if col not in df_out.columns:
             df_out[col] = 0
@@ -1529,6 +2176,14 @@ def run_day_trading_refinery(
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
+
+    mbp_bar_cov_stats = _coverage_stats(df_out.get('mbp_bar_coverage', 0.0), low_threshold=0.30)
+    mbp_roll_cov_stats = _coverage_stats(df_out.get('mbp_roll_lob_coverage', 0.0), low_threshold=0.50)
+    print(
+        "   📊 MBP coverage: "
+        f"bar_mean={mbp_bar_cov_stats['mean']:.1%}, bar_low(<30%)={mbp_bar_cov_stats['low_ratio']:.1%} | "
+        f"roll_mean={mbp_roll_cov_stats['mean']:.1%}, roll_low(<50%)={mbp_roll_cov_stats['low_ratio']:.1%}"
+    )
 
     # فلتر التدريب — للتحقق (لا يُحذف، train_v19 يُفلتر بنفسه)
     n_train_events = int(df_out['train_event_flag'].sum())
@@ -1548,6 +2203,14 @@ def run_day_trading_refinery(
         for reg in ['trending', 'ranging', 'volatile']:
             m = (df_out['regime_label'] == reg) & (df_out['train_event_flag'] == 1)
             regime_ev_counts[reg] = int(m.sum())
+    neutral_counts = {
+        str(k): int(v) for k, v in pd.to_numeric(df_out.get('neutral_reason', 0), errors='coerce')
+        .fillna(0).astype(int).value_counts().to_dict().items()
+    }
+    event_direction_counts = {
+        str(k): int(v) for k, v in pd.to_numeric(df_out.get('event_direction', 0), errors='coerce')
+        .fillna(0).astype(int).value_counts().to_dict().items()
+    }
 
     manifest = {
         'mode'                        : 'day_trading',
@@ -1559,6 +2222,13 @@ def run_day_trading_refinery(
         'regime_tp_sl'                : {k: list(v) for k, v in REGIME_TP_SL.items()},
         'regime_max_bars'             : REGIME_MAX_BARS,
         'regime_event_threshold'      : REGIME_EVENT_THRESHOLD,
+        'event_threshold_scale'       : float(event_threshold_scale),
+        'event_threshold_shift'       : float(event_threshold_shift),
+        'kalman_event_floor'          : float(kalman_event_floor),
+        'weak_event_to_directional'   : bool(weak_event_to_directional),
+        'weak_event_min_move_atr'     : float(weak_event_min_move_atr),
+        'sl_to_opposite'              : bool(sl_to_opposite),
+        'include_weak_directional_in_train': bool(include_weak_directional_in_train),
         'rows'                        : len(df_out),
         'label_distribution'          : {str(k): int(v) for k, v in label_dist.items()},
         'event_rate_tp_wins'          : float(event_strict),
@@ -1567,21 +2237,26 @@ def run_day_trading_refinery(
         'bias_long_short_counts'      : {'LONG': nc0, 'SHORT': nc1},
         'long_short_imbalance'        : round(imb, 3),
         'regime_train_event_counts'   : regime_ev_counts,
+        'neutral_reason_counts'       : neutral_counts,
+        'event_direction_counts'      : event_direction_counts,
         'catboost_surface_n'          : len(CATBOOST_ADVISOR_FEATURES_DT),
         'catboost_advisor_features'   : CATBOOST_ADVISOR_FEATURES_DT,
         'day_trading_context_features': DAY_TRADING_FEATURES,
         'lob_tensors_built'           : bool(build_lob_tensors),
         'lob_roll_lookback_bars'      : DEEPLOB_TIME_STEPS_DEFAULT,
         'lob_tensor_layout'           : 'rolling_bars_time_x_20_levels_x_3ch_peak_mbp_when_available',
+        'mbp_bar_coverage_stats'      : mbp_bar_cov_stats,
+        'mbp_roll_lob_coverage_stats' : mbp_roll_cov_stats,
         'ts_min'                      : str(df_out['ts_event'].min()),
         'ts_max'                      : str(df_out['ts_event'].max()),
         'label_logic'                 : (
             'Event Gate (hawkes+absorption+kyle+cvd zscore) → '
+            'Kalman Trend Filter (weak counter-trend veto) → '
             'First Barrier Hit (Regime-Aware TP/SL + Session Timeout) → '
             'SL outcomes → NEUTRAL'
         ),
     }
-    with open(os.path.join(output_dir, 'day_trading_manifest.json'), 'w') as f:
+    with open(os.path.join(output_dir, 'day_trading_manifest.json'), 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     print("\n" + "="*65)
@@ -1605,6 +2280,45 @@ if __name__ == '__main__':
     p.add_argument('--sl_mult', type=float, default=1.0, help='SL = sl_mult × ATR')
     p.add_argument('--no_lob',  action='store_true', help='تخطي بناء LOB tensors')
     p.add_argument(
+        '--event_threshold_scale',
+        type=float,
+        default=1.0,
+        help='scale لعَتبات Event Gate (أقل من 1.0 = إشارات أكثر، default=1.0)',
+    )
+    p.add_argument(
+        '--event_threshold_shift',
+        type=float,
+        default=0.0,
+        help='إزاحة لعَتبات Event Gate بعد الـ scale (قيمة سالبة = إشارات أكثر، default=0.0)',
+    )
+    p.add_argument(
+        '--kalman_event_floor',
+        type=float,
+        default=float(_KALMAN_EVENT_FLOOR),
+        help='عتبة event_score قبل Kalman counter-trend veto (أقل = veto أقل، default=0.70)',
+    )
+    p.add_argument(
+        '--weak_event_to_directional',
+        action='store_true',
+        help='حوّل weak-event rows إلى LONG/SHORT إذا حركة الأفق تخطت حد ATR (تقليل قوي للـ NEUTRAL).',
+    )
+    p.add_argument(
+        '--weak_event_min_move_atr',
+        type=float,
+        default=0.35,
+        help='الحد الأدنى لحركة weak-event (بوحدة ATR) قبل تحويلها لاتجاهي، default=0.35',
+    )
+    p.add_argument(
+        '--sl_to_opposite',
+        action='store_true',
+        help='حوّل long_sl→SHORT و short_sl→LONG بدل NEUTRAL (وضع aggressive).',
+    )
+    p.add_argument(
+        '--include_weak_directional_in_train',
+        action='store_true',
+        help='أدخل الاتجاهات الناتجة من weak-event ضمن train_event_flag.',
+    )
+    p.add_argument(
         '--strict_train_pool',
         action='store_true',
         help='يضيق train_event_flag: جلسات نشطة فقط + ATR >= 0.5× الوسيط (اتجاهي = فوز TP فقط)',
@@ -1621,4 +2335,11 @@ if __name__ == '__main__':
         sl_atr_mult=args.sl_mult,
         build_lob_tensors=not args.no_lob,
         strict_train_pool=args.strict_train_pool,
+        event_threshold_scale=args.event_threshold_scale,
+        event_threshold_shift=args.event_threshold_shift,
+        kalman_event_floor=args.kalman_event_floor,
+        weak_event_to_directional=args.weak_event_to_directional,
+        weak_event_min_move_atr=args.weak_event_min_move_atr,
+        sl_to_opposite=args.sl_to_opposite,
+        include_weak_directional_in_train=args.include_weak_directional_in_train,
     )

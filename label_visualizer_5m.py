@@ -393,8 +393,8 @@ def build_dashboard(data: dict, stats: dict) -> go.Figure:
 
     if mbo is not None and len(mbo) > 0:
         sides = mbo["side"].astype(str).str.upper()
-        buy_mbo = mbo[sides.isin({"B", "BID"})]
-        sell_mbo = mbo[sides.isin({"A", "ASK", "S", "SELL"})]
+        buy_mbo = mbo[sides.isin({"A", "ASK", "BUY", "BOT"})]
+        sell_mbo = mbo[sides.isin({"B", "BID", "S", "SELL"})]
 
         if len(buy_mbo) > 0:
             fig.add_trace(

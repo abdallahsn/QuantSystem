@@ -174,11 +174,13 @@ class AbsorptionIntensityEngine:
         self._aii_buf.append(raw)
         
         if len(self._aii_buf) >= 20:
-            p95 = float(np.percentile(self._aii_buf, 95))
-            if p95 > 0:
-                return round(min(raw / p95, 3.0), 6)
-                
-        return round(min(raw / 1000.0, 3.0), 6)
+            # Use robust center scaling to preserve spike structure instead of
+            # over-compressing around p95.
+            med = float(np.median(self._aii_buf))
+            scale = max(med, 1e-6)
+            return round(min(raw / scale, 10.0), 6)
+
+        return round(min(raw / 500.0, 10.0), 6)
 
 
 class FastTapeSpeedTracker:

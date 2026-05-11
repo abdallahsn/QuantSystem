@@ -61,6 +61,28 @@ def _input_shape_matches(model, seq_len: int, n_total: int) -> bool:
         return False
     return shape[-2:] == (int(seq_len), int(n_total))
 
+
+def _load_keras_model_allow_lambda(path: str, *, compile: bool = False, custom_objects: dict | None = None):
+    """
+    Keras 3 safe-mode blocks Lambda layer checkpoints by default.
+    Our trusted local Meta checkpoints use Lambda-based late-fusion slicing.
+    """
+    if not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow unavailable")
+    kwargs = {"compile": compile}
+    if custom_objects:
+        kwargs["custom_objects"] = custom_objects
+    try:
+        return tf.keras.models.load_model(path, safe_mode=False, **kwargs)
+    except TypeError:
+        cfg = getattr(tf.keras, "config", None)
+        if cfg is not None and hasattr(cfg, "enable_unsafe_deserialization"):
+            try:
+                cfg.enable_unsafe_deserialization()
+            except Exception:
+                pass
+        return tf.keras.models.load_model(path, **kwargs)
+
 # ── Warm-up LR ───────────────────────────────────────────────────
 if TF_AVAILABLE:
     class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
@@ -98,6 +120,52 @@ def _multitask_aux_heads(shared_tensor, dropout: float) -> dict:
     wall_ask_out = layers.Dense(1, activation='linear', name='wall_ask_out')(w)
 
     return {'range_ctx_out': range_ctx_out, 'wall_bid_out': wall_bid_out, 'wall_ask_out': wall_ask_out}
+
+
+def _late_fusion_block(
+    inp,
+    *,
+    n_flow_feat: int,
+    n_depth_feat: int,
+    fusion_dim: int = 64,
+    dropout: float = 0.10,
+):
+    """
+    Explicit late-fusion: Path-A (order-flow/stat+meta) + Path-B (depth embeddings)
+    are learned separately then fused.
+    """
+    if int(n_depth_feat) <= 0:
+        x = layers.LayerNormalization(epsilon=1e-6, name='flow_only_norm')(inp)
+        return x
+
+    n_flow_feat = int(max(n_flow_feat, 1))
+    n_depth_feat = int(max(n_depth_feat, 1))
+    flow_dim = int(max(24, fusion_dim // 2))
+    depth_dim = int(max(16, fusion_dim // 2))
+
+    flow = layers.Lambda(lambda t: t[..., :n_flow_feat], name='flow_path')(inp)
+    depth = layers.Lambda(
+        lambda t: t[..., n_flow_feat:n_flow_feat + n_depth_feat],
+        name='depth_path',
+    )(inp)
+
+    flow = layers.TimeDistributed(
+        layers.Dense(flow_dim, activation='gelu'),
+        name='flow_proj',
+    )(flow)
+    depth = layers.TimeDistributed(
+        layers.Dense(depth_dim, activation='gelu'),
+        name='depth_proj',
+    )(depth)
+
+    x = layers.Concatenate(name='late_fusion_concat')([flow, depth])
+    x = layers.TimeDistributed(
+        layers.Dense(int(max(32, fusion_dim)), activation='gelu'),
+        name='late_fusion_dense',
+    )(x)
+    x = layers.Dropout(float(max(dropout, 0.0)), name='late_fusion_dropout')(x)
+    x = layers.LayerNormalization(epsilon=1e-6, name='late_fusion_norm')(x)
+    return x
 
 
 class MetaLearnerLSTM:
@@ -163,9 +231,11 @@ class MetaLearnerLSTM:
 
         if os.path.exists(brain_file):
             try:
-                loaded_model = tf.keras.models.load_model(
-                    brain_file, compile=False,
-                    custom_objects={'WarmupCosineDecay': WarmupCosineDecay})
+                loaded_model = _load_keras_model_allow_lambda(
+                    brain_file,
+                    compile=False,
+                    custom_objects={'WarmupCosineDecay': WarmupCosineDecay},
+                )
                 if not _input_shape_matches(loaded_model, self.seq_len, self.n_total):
                     found_shape = _normalize_model_input_shape(loaded_model)
                     print(
@@ -186,6 +256,14 @@ class MetaLearnerLSTM:
                     if self.multitask_meta and not multitask_loaded:
                         print(
                             "[MetaLearner] ⚠️ multitask checkpoint missing auxiliary heads → rebuilding skeleton"
+                        )
+                        self.model = self._build()
+                    elif (
+                        self.n_visual > 0
+                        and not any(getattr(layer, 'name', '') == 'late_fusion_dense' for layer in loaded_model.layers)
+                    ):
+                        print(
+                            "[MetaLearner] ⚠️ legacy checkpoint without explicit late fusion → rebuilding"
                         )
                         self.model = self._build()
                     else:
@@ -211,8 +289,14 @@ class MetaLearnerLSTM:
             shape=(self.seq_len, self.n_total),
             name='meta_input')
 
-        # ── LayerNorm للتطبيع ──
-        x = layers.LayerNormalization(epsilon=1e-6)(inp)
+        # ── Explicit Late Fusion (Path-A + Path-B) ──
+        x = _late_fusion_block(
+            inp,
+            n_flow_feat=(self.n_stat + self.n_meta),
+            n_depth_feat=self.n_visual,
+            fusion_dim=64,
+            dropout=self.drop * 0.5,
+        )
 
         # ── LSTM Stack ──────────────────────────────────────────
         # LSTM 1: يُعيد كامل التسلسل
@@ -911,8 +995,14 @@ class MetaLearnerTCNLSTM(MetaLearnerLSTM):
             shape=(self.seq_len, self.n_total),
             name='meta_input')
 
-        # LayerNorm
-        x = layers.LayerNormalization(epsilon=1e-6)(inp)
+        # Explicit Late Fusion (Path-A + Path-B)
+        x = _late_fusion_block(
+            inp,
+            n_flow_feat=(self.n_stat + self.n_meta),
+            n_depth_feat=self.n_visual,
+            fusion_dim=64,
+            dropout=self.drop * 0.5,
+        )
 
         # ── TCN Block (التعديل 3) ──────────────────────────────
         x = _build_tcn_block(x, filters=self.tcn_filters, kernel_size=3, dilations=[1, 2, 4, 8])

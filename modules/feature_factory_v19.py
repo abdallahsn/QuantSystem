@@ -41,6 +41,7 @@ DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')
 DEFAULT_PASSTHROUGH_COLS = [
     'ts_event',
     'label_end_ts',
+    'lob_tensor_id',
     'price',
     'size',
     'bias_label',
@@ -105,6 +106,7 @@ DEFAULT_INT_COLS = {
     'timeout_move_exceeded_band',
     'effective_horizon',
     'soft_label_scenarios',
+    'lob_tensor_id',
 }
 FORBIDDEN_STAT_FEATURES = {
     'forward_return',
