@@ -60,12 +60,23 @@ from modules.regime_classifier import (
     RegimeClassifier,
 )
 from modules.slippage_model import DailyLossGuard, position_size_from_prediction
+VISUAL_MODEL_DEEPLOB = 'deeplob'
+VISUAL_MODEL_LOB_TRANSFORMER = 'lob_transformer'
+SUPPORTED_VISUAL_MODELS = {VISUAL_MODEL_DEEPLOB, VISUAL_MODEL_LOB_TRANSFORMER}
+
 try:
     from modules.deeplob_cnn import DeepLOBCNN
     DEEPLOB_AVAILABLE = True
 except Exception as exc:
     DEEPLOB_AVAILABLE = False
     print(f"  ⚠️ DeepLOB inference غير متاح — {exc}")
+
+try:
+    from modules.lob_transformer import LOBTransformer
+    LOB_TRANSFORMER_AVAILABLE = True
+except Exception as exc:
+    LOB_TRANSFORMER_AVAILABLE = False
+    print(f"  ⚠️ LOBTransformer inference unavailable — {exc}")
 
 try:
     from catboost import CatBoostClassifier, CatBoostRegressor
@@ -84,6 +95,13 @@ N_CLUSTERS = 4
 N_CB_PROBS = 2
 N_XGB_PROBS = 2
 STAGE1_TARGET_SOFT_LABEL = 'soft_label'
+
+
+def _resolve_visual_model_type(raw: str | None) -> str:
+    model_type = str(raw or VISUAL_MODEL_DEEPLOB).strip().lower()
+    if model_type not in SUPPORTED_VISUAL_MODELS:
+        model_type = VISUAL_MODEL_DEEPLOB
+    return model_type
 
 
 def _pseudo_prob_head(pred: np.ndarray) -> np.ndarray:
@@ -292,26 +310,40 @@ class V19PredictionEngine:
                 "❌ Regime classifier artifact is required by the feature schema but was not found."
             )
 
-        deeplob_path = os.path.join(models_dir, artifacts.get('deeplob_model', 'deeplob_cnn_v19.keras'))
         deeplob_cfg = self.schema.get('deeplob', {}) or {}
-        if DEEPLOB_AVAILABLE and os.path.exists(deeplob_path):
-            self.cnn = DeepLOBCNN(brain_file=deeplob_path)
-            if self.cnn is not None and not self.cnn._fitted:
-                self.cnn = None
+        visual_model_type = _resolve_visual_model_type(deeplob_cfg.get('model_type'))
+        visual_artifact = (
+            deeplob_cfg.get('model_artifact')
+            or (
+                artifacts.get('lob_transformer_model')
+                if visual_model_type == VISUAL_MODEL_LOB_TRANSFORMER
+                else artifacts.get('deeplob_model')
+            )
+            or ('lob_transformer_v19.keras' if visual_model_type == VISUAL_MODEL_LOB_TRANSFORMER else 'deeplob_cnn_v19.keras')
+        )
+        visual_model_path = os.path.join(models_dir, visual_artifact)
+        self.visual_model_type = visual_model_type
+        self.visual_encoder = None
+        if visual_model_type == VISUAL_MODEL_LOB_TRANSFORMER:
+            if LOB_TRANSFORMER_AVAILABLE and os.path.exists(visual_model_path):
+                self.visual_encoder = LOBTransformer(brain_file=visual_model_path)
         else:
-            self.cnn = None
-        if self.cnn is None:
-            print("  ⚠️ DeepLOB V19 missing or not fitted")
+            if DEEPLOB_AVAILABLE and os.path.exists(visual_model_path):
+                self.visual_encoder = DeepLOBCNN(brain_file=visual_model_path)
+        if self.visual_encoder is not None and not bool(getattr(self.visual_encoder, '_fitted', False)):
+            self.visual_encoder = None
+        if self.visual_encoder is None:
+            print(f"  ⚠️ Visual encoder missing or not fitted ({visual_model_type})")
         else:
-            print("  ✅ DeepLOB V19 loaded")
+            print(f"  ✅ Visual encoder loaded ({visual_model_type})")
         if (
             run_mode == 'live'
             and bool(deeplob_cfg.get('required_runtime', False))
             and len(self.visual_features) > 0
-            and self.cnn is None
+            and self.visual_encoder is None
         ):
             raise RuntimeError(
-                "❌ DeepLOB runtime/model required by schema, but inference runtime is unavailable."
+                f"❌ Visual runtime/model ({visual_model_type}) required by schema, but unavailable."
             )
 
         if os.path.exists(meta_path):
@@ -384,7 +416,7 @@ class V19PredictionEngine:
             'catboost_available': self.cb_advisor is not None,
             'xgboost_available': self.xgb_advisor is not None,
             'regime_available': bool(self.regime_clf._fitted),
-            'visual_available': self.cnn is not None,
+            'visual_available': self.visual_encoder is not None,
             'meta_available': self.meta is not None,
             'decision_policy_available': isinstance(self.decision_policy, dict),
             'event_gate_available': self.event_gate is not None,
@@ -535,6 +567,15 @@ class V19PredictionEngine:
         else:
             meta_df = self.regime_clf.predict_regime_meta(stat_df)
         meta_cols = list(self.regime_meta_features)
+        # Backward-compatible alias normalization between schema naming and
+        # regime classifier outputs.
+        alias_pairs = (
+            ('regime_lowliq_score', 'regime_low_liq_score'),
+            ('regime_low_liq_score', 'regime_lowliq_score'),
+        )
+        for target_col, source_col in alias_pairs:
+            if target_col in meta_cols and target_col not in meta_df.columns and source_col in meta_df.columns:
+                meta_df[target_col] = pd.to_numeric(meta_df[source_col], errors='coerce').fillna(0.0)
         missing = [col for col in meta_cols if col not in meta_df.columns]
         if missing:
             raise ValueError(
@@ -547,11 +588,11 @@ class V19PredictionEngine:
         if len(self.visual_features) == 0:
             return np.zeros((n, 0), dtype=np.float32)
 
-        if lob_tensor is None or self.cnn is None:
+        if lob_tensor is None or self.visual_encoder is None:
             return self.factory.zero_visual_embeddings(n)
 
         try:
-            emb = self.cnn.get_embeddings(lob_tensor)
+            emb = self.visual_encoder.get_embeddings(lob_tensor)
             emb = np.asarray(emb, dtype=np.float32)
             if emb.ndim == 1:
                 emb = emb.reshape(1, -1)
@@ -581,6 +622,23 @@ class V19PredictionEngine:
                 )
             cb_probs = meta_override[:, :self.base_prob_dim]
             regime_meta = meta_override[:, self.base_prob_dim:expected_dim]
+            # Defensive fallback: some legacy OOF/meta artifacts may contain
+            # all-zero base/regime blocks (or NaNs), which suppresses runtime
+            # CatBoost/XGBoost/regime signals. In that case, recompute online.
+            if cb_probs.size > 0:
+                cb_row_mass = np.abs(cb_probs).sum(axis=1)
+                cb_invalid = (~np.isfinite(cb_probs)).any(axis=1) | (cb_row_mass <= 1e-8)
+                if bool(np.any(cb_invalid)):
+                    live_cb = self._get_base_model_prob_block(base_model_X_stat)
+                    cb_probs = cb_probs.copy()
+                    cb_probs[cb_invalid] = live_cb[cb_invalid]
+            if regime_meta.size > 0 and self.regime_clf._fitted:
+                rg_row_mass = np.abs(regime_meta).sum(axis=1)
+                rg_invalid = (~np.isfinite(regime_meta)).any(axis=1) | (rg_row_mass <= 1e-8)
+                if bool(np.any(rg_invalid)):
+                    live_regime = self._get_regime_meta_block(stat_df)
+                    regime_meta = regime_meta.copy()
+                    regime_meta[rg_invalid] = live_regime[rg_invalid]
         else:
             cb_probs = self._get_base_model_prob_block(base_model_X_stat)
             regime_meta = self._get_regime_meta_block(stat_df)
@@ -879,6 +937,8 @@ class V19PredictionEngine:
         already_scaled: bool = False,
         visual_embeddings: np.ndarray | None = None,
         meta_features: np.ndarray | None = None,
+        lob_tensors: np.ndarray | None = None,
+        row_to_lob_tensor: np.ndarray | None = None,
     ) -> list[dict]:
         print(f"\n📊 V19 Backtest: {len(df):,} rows | already_scaled={already_scaled}")
         self.reset_state()
@@ -916,10 +976,17 @@ class V19PredictionEngine:
 
         results = []
         for i, (_, row) in enumerate(canonical_df.iterrows()):
+            lob_tensor = None
+            if row_to_lob_tensor is not None and lob_tensors is not None:
+                tensor_idx = int(row_to_lob_tensor[i])
+                if 0 <= tensor_idx < len(lob_tensors):
+                    lob_tensor = np.asarray(lob_tensors[tensor_idx], dtype=np.float32)
+                    row['lob_tensor_id'] = tensor_idx
             pred = self.predict_step(
                 row.to_dict(),
-                visual_embedding=visual_embeddings[i] if len(self.visual_features) else None,
+                visual_embedding=None if lob_tensor is not None else (visual_embeddings[i] if len(self.visual_features) else None),
                 meta_override=meta_features[i] if meta_features is not None else None,
+                lob_tensor=lob_tensor,
                 ts=canonical_df['ts_event'].iloc[i] if 'ts_event' in canonical_df.columns else None,
                 already_scaled=True,
             )
@@ -927,7 +994,10 @@ class V19PredictionEngine:
                 continue
 
             pred['idx'] = i
-            if len(self.visual_features):
+            if lob_tensor is not None:
+                pred['lob_tensor_id'] = int(row.get('lob_tensor_id', -1))
+                pred['entrydata_source'] = 'raw_lob_tensor'
+            if len(self.visual_features) and 'visual_norm' not in pred:
                 pred['visual_norm'] = round(float(np.linalg.norm(visual_embeddings[i])), 4)
 
             if y_bias is not None:
@@ -957,6 +1027,8 @@ def main():
     p.add_argument('--mode', choices=['backtest', 'live'], default='backtest')
     p.add_argument('--output', default='outputs_v19')
     p.add_argument('--visual_npy', default=None, help='optional precomputed visual embeddings for the same rows')
+    p.add_argument('--lob', default=None, help='optional raw lob_tensors.npy for EntryData replay')
+    p.add_argument('--lob_map_npy', default=None, help='optional row-aligned row_to_lob_tensor_id_v19.npy')
     p.add_argument('--input_scaled', action='store_true',
                    help='set this when using final stage1 artifact (already scaled)')
     args = p.parse_args()
@@ -970,7 +1042,23 @@ def main():
         visual_embeddings = None
         if args.visual_npy and os.path.exists(args.visual_npy):
             visual_embeddings = np.load(args.visual_npy)
-        results = engine.run_backtest(df, already_scaled=args.input_scaled, visual_embeddings=visual_embeddings)
+        lob_tensors = np.load(args.lob, mmap_mode='r') if args.lob and os.path.exists(args.lob) else None
+        row_to_lob = (
+            np.asarray(np.load(args.lob_map_npy), dtype=np.int32).reshape(-1)
+            if args.lob_map_npy and os.path.exists(args.lob_map_npy)
+            else (
+                pd.to_numeric(df['lob_tensor_id'], errors='coerce').fillna(-1).astype(np.int32).values
+                if 'lob_tensor_id' in df.columns
+                else None
+            )
+        )
+        results = engine.run_backtest(
+            df,
+            already_scaled=args.input_scaled,
+            visual_embeddings=visual_embeddings,
+            lob_tensors=lob_tensors,
+            row_to_lob_tensor=row_to_lob,
+        )
 
         os.makedirs(args.output, exist_ok=True)
         out_csv = os.path.join(args.output, 'v19_backtest_results.csv')

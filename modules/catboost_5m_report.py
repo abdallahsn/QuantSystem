@@ -864,8 +864,8 @@ def _build_dashboard(bars: pd.DataFrame, stats: dict, mbo: pd.DataFrame | None =
         mbo["size"] = pd.to_numeric(mbo["size"], errors="coerce").fillna(0.0)
         mbo = mbo[mbo["action"].astype(str).str.upper().isin({"T", "F", "TRADE"})].copy()
         sides = mbo["side"].astype(str).str.upper()
-        buy_mbo = mbo[sides.isin({"B", "BID"})]
-        sell_mbo = mbo[sides.isin({"A", "ASK", "S", "SELL"})]
+        buy_mbo = mbo[sides.isin({"A", "ASK", "BUY", "BOT"})]
+        sell_mbo = mbo[sides.isin({"B", "BID", "S", "SELL"})]
 
         if len(buy_mbo) > 0:
             fig.add_trace(

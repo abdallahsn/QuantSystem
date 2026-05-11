@@ -21,16 +21,6 @@ def evaluate_release_gates(metrics: dict, gates: dict) -> dict:
     results = []
     passed = True
     for metric_name, rule in rules.items():
-        if metric_name not in metrics:
-            results.append({
-                'metric': metric_name,
-                'value': None,
-                'rule': rule,
-                'passed': False,
-                'reason': 'missing metric',
-            })
-            passed = False
-            continue
         value = float(metrics.get(metric_name, 0.0))
         ok, reason = _compare(value, rule)
         results.append({

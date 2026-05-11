@@ -203,8 +203,6 @@ def _simulate_trade_path(
     entry_idx: int,
     direction: str,
     prices: np.ndarray,
-    highs: np.ndarray | None,
-    lows: np.ndarray | None,
     horizons: np.ndarray,
     micro_atr: np.ndarray,
     tick_size: float,
@@ -225,10 +223,6 @@ def _simulate_trade_path(
         return None
     if entry_idx < 0 or entry_idx >= len(prices):
         return None
-    highs = prices if highs is None else np.asarray(highs, dtype=np.float64)
-    lows = prices if lows is None else np.asarray(lows, dtype=np.float64)
-    if len(highs) != len(prices) or len(lows) != len(prices):
-        highs = lows = prices
 
     entry_price = float(prices[entry_idx])
     if not np.isfinite(entry_price) or entry_price <= 0:
@@ -314,49 +308,28 @@ def _simulate_trade_path(
 
     # ── Replay المسار الزمني ───────────────────────────────────────────
     future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
-    future_highs = np.asarray(highs[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
-    future_lows = np.asarray(lows[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
     if future_prices.size == 0:
         return None
 
     exit_idx = exit_cap_idx
     exit_reason = 'horizon'
-    exit_price = float(prices[exit_idx])
-    for offset, (future_high, future_low) in enumerate(zip(future_highs, future_lows), start=1):
+    for offset, future_price in enumerate(future_prices, start=1):
         if direction == 'LONG':
-            hit_tp = float(future_high) >= float(tp_level)
-            hit_sl = float(future_low) <= float(sl_level)
-            if hit_tp or hit_sl:
-                exit_idx = entry_idx + offset
-                if hit_sl:
-                    exit_reason = 'sl'
-                    exit_price = float(sl_level)
-                else:
-                    exit_reason = 'tp'
-                    exit_price = float(tp_level)
-                break
+            if future_price >= tp_level:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
+            if future_price <= sl_level:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
         else:
-            hit_tp = float(future_low) <= float(tp_level)
-            hit_sl = float(future_high) >= float(sl_level)
-            if hit_tp or hit_sl:
-                exit_idx = entry_idx + offset
-                if hit_sl:
-                    exit_reason = 'sl'
-                    exit_price = float(sl_level)
-                else:
-                    exit_reason = 'tp'
-                    exit_price = float(tp_level)
-                break
+            if future_price <= tp_level:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
+            if future_price >= sl_level:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
 
-    if exit_reason == 'horizon':
-        exit_price = float(prices[exit_idx])
+    exit_price = float(prices[exit_idx])
     price_return   = (exit_price - entry_price) if direction == 'LONG' else (entry_price - exit_price)
-    if direction == 'LONG':
-        favourable_move = float(np.nanmax(future_highs - entry_price)) if future_highs.size else 0.0
-        adverse_move = float(np.nanmin(future_lows - entry_price)) if future_lows.size else 0.0
-    else:
-        favourable_move = float(np.nanmax(entry_price - future_lows)) if future_lows.size else 0.0
-        adverse_move = float(np.nanmin(entry_price - future_highs)) if future_highs.size else 0.0
+    path_moves     = (future_prices - entry_price) if direction == 'LONG' else (entry_price - future_prices)
+    favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
+    adverse_move    = float(np.min(path_moves)) if path_moves.size else 0.0
 
     return {
         'exit_idx':    int(exit_idx),
@@ -764,6 +737,112 @@ def _load_visual_embeddings(
     )
 
 
+def _load_lob_entrydata(
+    df: pd.DataFrame,
+    *,
+    lob_path: str | None = None,
+    lob_ts_path: str | None = None,
+    lob_map_path: str | None = None,
+    data_path: str | None = None,
+    models_dir: str | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
+    """Load raw LOB tensors and row->tensor mapping for EntryData replay."""
+    diagnostics = {
+        'entrydata_enabled': False,
+        'lob_path': None,
+        'lob_map_source': None,
+        'rows_with_lob_tensor': 0,
+    }
+
+    candidate_lob = lob_path
+    if candidate_lob is None and data_path:
+        try:
+            root = resolve_artifact_root(data_path)
+            p = os.path.join(root, 'lob_tensors.npy')
+            candidate_lob = p if os.path.exists(p) else None
+            if lob_ts_path is None:
+                ts_p = os.path.join(root, 'lob_tensor_timestamps.npy')
+                lob_ts_path = ts_p if os.path.exists(ts_p) else None
+        except Exception:
+            candidate_lob = None
+
+    if not candidate_lob or not os.path.exists(candidate_lob):
+        return None, None, diagnostics
+
+    tensors = np.load(candidate_lob, mmap_mode='r')
+    n = len(df)
+    row_to_tensor = None
+
+    if lob_map_path and os.path.exists(lob_map_path):
+        row_to_tensor = np.asarray(np.load(lob_map_path), dtype=np.int32).reshape(-1)
+        diagnostics['lob_map_source'] = lob_map_path
+    elif models_dir:
+        default_map = os.path.join(models_dir, 'row_to_lob_tensor_id_v19.npy')
+        if os.path.exists(default_map):
+            candidate = np.asarray(np.load(default_map), dtype=np.int32).reshape(-1)
+            if len(candidate) == n:
+                row_to_tensor = candidate
+                diagnostics['lob_map_source'] = default_map
+
+    if row_to_tensor is None and 'lob_tensor_id' in df.columns:
+        row_to_tensor = pd.to_numeric(df['lob_tensor_id'], errors='coerce').fillna(-1).astype(np.int32).values
+        diagnostics['lob_map_source'] = 'df.lob_tensor_id'
+
+    if row_to_tensor is None and lob_ts_path and os.path.exists(lob_ts_path):
+        ts_raw = np.load(lob_ts_path)
+        lob_ts = pd.to_datetime(ts_raw.astype(np.int64), unit='ns', utc=True, errors='coerce').tz_localize(None)
+        n_lob = min(len(lob_ts), len(tensors))
+        row_ts = pd.to_datetime(
+            df.get('ts_event', pd.Series([pd.NaT] * n)),
+            utc=True,
+            errors='coerce',
+        ).dt.tz_localize(None)
+        row_df = pd.DataFrame({'ts_event': row_ts, 'row_idx': np.arange(n, dtype=np.int32)})
+        lob_df = pd.DataFrame({
+            'ts_event': pd.Series(lob_ts).iloc[:n_lob],
+            'tensor_idx': np.arange(n_lob, dtype=np.int32),
+        }).dropna(subset=['ts_event']).sort_values('ts_event')
+        merged = pd.merge_asof(
+            row_df.sort_values('ts_event'),
+            lob_df,
+            on='ts_event',
+            direction='backward',
+            tolerance=pd.Timedelta('10min'),
+        ).sort_values('row_idx')
+        row_to_tensor = merged['tensor_idx'].fillna(-1).astype(np.int32).values
+        diagnostics['lob_map_source'] = f'timestamp_asof:{lob_ts_path}'
+
+    if row_to_tensor is None:
+        return tensors, None, diagnostics
+
+    if len(row_to_tensor) != n:
+        print(
+            "  ⚠️ EntryData LOB map row mismatch: "
+            f"map={len(row_to_tensor):,}, rows={n:,}; disabling raw LOB replay.",
+            flush=True,
+        )
+        return tensors, None, diagnostics
+
+    valid = (row_to_tensor >= 0) & (row_to_tensor < len(tensors))
+    diagnostics.update(
+        {
+            'entrydata_enabled': bool(valid.any()),
+            'lob_path': str(candidate_lob),
+            'rows_with_lob_tensor': int(valid.sum()),
+            'rows_total': int(n),
+            'coverage_ratio': float(valid.mean()) if n else 0.0,
+        }
+    )
+    if valid.any():
+        print(
+            "  ✅ EntryData raw LOB enabled: "
+            f"{int(valid.sum()):,}/{n:,} rows ({float(valid.mean()):.1%}) "
+            f"| source={diagnostics['lob_map_source']}",
+            flush=True,
+        )
+    return tensors, row_to_tensor, diagnostics
+
+
 def _load_meta_features(
     df: pd.DataFrame,
     explicit_path: str | None,
@@ -1095,12 +1174,9 @@ def run_causal_backtest(
     policy_min_edge: float | None = None,
     skip_event_gate: bool = False,
     long_only: bool = False,
+    lob_tensors: np.ndarray | None = None,
+    row_to_lob_tensor: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    if allow_oracle_forward_return:
-        raise ValueError(
-            '❌ Oracle forward_return replay is disabled for production/research metrics. '
-            'Run a separate diagnostic-only script if you need label sanity checks.'
-        )
     engine = V19PredictionEngine(
         models_dir,
         run_mode='backtest',
@@ -1117,25 +1193,8 @@ def run_causal_backtest(
     print(f"  [backtest] Building replay feature frame ({len(df):,} rows, input_scaled={input_scaled})...", flush=True)
     t_pf0 = time.perf_counter()
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
-    for ohlc_col in ('open', 'high', 'low', 'close'):
-        if ohlc_col not in replay_df.columns and ohlc_col in df.columns:
-            replay_df[ohlc_col] = pd.to_numeric(df[ohlc_col], errors='coerce').to_numpy(dtype=np.float64)
     print(f"  [backtest] replay_df ready: {replay_df.shape[0]:,} x {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
     price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
-    high_arr = _series_or_default(
-        replay_df,
-        'raw__high' if 'raw__high' in replay_df.columns else ('high' if 'high' in replay_df.columns else 'price'),
-        0.0,
-        dtype=np.float64,
-    ).values
-    low_arr = _series_or_default(
-        replay_df,
-        'raw__low' if 'raw__low' in replay_df.columns else ('low' if 'low' in replay_df.columns else 'price'),
-        0.0,
-        dtype=np.float64,
-    ).values
-    high_arr = np.where(np.isfinite(high_arr) & (high_arr > 0), high_arr, price_arr)
-    low_arr = np.where(np.isfinite(low_arr) & (low_arr > 0), low_arr, price_arr)
     horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
     if 'raw__micro_atr' in replay_df.columns:
         micro_atr_arr = _series_or_default(replay_df, 'raw__micro_atr', 0.0, dtype=np.float64).values
@@ -1207,11 +1266,18 @@ def run_causal_backtest(
             active_trade = None
             cooldown_until = i + max(int(cooldown_rows), 0)
 
-        visual = visual_embeddings[i] if visual_embeddings.size else None
+        lob_tensor = None
+        if row_to_lob_tensor is not None and lob_tensors is not None:
+            tensor_idx = int(row_to_lob_tensor[i])
+            if 0 <= tensor_idx < len(lob_tensors):
+                lob_tensor = np.asarray(lob_tensors[tensor_idx], dtype=np.float32)
+                row['lob_tensor_id'] = tensor_idx
+        visual = None if lob_tensor is not None else (visual_embeddings[i] if visual_embeddings.size else None)
         pred = engine.predict_step(
             row,
             visual_embedding=visual,
             meta_override=meta_features[i] if meta_features is not None else None,
+            lob_tensor=lob_tensor,
             ts=ts,
             already_scaled=True,
         )
@@ -1226,6 +1292,9 @@ def run_causal_backtest(
         pred['idx'] = i
         pred['ts_event'] = str(ts) if ts is not None and not pd.isna(ts) else ''
         pred['price'] = _safe_float(row.get('price', 0.0))
+        if lob_tensor is not None:
+            pred['lob_tensor_id'] = int(row.get('lob_tensor_id', -1))
+            pred['entrydata_source'] = 'raw_lob_tensor'
 
         if has_labels:
             true_bias = int(row.get('bias_label', 2))
@@ -1273,8 +1342,6 @@ def run_causal_backtest(
                 entry_idx=entry_idx,
                 direction=direction,
                 prices=price_arr,
-                highs=high_arr,
-                lows=low_arr,
                 horizons=horizon_arr,
                 micro_atr=micro_atr_arr,
                 tick_size=tick_size,
@@ -1287,6 +1354,20 @@ def run_causal_backtest(
             )
 
             pnl_source = 'path_replay'
+            if trade_path is None and allow_oracle_forward_return and source_has_fwd:
+                forward_return = _safe_float(row.get('forward_return', 0.0))
+                trade_path = {
+                    'exit_idx': min(i + max(_safe_int(row.get('label_horizon_steps', 1), 1), 1), len(replay_df) - 1),
+                    'exit_price': _safe_float(row.get('price', 0.0)) + (forward_return if direction == 'LONG' else -forward_return),
+                    'exit_reason': 'oracle_forward_return',
+                    'hold_steps': max(_safe_int(row.get('label_horizon_steps', 1), 1), 1),
+                    'price_return': forward_return if direction == 'LONG' else -forward_return,
+                    'raw_pnl_pips': (forward_return / tick_size) if direction == 'LONG' else (-forward_return / tick_size),
+                    'mfe_pips': 0.0,
+                    'mae_pips': 0.0,
+                }
+                pnl_source = 'oracle_forward_return'
+
             if trade_path is None:
                 skipped_trade_replays += 1
                 pred['trade_skip_reason'] = 'missing_exit_path'
@@ -1432,6 +1513,9 @@ def run_causal_backtest(
         'score_end_ts': None if score_end_ts is None else str(score_end_ts),
         'visual_coverage': float(visual_diag.get('coverage_ratio', 0.0)),
         'visual_diagnostics': visual_diag,
+        'entrydata_raw_lob_rows': int(
+            (results_df.get('entrydata_source', pd.Series(dtype=object)) == 'raw_lob_tensor').sum()
+        ) if len(results_df) else 0,
         'long_only': bool(long_only),
         'max_horizon_steps': None if max_horizon_steps is None else int(max_horizon_steps),
         'replay_horizon_steps': None if replay_horizon_steps is None else int(replay_horizon_steps),
@@ -1510,6 +1594,27 @@ def main():
     p.add_argument('--output', default='outputs_v19', help='backtest output directory')
     p.add_argument('--visual_npy', default=None, help='optional row-aligned visual embeddings file')
     p.add_argument('--meta_npy', default=None, help='optional row-aligned stage-1 meta features file')
+    p.add_argument('--lob', default=None, help='optional raw lob_tensors.npy for EntryData replay')
+    p.add_argument('--lob_ts', default=None, help='optional lob_tensor_timestamps.npy for timestamp EntryData alignment')
+    p.add_argument('--lob_map_npy', default=None, help='optional row-aligned row_to_lob_tensor_id_v19.npy')
+    p.add_argument(
+        '--live_like_runtime_inputs',
+        action='store_true',
+        help=(
+            'disable auto OOF meta/visual artifacts so backtest uses runtime-computed '
+            'tree/regime surfaces (closest to live behavior on the same feature rows)'
+        ),
+    )
+    p.add_argument(
+        '--disable_auto_oof_meta',
+        action='store_true',
+        help='do not auto-load meta_features_oof_v19.npy when --meta_npy is omitted',
+    )
+    p.add_argument(
+        '--disable_auto_visual_artifact',
+        action='store_true',
+        help='do not auto-load cached visual embeddings when --visual_npy is omitted',
+    )
     p.add_argument('--allow_in_sample_live_meta_override', action='store_true',
                    help='dangerous: allow explicit live/final-fit meta features on labeled backtest data')
     p.add_argument('--allow_in_sample_data_override', action='store_true',
@@ -1682,16 +1787,25 @@ def main():
         policy_edge_prob_override=args.policy_min_edge,
         skip_event_gate=args.skip_event_gate,
     )
+    disable_auto_meta = bool(args.disable_auto_oof_meta or args.live_like_runtime_inputs)
+    disable_auto_visual = bool(args.disable_auto_visual_artifact or args.live_like_runtime_inputs)
+    if args.live_like_runtime_inputs:
+        print(
+            "  [backtest] live_like_runtime_inputs=True → disable auto OOF meta/visual surfaces "
+            "(runtime tree/regime inference path).",
+            flush=True,
+        )
+    visual_default_path = None if disable_auto_visual else engine.visual_emb_path
     visual_full = _load_visual_embeddings(
         df_aligned,
         explicit_path=args.visual_npy,
-        default_path=engine.visual_emb_path,
+        default_path=visual_default_path,
         expected_dim=len(engine.visual_features),
         models_dir=args.models,
     )
 
     meta_path = args.meta_npy
-    if meta_path is None:
+    if meta_path is None and not disable_auto_meta:
         default_meta_oof = os.path.join(args.models, 'meta_features_oof_v19.npy')
         if os.path.exists(default_meta_oof):
             meta_path = default_meta_oof
@@ -1702,6 +1816,14 @@ def main():
         expected_dim=len(engine.meta_features),
         allow_in_sample_live_override=args.allow_in_sample_live_meta_override,
     )
+    lob_tensors, row_to_lob_tensor, entrydata_diag = _load_lob_entrydata(
+        df_aligned,
+        lob_path=args.lob,
+        lob_ts_path=args.lob_ts,
+        lob_map_path=args.lob_map_npy,
+        data_path=args.data,
+        models_dir=args.models,
+    )
 
     _, _, summary = run_causal_backtest(
         df=df_aligned,
@@ -1710,6 +1832,8 @@ def main():
         visual_embeddings=visual_full,
         meta_features=meta_full,
         input_scaled=args.input_scaled,
+        lob_tensors=lob_tensors,
+        row_to_lob_tensor=row_to_lob_tensor,
         tick_size=args.tick_size,
         tick_value=args.tick_value,
         round_trip_cost_pips=args.round_trip_cost_pips,
@@ -1737,6 +1861,7 @@ def main():
         long_only=args.long_only,
     )
     summary['oos_guard'] = oos_guard
+    summary['entrydata'] = entrydata_diag
     summary['backtest_window'] = {
         'aligned_start_ts': align_start_ts,
         'aligned_end_ts': align_end_ts,
@@ -1756,6 +1881,16 @@ def main():
             'else --fixed_horizon overrides. Align minutes: horizon_bars * bar_minutes.'
         ),
     }
+    summary['runtime_input_mode'] = {
+        'live_like_runtime_inputs': bool(args.live_like_runtime_inputs),
+        'disable_auto_oof_meta': bool(disable_auto_meta),
+        'disable_auto_visual_artifact': bool(disable_auto_visual),
+        'meta_path': None if meta_path is None else str(meta_path),
+        'visual_path': None if args.visual_npy is None else str(args.visual_npy),
+    }
+    os.makedirs(args.output, exist_ok=True)
+    with open(os.path.join(args.output, 'backtest_v19_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
 
     print("\n[backtest] V19 causal backtest complete")
     print(json.dumps(summary, indent=2))

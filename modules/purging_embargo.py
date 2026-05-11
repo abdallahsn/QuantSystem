@@ -57,14 +57,13 @@ def walk_forward_expanding(
     test_n = max(1, int(n_samples * test_size))
     min_train = max(int(n_samples * min_train_pct), int(min_train_rows))
     min_train = min(min_train, max(test_n + 50, n_samples - test_n))
-    if n_samples <= min_train:
+    tail_n = max(0, n_samples - min_train)
+    effective_folds = max(int(n_folds), int(np.ceil(tail_n / max(test_n, 1))))
+    if tail_n <= 0:
         return
 
     tail_idx = np.arange(min_train, n_samples, dtype=np.int64)
-    # Respect the caller's fold cap as a hard upper bound. Any adaptive reduction
-    # is decided upstream in build_time_splits(); this layer should never expand
-    # the fold count again and silently create smaller test windows.
-    effective_folds = min(max(int(n_folds), 1), len(tail_idx))
+    effective_folds = min(max(effective_folds, 1), len(tail_idx))
     test_blocks = [block for block in np.array_split(tail_idx, effective_folds) if len(block) > 0]
 
     for test_idx in test_blocks:

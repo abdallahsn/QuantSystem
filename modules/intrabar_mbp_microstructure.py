@@ -5,6 +5,7 @@ import pandas as pd
 
 
 MBP_LEVELS_DEFAULT = 10
+MBP_INTRABAR_SLICES_DEFAULT = 12
 
 
 def _to_dt64_ns(s: pd.Series) -> pd.Series:
@@ -37,7 +38,7 @@ def enrich_bars_with_intrabar_mbp(
     df_mbp: pd.DataFrame,
     *,
     freq: str = "5min",
-    n_slices: int = 6,
+    n_slices: int = MBP_INTRABAR_SLICES_DEFAULT,
     levels: int = MBP_LEVELS_DEFAULT,
 ) -> pd.DataFrame:
     """
@@ -85,8 +86,9 @@ def enrich_bars_with_intrabar_mbp(
 
     ts = mbp["ts_event"].to_numpy(dtype="datetime64[ns]", copy=False)
 
+    n_slices_eff = int(max(int(n_slices), 2))
     bar_delta = pd.to_timedelta(freq)
-    slice_ns = int((bar_delta / max(int(n_slices), 1)).total_seconds() * 1e9)
+    slice_ns = int((bar_delta / n_slices_eff).total_seconds() * 1e9)
     bar_starts = _to_dt64_ns(bars["ts_event"]).to_numpy(dtype="datetime64[ns]", copy=False)
 
     # outputs (max/volatility-aware)
@@ -122,23 +124,23 @@ def enrich_bars_with_intrabar_mbp(
             missing_bar += 1
             continue
         idx = np.flatnonzero(m)
-        sid = _slice_ids(ts[idx], t0, slice_ns, int(n_slices))
+        sid = _slice_ids(ts[idx], t0, slice_ns, n_slices_eff)
 
         # slice aggregations
-        sp_s = np.zeros(int(n_slices), dtype=np.float64)
-        imb_s = np.zeros(int(n_slices), dtype=np.float64)
-        bd_s = np.zeros(int(n_slices), dtype=np.float64)
-        ad_s = np.zeros(int(n_slices), dtype=np.float64)
-        mpdev_s = np.zeros(int(n_slices), dtype=np.float64)
-        bw_s = np.zeros(int(n_slices), dtype=np.float64)
-        aw_s = np.zeros(int(n_slices), dtype=np.float64)
+        sp_s = np.zeros(n_slices_eff, dtype=np.float64)
+        imb_s = np.zeros(n_slices_eff, dtype=np.float64)
+        bd_s = np.zeros(n_slices_eff, dtype=np.float64)
+        ad_s = np.zeros(n_slices_eff, dtype=np.float64)
+        mpdev_s = np.zeros(n_slices_eff, dtype=np.float64)
+        bw_s = np.zeros(n_slices_eff, dtype=np.float64)
+        aw_s = np.zeros(n_slices_eff, dtype=np.float64)
 
         bid_slope_acc = 0.0
         ask_slope_acc = 0.0
         accel_acc = 0.0
         used_slices = 0
 
-        for s in range(int(n_slices)):
+        for s in range(n_slices_eff):
             sm = sid == s
             if not np.any(sm):
                 continue
@@ -155,7 +157,10 @@ def enrich_bars_with_intrabar_mbp(
             bid_slope_acc += _depth_slope(bd_slice)
             ask_slope_acc += _depth_slope(ad_slice)
             if bd_slice.size > 1:
-                accel_acc += abs(float(bd_slice[-1] - bd_slice[0]))
+                # اتجاهي: موجب = تراكم bid depth مقابل ask depth، سالب = سحب سيولة.
+                bid_delta = float(bd_slice[-1] - bd_slice[0])
+                ask_delta = float(ad_slice[-1] - ad_slice[0])
+                accel_acc += (bid_delta - ask_delta)
             used_slices += 1
 
         denom_slices = float(max(used_slices, 1))

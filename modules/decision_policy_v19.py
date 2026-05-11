@@ -4,17 +4,14 @@ decision_policy_v19.py - Cost-aware decision policy helpers for QuantSystem V19
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-POLICY_VERSION = "v19-cost-aware-v2"
-DEFAULT_DECISION_POLICY_ARTIFACT = "decision_policy_v2.json"
-LEGACY_DECISION_POLICY_ARTIFACT = "decision_policy_v19.json"
+POLICY_VERSION = "v19-cost-aware-v1"
+DEFAULT_DECISION_POLICY_ARTIFACT = "decision_policy_v19.json"
 MIN_POLICY_SUPPORT = 24
 MIN_POLICY_COVERAGE_RATIO = 0.50
 
@@ -130,27 +127,7 @@ def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
     return float(np.sum(values * np.clip(weights, 0.0, None)) / weight_sum)
 
 
-def _cost_model_hash(cost_config: dict | None = None, replay_config: dict | None = None) -> str:
-    payload = {
-        "cost": dict(cost_config or {}),
-        "replay": dict(replay_config or {}),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def compute_policy_cost_model_hash(cost_config: dict | None = None, replay_config: dict | None = None) -> str:
-    return _cost_model_hash(cost_config, replay_config)
-
-
-def _side_stats(
-    frame: pd.DataFrame,
-    side_label: int,
-    cost_pips: float,
-    side_probs: np.ndarray | None = None,
-    *,
-    allow_forward_return_fallback: bool = False,
-) -> dict:
+def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_probs: np.ndarray | None = None) -> dict:
     if frame.empty:
         baseline = max(float(cost_pips), 1.0)
         threshold = (baseline + float(cost_pips)) / max(2.0 * baseline + float(cost_pips), 1e-8)
@@ -166,8 +143,13 @@ def _side_stats(
             "avg_abs_return_pips": float(baseline),
         }
 
-    realized_col = "_realized_long_net_pnl_pips" if int(side_label) == 0 else "_realized_short_net_pnl_pips"
-    realized_valid_col = "_realized_long_valid" if int(side_label) == 0 else "_realized_short_valid"
+    if "_abs_forward_pips" in frame.columns:
+        forward_pips = pd.to_numeric(frame["_abs_forward_pips"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    else:
+        forward_pips = np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+        tick_size = max(_safe_float(frame.attrs.get("tick_size", 1.0), 1.0), 1e-8)
+        forward_pips = forward_pips / tick_size
+    labels = pd.to_numeric(frame.get("bias_label", 1), errors="coerce").fillna(1).astype(np.int32).to_numpy()
     covered = pd.to_numeric(frame.get("policy_covered", 0), errors="coerce").fillna(0).astype(np.int8).to_numpy()
     weights = (
         np.clip(np.asarray(side_probs, dtype=np.float64).reshape(-1), 0.0, 1.0)
@@ -177,49 +159,10 @@ def _side_stats(
     if len(weights) != len(frame):
         raise ValueError(f"side_probs length mismatch: {len(weights)} vs {len(frame)}")
 
-    if realized_col in frame.columns:
-        realized_pnl = pd.to_numeric(frame.get(realized_col), errors="coerce").to_numpy(dtype=np.float64)
-        valid_mask = (
-            pd.to_numeric(frame.get(realized_valid_col), errors="coerce").fillna(0).astype(np.int8).to_numpy() > 0
-            if realized_valid_col in frame.columns
-            else np.isfinite(realized_pnl)
-        )
-        realized_pnl = np.where(valid_mask, realized_pnl, np.nan)
-        abs_pips = np.abs(np.where(np.isfinite(realized_pnl), realized_pnl, 0.0))
-        win_mask = valid_mask & np.isfinite(realized_pnl) & (realized_pnl > 0.0)
-        loss_mask = valid_mask & np.isfinite(realized_pnl) & (realized_pnl < 0.0)
-        avg_win = _weighted_mean(realized_pnl[win_mask], weights[win_mask]) if np.any(win_mask) else 0.0
-        avg_loss = _weighted_mean(np.abs(realized_pnl[loss_mask]), weights[loss_mask]) if np.any(loss_mask) else 0.0
-        realized_prior = _weighted_mean(win_mask.astype(np.float32), weights) if np.any(valid_mask) else 0.5
-    else:
-        if not bool(allow_forward_return_fallback):
-            baseline = max(float(cost_pips), 1.0)
-            threshold = (baseline + float(cost_pips)) / max(2.0 * baseline + float(cost_pips), 1e-8)
-            return {
-                "support": int(len(frame)),
-                "weighted_support": float(np.sum(weights)),
-                "win_support": 0,
-                "loss_support": 0,
-                "coverage_ratio": float(np.mean(covered.astype(np.float32))) if len(covered) else 0.0,
-                "avg_win_pips": float(baseline),
-                "avg_loss_pips": float(baseline),
-                "threshold_from_cost": float(np.clip(threshold, 0.0, 1.0)),
-                "realized_prior": 0.5,
-                "avg_abs_return_pips": float(baseline),
-                "stats_source": "cost_floor_no_realized_replay",
-            }
-        if "_abs_forward_pips" in frame.columns:
-            abs_pips = pd.to_numeric(frame["_abs_forward_pips"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-        else:
-            abs_pips = np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
-            tick_size = max(_safe_float(frame.attrs.get("tick_size", 1.0), 1.0), 1e-8)
-            abs_pips = abs_pips / tick_size
-        labels = pd.to_numeric(frame.get("bias_label", 1), errors="coerce").fillna(1).astype(np.int32).to_numpy()
-        win_mask = labels == int(side_label)
-        loss_mask = labels == int(1 - side_label)
-        avg_win = _weighted_mean(abs_pips[win_mask], weights[win_mask]) if np.any(win_mask) else 0.0
-        avg_loss = _weighted_mean(abs_pips[loss_mask], weights[loss_mask]) if np.any(loss_mask) else 0.0
-        realized_prior = _weighted_mean(win_mask.astype(np.float32), weights) if len(win_mask) else 0.5
+    win_mask = labels == int(side_label)
+    loss_mask = labels == int(1 - side_label)
+    avg_win = _weighted_mean(forward_pips[win_mask], weights[win_mask]) if np.any(win_mask) else 0.0
+    avg_loss = _weighted_mean(forward_pips[loss_mask], weights[loss_mask]) if np.any(loss_mask) else 0.0
     baseline = max(float(cost_pips), 1.0)
     avg_win = max(avg_win, baseline)
     avg_loss = max(avg_loss, baseline)
@@ -234,9 +177,8 @@ def _side_stats(
         "avg_win_pips": float(avg_win),
         "avg_loss_pips": float(avg_loss),
         "threshold_from_cost": float(np.clip(threshold, 0.0, 1.0)),
-        "realized_prior": float(realized_prior),
-        "avg_abs_return_pips": _weighted_mean(abs_pips, weights) if len(abs_pips) else float(baseline),
-        "stats_source": "realized_execution" if realized_col in frame.columns else "forward_return_diagnostic",
+        "realized_prior": _weighted_mean(win_mask.astype(np.float32), weights) if len(win_mask) else 0.5,
+        "avg_abs_return_pips": _weighted_mean(forward_pips, weights) if len(forward_pips) else float(baseline),
     }
 
 
@@ -250,9 +192,6 @@ def build_decision_policy(
     source: str = "stage1_oof",
     min_support: int = MIN_POLICY_SUPPORT,
     min_coverage_ratio: float = MIN_POLICY_COVERAGE_RATIO,
-    calibration_source: str = "realized_execution_oof",
-    cost_model_hash: str | None = None,
-    policy_build_window: dict | None = None,
 ) -> dict:
     frame = df.copy().reset_index(drop=True)
     probs = np.asarray(bias_probs, dtype=np.float64)
@@ -263,10 +202,6 @@ def build_decision_policy(
         return {
             "policy_version": POLICY_VERSION,
             "source": str(source),
-            "calibration_source": str(calibration_source),
-            "cost_model_hash": str(cost_model_hash or _cost_model_hash(cost_config, None)),
-            "policy_build_window": dict(policy_build_window or {}),
-            "stats_are_net_of_costs": bool(str(calibration_source).strip().lower() == "realized_execution_oof"),
             "coverage_ratio": 0.0,
             "minimum_support": int(min_support),
             "minimum_coverage_ratio": float(min_coverage_ratio),
@@ -293,32 +228,15 @@ def build_decision_policy(
     frame["dominant_regime"] = np.argmax(regime_arr[:, :4], axis=1).astype(np.int32)
     frame["prob_long"] = np.clip(probs[:, 0], 0.0, 1.0)
     frame["prob_short"] = np.clip(probs[:, 1], 0.0, 1.0)
-    allow_forward_return_fallback = str(calibration_source).strip().lower() in {
-        "forward_return_labels",
-        "diagnostic_forward_return",
-    }
-    if allow_forward_return_fallback:
-        tick_size = max(_safe_float((cost_config or {}).get("tick_size", 1.0), 1.0), 1e-8)
-        frame["_abs_forward_pips"] = (
-            np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
-            / tick_size
-        )
+    tick_size = max(_safe_float((cost_config or {}).get("tick_size", 1.0), 1.0), 1e-8)
+    frame["_abs_forward_pips"] = (
+        np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+        / tick_size
+    )
 
     global_block = {
-        "LONG": _side_stats(
-            frame,
-            0,
-            cost_model["effective_cost_pips"],
-            frame["prob_long"].to_numpy(dtype=np.float64),
-            allow_forward_return_fallback=allow_forward_return_fallback,
-        ),
-        "SHORT": _side_stats(
-            frame,
-            1,
-            cost_model["effective_cost_pips"],
-            frame["prob_short"].to_numpy(dtype=np.float64),
-            allow_forward_return_fallback=allow_forward_return_fallback,
-        ),
+        "LONG": _side_stats(frame, 0, cost_model["effective_cost_pips"], frame["prob_long"].to_numpy(dtype=np.float64)),
+        "SHORT": _side_stats(frame, 1, cost_model["effective_cost_pips"], frame["prob_short"].to_numpy(dtype=np.float64)),
     }
 
     structures: dict[str, dict[str, Any]] = {}
@@ -327,20 +245,8 @@ def build_decision_policy(
             "support": int(len(bucket_df)),
             "coverage_ratio": float(bucket_df["policy_covered"].mean()) if len(bucket_df) else 0.0,
             "global": {
-                "LONG": _side_stats(
-                    bucket_df,
-                    0,
-                    cost_model["effective_cost_pips"],
-                    bucket_df["prob_long"].to_numpy(dtype=np.float64),
-                    allow_forward_return_fallback=allow_forward_return_fallback,
-                ),
-                "SHORT": _side_stats(
-                    bucket_df,
-                    1,
-                    cost_model["effective_cost_pips"],
-                    bucket_df["prob_short"].to_numpy(dtype=np.float64),
-                    allow_forward_return_fallback=allow_forward_return_fallback,
-                ),
+                "LONG": _side_stats(bucket_df, 0, cost_model["effective_cost_pips"], bucket_df["prob_long"].to_numpy(dtype=np.float64)),
+                "SHORT": _side_stats(bucket_df, 1, cost_model["effective_cost_pips"], bucket_df["prob_short"].to_numpy(dtype=np.float64)),
             },
             "by_regime": {},
         }
@@ -357,10 +263,6 @@ def build_decision_policy(
     out_pol = {
         "policy_version": POLICY_VERSION,
         "source": str(source),
-        "calibration_source": str(calibration_source),
-        "cost_model_hash": str(cost_model_hash or _cost_model_hash(cost_config, None)),
-        "policy_build_window": dict(policy_build_window or {}),
-        "stats_are_net_of_costs": bool(str(calibration_source).strip().lower() == "realized_execution_oof"),
         "coverage_ratio": float(np.mean(coverage.astype(np.float32))) if len(coverage) else 0.0,
         "minimum_support": int(min_support),
         "minimum_coverage_ratio": float(min_coverage_ratio),
@@ -450,10 +352,8 @@ def evaluate_decision_policy(
     long_side = _resolve_side_policy(policy, "LONG", structure_bucket, regime_arr)
     short_side = _resolve_side_policy(policy, "SHORT", structure_bucket, regime_arr)
     cost_pips = _safe_float(((policy.get("cost_model") or {}).get("effective_cost_pips")), 0.0)
-    stats_are_net_of_costs = bool(policy.get("stats_are_net_of_costs", False))
-    applied_cost_term = 0.0 if stats_are_net_of_costs else cost_pips
-    ev_long = p_long * _safe_float(long_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_long) * _safe_float(long_side.get("avg_loss_pips", 0.0), 0.0) - applied_cost_term
-    ev_short = p_short * _safe_float(short_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_short) * _safe_float(short_side.get("avg_loss_pips", 0.0), 0.0) - applied_cost_term
+    ev_long = p_long * _safe_float(long_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_long) * _safe_float(long_side.get("avg_loss_pips", 0.0), 0.0) - cost_pips
+    ev_short = p_short * _safe_float(short_side.get("avg_win_pips", 0.0), 0.0) - (1.0 - p_short) * _safe_float(short_side.get("avg_loss_pips", 0.0), 0.0) - cost_pips
     effective_coverage = float(policy.get("coverage_ratio", 0.0)) if coverage_ratio is None else float(coverage_ratio)
     coverage_ok = effective_coverage >= _safe_float(policy.get("minimum_coverage_ratio", MIN_POLICY_COVERAGE_RATIO), MIN_POLICY_COVERAGE_RATIO)
     runtime_penalty = _clip01(runtime_penalty)
@@ -475,8 +375,6 @@ def evaluate_decision_policy(
         "regime_entropy": float(regime_entropy),
         "regime_entropy_blend": float(entropy_blend),
         "cost_pips": float(cost_pips),
-        "cost_term_applied_pips": float(applied_cost_term),
-        "stats_are_net_of_costs": bool(stats_are_net_of_costs),
         "expected_value_long_pips": float(ev_long),
         "expected_value_short_pips": float(ev_short),
         "long_threshold": float(long_thr),

@@ -10,8 +10,11 @@ class KylesLambdaEngine:
     Kyle's Lambda = تكلفة تحريك السعر بوحدة حجم واحدة
     """
 
-    def __init__(self, window: int = 50):
+    def __init__(self, window: int = 50, output_mode: str = "raw"):
         self.window     = window
+        self.output_mode = str(output_mode).strip().lower()
+        if self.output_mode not in {"raw", "zscore"}:
+            self.output_mode = "raw"
         self._prices    = deque(maxlen=window + 1)
         self._volumes   = deque(maxlen=window)
         self._lambdas   = deque(maxlen=window)
@@ -30,15 +33,22 @@ class KylesLambdaEngine:
         lam = dp / dv if dv > 0 else 0.0
         self._lambdas.append(lam)
 
-        # تحسين: حساب الـ Z-Score لـ Kyle's Lambda ليكون معبر أكثر للموديل (Stationary)
-        if len(self._lambdas) >= 10:
-            arr = np.array(self._lambdas)
-            mean_lam = float(np.mean(arr))
-            std_lam = float(np.std(arr)) + 1e-8
-            z_score = (lam - mean_lam) / std_lam
-            return round(float(np.clip(z_score, -4.0, 4.0)), 4)
-            
-        return 0.0
+        if self.output_mode == "zscore":
+            # Optional stationary representation when explicitly requested.
+            if len(self._lambdas) >= 10:
+                arr = np.array(self._lambdas, dtype=np.float64)
+                mean_lam = float(np.mean(arr))
+                std_lam = float(np.std(arr)) + 1e-8
+                z_score = (lam - mean_lam) / std_lam
+                return round(float(np.clip(z_score, -4.0, 4.0)), 4)
+            return 0.0
+
+        # Default: keep Kyle λ in economic units (non-negative by definition).
+        # Use a short robust smooth to avoid noisy spikes at low volume prints.
+        if len(self._lambdas) >= 5:
+            tail = np.array(list(self._lambdas)[-min(20, len(self._lambdas)):], dtype=np.float64)
+            lam = float(np.median(tail))
+        return round(float(max(lam, 0.0)), 8)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -185,9 +195,9 @@ class VNETEngine:
         weight = 2.0 if is_large else 1.0
 
         # الاتجاه يتم تحديده من الـ aggressor side (Buy=الشراء من العرض، Sell=البيع للطلب)
-        if side in ('B', 'BID'):
+        if side in ('A', 'ASK', 'BUY', 'BOT'):
             direction = 1.0
-        elif side in ('A', 'S', 'ASK', 'SELL'):
+        elif side in ('B', 'BID', 'S', 'SELL'):
             direction = -1.0
         else:
             direction = 0.0

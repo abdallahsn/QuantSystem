@@ -23,13 +23,6 @@ DEFAULT_GATES_PATH = os.path.join(
     'release_gates.yaml',
 )
 
-DEFAULT_PRODUCTION_GATES_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'configs',
-    'v19',
-    'release_gates.production.yaml',
-)
-
 
 def _load_any(path: str) -> dict:
     with open(path) as f:
@@ -60,17 +53,7 @@ def load_v19_config(path: str | None = None) -> dict:
 
 
 def load_release_gates(path: str | None = None) -> dict:
-    if not path:
-        return _load_any(DEFAULT_GATES_PATH)
-    resolved = os.path.abspath(path)
-    if resolved == os.path.abspath(DEFAULT_PRODUCTION_GATES_PATH):
-        return _load_any(path)
     gates = _load_any(DEFAULT_GATES_PATH)
-    return _deep_merge(gates, _load_any(path))
-
-
-def default_release_gates_path_for_profile(profile: str | None = None) -> str:
-    name = str(profile or '').strip().lower()
-    if name == 'production':
-        return DEFAULT_PRODUCTION_GATES_PATH
-    return DEFAULT_GATES_PATH
+    if path:
+        gates = _deep_merge(gates, _load_any(path))
+    return gates

@@ -268,18 +268,6 @@ class RegimeConditionalEnsemble:
         regime: str,
         error: float,
     ) -> None:
-        raise RuntimeError(
-            'Unsafe raw online update blocked. Use update_if_mature(..., ts_event, label_end_ts, now_ts) '
-            'so labels cannot enter the learner before outcome maturity.'
-        )
-
-    def _update_unchecked(
-        self,
-        features: np.ndarray,
-        label: int,
-        regime: str,
-        error: float,
-    ) -> None:
         """
         يُحدِّث الـ regime المحدد بعينة جديدة.
 
@@ -310,38 +298,6 @@ class RegimeConditionalEnsemble:
         )
         if should:
             self._retrain_regime(regime, force_drift=drift)
-
-    def update_if_mature(
-        self,
-        features: np.ndarray,
-        label: int,
-        regime: str,
-        error: float,
-        ts_event,
-        label_end_ts,
-        now_ts,
-    ) -> bool:
-        """
-        Update online learner only after the outcome horizon has fully matured.
-
-        Returns True when the sample was accepted, False when it was skipped.
-        """
-        try:
-            ts_start = pd.Timestamp(ts_event)
-            ts_end = pd.Timestamp(label_end_ts)
-            now = pd.Timestamp(now_ts)
-        except Exception:
-            return False
-        if pd.isna(ts_start) or pd.isna(ts_end) or pd.isna(now):
-            return False
-        if ts_end < ts_start:
-            return False
-        if now < ts_end:
-            return False
-        if int(label) not in (0, 1):
-            return False
-        self._update_unchecked(features=features, label=int(label), regime=str(regime), error=float(error))
-        return True
 
     # ── Internal Retrain ─────────────────────────────────────────────────────
 

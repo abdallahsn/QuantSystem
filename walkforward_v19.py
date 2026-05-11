@@ -17,7 +17,7 @@ from modules.config_v19 import load_release_gates, load_v19_config
 from modules.manifest_v19 import write_manifest
 from modules.raw_replay_v19 import build_replay_dataset, normalize_ts, read_market_data
 from modules.release_gates_v19 import evaluate_release_gates, save_gate_report
-from train_v19 import _align_lob_to_rows, _load_lob_inputs, run_training_pipeline
+from train_v19 import _align_lob_to_rows, _load_lob_inputs, _resolve_visual_model_type, run_training_pipeline
 
 try:
     from modules.deeplob_cnn import DeepLOBCNN, VISUAL_EMB_DIM
@@ -25,6 +25,12 @@ try:
 except ImportError:
     VISUAL_EMB_DIM = 8
     DEEPLOB_AVAILABLE = False
+
+try:
+    from modules.lob_transformer import LOBTransformer
+    LOB_TRANSFORMER_AVAILABLE = True
+except ImportError:
+    LOB_TRANSFORMER_AVAILABLE = False
 
 
 def build_walkforward_windows(
@@ -103,6 +109,7 @@ def compute_eval_visual_embeddings(
     diagnostics = {
         'source': 'zeros',
         'reason': 'init',
+        'visual_model_type': None,
         'rows_total': int(len(df)),
         'lob_tensors_available': 0,
         'lob_timestamps_available': 0,
@@ -129,12 +136,32 @@ def compute_eval_visual_embeddings(
             return out, diagnostics
         return out
 
-    if not DEEPLOB_AVAILABLE:
-        return _return(zero, source='zeros', reason='deeplob_unavailable')
+    schema_path = os.path.join(models_dir, 'feature_schema_v19.json')
+    schema = {}
+    if os.path.exists(schema_path):
+        try:
+            with open(schema_path, 'r', encoding='utf-8') as f:
+                schema = json.load(f)
+        except Exception:
+            schema = {}
+    deeplob_cfg = (schema.get('deeplob') or {}) if isinstance(schema, dict) else {}
+    visual_model_type = _resolve_visual_model_type(deeplob_cfg.get('model_type'))
+    visual_artifact = (
+        deeplob_cfg.get('model_artifact')
+        or ('lob_transformer_v19.keras' if visual_model_type == 'lob_transformer' else 'deeplob_cnn_v19.keras')
+    )
+    visual_model_path = os.path.join(models_dir, visual_artifact)
+    diagnostics['visual_model_type'] = visual_model_type
 
-    deeplob_path = os.path.join(models_dir, 'deeplob_cnn_v19.keras')
-    if not os.path.exists(deeplob_path):
-        return _return(zero, source='zeros', reason='missing_deeplob_model')
+    if visual_model_type == 'lob_transformer':
+        if not LOB_TRANSFORMER_AVAILABLE:
+            return _return(zero, source='zeros', reason='lob_transformer_unavailable')
+    else:
+        if not DEEPLOB_AVAILABLE:
+            return _return(zero, source='zeros', reason='deeplob_unavailable')
+
+    if not os.path.exists(visual_model_path):
+        return _return(zero, source='zeros', reason=f'missing_visual_model:{visual_model_type}')
 
     lob_tensors, lob_timestamps = _load_lob_inputs(test_lob, test_lob_ts)
     if lob_tensors is None or lob_timestamps is None:
@@ -148,16 +175,19 @@ def compute_eval_visual_embeddings(
     diagnostics['rows_with_tensor'] = rows_with_tensor
     diagnostics['rows_with_tensor_ratio'] = round(_safe_ratio(rows_with_tensor, len(df)), 4)
 
-    cnn = DeepLOBCNN(brain_file=deeplob_path)
-    if cnn.model is None or not cnn._fitted:
-        return _return(zero, source='zeros', reason='cnn_not_fitted')
+    if visual_model_type == 'lob_transformer':
+        encoder = LOBTransformer(brain_file=visual_model_path)
+    else:
+        encoder = DeepLOBCNN(brain_file=visual_model_path)
+    if encoder.model is None or not encoder._fitted:
+        return _return(zero, source='zeros', reason=f'encoder_not_fitted:{visual_model_type}')
 
     used_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
     diagnostics['used_tensor_count'] = int(len(used_tensor_ids))
     emb_lookup = {}
     if len(used_tensor_ids):
         X = np.asarray(lob_tensors[used_tensor_ids], dtype=np.float32)
-        emb = np.asarray(cnn.get_embeddings(X), dtype=np.float32)
+        emb = np.asarray(encoder.get_embeddings(X), dtype=np.float32)
         for i, tid in enumerate(used_tensor_ids):
             emb_lookup[int(tid)] = emb[i]
 
@@ -165,7 +195,7 @@ def compute_eval_visual_embeddings(
     for row_idx, tensor_idx in enumerate(row_to_tensor):
         if int(tensor_idx) in emb_lookup:
             out[row_idx] = emb_lookup[int(tensor_idx)][:VISUAL_EMB_DIM]
-    return _return(out, source='cnn_eval', reason='ok')
+    return _return(out, source=f'{visual_model_type}_eval', reason='ok')
 
 
 def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
