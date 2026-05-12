@@ -98,6 +98,7 @@ Check:
 - GPU/CPU compatibility
 - batch inference performance
 
+
 ## Required Output Format
 For every task, respond with:
 
