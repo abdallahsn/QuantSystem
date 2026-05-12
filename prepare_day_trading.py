@@ -98,12 +98,14 @@ DAY_TRADING_FEATURES = [
     # Order Flow (مُجمَّع على bar)
     'buy_ratio',        # نسبة الشراء في الـ bar
     'bar_cvd_delta',    # تغير CVD داخل الـ bar
-    'lob_imbalance',    # اختلال عمق السوق المُجمَّع
+    'lob_imbalance',    # MBP depth imbalance when available; explicit flow proxy fallback otherwise
+    'lob_imbalance_is_depth',
     # جسر السيولة (مُجمَّع من التكات داخل الشمعة — أسماء صريحة للمسار الهجين)
     'num_trades',       # = tick_count
     'avg_trade_size',   # volume / num_trades
     'absorption_bar',   # ضغط شراء داخل الشمعة (≈ buy_ratio)
     'order_flow_imbalance',  # (buy_vol - sell_vol) / total ∈ [-1,1]
+    'trade_flow_imbalance_proxy',
     'spread_bar',       # متوسط سبريد التيكات إن وُجد عمود spread
 
     # Intrabar (5m → 12× slices) — spike-preserving microstructure
@@ -158,6 +160,8 @@ TRADE_ACTIONS = {'T', 'F', 'TRADE', 'EXECUTE', 'E', '0'}
 # - B / BID / SELL -> sell-initiated (hitting bid)
 BUY_SIDES = {'A', 'ASK', 'BUY', 'BOT'}
 SELL_SIDES = {'B', 'BID', 'S', 'SELL'}
+CVD_DIRECTION_MIN_ABS = 1.0
+OBI_DIRECTION_MIN_ABS = 0.05
 CORE_MBO_REQUIRED_COLS = [
     'cvd',
     'session_cvd',
@@ -587,12 +591,68 @@ def attach_hybrid_liquidity_bridge(
     sums = bv.to_numpy(dtype=np.float64) + sv.to_numpy(dtype=np.float64)
     tot = pd.Series(np.maximum(sums, 1e-9), index=out.index)
     out['order_flow_imbalance'] = np.clip((bv - sv) / tot, -1.0, 1.0)
+    out['trade_flow_imbalance_proxy'] = out['order_flow_imbalance'].astype(np.float32)
     if 'spread' in df_ticks.columns:
         sp = pd.to_numeric(df_ticks['spread'], errors='coerce').resample(freq).mean()
         out['spread_bar'] = sp.reindex(out.index)
         out['spread_bar'] = pd.to_numeric(out['spread_bar'], errors='coerce').fillna(0.0)
     else:
         out['spread_bar'] = np.zeros(len(out), dtype=np.float32)
+    return out
+
+
+def _sign_with_deadband(values, *, min_abs: float) -> np.ndarray:
+    arr = pd.to_numeric(pd.Series(values), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    out = np.zeros(arr.shape[0], dtype=np.int8)
+    thr = float(max(min_abs, 0.0))
+    out[arr > thr] = 1
+    out[arr < -thr] = -1
+    return out
+
+
+def apply_mbp_lob_imbalance(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep the legacy `lob_imbalance` column, but make its source explicit:
+      - preferred: signed MBP depth imbalance from intrabar MBP aggregation;
+      - fallback: trade-flow proxy from MBO buy/sell volume when MBP is unavailable.
+
+    This prevents the tabular model from silently treating order-flow imbalance as
+    independent depth information.
+    """
+    out = df.copy()
+    if 'trade_flow_imbalance_proxy' in out.columns:
+        proxy = pd.to_numeric(out['trade_flow_imbalance_proxy'], errors='coerce')
+    elif 'order_flow_imbalance' in out.columns:
+        proxy = pd.to_numeric(out['order_flow_imbalance'], errors='coerce')
+    elif 'buy_ratio' in out.columns:
+        proxy = (pd.to_numeric(out['buy_ratio'], errors='coerce') - 0.5) * 2.0
+    else:
+        proxy = pd.Series(0.0, index=out.index)
+    proxy = proxy.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0).astype(np.float32)
+    out['trade_flow_imbalance_proxy'] = proxy
+
+    depth = None
+    if 'mbp_imbalance_signed_peak' in out.columns:
+        depth = pd.to_numeric(out['mbp_imbalance_signed_peak'], errors='coerce')
+    elif {'mbp_depth_bid_max', 'mbp_depth_ask_max'}.issubset(out.columns):
+        bid = pd.to_numeric(out['mbp_depth_bid_max'], errors='coerce').fillna(0.0).astype(np.float64)
+        ask = pd.to_numeric(out['mbp_depth_ask_max'], errors='coerce').fillna(0.0).astype(np.float64)
+        depth = (bid - ask) / (bid + ask).clip(lower=1e-9)
+
+    if depth is None:
+        out['lob_imbalance'] = proxy
+        out['lob_imbalance_is_depth'] = np.zeros(len(out), dtype=np.int8)
+        return out
+
+    depth = depth.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0).astype(np.float32)
+    if 'mbp_bar_coverage' in out.columns:
+        cov = pd.to_numeric(out['mbp_bar_coverage'], errors='coerce').fillna(0.0).astype(np.float64)
+        has_depth = cov > 0.0
+    else:
+        has_depth = pd.Series(np.abs(depth.to_numpy(dtype=np.float32)) > 1e-12, index=out.index)
+
+    out['lob_imbalance'] = np.where(has_depth.to_numpy(), depth.to_numpy(), proxy.to_numpy()).astype(np.float32)
+    out['lob_imbalance_is_depth'] = has_depth.astype(np.int8).to_numpy()
     return out
 
 def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
@@ -762,9 +822,10 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
         lambda x: float(x.iloc[-1] - x.iloc[0]) / max(len(x), 1) if len(x) > 1 else 0.0,
     ).fillna(0.0)
     bars['cvd_velocity_signed'] = pd.to_numeric(bars.get('bar_cvd_delta', 0.0), errors='coerce').fillna(0.0)
-    bars['cvd_net_direction'] = np.sign(
-        pd.to_numeric(bars['cvd_velocity_signed'], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
-    ).astype(np.int8)
+    bars['cvd_net_direction'] = _sign_with_deadband(
+        bars['cvd_velocity_signed'],
+        min_abs=CVD_DIRECTION_MIN_ABS,
+    )
 
     def _count_reversals(series: pd.Series) -> float:
         vals = pd.to_numeric(series, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
@@ -783,7 +844,7 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
         errors='coerce',
     ).fillna(0.0)
     bars['obi_net'] = obi_base.astype(np.float32)
-    bars['obi_direction'] = np.sign(obi_base.to_numpy(dtype=np.float64)).astype(np.int8)
+    bars['obi_direction'] = _sign_with_deadband(obi_base, min_abs=OBI_DIRECTION_MIN_ABS)
     cr_sum = pd.to_numeric(df['cancel_ratio'], errors='coerce').resample(freq).sum() if 'cancel_ratio' in df.columns else pd.Series(
         np.zeros(len(bars)),
         index=bars.index,
@@ -849,8 +910,9 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
     df['is_overlap'] = ((t >= pd.to_datetime('12:00').time()) & (t < pd.to_datetime('16:00').time())).astype(np.int8)
     df['is_ny']      = ((t >= pd.to_datetime('13:30').time()) & (t < pd.to_datetime('20:00').time())).astype(np.int8)
 
-    # LOB imbalance مُجمَّع (buy pressure)
-    df['lob_imbalance'] = (df['buy_ratio'] - 0.5) * 2  # [-1, 1]
+    # Fallback only. When MBP is present, apply_mbp_lob_imbalance replaces this
+    # with signed book-depth imbalance after intrabar MBP enrichment.
+    df = apply_mbp_lob_imbalance(df)
 
     df = apply_bar_level_catboost_parities(df, freq=freq)
     return df.fillna(0)
@@ -942,12 +1004,12 @@ def add_event_direction(df: pd.DataFrame) -> pd.DataFrame:
         obi_dir = pd.to_numeric(out['obi_direction'], errors='coerce').fillna(0).astype(np.int8)
     else:
         obi_raw = pd.to_numeric(out.get('obi', out.get('order_flow_imbalance', 0.0)), errors='coerce').fillna(0.0)
-        obi_dir = np.sign(obi_raw.to_numpy(dtype=np.float64)).astype(np.int8)
+        obi_dir = _sign_with_deadband(obi_raw, min_abs=OBI_DIRECTION_MIN_ABS)
         obi_dir = pd.Series(obi_dir, index=out.index, dtype=np.int8)
 
     kalman_dir = pd.to_numeric(out.get('kalman_direction', 0), errors='coerce').fillna(0).astype(np.int8)
     vote = (
-        np.sign(cvd_signed.to_numpy(dtype=np.float64)).astype(np.int8)
+        _sign_with_deadband(cvd_signed, min_abs=CVD_DIRECTION_MIN_ABS)
         + np.sign(obi_dir.to_numpy(dtype=np.int8)).astype(np.int8)
         + np.sign(kalman_dir.to_numpy(dtype=np.int8)).astype(np.int8)
     )
@@ -1202,7 +1264,6 @@ def build_rolling_lob_tensors_from_mbp(
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
-    tensors = _normalize_lob_tensor_nonflat(tensors)
     snap_ratio = float(bars_with_snapshot) / float(max(n_bars, 1))
     mean_roll_cov = float(np.mean(roll_cov)) if len(roll_cov) else 0.0
     low_roll_ratio = float(np.mean(roll_cov < 0.50)) if len(roll_cov) else 1.0
@@ -1273,7 +1334,6 @@ def build_rolling_lob_tensors_mbo_only(
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
-    tensors = _normalize_lob_tensor_nonflat(tensors)
     return tensors, timestamps.copy(), roll_cov
 
 
@@ -2019,11 +2079,21 @@ def run_day_trading_refinery(
         df_mbo = pd.concat(chunks, ignore_index=True)
     df_mbo['ts_event'] = pd.to_datetime(df_mbo['ts_event'])
     df_mbo = df_mbo.sort_values('ts_event').reset_index(drop=True)
+    mbo_dup_ts = int(df_mbo['ts_event'].duplicated().sum())
+    mbo_key_cols = [c for c in ('ts_event', 'action', 'side', 'price', 'size', 'order_id') if c in df_mbo.columns]
+    mbo_dup_key = int(df_mbo.duplicated(subset=mbo_key_cols).sum()) if mbo_key_cols else 0
+    if mbo_dup_ts:
+        print(
+            f"  ⚠️ MBO duplicate ts_event rows: {mbo_dup_ts:,} "
+            f"(duplicate_key_rows={mbo_dup_key:,}; not dropped because tick feeds can share timestamps)"
+        )
     df_mbo = enrich_mbo_with_core_microstructure(df_mbo)
     print(f"  ✅ {len(df_mbo):,} تيك | {df_mbo['ts_event'].min()} → {df_mbo['ts_event'].max()}")
 
     # ── 1b. تحميل MBP (اختياري) ─────────────────────────────────────────────
     df_mbp = None
+    mbp_dup_ts = 0
+    mbp_dup_key = 0
     if mbp_path:
         print("\n📥 تحميل MBP10 data (optional)...")
         mbp_p = str(mbp_path)
@@ -2044,6 +2114,14 @@ def run_day_trading_refinery(
         if df_mbp is not None:
             df_mbp['ts_event'] = pd.to_datetime(df_mbp['ts_event'])
             df_mbp = df_mbp.sort_values('ts_event').reset_index(drop=True)
+            mbp_dup_ts = int(df_mbp['ts_event'].duplicated().sum())
+            mbp_key_cols = [c for c in ('ts_event', 'bid_px_00', 'ask_px_00', 'bid_sz_00', 'ask_sz_00') if c in df_mbp.columns]
+            mbp_dup_key = int(df_mbp.duplicated(subset=mbp_key_cols).sum()) if mbp_key_cols else 0
+            if mbp_dup_ts:
+                print(
+                    f"  ⚠️ MBP duplicate ts_event rows: {mbp_dup_ts:,} "
+                    f"(duplicate_key_rows={mbp_dup_key:,}; snapshots kept for intrabar aggregation)"
+                )
             print(f"  ✅ {len(df_mbp):,} mbp rows | {df_mbp['ts_event'].min()} → {df_mbp['ts_event'].max()}")
 
     # ── 2. Aggregate → Bars ───────────────────────────────────────
@@ -2061,6 +2139,7 @@ def run_day_trading_refinery(
     df_bars = enrich_bars_with_intrabar(df_bars, df_mbo, freq=freq, n_slices=12)
     if df_mbp is not None and len(df_mbp):
         df_bars = enrich_bars_with_intrabar_mbp(df_bars, df_mbp, freq=freq, n_slices=12, levels=10)
+    df_bars = apply_mbp_lob_imbalance(df_bars)
     print("\n📈 Kalman Trend Filter...")
     df_bars = add_kalman_trend(df_bars)
     print("\n🧭 Regime assignment...")
@@ -2184,6 +2263,19 @@ def run_day_trading_refinery(
         f"bar_mean={mbp_bar_cov_stats['mean']:.1%}, bar_low(<30%)={mbp_bar_cov_stats['low_ratio']:.1%} | "
         f"roll_mean={mbp_roll_cov_stats['mean']:.1%}, roll_low(<50%)={mbp_roll_cov_stats['low_ratio']:.1%}"
     )
+    lob_depth_ratio = float(
+        pd.to_numeric(df_out.get('lob_imbalance_is_depth', 0), errors='coerce').fillna(0).astype(np.float64).mean()
+    )
+    lob_flow_corr = None
+    if {'lob_imbalance', 'order_flow_imbalance'}.issubset(df_out.columns) and len(df_out) >= 3:
+        lob_flow_corr_raw = df_out[['lob_imbalance', 'order_flow_imbalance']].corr(method='spearman').iloc[0, 1]
+        if pd.notna(lob_flow_corr_raw):
+            lob_flow_corr = float(lob_flow_corr_raw)
+    print(
+        "   📊 LOB imbalance source: "
+        f"depth_rows={lob_depth_ratio:.1%} | "
+        f"spearman_vs_order_flow={lob_flow_corr if lob_flow_corr is not None else 'n/a'}"
+    )
 
     # فلتر التدريب — للتحقق (لا يُحذف، train_v19 يُفلتر بنفسه)
     n_train_events = int(df_out['train_event_flag'].sum())
@@ -2230,6 +2322,10 @@ def run_day_trading_refinery(
         'sl_to_opposite'              : bool(sl_to_opposite),
         'include_weak_directional_in_train': bool(include_weak_directional_in_train),
         'rows'                        : len(df_out),
+        'mbo_duplicate_ts_rows'       : mbo_dup_ts,
+        'mbo_duplicate_key_rows'      : mbo_dup_key,
+        'mbp_duplicate_ts_rows'       : mbp_dup_ts,
+        'mbp_duplicate_key_rows'      : mbp_dup_key,
         'label_distribution'          : {str(k): int(v) for k, v in label_dist.items()},
         'event_rate_tp_wins'          : float(event_strict),
         'train_event_pool_rate'       : float(train_pool),
@@ -2243,10 +2339,14 @@ def run_day_trading_refinery(
         'catboost_advisor_features'   : CATBOOST_ADVISOR_FEATURES_DT,
         'day_trading_context_features': DAY_TRADING_FEATURES,
         'lob_tensors_built'           : bool(build_lob_tensors),
+        'lob_tensor_normalization'    : 'raw_unscaled_train_pipeline_must_fit_normalizer_on_train_only',
         'lob_roll_lookback_bars'      : DEEPLOB_TIME_STEPS_DEFAULT,
         'lob_tensor_layout'           : 'rolling_bars_time_x_20_levels_x_3ch_peak_mbp_when_available',
         'mbp_bar_coverage_stats'      : mbp_bar_cov_stats,
         'mbp_roll_lob_coverage_stats' : mbp_roll_cov_stats,
+        'lob_imbalance_source'        : 'mbp_depth_when_available_else_trade_flow_proxy',
+        'lob_imbalance_depth_row_rate': lob_depth_ratio,
+        'lob_imbalance_vs_order_flow_spearman': lob_flow_corr,
         'ts_min'                      : str(df_out['ts_event'].min()),
         'ts_max'                      : str(df_out['ts_event'].max()),
         'label_logic'                 : (

@@ -246,6 +246,11 @@ TRAINING_PASSTHROUGH_COLS = [
         'ts_event',
         'label_end_ts',
         'price',
+        'open',
+        'high',
+        'low',
+        'close',
+        'volume',
         'size',
         'bias_label',
         'conf_label',
@@ -1718,6 +1723,8 @@ def stage1_oof_meta(
     cost_config: dict | None = None,
     sample_weight_mode: str = SAMPLE_WEIGHT_MODE_COMBINED,
     stage1_target: str = STAGE1_TARGET_BIAS,
+    split_time: pd.Timestamp | str | None = None,
+    train_frac: float = 0.80,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("\n" + "═" * 65)
     print("🐱 STAGE 1 — V19 OOF CatBoost + XGBoost + Regime Meta-Features")
@@ -2377,13 +2384,35 @@ def stage1_oof_meta(
             except OSError:
                 pass
 
+    final_split_ctx = _sequence_split_context(
+        df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=_parse_optional_timestamp(split_time),
+    )
+    final_train_idx = np.flatnonzero(
+        np.asarray(final_split_ctx.get('train_row_ok', []), dtype=bool)
+    ).astype(np.int32)
+    final_holdout_idx = np.flatnonzero(
+        np.asarray(final_split_ctx.get('val_row_ok', []), dtype=bool)
+    ).astype(np.int32)
+    if len(final_train_idx) == 0:
+        raise RuntimeError(
+            '❌ Final Stage-1 train set is empty before the official split_time. '
+            'Refusing to train final CatBoost/XGBoost on holdout rows.'
+        )
+    print(
+        "  Final Stage-1 split guard: "
+        f"train={len(final_train_idx):,} holdout={len(final_holdout_idx):,} "
+        f"split={final_split_ctx.get('split_time')}"
+    )
+
     final_scaler = inference_scaler_params
     X_final = _apply_scaler_to_stat_frame(
         raw_stat,
         final_scaler,
         clip_range=TREE_MODEL_SCALER_CLIP_RANGE,
     ).values.astype(np.float32)
-    final_train_idx, final_holdout_idx = _chronological_holdout_indices(len(df), holdout_frac=0.10)
     if use_soft_target:
         final_train_sw = _stability_mc_sample_weights(df.iloc[final_train_idx].reset_index(drop=True))
     else:
@@ -2597,7 +2626,7 @@ def stage1_oof_meta(
         live_xgb_probs = _apply_long_calibrator(final_xgb_calibrator, live_xgb_raw)
 
     final_regime = RegimeClassifier(n_regimes=N_CLUSTERS, model_type=regime_model_type)
-    final_regime.fit(df.copy(), output_dir=output_dir)
+    final_regime.fit(df.iloc[final_train_idx].copy(), output_dir=output_dir)
     live_regime_meta = final_regime.predict_regime_meta(df.copy()).values.astype(np.float32)
 
     with open(os.path.join(output_dir, 'meta_feature_names_v19.json'), 'w') as f:
@@ -2887,6 +2916,8 @@ def stage2_oof_visual_embeddings(
     *,
     visual_model_type: str = VISUAL_MODEL_LOB_TRANSFORMER,
     max_age: str = DEFAULT_LOB_MAX_AGE,
+    split_time: pd.Timestamp | str | None = None,
+    train_frac: float = 0.80,
 ) -> tuple[np.ndarray, np.ndarray]:
     import gc
 
@@ -3051,8 +3082,20 @@ def stage2_oof_visual_embeddings(
         })
 
     live_row_embs = np.zeros((n_rows, VISUAL_EMB_DIM), dtype=np.float32)
-    final_tensor_ids = np.unique(row_to_tensor[row_to_tensor >= 0]).astype(np.int32)
+    final_split_ctx = _sequence_split_context(
+        df,
+        seq_len=SEQ_LEN,
+        train_frac=train_frac,
+        split_time=_parse_optional_timestamp(split_time),
+    )
+    final_train_rows = np.flatnonzero(
+        np.asarray(final_split_ctx.get('train_row_ok', []), dtype=bool)
+    ).astype(np.int32)
+    final_tensor_ids = np.unique(row_to_tensor[final_train_rows][row_to_tensor[final_train_rows] >= 0]).astype(np.int32)
     final_tensor_ids = final_tensor_ids[tensor_target_seen[final_tensor_ids]]
+    metrics['final_fit_train_rows'] = int(len(final_train_rows))
+    metrics['final_fit_train_tensors'] = int(len(final_tensor_ids))
+    metrics['final_fit_split_time'] = str(final_split_ctx.get('split_time'))
     if len(final_tensor_ids) >= 32:
         final_model_name = (
             'lob_transformer_final_tmp.keras'
@@ -4159,6 +4202,8 @@ def run_training_pipeline(
             cost_config=(config_snapshot or {}).get('backtest', {}),
             sample_weight_mode=sw_mode_cfg,
             stage1_target=st1_tgt_cfg,
+            split_time=training_window.get('split_time'),
+            train_frac=train_frac,
         )
         meta_feature_names = resolve_meta_feature_names(meta_dim=int(meta_features.shape[1]))
     else:
@@ -4268,6 +4313,8 @@ def run_training_pipeline(
             lob_timestamps=lob_timestamps,
             visual_model_type=visual_model_type,
             max_age=lob_max_age,
+            split_time=training_window.get('split_time'),
+            train_frac=train_frac,
         )
     else:
         visual_embeddings, visual_coverage, visual_source = _load_or_init_visual_artifacts(output_dir, len(event_df))

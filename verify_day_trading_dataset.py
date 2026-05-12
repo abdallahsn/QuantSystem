@@ -33,6 +33,7 @@ REQUIRED_FOR_TRAIN = (
 # prepare_day_trading adds raw__* for CATBOOST_ADVISOR_FEATURES_DT (31)
 EXPECTED_RAW_PREFIX = "raw__"
 EXPECTED_RAW_COUNT = 31
+MIN_RELIABLE_TRAIN_ROWS_WARN = 1000
 
 INTRABAR_MBO = (
     "spoof_peak_slice",
@@ -61,6 +62,11 @@ INTRABAR_MBP = (
     "mbp_wall_bid_peak",
     "mbp_wall_ask_peak",
     "mbp_depth_shock_flag",
+)
+
+INTRABAR_MBP_STRONG = (
+    "mbp_imbalance_signed_peak",
+    "mbp_imbalance_mean",
 )
 
 
@@ -101,6 +107,11 @@ def main() -> int:
     df = pd.read_parquet(data_path)
     n, ncol = len(df), len(df.columns)
     print(f"   Rows: {n:,} | Columns: {ncol}")
+    if n < MIN_RELIABLE_TRAIN_ROWS_WARN:
+        print(
+            f"⚠️ Rows below {MIN_RELIABLE_TRAIN_ROWS_WARN:,}: OK for smoke/refinery checks, "
+            "not enough for reliable full training."
+        )
 
     ok = True
 
@@ -165,6 +176,51 @@ def main() -> int:
     _check_group("Intrabar MBO", INTRABAR_MBO)
     _check_group("MBP intrabar", INTRABAR_MBP)
 
+    strong_missing = [c for c in INTRABAR_MBP_STRONG if c not in df.columns]
+    if strong_missing:
+        print(f"⚠️ MBP signed imbalance columns missing: {strong_missing}")
+    else:
+        print("✅ MBP signed imbalance columns present")
+
+    if {"lob_imbalance", "order_flow_imbalance"}.issubset(df.columns):
+        lob = pd.to_numeric(df["lob_imbalance"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        ofi = pd.to_numeric(df["order_flow_imbalance"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        valid = lob.notna() & ofi.notna()
+        corr = float("nan")
+        if int(valid.sum()) >= 3:
+            corr = float(pd.DataFrame({"lob": lob[valid], "ofi": ofi[valid]}).corr(method="spearman").iloc[0, 1])
+        depth_rate = None
+        if "lob_imbalance_is_depth" in df.columns:
+            depth_rate = float(
+                pd.to_numeric(df["lob_imbalance_is_depth"], errors="coerce").fillna(0.0).astype(float).mean()
+            )
+        cov_mean = None
+        if "mbp_bar_coverage" in df.columns:
+            cov_mean = float(pd.to_numeric(df["mbp_bar_coverage"], errors="coerce").fillna(0.0).mean())
+        print(
+            "✅ LOB imbalance source sanity: "
+            f"spearman_vs_order_flow={corr:.4f} | "
+            f"depth_rate={depth_rate if depth_rate is not None else 'n/a'} | "
+            f"mbp_cov_mean={cov_mean if cov_mean is not None else 'n/a'}"
+        )
+        if (
+            depth_rate is not None
+            and cov_mean is not None
+            and cov_mean > 0.30
+            and depth_rate < 0.50
+        ):
+            ok = False
+            print("❌ MBP coverage exists, but lob_imbalance mostly uses trade-flow fallback.")
+        elif (
+            depth_rate is None
+            and cov_mean is not None
+            and cov_mean > 0.30
+            and np.isfinite(corr)
+            and abs(corr) > 0.999
+        ):
+            ok = False
+            print("❌ lob_imbalance is indistinguishable from order_flow_imbalance despite MBP coverage.")
+
     lob_path = args.lob
     if lob_path:
         lob_path = os.path.abspath(lob_path)
@@ -191,6 +247,20 @@ def main() -> int:
                 print("❌ LOB sample contains NaN/Inf")
             else:
                 print(f"   LOB sample finite: min={arr.min():.6g} max={arr.max():.6g}")
+                if arr.size:
+                    ch_std = arr.reshape(-1, arr.shape[-1]).std(axis=0) if arr.ndim == 4 else np.array([])
+                    per_tensor_std = arr.reshape(arr.shape[0], -1).std(axis=1) if arr.ndim >= 2 else np.array([])
+                    collapsed_ratio = float(np.mean(per_tensor_std < 1e-8)) if per_tensor_std.size else 1.0
+                    print(
+                        "   LOB sample channel std: "
+                        f"{np.array2string(ch_std, precision=6)} | collapsed_tensor_ratio={collapsed_ratio:.2%}"
+                    )
+                    if ch_std.size and bool(np.all(ch_std < 1e-8)):
+                        ok = False
+                        print("❌ LOB sample channels are collapsed/all-flat")
+                    elif collapsed_ratio > 0.95:
+                        ok = False
+                        print("❌ Most sampled LOB tensors are collapsed/all-flat")
 
         if not os.path.isfile(ts_path):
             ok = False
@@ -201,6 +271,15 @@ def main() -> int:
             if lob_ts.shape[0] != n:
                 ok = False
                 print(f"❌ LOB ts length {lob_ts.shape[0]} != parquet rows {n}")
+            elif "ts_event" in df.columns:
+                expected_ts = pd.to_datetime(df["ts_event"], utc=True, errors="coerce").dt.tz_localize(None)
+                expected_ns = expected_ts.astype("datetime64[ns]").astype("int64").to_numpy()
+                lob_ns = lob_ts.astype("int64", copy=False)
+                exact_ratio = float(np.mean(lob_ns == expected_ns)) if n else 1.0
+                print(f"   LOB timestamp exact alignment: {exact_ratio:.2%}")
+                if exact_ratio < 0.99:
+                    ok = False
+                    print("❌ LOB timestamps are not aligned to day_trading_features.ts_event")
 
     if ok:
         print("\n✅ Pre-training verification passed.")

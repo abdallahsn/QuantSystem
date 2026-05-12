@@ -206,6 +206,9 @@ def _simulate_trade_path(
     horizons: np.ndarray,
     micro_atr: np.ndarray,
     tick_size: float,
+    opens: np.ndarray | None = None,
+    highs: np.ndarray | None = None,
+    lows: np.ndarray | None = None,
     direction_threshold_ticks: float = 1.0,
     tp_mult: float = 1.5,
     sl_mult: float = 1.0,
@@ -306,30 +309,61 @@ def _simulate_trade_path(
             tp_level = entry_price - tp_distance
             sl_level = entry_price + sl_distance
 
-    # ── Replay المسار الزمني ───────────────────────────────────────────
+    opens_arr = np.asarray(opens if opens is not None else prices, dtype=np.float64)
+    highs_arr = np.asarray(highs if highs is not None else prices, dtype=np.float64)
+    lows_arr = np.asarray(lows if lows is not None else prices, dtype=np.float64)
     future_prices = np.asarray(prices[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_highs = np.asarray(highs_arr[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_lows = np.asarray(lows_arr[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
+    future_opens = np.asarray(opens_arr[entry_idx + 1:exit_cap_idx + 1], dtype=np.float64)
     if future_prices.size == 0:
         return None
 
     exit_idx = exit_cap_idx
     exit_reason = 'horizon'
-    for offset, future_price in enumerate(future_prices, start=1):
-        if direction == 'LONG':
-            if future_price >= tp_level:
-                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
-            if future_price <= sl_level:
-                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
-        else:
-            if future_price <= tp_level:
-                exit_idx = entry_idx + offset; exit_reason = 'tp'; break
-            if future_price >= sl_level:
-                exit_idx = entry_idx + offset; exit_reason = 'sl'; break
-
     exit_price = float(prices[exit_idx])
+    for offset, future_price in enumerate(future_prices, start=1):
+        h = float(future_highs[offset - 1]) if np.isfinite(future_highs[offset - 1]) else float(future_price)
+        l = float(future_lows[offset - 1]) if np.isfinite(future_lows[offset - 1]) else float(future_price)
+        o = float(future_opens[offset - 1]) if np.isfinite(future_opens[offset - 1]) else float(future_price)
+        if direction == 'LONG':
+            hit_tp = h >= tp_level
+            hit_sl = l <= sl_level
+            if hit_tp and hit_sl:
+                exit_idx = entry_idx + offset
+                if abs(tp_level - o) <= abs(o - sl_level):
+                    exit_reason = 'tp'; exit_price = float(tp_level)
+                else:
+                    exit_reason = 'sl'; exit_price = float(sl_level)
+                break
+            if hit_tp:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; exit_price = float(tp_level); break
+            if hit_sl:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; exit_price = float(sl_level); break
+        else:
+            hit_tp = l <= tp_level
+            hit_sl = h >= sl_level
+            if hit_tp and hit_sl:
+                exit_idx = entry_idx + offset
+                if abs(o - tp_level) <= abs(sl_level - o):
+                    exit_reason = 'tp'; exit_price = float(tp_level)
+                else:
+                    exit_reason = 'sl'; exit_price = float(sl_level)
+                break
+            if hit_tp:
+                exit_idx = entry_idx + offset; exit_reason = 'tp'; exit_price = float(tp_level); break
+            if hit_sl:
+                exit_idx = entry_idx + offset; exit_reason = 'sl'; exit_price = float(sl_level); break
+
     price_return   = (exit_price - entry_price) if direction == 'LONG' else (entry_price - exit_price)
-    path_moves     = (future_prices - entry_price) if direction == 'LONG' else (entry_price - future_prices)
+    if direction == 'LONG':
+        path_moves = future_highs - entry_price
+        adverse_moves = future_lows - entry_price
+    else:
+        path_moves = entry_price - future_lows
+        adverse_moves = entry_price - future_highs
     favourable_move = float(np.max(path_moves)) if path_moves.size else 0.0
-    adverse_move    = float(np.min(path_moves)) if path_moves.size else 0.0
+    adverse_move    = float(np.min(adverse_moves)) if adverse_moves.size else 0.0
 
     return {
         'exit_idx':    int(exit_idx),
@@ -1195,6 +1229,18 @@ def run_causal_backtest(
     replay_df = engine.factory.prepare_frame(df, already_scaled=input_scaled, include_meta=True)
     print(f"  [backtest] replay_df ready: {replay_df.shape[0]:,} x {replay_df.shape[1]} in {time.perf_counter() - t_pf0:.1f}s", flush=True)
     price_arr = _series_or_default(replay_df, 'price', 0.0, dtype=np.float64).values
+    open_arr = (
+        _series_or_default(replay_df, 'open', 0.0, dtype=np.float64).values
+        if 'open' in replay_df.columns else price_arr.copy()
+    )
+    high_arr = (
+        _series_or_default(replay_df, 'high', 0.0, dtype=np.float64).values
+        if 'high' in replay_df.columns else price_arr.copy()
+    )
+    low_arr = (
+        _series_or_default(replay_df, 'low', 0.0, dtype=np.float64).values
+        if 'low' in replay_df.columns else price_arr.copy()
+    )
     horizon_arr = _series_or_default(replay_df, 'label_horizon_steps', 0, dtype=np.int32).values
     if 'raw__micro_atr' in replay_df.columns:
         micro_atr_arr = _series_or_default(replay_df, 'raw__micro_atr', 0.0, dtype=np.float64).values
@@ -1345,6 +1391,9 @@ def run_causal_backtest(
                 horizons=horizon_arr,
                 micro_atr=micro_atr_arr,
                 tick_size=tick_size,
+                opens=open_arr,
+                highs=high_arr,
+                lows=low_arr,
                 direction_threshold_ticks=direction_threshold_ticks,
                 tp_mult=tp_mult,
                 sl_mult=sl_mult,

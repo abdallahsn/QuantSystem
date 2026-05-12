@@ -211,15 +211,10 @@ def run_bar_pipeline(
     ...     if signal == 'LONG' and conf >= 0.62:
     ...         execute_long(bar['close'])
     """
-    regime      = str(df_bar_row.get('regime_label', 'ranging'))
-    event_score = float(df_bar_row.get('event_score', 0.0))
-
-    return predict_live(
-        bar_features   = df_bar_row,
-        current_regime = regime,
-        event_score    = event_score,
-        models         = models,
-        ensemble       = ensemble,
+    raise RuntimeError(
+        "Deprecated unsafe live path. Use predict_v19.V19PredictionEngine instead; "
+        "it applies feature_schema_v19.json, scaler_params.json, base-model/meta "
+        "surfaces, sequence buffering, event gates, and failsafe policy."
     )
 
 

@@ -100,6 +100,8 @@ def enrich_bars_with_intrabar_mbp(
         "mbp_depth_ask_max": np.zeros(len(bars), dtype=np.float32),
         "mbp_depth_sum_max": np.zeros(len(bars), dtype=np.float32),
         "mbp_imbalance_peak": np.zeros(len(bars), dtype=np.float32),
+        "mbp_imbalance_signed_peak": np.zeros(len(bars), dtype=np.float32),
+        "mbp_imbalance_mean": np.zeros(len(bars), dtype=np.float32),
         "mbp_imbalance_direction_pct": np.zeros(len(bars), dtype=np.float32),
         "mbp_microprice_dev_max": np.zeros(len(bars), dtype=np.float32),
         "mbp_wall_bid_peak": np.zeros(len(bars), dtype=np.float32),
@@ -172,6 +174,8 @@ def enrich_bars_with_intrabar_mbp(
         out["mbp_depth_ask_max"][i] = float(np.max(ad_s))
         out["mbp_depth_sum_max"][i] = float(np.max(bd_s + ad_s))
         out["mbp_imbalance_peak"][i] = float(np.max(np.abs(imb_s)))
+        out["mbp_imbalance_signed_peak"][i] = float(imb_s[int(np.argmax(np.abs(imb_s)))])
+        out["mbp_imbalance_mean"][i] = float(np.mean(imb_s))
 
         signs = np.sign(imb_s)
         nz = signs != 0
@@ -206,4 +210,3 @@ def enrich_bars_with_intrabar_mbp(
         )
 
     return bars
-
