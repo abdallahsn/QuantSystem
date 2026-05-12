@@ -1,0 +1,22 @@
+# Python runtime/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments
+.venv/
+venv/
+
+# Local OS/editor noise
+.DS_Store
+.idea/
+
+# Local test/build caches
+.pytest_cache/
+
+# Generated training/runtime artifacts
+catboost_info/
+outputs/
+pipeline_*/
+*_run.log
+*.log
