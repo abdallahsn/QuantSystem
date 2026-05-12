@@ -137,9 +137,10 @@ DAY_TRADING_FEATURES = [
     'mbp_ask_slope_intrabar',
     'mbp_depth_accel',
     'event_direction',
+    'cvd_prev_session',
 ]
 
-# ─── يُطابق prepare_training_data.CATBOOST_ADVISOR_FEATURES حرفًا (N=31) ──────
+# ─── يُطابق prepare_training_data.CATBOOST_ADVISOR_FEATURES حرفًا (N=32) ──────
 CATBOOST_ADVISOR_FEATURES_DT = [
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
@@ -151,7 +152,7 @@ CATBOOST_ADVISOR_FEATURES_DT = [
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'kyle_lambda', 'hawkes_intensity', 'vnet',
-    'vwap_z_score',
+    'vwap_z_score', 'cvd_prev_session',
 ]
 
 TRADE_ACTIONS = {'T', 'F', 'TRADE', 'EXECUTE', 'E', '0'}
@@ -909,6 +910,26 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
     df['is_london']  = ((t >= pd.to_datetime('07:00').time()) & (t < pd.to_datetime('12:00').time())).astype(np.int8)
     df['is_overlap'] = ((t >= pd.to_datetime('12:00').time()) & (t < pd.to_datetime('16:00').time())).astype(np.int8)
     df['is_ny']      = ((t >= pd.to_datetime('13:30').time()) & (t < pd.to_datetime('20:00').time())).astype(np.int8)
+    sess = np.select(
+        [
+            (t >= pd.to_datetime('07:00').time()) & (t < pd.to_datetime('12:00').time()),
+            (t >= pd.to_datetime('12:00').time()) & (t < pd.to_datetime('13:30').time()),
+            (t >= pd.to_datetime('13:30').time()) & (t < pd.to_datetime('20:00').time()),
+        ],
+        ['london', 'overlap', 'ny'],
+        default='asia',
+    )
+    sess_change = pd.Series(sess, index=df.index).ne(pd.Series(sess, index=df.index).shift(1)).cumsum()
+    prev_session_cvd = np.zeros(len(df), dtype=np.float64)
+    last_completed_cvd = 0.0
+    cvd_values = pd.to_numeric(df.get('cvd', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    for _, idx in pd.Series(df.index, index=df.index).groupby(sess_change, sort=False):
+        loc = idx.to_numpy(dtype=np.int64)
+        if loc.size == 0:
+            continue
+        prev_session_cvd[loc] = last_completed_cvd
+        last_completed_cvd = float(cvd_values[loc[-1]])
+    df['cvd_prev_session'] = prev_session_cvd.astype(np.float64)
 
     # Fallback only. When MBP is present, apply_mbp_lob_imbalance replaces this
     # with signed book-depth imbalance after intrabar MBP enrichment.
@@ -1221,7 +1242,7 @@ def build_rolling_lob_tensors_from_mbp(
         tot_d = b_depth_row + a_depth_row + 1e-9
         imb_mag = np.abs((b_depth_row - a_depth_row) / tot_d)
         peak_local = int(idx_m[np.argmax(imb_mag)])
-        depth_raw = np.concatenate([bid_sz[peak_local][::-1], ask_sz[peak_local]], axis=0)
+        depth_raw = np.concatenate([bid_sz[peak_local], ask_sz[peak_local]], axis=0)
         depth_feat = np.log1p(np.maximum(depth_raw.astype(np.float64), 0.0)).astype(np.float32)
         bid0 = float(bid_px[peak_local][0]) if bid_px.shape[1] else 0.0
         ask0 = float(ask_px[peak_local][0]) if ask_px.shape[1] else 0.0
@@ -1260,7 +1281,7 @@ def build_rolling_lob_tensors_from_mbp(
             depth_feat, buy_fp, sell_fp = snap
             tensors[bi, lag, :, 0] = depth_feat
             tensors[bi, lag, levels:, 1] = buy_fp
-            tensors[bi, lag, :levels, 2] = sell_fp[::-1]
+            tensors[bi, lag, :levels, 2] = sell_fp
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
@@ -2020,7 +2041,7 @@ def run_day_trading_refinery(
     mbp_path: str | None,
     output_dir: str,
     freq: str = '5min',
-    horizon_bars: int = 6,
+    horizon_bars: int = 4,
     tp_atr_mult: float = 1.5,
     sl_atr_mult: float = 1.0,
     build_lob_tensors: bool = True,
@@ -2375,7 +2396,7 @@ if __name__ == '__main__':
     p.add_argument('--mbp',     default=None, help='اختياري: مسار ملف/مجلد MBP10 (csv/parquet) لاستخراج ميزات book قوية')
     p.add_argument('--output',  default='pipeline_day_trading/features', help='مسار الـ output')
     p.add_argument('--freq',    default='5min', choices=['5min', '15min', '30min'])
-    p.add_argument('--horizon', type=int, default=6,   help='عدد bars للـ label horizon')
+    p.add_argument('--horizon', type=int, default=4,   help='عدد bars للـ label horizon')
     p.add_argument('--tp_mult', type=float, default=1.5, help='TP = tp_mult × ATR')
     p.add_argument('--sl_mult', type=float, default=1.0, help='SL = sl_mult × ATR')
     p.add_argument('--no_lob',  action='store_true', help='تخطي بناء LOB tensors')

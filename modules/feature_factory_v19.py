@@ -142,6 +142,8 @@ FORBIDDEN_STAT_FEATURES = {
     'bias_label_detail',
     'neutral_reason',
     'timeout_move_exceeded_band',
+    'label_dynamic_threshold',
+    'effective_horizon',
     'soft_label',
     'label_confidence',
     'soft_label_long',

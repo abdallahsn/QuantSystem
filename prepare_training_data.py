@@ -584,8 +584,8 @@ CATBOOST_ADVISOR_FEATURES = [
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'kyle_lambda', 'hawkes_intensity', 'vnet',
-    'vwap_z_score',
-]  # N = 31
+    'vwap_z_score', 'cvd_prev_session',
+]  # N = 32
 
 RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]

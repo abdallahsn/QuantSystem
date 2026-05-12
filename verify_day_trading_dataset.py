@@ -30,10 +30,31 @@ REQUIRED_FOR_TRAIN = (
     "forward_return",
 )
 
-# prepare_day_trading adds raw__* for CATBOOST_ADVISOR_FEATURES_DT (31)
+# prepare_day_trading adds raw__* for CATBOOST_ADVISOR_FEATURES_DT (32)
 EXPECTED_RAW_PREFIX = "raw__"
-EXPECTED_RAW_COUNT = 31
+EXPECTED_RAW_COUNT = 32
 MIN_RELIABLE_TRAIN_ROWS_WARN = 1000
+LABEL_DERIVED_FEATURES = (
+    "bias_label",
+    "conf_label",
+    "signal_quality",
+    "forward_return",
+    "label_horizon_steps",
+    "effective_horizon",
+    "label_dynamic_threshold",
+    "path_outcome",
+    "adverse_path_flag",
+    "bias_label_detail",
+    "neutral_reason",
+    "timeout_move_exceeded_band",
+    "soft_label",
+    "label_confidence",
+    "soft_label_long",
+    "soft_label_short",
+    "soft_sample_weight",
+    "mc_sample_weight",
+    "label_stability",
+)
 
 INTRABAR_MBO = (
     "spoof_peak_slice",
@@ -131,6 +152,16 @@ def main() -> int:
         )
     else:
         print(f"✅ raw__* columns: {len(raw_cols)}")
+
+    leaked_raw = sorted(
+        c for c in raw_cols
+        if c[len(EXPECTED_RAW_PREFIX):] in set(LABEL_DERIVED_FEATURES)
+    )
+    if leaked_raw:
+        ok = False
+        print(f"❌ raw__ feature surface contains label-derived columns: {leaked_raw}")
+    else:
+        print("✅ raw__ feature surface excludes label-derived columns")
 
     if "ts_event" in df.columns:
         ts = pd.to_datetime(df["ts_event"], utc=True, errors="coerce")

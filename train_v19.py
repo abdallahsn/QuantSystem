@@ -229,6 +229,8 @@ FORBIDDEN_MODEL_INPUT_COLS = {
     'bias_label_detail',
     'neutral_reason',
     'timeout_move_exceeded_band',
+    'label_dynamic_threshold',
+    'effective_horizon',
     'kalman_trend_label',
     'kalman_trend_strength',
     'kalman_price',
