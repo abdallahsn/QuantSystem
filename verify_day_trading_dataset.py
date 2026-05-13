@@ -30,9 +30,9 @@ REQUIRED_FOR_TRAIN = (
     "forward_return",
 )
 
-# prepare_day_trading adds raw__* for CATBOOST_ADVISOR_FEATURES_DT (32)
+# prepare_day_trading adds raw__* for CATBOOST_ADVISOR_FEATURES_DT (37)
 EXPECTED_RAW_PREFIX = "raw__"
-EXPECTED_RAW_COUNT = 32
+EXPECTED_RAW_COUNT = 37
 MIN_RELIABLE_TRAIN_ROWS_WARN = 1000
 LABEL_DERIVED_FEATURES = (
     "bias_label",
@@ -52,6 +52,9 @@ LABEL_DERIVED_FEATURES = (
     "soft_label_long",
     "soft_label_short",
     "soft_sample_weight",
+    "soft_label_confidence",
+    "soft_label_entropy",
+    "soft_label_scenarios",
     "mc_sample_weight",
     "label_stability",
 )
@@ -90,6 +93,15 @@ INTRABAR_MBP_STRONG = (
     "mbp_imbalance_mean",
 )
 
+DAY_TRADING_CONTEXT_REQUIRED = (
+    "cvd_prev_session",
+    "cvd_session_open_delta",
+    "cvd_session_zscore_causal",
+    "cvd_velocity_norm_by_volume",
+    "cvd_slope_3b",
+    "lob_depth_imbalance",
+)
+
 
 def _series_stats(s: pd.Series) -> dict:
     x = pd.to_numeric(s, errors="coerce")
@@ -112,11 +124,28 @@ def _series_stats(s: pd.Series) -> dict:
     }
 
 
+def _load_manifest(data_path: str) -> dict:
+    root = os.path.dirname(os.path.abspath(data_path))
+    for name in ("day_trading_manifest.json", "manifest.json", "feature_manifest.json"):
+        p = os.path.join(root, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            import json
+            with open(p, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            print(f"⚠️ Could not read manifest {p}: {exc}")
+    return {}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Verify day_trading_features.parquet (+ optional LOB) before train_v19.")
     p.add_argument("--data", required=True, help="Path to day_trading_features.parquet")
     p.add_argument("--lob", default=None, help="Path to lob_tensors.npy (optional)")
     p.add_argument("--lob_ts", default=None, help="Path to lob_tensor_timestamps.npy (default: next to --lob)")
+    p.add_argument("--allow_horizon_gt4", action="store_true", help="Allow day-trading horizon >4 for explicit ablation runs.")
     args = p.parse_args()
 
     data_path = os.path.abspath(args.data)
@@ -126,6 +155,7 @@ def main() -> int:
 
     print(f"📥 Loading: {data_path}")
     df = pd.read_parquet(data_path)
+    manifest = _load_manifest(data_path)
     n, ncol = len(df), len(df.columns)
     print(f"   Rows: {n:,} | Columns: {ncol}")
     if n < MIN_RELIABLE_TRAIN_ROWS_WARN:
@@ -153,9 +183,10 @@ def main() -> int:
     else:
         print(f"✅ raw__* columns: {len(raw_cols)}")
 
+    label_set = set(LABEL_DERIVED_FEATURES)
     leaked_raw = sorted(
         c for c in raw_cols
-        if c[len(EXPECTED_RAW_PREFIX):] in set(LABEL_DERIVED_FEATURES)
+        if c[len(EXPECTED_RAW_PREFIX):] in label_set or c[len(EXPECTED_RAW_PREFIX):].startswith("soft_label")
     )
     if leaked_raw:
         ok = False
@@ -181,13 +212,40 @@ def main() -> int:
         vc = df["bias_label"].value_counts().sort_index()
         print(f"✅ bias_label distribution:\n{vc.to_string()}")
 
+    manifest_mode = str(manifest.get("mode", "")).lower()
+    horizon = manifest.get("horizon_bars_default", None)
+    if horizon is None and "label_horizon_steps" in df.columns:
+        h = pd.to_numeric(df["label_horizon_steps"], errors="coerce").dropna()
+        if len(h):
+            horizon = float(h.median())
+    if manifest_mode == "day_trading" or "day_trading_features" in os.path.basename(data_path):
+        if horizon is not None and float(horizon) > 4 and not args.allow_horizon_gt4:
+            ok = False
+            print(f"❌ Day-trading horizon is {float(horizon):.1f}; expected <=4 unless --allow_horizon_gt4.")
+        else:
+            print(f"✅ Day-trading horizon check: {horizon if horizon is not None else 'n/a'}")
+        layout_version = str(manifest.get("lob_layout_version", ""))
+        if manifest and layout_version != "mbp_near_to_far_v2":
+            ok = False
+            print(f"❌ Unexpected/missing lob_layout_version: {layout_version or '<missing>'}")
+
+    actual_event_rate = manifest.get("actual_event_rate", None) if manifest else None
+    if actual_event_rate is None and "is_event" in df.columns:
+        actual_event_rate = float(pd.to_numeric(df["is_event"], errors="coerce").fillna(0).mean())
+    if actual_event_rate is not None:
+        er = float(actual_event_rate)
+        print(f"✅ actual_event_rate: {er:.2%}")
+        if (manifest_mode == "day_trading" or "day_trading_features" in os.path.basename(data_path)) and not (0.15 <= er <= 0.25):
+            ok = False
+            print("❌ Day-trading event rate is outside strict 15-25% acceptance band.")
+
     def _check_group(name: str, cols: tuple[str, ...]) -> None:
         nonlocal ok
         present = [c for c in cols if c in df.columns]
         absent = [c for c in cols if c not in df.columns]
         if absent:
             print(f"⚠️ {name}: missing {len(absent)}/{len(cols)} → {absent[:6]}{'...' if len(absent) > 6 else ''}")
-            if name == "MBP intrabar":
+            if name in ("MBP intrabar", "Day-trading context"):
                 ok = False
             return
         print(f"✅ {name}: all {len(cols)} columns present")
@@ -206,6 +264,7 @@ def main() -> int:
 
     _check_group("Intrabar MBO", INTRABAR_MBO)
     _check_group("MBP intrabar", INTRABAR_MBP)
+    _check_group("Day-trading context", DAY_TRADING_CONTEXT_REQUIRED)
 
     strong_missing = [c for c in INTRABAR_MBP_STRONG if c not in df.columns]
     if strong_missing:
@@ -242,15 +301,13 @@ def main() -> int:
         ):
             ok = False
             print("❌ MBP coverage exists, but lob_imbalance mostly uses trade-flow fallback.")
-        elif (
-            depth_rate is None
-            and cov_mean is not None
-            and cov_mean > 0.30
-            and np.isfinite(corr)
-            and abs(corr) > 0.999
-        ):
+        elif cov_mean is not None and cov_mean > 0.30 and np.isfinite(corr) and abs(corr) > 0.98:
             ok = False
-            print("❌ lob_imbalance is indistinguishable from order_flow_imbalance despite MBP coverage.")
+            print("❌ lob_imbalance is too close to order_flow_imbalance despite MBP coverage.")
+
+        if args.lob is None and cov_mean is not None and cov_mean > 0.30:
+            ok = False
+            print("❌ MBP coverage is available; provide --lob so LOB tensor alignment/layout can be verified.")
 
     lob_path = args.lob
     if lob_path:
@@ -286,6 +343,16 @@ def main() -> int:
                         "   LOB sample channel std: "
                         f"{np.array2string(ch_std, precision=6)} | collapsed_tensor_ratio={collapsed_ratio:.2%}"
                     )
+                    if arr.ndim == 4 and arr.shape[2] >= 20:
+                        depth_ch = arr[..., 0]
+                        levels = depth_ch.shape[2] // 2
+                        near = np.nanmean(np.concatenate([depth_ch[:, :, :5].ravel(), depth_ch[:, :, levels:levels + 5].ravel()]))
+                        far = np.nanmean(np.concatenate([depth_ch[:, :, max(levels - 5, 0):levels].ravel(), depth_ch[:, :, -5:].ravel()]))
+                        near_far_ratio = float(near / max(far, 1e-12)) if np.isfinite(near) and np.isfinite(far) else float("nan")
+                        print(f"   LOB near/far depth ratio: {near_far_ratio:.4f}")
+                        if np.isfinite(near_far_ratio) and near_far_ratio < 0.75:
+                            ok = False
+                            print("❌ LOB near/far structure is suspiciously inverted or flat.")
                     if ch_std.size and bool(np.all(ch_std < 1e-8)):
                         ok = False
                         print("❌ LOB sample channels are collapsed/all-flat")

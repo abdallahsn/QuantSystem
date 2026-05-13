@@ -7,7 +7,7 @@ prepare_day_trading.py — Day Trading Refinery for QuantSystem V19
 **المرحلة 1 — تجميع غني (هذا الملف = «جسر السيولة»، بدون mbo_aggregator منفصل):**
   - من MBO/MBP الخام → شمعة OHLCV + ميزات ميكروستراكتشر مُجمَّعة (CVD، امتصاص، تدفق، …).
   - بناء LOB tensor لكل شمعة (50 × 20 × 3): البعد الأول = آخر 50 شمعة تاريخية؛ مع MBP لقطة ذروة imbalance لكل شمعة.
-  - محاذاة سطح CatBoost الـ31 مع prepare_training_data (أعمدة + raw__*).
+  - محاذاة سطح CatBoost مع prepare_training_data (أعمدة + raw__*).
 
 **المرحلة 2 — تدريب موحّد (train_v19.py):**
   - CatBoost/XGB على الميزات الجدولية (+ soft_label أو bias).
@@ -89,6 +89,7 @@ DAY_TRADING_FEATURES = [
     'is_ny',            # جلسة نيويورك
     # Multi-Timeframe Context
     'cvd_slope_6b',     # ميل CVD على ~30 دقيقة (Δ يعتمد على freq)
+    'cvd_slope_3b',     # ميل أقصر متوافق مع half-life سريع
     'volume_ratio_6b',  # نسبة volume الحالي للمتوسط
     'vwap_dist_6b',     # مسافة السعر عن VWAP
     'return_6b',        # عائد آخر 6 bars
@@ -98,7 +99,8 @@ DAY_TRADING_FEATURES = [
     # Order Flow (مُجمَّع على bar)
     'buy_ratio',        # نسبة الشراء في الـ bar
     'bar_cvd_delta',    # تغير CVD داخل الـ bar
-    'lob_imbalance',    # MBP depth imbalance when available; explicit flow proxy fallback otherwise
+    'lob_imbalance',    # alias مؤقت: depth عند توفر MBP، fallback فقط عند غياب MBP
+    'lob_depth_imbalance',
     'lob_imbalance_is_depth',
     # جسر السيولة (مُجمَّع من التكات داخل الشمعة — أسماء صريحة للمسار الهجين)
     'num_trades',       # = tick_count
@@ -138,9 +140,12 @@ DAY_TRADING_FEATURES = [
     'mbp_depth_accel',
     'event_direction',
     'cvd_prev_session',
+    'cvd_session_open_delta',
+    'cvd_session_zscore_causal',
+    'cvd_velocity_norm_by_volume',
 ]
 
-# ─── يُطابق prepare_training_data.CATBOOST_ADVISOR_FEATURES حرفًا (N=32) ──────
+# ─── يُطابق prepare_training_data.CATBOOST_ADVISOR_FEATURES حرفًا (N=37) ──────
 CATBOOST_ADVISOR_FEATURES_DT = [
     'cvd', 'obi', 'absorption_intensity', 'cancel_ratio',
     'spoofing_ratio', 'spoofing_duration', 'liquidity_trap',
@@ -152,7 +157,9 @@ CATBOOST_ADVISOR_FEATURES_DT = [
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'kyle_lambda', 'hawkes_intensity', 'vnet',
-    'vwap_z_score', 'cvd_prev_session',
+    'vwap_z_score', 'cvd_prev_session', 'cvd_session_open_delta',
+    'cvd_session_zscore_causal', 'cvd_velocity_norm_by_volume',
+    'cvd_slope_3b', 'lob_depth_imbalance',
 ]
 
 TRADE_ACTIONS = {'T', 'F', 'TRADE', 'EXECUTE', 'E', '0'}
@@ -163,6 +170,12 @@ BUY_SIDES = {'A', 'ASK', 'BUY', 'BOT'}
 SELL_SIDES = {'B', 'BID', 'S', 'SELL'}
 CVD_DIRECTION_MIN_ABS = 1.0
 OBI_DIRECTION_MIN_ABS = 0.05
+DAY_TRADING_DEFAULT_HORIZON_BARS = 4
+EVENT_GATE_MODE_FIXED = 'fixed'
+EVENT_GATE_MODE_CAUSAL_QUANTILE = 'causal_quantile'
+DEFAULT_EVENT_TARGET_RATE = 0.20
+DEFAULT_EVENT_MIN_SCORE_FLOOR = 0.20
+LOB_LAYOUT_VERSION = 'mbp_near_to_far_v2'
 CORE_MBO_REQUIRED_COLS = [
     'cvd',
     'session_cvd',
@@ -191,6 +204,41 @@ def _resolve_mbo_size_column(df_mbo: pd.DataFrame) -> str:
         if candidate in df_mbo.columns:
             return candidate
     raise KeyError("MBO data must include one of size/qty/volume")
+
+
+def _causal_quantile_threshold(
+    values: pd.Series,
+    *,
+    target_rate: float,
+    window: int = EVENT_ZSCORE_WINDOW,
+    min_periods: int = EVENT_ZSCORE_MIN_PERIODS,
+    floor: float = 0.0,
+) -> pd.Series:
+    """Per-row threshold from prior rows only; no current/future score participates."""
+    s = pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float64)
+    q = 1.0 - float(np.clip(target_rate, 0.01, 0.99))
+    prior = s.shift(1)
+    roll = prior.rolling(int(max(window, 2)), min_periods=int(max(min_periods, 1))).quantile(q)
+    expanding = prior.expanding(min_periods=int(max(min_periods, 1))).quantile(q)
+    threshold = roll.combine_first(expanding).fillna(float(floor))
+    return threshold.clip(lower=float(floor), upper=1.0).astype(np.float32)
+
+
+def _causal_rate_mask(
+    scores: pd.Series,
+    base_mask: pd.Series | np.ndarray,
+    *,
+    target_rate: float,
+    floor: float = 0.0,
+) -> pd.Series:
+    threshold = _causal_quantile_threshold(
+        scores,
+        target_rate=target_rate,
+        floor=floor,
+    )
+    score_s = pd.to_numeric(scores, errors='coerce').fillna(0.0).astype(np.float64)
+    mask_s = pd.Series(base_mask, index=score_s.index).astype(bool)
+    return (mask_s & (score_s >= threshold.astype(np.float64))).astype(bool)
 
 
 def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
@@ -641,6 +689,7 @@ def apply_mbp_lob_imbalance(df: pd.DataFrame) -> pd.DataFrame:
         depth = (bid - ask) / (bid + ask).clip(lower=1e-9)
 
     if depth is None:
+        out['lob_depth_imbalance'] = np.zeros(len(out), dtype=np.float32)
         out['lob_imbalance'] = proxy
         out['lob_imbalance_is_depth'] = np.zeros(len(out), dtype=np.int8)
         return out
@@ -652,6 +701,7 @@ def apply_mbp_lob_imbalance(df: pd.DataFrame) -> pd.DataFrame:
     else:
         has_depth = pd.Series(np.abs(depth.to_numpy(dtype=np.float32)) > 1e-12, index=out.index)
 
+    out['lob_depth_imbalance'] = np.where(has_depth.to_numpy(), depth.to_numpy(), 0.0).astype(np.float32)
     out['lob_imbalance'] = np.where(has_depth.to_numpy(), depth.to_numpy(), proxy.to_numpy()).astype(np.float32)
     out['lob_imbalance_is_depth'] = has_depth.astype(np.int8).to_numpy()
     return out
@@ -892,6 +942,8 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
     df['macd_hist'] = macd - macd.ewm(span=9, adjust=False).mean()
 
     nb_short = max(2, _bars_for_target_minutes(freq, 30))
+    nb_micro = min(3, nb_short)
+    df['cvd_slope_3b']    = df['cvd'].diff(nb_micro) / float(max(nb_micro, 1))
     df['return_6b']       = df['close'].pct_change(nb_short)
     df['volume_ratio_6b'] = df['volume'] / df['volume'].rolling(nb_short, min_periods=1).mean().clip(lower=1)
     df['cvd_slope_6b']    = df['cvd'].diff(nb_short) / float(nb_short)
@@ -921,6 +973,8 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
     )
     sess_change = pd.Series(sess, index=df.index).ne(pd.Series(sess, index=df.index).shift(1)).cumsum()
     prev_session_cvd = np.zeros(len(df), dtype=np.float64)
+    session_open_delta = np.zeros(len(df), dtype=np.float64)
+    session_zscore = np.zeros(len(df), dtype=np.float64)
     last_completed_cvd = 0.0
     cvd_values = pd.to_numeric(df.get('cvd', 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
     for _, idx in pd.Series(df.index, index=df.index).groupby(sess_change, sort=False):
@@ -928,8 +982,20 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = '5min') -> pd.DataFra
         if loc.size == 0:
             continue
         prev_session_cvd[loc] = last_completed_cvd
+        session_open_delta[loc] = cvd_values[loc] - cvd_values[loc[0]]
+        expanding = pd.Series(session_open_delta[loc], index=loc, dtype=np.float64)
+        prior_mean = expanding.shift(1).expanding(min_periods=3).mean()
+        prior_std = expanding.shift(1).expanding(min_periods=3).std().replace(0.0, np.nan)
+        session_zscore[loc] = ((expanding - prior_mean) / prior_std).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=np.float64)
         last_completed_cvd = float(cvd_values[loc[-1]])
     df['cvd_prev_session'] = prev_session_cvd.astype(np.float64)
+    df['cvd_session_open_delta'] = session_open_delta.astype(np.float64)
+    df['cvd_session_zscore_causal'] = session_zscore.astype(np.float64)
+    volume_safe = pd.to_numeric(df.get('volume', 0.0), errors='coerce').fillna(0.0).astype(np.float64).clip(lower=1.0)
+    bar_cvd_delta_src = df['bar_cvd_delta'] if 'bar_cvd_delta' in df.columns else pd.Series(0.0, index=df.index)
+    df['cvd_velocity_norm_by_volume'] = (
+        pd.to_numeric(bar_cvd_delta_src, errors='coerce').fillna(0.0).astype(np.float64) / volume_safe
+    ).clip(-1.0, 1.0)
 
     # Fallback only. When MBP is present, apply_mbp_lob_imbalance replaces this
     # with signed book-depth imbalance after intrabar MBP enrichment.
@@ -1126,6 +1192,39 @@ def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> 
         'low_ratio': float(np.mean(vals < float(low_threshold))),
         'threshold': float(low_threshold),
     }
+
+
+def _estimate_signal_half_life_median(
+    df: pd.DataFrame,
+    *,
+    features: tuple[str, ...] = (
+        'hawkes_intensity',
+        'kyle_lambda',
+        'absorption_intensity',
+        'bar_cvd_delta',
+        'cvd_velocity_norm_by_volume',
+        'lob_depth_imbalance',
+        'event_score',
+    ),
+    max_lag: int = 15,
+) -> float | None:
+    half_lives: list[int] = []
+    for col in features:
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float64)
+        if len(s) < 8 or float(s.std()) <= 1e-12:
+            continue
+        for lag in range(1, int(max_lag) + 1):
+            corr = s.corr(s.shift(lag), method='spearman')
+            if not np.isfinite(corr) or abs(float(corr)) <= 0.5:
+                half_lives.append(lag)
+                break
+        else:
+            half_lives.append(int(max_lag) + 1)
+    if not half_lives:
+        return None
+    return float(np.median(np.asarray(half_lives, dtype=np.float64)))
 
 
 def _trade_footprint_bar(
@@ -1367,6 +1466,9 @@ def detect_microstructure_events(
     *,
     threshold_scale: float = 1.0,
     threshold_shift: float = 0.0,
+    event_gate_mode: str = EVENT_GATE_MODE_CAUSAL_QUANTILE,
+    event_target_rate: float = DEFAULT_EVENT_TARGET_RATE,
+    event_min_score_floor: float = DEFAULT_EVENT_MIN_SCORE_FLOOR,
 ) -> pd.DataFrame:
     """
     يكشف اللحظات التي يكون فيها informed flow حقيقي ويُضيف:
@@ -1413,12 +1515,16 @@ def detect_microstructure_events(
 
     # ── حساب event_score المرجح ──────────────────────────────────────────────
     w = EVENT_SCORE_WEIGHTS
+    hawkes_component = ((hawkes_z - 1.0) / 2.0).clip(0.0, 1.0)
+    absorb_component = ((absorb_z - 1.0) / 2.0).clip(0.0, 1.0)
+    kyle_component = ((kyle_z - 0.5) / 2.0).clip(0.0, 1.0)
+    cvd_component = ((cvd_align - 0.6) / 0.4).clip(0.0, 1.0)
     event_score = (
-        (hawkes_z  > 1.0).astype(np.float32) * w['hawkes_z_above_1']  +
-        (absorb_z  > 1.0).astype(np.float32) * w['absorb_z_above_1']  +
-        (kyle_z    > 0.5).astype(np.float32) * w['kyle_z_above_05']   +
-        (cvd_align > 0.6).astype(np.float32) * w['cvd_align_above_06']
-    ).astype(np.float32)
+        hawkes_component.astype(np.float32) * w['hawkes_z_above_1']  +
+        absorb_component.astype(np.float32) * w['absorb_z_above_1']  +
+        kyle_component.astype(np.float32) * w['kyle_z_above_05']   +
+        cvd_component.astype(np.float32) * w['cvd_align_above_06']
+    ).clip(0.0, 1.0).astype(np.float32)
 
     # ── Regime Gate (المشكلة I) ───────────────────────────────────────────────
     if 'regime_label' in df.columns:
@@ -1428,19 +1534,39 @@ def detect_microstructure_events(
     else:
         base_threshold = pd.Series(0.60, index=df.index, dtype=np.float32)
 
+    mode = str(event_gate_mode or EVENT_GATE_MODE_CAUSAL_QUANTILE).strip().lower()
+    if mode not in {EVENT_GATE_MODE_FIXED, EVENT_GATE_MODE_CAUSAL_QUANTILE}:
+        raise ValueError(
+            f"Unsupported event_gate_mode={event_gate_mode!r}; "
+            f"expected {EVENT_GATE_MODE_FIXED!r} or {EVENT_GATE_MODE_CAUSAL_QUANTILE!r}"
+        )
+    target = float(np.clip(event_target_rate, 0.01, 0.99))
+    min_floor = float(np.clip(event_min_score_floor, 0.0, 0.95))
     scale = float(max(threshold_scale, 0.01))
     shift = float(threshold_shift)
-    threshold = (base_threshold.astype(np.float64) * scale + shift).clip(0.05, 0.95).astype(np.float32)
+    fixed_threshold = (base_threshold.astype(np.float64) * scale + shift).clip(min_floor, 0.95).astype(np.float32)
+    if mode == EVENT_GATE_MODE_CAUSAL_QUANTILE:
+        causal_threshold = _causal_quantile_threshold(
+            pd.Series(event_score, index=df.index),
+            target_rate=target,
+            floor=min_floor,
+        )
+        threshold = np.maximum(fixed_threshold.to_numpy(dtype=np.float32), causal_threshold.to_numpy(dtype=np.float32))
+    else:
+        threshold = fixed_threshold.to_numpy(dtype=np.float32)
 
     df['event_score'] = event_score
-    df['is_event'] = (event_score >= threshold.values).astype(np.int8)
+    df['event_threshold'] = threshold.astype(np.float32)
+    df['event_gate_mode'] = mode
+    df['event_target_rate'] = np.float32(target)
+    df['is_event'] = (event_score >= threshold).astype(np.int8)
 
     # ── إحصاءات التشخيص ──────────────────────────────────────────────────────
     n_total = len(df)
     n_event = int(df['is_event'].sum())
     print(
         f"  📊 Event Detection: {n_event:,}/{n_total:,} bars = {n_event/max(n_total,1):.1%} events "
-        f"(threshold_scale={scale:.2f}, shift={shift:+.2f})"
+        f"(mode={mode}, target={target:.1%}, floor={min_floor:.2f}, threshold_scale={scale:.2f}, shift={shift:+.2f})"
     )
     if 'regime_label' in df.columns:
         for reg in ['trending', 'ranging', 'volatile']:
@@ -2041,7 +2167,7 @@ def run_day_trading_refinery(
     mbp_path: str | None,
     output_dir: str,
     freq: str = '5min',
-    horizon_bars: int = 4,
+    horizon_bars: int = DAY_TRADING_DEFAULT_HORIZON_BARS,
     tp_atr_mult: float = 1.5,
     sl_atr_mult: float = 1.0,
     build_lob_tensors: bool = True,
@@ -2049,6 +2175,9 @@ def run_day_trading_refinery(
     strict_train_pool: bool = False,
     event_threshold_scale: float = 1.0,
     event_threshold_shift: float = 0.0,
+    event_gate_mode: str = EVENT_GATE_MODE_CAUSAL_QUANTILE,
+    event_target_rate: float = DEFAULT_EVENT_TARGET_RATE,
+    event_min_score_floor: float = DEFAULT_EVENT_MIN_SCORE_FLOOR,
     kalman_event_floor: float = _KALMAN_EVENT_FLOOR,
     weak_event_to_directional: bool = False,
     weak_event_min_move_atr: float = 0.35,
@@ -2068,6 +2197,8 @@ def run_day_trading_refinery(
         "   EventGate tuning: "
         f"threshold_scale={float(event_threshold_scale):.2f}, "
         f"threshold_shift={float(event_threshold_shift):+.2f}, "
+        f"mode={event_gate_mode}, target={float(event_target_rate):.1%}, "
+        f"floor={float(event_min_score_floor):.2f}, "
         f"kalman_floor={float(kalman_event_floor):.2f}"
     )
     print(
@@ -2173,6 +2304,9 @@ def run_day_trading_refinery(
         df_bars,
         threshold_scale=event_threshold_scale,
         threshold_shift=event_threshold_shift,
+        event_gate_mode=event_gate_mode,
+        event_target_rate=event_target_rate,
+        event_min_score_floor=event_min_score_floor,
     )
     print("\n🧭 Directional voting (CVD + OBI + Kalman)...")
     df_bars = add_event_direction(df_bars)
@@ -2191,6 +2325,22 @@ def run_day_trading_refinery(
         sl_to_opposite=sl_to_opposite,
         include_weak_directional_in_train=include_weak_directional_in_train,
     )
+    if 'train_event_flag' in df_labeled.columns and 'event_score' in df_labeled.columns:
+        before_train_pool = float(pd.to_numeric(df_labeled['train_event_flag'], errors='coerce').fillna(0).mean())
+        if before_train_pool > float(event_target_rate):
+            capped_mask = _causal_rate_mask(
+                df_labeled['event_score'],
+                pd.to_numeric(df_labeled['train_event_flag'], errors='coerce').fillna(0).astype(np.int8) == 1,
+                target_rate=event_target_rate,
+                floor=event_min_score_floor,
+            )
+            df_labeled['train_event_flag'] = capped_mask.astype(np.int8).to_numpy()
+            after_train_pool = float(df_labeled['train_event_flag'].mean())
+            print(
+                "  🔒 train_event_flag capped causally: "
+                f"{before_train_pool:.1%} → {after_train_pool:.1%} "
+                f"(target={float(event_target_rate):.1%})"
+            )
 
     # توافق backward: أضف label_end_ts إذا لم توجد
     if 'label_end_ts' not in df_labeled.columns:
@@ -2279,6 +2429,13 @@ def run_day_trading_refinery(
 
     mbp_bar_cov_stats = _coverage_stats(df_out.get('mbp_bar_coverage', 0.0), low_threshold=0.30)
     mbp_roll_cov_stats = _coverage_stats(df_out.get('mbp_roll_lob_coverage', 0.0), low_threshold=0.50)
+    effective_horizon_median = float(
+        pd.to_numeric(df_out.get('effective_horizon', horizon_bars), errors='coerce')
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(horizon_bars)
+        .median()
+    )
+    signal_half_life_median = _estimate_signal_half_life_median(df_out)
     print(
         "   📊 MBP coverage: "
         f"bar_mean={mbp_bar_cov_stats['mean']:.1%}, bar_low(<30%)={mbp_bar_cov_stats['low_ratio']:.1%} | "
@@ -2330,6 +2487,9 @@ def run_day_trading_refinery(
         'version'                     : 'v19-event-gate',
         'freq'                        : freq,
         'horizon_bars_default'        : horizon_bars,
+        'label_horizon_source'        : 'day_trading.horizon_bars',
+        'effective_horizon_median'    : effective_horizon_median,
+        'signal_half_life_median'     : signal_half_life_median,
         'tp_atr_mult_default'         : tp_atr_mult,
         'sl_atr_mult_default'         : sl_atr_mult,
         'regime_tp_sl'                : {k: list(v) for k, v in REGIME_TP_SL.items()},
@@ -2337,6 +2497,10 @@ def run_day_trading_refinery(
         'regime_event_threshold'      : REGIME_EVENT_THRESHOLD,
         'event_threshold_scale'       : float(event_threshold_scale),
         'event_threshold_shift'       : float(event_threshold_shift),
+        'event_gate_mode'             : str(event_gate_mode),
+        'event_target_rate'           : float(event_target_rate),
+        'event_min_score_floor'       : float(event_min_score_floor),
+        'actual_event_rate'           : float(pd.to_numeric(df_out.get('is_event', 0), errors='coerce').fillna(0).mean()),
         'kalman_event_floor'          : float(kalman_event_floor),
         'weak_event_to_directional'   : bool(weak_event_to_directional),
         'weak_event_min_move_atr'     : float(weak_event_min_move_atr),
@@ -2360,9 +2524,10 @@ def run_day_trading_refinery(
         'catboost_advisor_features'   : CATBOOST_ADVISOR_FEATURES_DT,
         'day_trading_context_features': DAY_TRADING_FEATURES,
         'lob_tensors_built'           : bool(build_lob_tensors),
+        'lob_layout_version'          : LOB_LAYOUT_VERSION,
         'lob_tensor_normalization'    : 'raw_unscaled_train_pipeline_must_fit_normalizer_on_train_only',
         'lob_roll_lookback_bars'      : DEEPLOB_TIME_STEPS_DEFAULT,
-        'lob_tensor_layout'           : 'rolling_bars_time_x_20_levels_x_3ch_peak_mbp_when_available',
+        'lob_tensor_layout'           : 'rolling_bars_time_x_20_levels_x_3ch_peak_mbp_near_to_far_when_available',
         'mbp_bar_coverage_stats'      : mbp_bar_cov_stats,
         'mbp_roll_lob_coverage_stats' : mbp_roll_cov_stats,
         'lob_imbalance_source'        : 'mbp_depth_when_available_else_trade_flow_proxy',
@@ -2396,7 +2561,7 @@ if __name__ == '__main__':
     p.add_argument('--mbp',     default=None, help='اختياري: مسار ملف/مجلد MBP10 (csv/parquet) لاستخراج ميزات book قوية')
     p.add_argument('--output',  default='pipeline_day_trading/features', help='مسار الـ output')
     p.add_argument('--freq',    default='5min', choices=['5min', '15min', '30min'])
-    p.add_argument('--horizon', type=int, default=4,   help='عدد bars للـ label horizon')
+    p.add_argument('--horizon', type=int, default=DAY_TRADING_DEFAULT_HORIZON_BARS,   help='عدد bars للـ label horizon')
     p.add_argument('--tp_mult', type=float, default=1.5, help='TP = tp_mult × ATR')
     p.add_argument('--sl_mult', type=float, default=1.0, help='SL = sl_mult × ATR')
     p.add_argument('--no_lob',  action='store_true', help='تخطي بناء LOB tensors')
@@ -2411,6 +2576,24 @@ if __name__ == '__main__':
         type=float,
         default=0.0,
         help='إزاحة لعَتبات Event Gate بعد الـ scale (قيمة سالبة = إشارات أكثر، default=0.0)',
+    )
+    p.add_argument(
+        '--event_gate_mode',
+        default=EVENT_GATE_MODE_CAUSAL_QUANTILE,
+        choices=[EVENT_GATE_MODE_FIXED, EVENT_GATE_MODE_CAUSAL_QUANTILE],
+        help='طريقة عتبة event gate: fixed أو causal_quantile لضبط معدل الأحداث دون lookahead.',
+    )
+    p.add_argument(
+        '--event_target_rate',
+        type=float,
+        default=DEFAULT_EVENT_TARGET_RATE,
+        help='معدل events/train pool المستهدف في causal_quantile، default=0.20.',
+    )
+    p.add_argument(
+        '--event_min_score_floor',
+        type=float,
+        default=DEFAULT_EVENT_MIN_SCORE_FLOOR,
+        help='أدنى event_score مسموح قبل اعتبار bar حدثا، default=0.20.',
     )
     p.add_argument(
         '--kalman_event_floor',
@@ -2458,6 +2641,9 @@ if __name__ == '__main__':
         strict_train_pool=args.strict_train_pool,
         event_threshold_scale=args.event_threshold_scale,
         event_threshold_shift=args.event_threshold_shift,
+        event_gate_mode=args.event_gate_mode,
+        event_target_rate=args.event_target_rate,
+        event_min_score_floor=args.event_min_score_floor,
         kalman_event_floor=args.kalman_event_floor,
         weak_event_to_directional=args.weak_event_to_directional,
         weak_event_min_move_atr=args.weak_event_min_move_atr,

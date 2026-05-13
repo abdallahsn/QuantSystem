@@ -13,9 +13,9 @@
     "feature_roll_window": 150,
     "direction_threshold_ticks": 1.0,
     "causal_threshold_mode": "expanding",
-    "raw_event_target_rate": 0.7,
-    "training_event_target_rate": 0.25,
-    "training_event_score_threshold": 0.0,
+    "raw_event_target_rate": 0.25,
+    "training_event_target_rate": 0.2,
+    "training_event_score_threshold": null,
     "lob_event_sample": 100000,
     "tp_mult": 1.2,
     "sl_mult": 1.0,
@@ -43,6 +43,12 @@
     "horizon_std": 0.15,
     "tp_std": 0.1,
     "sl_std": 0.1
+  },
+  "day_trading": {
+    "horizon_bars": 4,
+    "event_gate_mode": "causal_quantile",
+    "event_target_rate": 0.2,
+    "event_min_score_floor": 0.2
   },
   "training": {
     "output_dir": "outputs_v19",

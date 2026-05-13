@@ -584,8 +584,10 @@ CATBOOST_ADVISOR_FEATURES = [
     'trend_strength', 'correction_depth', 'liquidity_sweep',
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'kyle_lambda', 'hawkes_intensity', 'vnet',
-    'vwap_z_score', 'cvd_prev_session',
-]  # N = 32
+    'vwap_z_score', 'cvd_prev_session', 'cvd_session_open_delta',
+    'cvd_session_zscore_causal', 'cvd_velocity_norm_by_volume',
+    'cvd_slope_3b', 'lob_depth_imbalance',
+]  # N = 37
 
 RAW_STAT_PREFIX = 'raw__'
 RAW_STAT_FEATURE_COLS = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES]

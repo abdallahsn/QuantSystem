@@ -239,6 +239,9 @@ FORBIDDEN_MODEL_INPUT_COLS = {
     'soft_label_long',
     'soft_label_short',
     'soft_sample_weight',
+    'soft_label_confidence',
+    'soft_label_entropy',
+    'soft_label_scenarios',
     'mc_sample_weight',
     'label_stability',
 }
