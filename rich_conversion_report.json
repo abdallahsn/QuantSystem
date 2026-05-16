@@ -1,0 +1,183 @@
+{
+  "inputs": {
+    "mbo": "/Users/abdallah/Downloads/QS_FINAL/rich_mbo.csv",
+    "mbp": "/Users/abdallah/Downloads/QS_FINAL/rich_mbp.csv"
+  },
+  "outputs": {
+    "mbo_parquet": "/Users/abdallah/Downloads/QS_FINAL/rich_mbo.parquet",
+    "mbp_parquet": "/Users/abdallah/Downloads/QS_FINAL/rich_mbp.parquet",
+    "features_parquet": "/Users/abdallah/Downloads/QS_FINAL/rich_threshold_features.parquet"
+  },
+  "bar_frequency": "5min",
+  "raw": {
+    "mbo": {
+      "name": "mbo",
+      "rows": 4500,
+      "columns": [
+        "ts_recv",
+        "ts_event",
+        "rtype",
+        "publisher_id",
+        "instrument_id",
+        "action",
+        "side",
+        "price",
+        "size",
+        "channel_id",
+        "order_id",
+        "flags",
+        "ts_in_delta",
+        "sequence",
+        "symbol"
+      ],
+      "duplicate_rows": 0,
+      "missing_ts_event": 0,
+      "duplicate_ts_event": 0,
+      "ts_event_monotonic_in_input_order": true,
+      "time_start": "2024-12-30 00:00:00+00:00",
+      "time_end": "2025-01-02 14:39:53+00:00",
+      "backward_timestamp_steps": 0,
+      "symbols_sample": [
+        "6BH5"
+      ],
+      "symbol_count": 1,
+      "instrument_ids_sample": [
+        "29307"
+      ],
+      "instrument_id_count": 1,
+      "missing_price": 345,
+      "non_positive_price": 0,
+      "missing_size": 0,
+      "negative_size": 0,
+      "action_counts": {
+        "A": 1370,
+        "T": 1067,
+        "C": 1016,
+        "F": 702,
+        "R": 345
+      }
+    },
+    "mbp": {
+      "name": "mbp",
+      "rows": 2000,
+      "columns": [
+        "ts_recv",
+        "ts_event",
+        "rtype",
+        "publisher_id",
+        "instrument_id",
+        "action",
+        "side",
+        "depth",
+        "price",
+        "size",
+        "flags",
+        "ts_in_delta",
+        "sequence",
+        "symbol",
+        "bid_px_00",
+        "ask_px_00",
+        "bid_sz_00",
+        "ask_sz_00",
+        "bid_ct_00",
+        "ask_ct_00",
+        "bid_px_01",
+        "ask_px_01",
+        "bid_sz_01",
+        "ask_sz_01",
+        "bid_ct_01",
+        "ask_ct_01",
+        "bid_px_02",
+        "ask_px_02",
+        "bid_sz_02",
+        "ask_sz_02",
+        "bid_ct_02",
+        "ask_ct_02",
+        "bid_px_03",
+        "ask_px_03",
+        "bid_sz_03",
+        "ask_sz_03",
+        "bid_ct_03",
+        "ask_ct_03",
+        "bid_px_04",
+        "ask_px_04",
+        "bid_sz_04",
+        "ask_sz_04",
+        "bid_ct_04",
+        "ask_ct_04",
+        "bid_px_05",
+        "ask_px_05",
+        "bid_sz_05",
+        "ask_sz_05",
+        "bid_ct_05",
+        "ask_ct_05",
+        "bid_px_06",
+        "ask_px_06",
+        "bid_sz_06",
+        "ask_sz_06",
+        "bid_ct_06",
+        "ask_ct_06",
+        "bid_px_07",
+        "ask_px_07",
+        "bid_sz_07",
+        "ask_sz_07",
+        "bid_ct_07",
+        "ask_ct_07",
+        "bid_px_08",
+        "ask_px_08",
+        "bid_sz_08",
+        "ask_sz_08",
+        "bid_ct_08",
+        "ask_ct_08",
+        "bid_px_09",
+        "ask_px_09",
+        "bid_sz_09",
+        "ask_sz_09",
+        "bid_ct_09",
+        "ask_ct_09"
+      ],
+      "duplicate_rows": 0,
+      "missing_ts_event": 0,
+      "duplicate_ts_event": 0,
+      "ts_event_monotonic_in_input_order": true,
+      "time_start": "2024-12-30 08:00:00+00:00",
+      "time_end": "2024-12-30 10:46:35+00:00",
+      "backward_timestamp_steps": 0,
+      "symbols_sample": [
+        "6BH5"
+      ],
+      "symbol_count": 1,
+      "instrument_ids_sample": [
+        "29307"
+      ],
+      "instrument_id_count": 1,
+      "missing_price": 0,
+      "non_positive_price": 0,
+      "missing_size": 0,
+      "negative_size": 0,
+      "action_counts": {
+        "A": 2000
+      }
+    }
+  },
+  "notes": [
+    "raw MBO/MBP parquet files preserve input rows after timestamp/numeric coercion",
+    "feature parquet uses MBO trade bars first and MBP mid-price bars only where no MBO trade bar exists",
+    "atr_14 is a causal rolling mean over true range in timestamp order"
+  ],
+  "features": {
+    "mbo_trade_rows_used": 1769,
+    "mbo_bars": 126,
+    "mbp_snapshot_rows_used": 2000,
+    "mbp_bars": 34,
+    "feature_rows": 146,
+    "feature_time_start": "2024-12-30 00:00:00+00:00",
+    "feature_time_end": "2025-01-02 14:35:00+00:00",
+    "feature_ts_event_monotonic": true,
+    "feature_duplicate_ts_event": 0,
+    "feature_sources": {
+      "MBO": 126,
+      "MBP": 20
+    }
+  }
+}
