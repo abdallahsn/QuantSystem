@@ -1545,6 +1545,7 @@ def _load_source_refinery_contract(csv_path: str) -> dict:
         'dataset_id': None,
         'schema_version': None,
         'label_mode': None,
+        'continuous_contract': None,
         'split_time': None,
         'manifest_path': manifest_path if os.path.exists(manifest_path) else None,
     }
@@ -1555,6 +1556,7 @@ def _load_source_refinery_contract(csv_path: str) -> dict:
             out['dataset_id'] = extra.get('dataset_id')
             out['schema_version'] = extra.get('schema_version')
             out['label_mode'] = extra.get('label_mode')
+            out['continuous_contract'] = extra.get('continuous_contract')
             split_meta = extra.get('split_meta', {}) or {}
             out['split_time'] = split_meta.get('split_time')
         except Exception:

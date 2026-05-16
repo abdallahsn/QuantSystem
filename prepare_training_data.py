@@ -11,7 +11,7 @@ prepare_training_data.py — V19 Data Refinery
 """
 
 # QuantSystem V19
-import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib, time
+import argparse, datetime, os, sys, multiprocessing, json, inspect, hashlib, time, re
 
 # Default runtime threading guards for multiprocessing-heavy refinery stages.
 # Respect user-provided env overrides when present.
@@ -105,6 +105,7 @@ DEEPLOB_MAX_EVENTS_DEFAULT = 5_000_000
 DEEPLOB_MAX_TENSORS_DEFAULT = 25_000
 DEEPLOB_MAX_GB_DEFAULT = 0.30
 LOB_EVENT_SAMPLE_DEFAULT = 100_000
+FUTURES_CONTRACT_RE = re.compile(r"^(?P<root>.+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{1,4})$", re.IGNORECASE)
 
 try:
     from modules.labels_v19 import (
@@ -657,8 +658,8 @@ def _validate_input_schema(df: pd.DataFrame, *, kind: str) -> None:
     missing: list[str] = []
     if _first_present_column(df, ('ts_event', 'ts_recv')) is None:
         missing.append('timestamp column (ts_event or ts_recv)')
-    if _first_present_column(df, ('symbol', 'instrument_id')) is None:
-        missing.append('contract column (symbol or instrument_id)')
+    if _first_present_column(df, ('symbol', 'raw_symbol', 'instrument_id')) is None:
+        missing.append('contract column (symbol, raw_symbol, or instrument_id)')
 
     if kind == 'mbo':
         if 'price' not in df.columns:
@@ -777,7 +778,10 @@ def _normalize_databento_columns(df: pd.DataFrame, *, kind: str = 'mbo') -> pd.D
             )
 
     if 'symbol' not in df.columns:
-        df['symbol'] = df['instrument_id'].astype(str)
+        if 'raw_symbol' in df.columns:
+            df['symbol'] = df['raw_symbol'].astype(str)
+        else:
+            df['symbol'] = df['instrument_id'].astype(str)
     symbol_text = df['symbol'].astype(str).str.strip()
     invalid_symbol = df['symbol'].isna() | symbol_text.isin({'', 'NAN', 'NONE', 'UNKNOWN'})
     if bool(invalid_symbol.any()):
@@ -810,6 +814,56 @@ def _normalize_databento_columns(df: pd.DataFrame, *, kind: str = 'mbo') -> pd.D
     n_acts  = df['action'].value_counts().to_dict() if 'action' in df.columns else {}
     print(f"  ✅ Normalize: {n_final:,} صف | actions={n_acts}")
     return df
+
+
+def _parse_futures_contract_symbol(symbol: str) -> dict | None:
+    token = str(symbol or '').strip().upper()
+    if not token:
+        return None
+    match = FUTURES_CONTRACT_RE.match(token)
+    if not match:
+        return None
+    return {
+        'symbol': token,
+        'root': match.group('root').upper(),
+        'month_code': match.group('month').upper(),
+        'year_suffix': match.group('year'),
+    }
+
+
+def _apply_continuous_contract_root(df: pd.DataFrame, root: str, *, kind: str) -> pd.DataFrame:
+    root = str(root or '').strip().upper()
+    if not root:
+        return df
+    if 'symbol' not in df.columns:
+        raise ValueError(f"❌ Continuous contract mode requires symbol/raw_symbol for {kind.upper()} input")
+
+    out = df.copy()
+    parsed = out['symbol'].astype(str).str.strip().str.upper().map(_parse_futures_contract_symbol)
+    invalid = parsed.isna()
+    if bool(invalid.any()):
+        sample = out.loc[invalid, 'symbol'].astype(str).head(10).tolist()
+        raise ValueError(
+            "❌ Continuous contract mode received symbols that do not look like futures contracts "
+            f"for {kind.upper()}: sample={sample}"
+        )
+
+    roots = parsed.map(lambda item: item['root'])
+    bad_root = roots != root
+    if bool(bad_root.any()):
+        sample = out.loc[bad_root, 'symbol'].astype(str).head(10).tolist()
+        detected = sorted({str(v) for v in roots.loc[bad_root].head(20).tolist()})
+        raise ValueError(
+            "❌ Continuous contract mode only allows one root. "
+            f"expected_root={root} detected_roots={detected} sample_symbols={sample}"
+        )
+
+    out['contract_symbol'] = parsed.map(lambda item: item['symbol'])
+    out['contract_root'] = root
+    out['contract_month_code'] = parsed.map(lambda item: item['month_code'])
+    out['contract_year_suffix'] = parsed.map(lambda item: item['year_suffix'])
+    out['symbol'] = root
+    return out
 
 
 def _artifact_phase_dir(output_dir: str, *parts: str) -> str:
@@ -851,6 +905,8 @@ def _frame_integrity_snapshot(
 
     if symbol_col in df.columns:
         symbol_source = df[symbol_col]
+    elif 'raw_symbol' in df.columns:
+        symbol_source = df['raw_symbol']
     elif 'instrument_id' in df.columns:
         symbol_source = df['instrument_id']
     else:
@@ -926,6 +982,8 @@ def _new_integrity_accumulator(kind: str) -> dict:
 def _merge_symbol_counts(target: dict, frame: pd.DataFrame) -> None:
     if 'symbol' in frame.columns:
         series = frame['symbol']
+    elif 'raw_symbol' in frame.columns:
+        series = frame['raw_symbol']
     elif 'instrument_id' in frame.columns:
         series = frame['instrument_id']
     else:
@@ -1123,24 +1181,62 @@ def _assert_single_contract(
     )
 
 
+def _contract_symbol_count_map(df: pd.DataFrame) -> dict[str, int]:
+    if 'contract_symbol' not in df.columns:
+        return {}
+    counts = df['contract_symbol'].fillna('UNKNOWN').astype(str).value_counts()
+    return {str(key): int(value) for key, value in counts.items()}
+
+
+def _continuous_contract_summary(df: pd.DataFrame, root: str) -> dict:
+    root = str(root or '').strip().upper()
+    counts = _contract_symbol_count_map(df)
+    summary = {
+        'enabled': bool(root),
+        'root': root or None,
+        'contract_symbol_counts': counts,
+        'contract_count': int(len(counts)),
+    }
+    if 'ts_event' in df.columns and 'contract_symbol' in df.columns:
+        work = df[['ts_event', 'contract_symbol']].copy()
+        work['ts_event'] = pd.to_datetime(work['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+        work = work.dropna(subset=['ts_event'])
+        contracts = []
+        for contract_symbol, group in work.groupby('contract_symbol', sort=True):
+            contracts.append({
+                'contract_symbol': str(contract_symbol),
+                'rows': int(len(group)),
+                'ts_min': str(group['ts_event'].min()),
+                'ts_max': str(group['ts_event'].max()),
+            })
+        summary['contracts'] = sorted(contracts, key=lambda row: row.get('ts_min') or '')
+    return summary
+
+
 def _write_contract_consistency_report(
     *,
     output_dir: str,
     expected_symbol: str,
     input_symbol_counts: dict[str, int],
     final_symbol_counts: dict[str, int],
+    continuous_contract: dict | None = None,
 ) -> str:
     expected = str(expected_symbol or '').strip()
     final_clean = {str(k): int(v) for k, v in (final_symbol_counts or {}).items() if int(v) > 0}
     detected_symbol = next(iter(final_clean.keys())) if len(final_clean) == 1 else None
-    passed = len(final_clean) <= 1 and (not expected or detected_symbol == expected)
+    continuous = continuous_contract or {}
+    continuous_enabled = bool(continuous.get('enabled', False))
+    continuous_root = str(continuous.get('root') or '').strip()
+    expected_effective = continuous_root or expected
+    passed = len(final_clean) <= 1 and (not expected_effective or detected_symbol == expected_effective)
     report = {
         'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-        'mode': 'single_contract_required',
-        'expected_symbol': expected or None,
+        'mode': 'continuous_contract_root' if continuous_enabled else 'single_contract_required',
+        'expected_symbol': expected_effective or None,
         'input_symbol_counts': {str(k): int(v) for k, v in (input_symbol_counts or {}).items()},
         'final_symbol_counts': final_clean,
         'detected_symbol': detected_symbol,
+        'continuous_contract': continuous,
         'passed': bool(passed),
     }
     path = os.path.join(output_dir, 'contract_consistency_report.json')
@@ -1237,6 +1333,7 @@ def _canonicalize_input_file(
     chunk_rows: int,
     resume: bool = False,
     progress_label: str | None = None,
+    continuous_contract_root: str = '',
 ) -> tuple[list[dict], dict]:
     phase_dir = _artifact_phase_dir(output_dir, 'normalized', kind)
     records: list[dict] = []
@@ -1247,6 +1344,13 @@ def _canonicalize_input_file(
         shard_path = os.path.join(phase_dir, f'{kind}_{shard_idx:05d}.parquet')
         if resume and os.path.exists(shard_path):
             normalized = read_table(shard_path)
+            normalized = _apply_continuous_contract_root(
+                normalized,
+                continuous_contract_root,
+                kind=kind,
+            )
+            if continuous_contract_root:
+                write_table(normalized, shard_path, compression='snappy')
             _update_integrity_accumulator(integrity, chunk, normalized)
             record = _shard_record(shard_path, normalized, shard_idx)
             records.append(record)
@@ -1262,6 +1366,11 @@ def _canonicalize_input_file(
             continue
 
         normalized = _normalize_databento_columns(chunk, kind=kind)
+        normalized = _apply_continuous_contract_root(
+            normalized,
+            continuous_contract_root,
+            kind=kind,
+        )
         if 'ts_event' in normalized.columns:
             normalized['ts_event'] = _coerce_naive_timestamp_series(
                 normalized['ts_event'],
@@ -1286,7 +1395,16 @@ def _canonicalize_input_file(
             f'canonical_{kind}',
             {'kind': kind, 'processed_shards': int(shard_idx + 1), 'last_shard': record},
         )
-    return records, _finalize_integrity_accumulator(integrity)
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            pd.Timestamp.max if item.get('ts_min') is None else pd.Timestamp(item.get('ts_min')),
+            int(item.get('shard_idx', 0)),
+        ),
+    )
+    for idx, record in enumerate(ordered):
+        record['shard_idx'] = int(idx)
+    return ordered, _finalize_integrity_accumulator(integrity)
 
 
 def _load_warmup_frame(prev_path: str | None, warmup_rows: int) -> pd.DataFrame:
@@ -3147,7 +3265,9 @@ def _normalize_and_save(
                  'is_expansion', 'event_flag', 'train_event_flag', 'event_score', 'event_trigger_count',
                  'session', 'liq_score', 'regime_label', 'regime_cluster',
                  'ts_event', 'label_end_ts', 'forward_return', 'label_horizon_steps',
-                 'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice'] + session_meta
+                 'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice',
+                 'symbol', 'contract_symbol', 'contract_root', 'contract_month_code',
+                 'contract_year_suffix'] + session_meta
     meta_cols += [c for c in SOFT_LABEL_ARTIFACT_COLS if c in df.columns]
     raw_stat_cols = [c for c in RAW_STAT_FEATURE_COLS if c in df.columns]
     out_cols  = [c for c in meta_cols + raw_stat_cols + MODEL_FEATURE_COLS + roll_cols if c in df.columns]
@@ -3287,6 +3407,7 @@ def run_refinery(
     soft_label_sl_std: float | None = None,
     config_path: str | None = None,
     enforce_economic_tp_floor: bool | None = None,
+    continuous_contract_root: str = '',
     **legacy_kwargs,
 ):
     _configure_stdio_utf8()
@@ -3308,6 +3429,12 @@ def run_refinery(
     print(f"  ⚡ Sharded streaming ({resolved_chunk_rows:,}/shard)")
     print(f"  ⚙️  Workers: MBO={mbo_workers} | MBP={mbp_workers}")
     print(f"  ♻️ Resume: {'ON' if resume else 'OFF'} | Warmup rows={int(max(shard_warmup_rows, 0)):,}")
+    continuous_contract_root = str(continuous_contract_root or '').strip().upper()
+    if continuous_contract_root:
+        print(
+            "  🔁 Continuous contract root mode: "
+            f"root={continuous_contract_root} | original symbols preserved in contract_symbol"
+        )
     print(
         "  🧭 Regime: "
         f"mode={_resolve_regime_mode(regime_mode)} | "
@@ -3383,6 +3510,7 @@ def run_refinery(
         chunk_rows=resolved_chunk_rows,
         resume=resume,
         progress_label='Phase A / MBO canonicalize',
+        continuous_contract_root=continuous_contract_root,
     )
     if not mbo_records:
         raise RuntimeError("❌ No canonical MBO shards were produced")
@@ -3398,6 +3526,7 @@ def run_refinery(
             chunk_rows=resolved_chunk_rows,
             resume=resume,
             progress_label='Phase A / MBP canonicalize',
+            continuous_contract_root=continuous_contract_root,
         )
     pipeline_tracker.finish(
         mbo_shards=len(mbo_records),
@@ -3929,10 +4058,11 @@ def run_refinery(
     )
     final_integrity = _frame_integrity_snapshot(df_final)
     _, final_symbol_counts = _frame_symbol_count_map(df_final)
+    continuous_contract = _continuous_contract_summary(df_final, continuous_contract_root)
     _assert_single_contract(
         symbol_counts=final_symbol_counts,
         context='final_labeled_artifact',
-        expected_symbol=symbol,
+        expected_symbol=continuous_contract_root or symbol,
     )
 
     split_meta = {}
@@ -3965,6 +4095,7 @@ def run_refinery(
     contract.update({
         'artifact_layout': 'stage1_v2_sharded_parquet',
         'data_format': 'parquet',
+        'continuous_contract': continuous_contract,
         'chunk_rows': int(resolved_chunk_rows),
         'mbo_workers': int(mbo_workers),
         'mbp_workers': int(mbp_workers),
@@ -4023,6 +4154,7 @@ def run_refinery(
             'regime_progress_every': int(max(regime_progress_every, 0)),
             'merge_tolerance_ms': int(merge_tolerance_ms),
             'step4_min_parallel_rows': int(step4_min_parallel_rows),
+            'continuous_contract_root': continuous_contract_root or None,
         },
         inputs={
             'mbo': os.path.abspath(mbo_path),
@@ -4047,9 +4179,10 @@ def run_refinery(
     print(f"  ✅ Data integrity report: {integrity_report_path}")
     contract_report_path = _write_contract_consistency_report(
         output_dir=output_dir,
-        expected_symbol=symbol,
+        expected_symbol=continuous_contract_root or symbol,
         input_symbol_counts=input_symbol_counts,
         final_symbol_counts=final_symbol_counts,
+        continuous_contract=continuous_contract,
     )
     print(f"  ✅ Contract consistency report: {contract_report_path}")
     label_quality_report_path = _write_label_quality_report(df_final, output_dir)
@@ -4104,6 +4237,11 @@ if __name__=='__main__':
     p.add_argument('--mbo',        required=True)
     p.add_argument('--mbp',        required=True)
     p.add_argument('--symbol',     default='')
+    p.add_argument(
+        '--continuous_contract_root',
+        default=str(_refinery_defaults.get('continuous_contract_root', '') or ''),
+        help='Allow quarterly futures contracts for one root, e.g. ES accepts ESH5/ESM5/ESU5 and preserves contract_symbol.',
+    )
     p.add_argument('--output',     default=_refinery_defaults.get('output_dir', 'outputs'))
     p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(_refinery_defaults.get('chunk_rows', _refinery_defaults.get('chunksize', 2_000_000))))
     p.add_argument('--label_mode', choices=['v19'], default=str(_refinery_defaults.get('label_mode', 'v19')))
@@ -4187,7 +4325,7 @@ if __name__=='__main__':
                    help='relative std used to perturb SL in Monte Carlo mode')
     a  = p.parse_args()
     cs = None if a.chunk_rows == 0 else a.chunk_rows
-    run_refinery(a.mbo, a.mbp, a.symbol, a.output,
+    run_refinery(mbo_path=a.mbo, mbp_path=a.mbp, symbol=a.symbol, output_dir=a.output,
                  chunksize=cs, chunk_rows=cs, label_mode=a.label_mode,
                  n_workers=a.n_workers, target_bars=a.target_bars,
                  mbo_workers=a.mbo_workers, mbp_workers=a.mbp_workers,
@@ -4223,4 +4361,5 @@ if __name__=='__main__':
                  soft_label_sl_std=a.soft_label_sl_std,
                  config_path=a.config,
                  enforce_economic_tp_floor=a.enforce_economic_tp_floor,
+                 continuous_contract_root=a.continuous_contract_root,
     )

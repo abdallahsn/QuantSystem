@@ -34,6 +34,11 @@ def main():
     p.add_argument('--mbo', required=True)
     p.add_argument('--mbp', required=True)
     p.add_argument('--symbol', default='')
+    p.add_argument(
+        '--continuous_contract_root',
+        default='',
+        help='Allow quarterly futures contracts for one root, e.g. ES accepts ESH5/ESM5/ESU5 and preserves contract_symbol.',
+    )
     p.add_argument('--output', default=defaults.get('output_dir', 'outputs_v19'))
     p.add_argument('--chunk_rows', '--chunksize', dest='chunk_rows', type=int, default=int(defaults.get('chunk_rows', defaults.get('chunksize', 2_000_000))))
     p.add_argument('--label_mode', choices=['v19'], default=defaults.get('label_mode', 'v19'))
@@ -134,6 +139,7 @@ def main():
         mbo_path=args.mbo,
         mbp_path=args.mbp,
         symbol=args.symbol,
+        continuous_contract_root=args.continuous_contract_root,
         output_dir=args.output,
         chunksize=None if args.chunk_rows == 0 else args.chunk_rows,
         chunk_rows=None if args.chunk_rows == 0 else args.chunk_rows,

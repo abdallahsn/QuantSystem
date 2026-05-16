@@ -67,6 +67,19 @@ def write_table(df: pd.DataFrame, path: str, *, compression: str = "snappy") -> 
 
 def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.DataFrame]:
     path = _abs(path)
+    if os.path.isdir(path):
+        supported = (".parquet", ".pq", ".snappy", ".csv", ".csv.gz", ".csv.zst", ".gz", ".zst")
+        files = [
+            _abs(os.path.join(path, name))
+            for name in sorted(os.listdir(path))
+            if os.path.isfile(os.path.join(path, name)) and name.lower().endswith(supported)
+        ]
+        if not files:
+            raise FileNotFoundError(f"No supported table files found under directory: {path}")
+        for file_path in files:
+            yield from iter_table_chunks(file_path, chunk_rows)
+        return
+
     ext = os.path.splitext(path)[1].lower()
     rows = int(chunk_rows or 0)
     if ext in {".parquet", ".pq", ".snappy"}:

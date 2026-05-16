@@ -138,14 +138,8 @@ python prepare_training_data.py \
 ## 4) Day-Trading Hybrid Refinery
 
 ```bash
-python prepare_day_trading.py \
-  --mbo /path/to/mbo_parquet_or_dir \
-  --mbp /path/to/mbp10_file_or_dir \
-  --output pipeline_day_trading/features \
-  --freq 5min \
-  --horizon 6 \
-  --tp_mult 1.5 \
-  --sl_mult 1.0
+python prepare_day_trading.py --mbo mbo7.csv --mbp mbp7.csv --output pipeline_day_trading\features --freq 5min --horizon 4 --tp_mult 1.0 --sl_mult 0.9
+python prepare_day_trading.py --mbo /path/to/mbo_parquet_or_dir --mbp /path/to/mbp10_file_or_dir --output pipeline_day_trading/features --freq 5min --horizon 6 --tp_mult 1.5 --sl_mult 1.0
 ```
 
 يحول بيانات tick/order-book إلى شموع 5m/15m/30m مع ميزات intrabar وlabels وLOB tensors.
@@ -162,10 +156,7 @@ python prepare_day_trading.py \
 - `--strict_train_pool`: تضييق train_event_flag لجلسات نشطة وATR كاف.
 
 ```bash
-python verify_day_trading_dataset.py \
-  --data pipeline_day_trading/features/day_trading_features.parquet \
-  --lob pipeline_day_trading/features/lob_tensors.npy \
-  --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy
+python verify_day_trading_dataset.py --data pipeline_day_trading/features/day_trading_features.parquet --lob pipeline_day_trading/features/lob_tensors.npy --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy
 ```
 
 يفحص artifact day-trading قبل التدريب.
