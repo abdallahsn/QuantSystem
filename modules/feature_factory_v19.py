@@ -35,6 +35,11 @@ SUPPORTED_META_FEATURES = {
 }
 EXPECTED_META_FEATURES = len(FULL_META_FEATURES)
 ROBUST_IQR_MIN = 1e-2
+RAW_STAT_PREFIX = 'raw__'
+FORWARD_SUPERVISION_TARGETS = {
+    'bid_wall_delta_fwd_k',
+    'ask_wall_delta_fwd_k',
+}
 
 
 DEFAULT_TIMESTAMP_COLS = ('ts_event', 'label_end_ts')
@@ -114,6 +119,7 @@ DEFAULT_INT_COLS = {
     'lob_tensor_id',
 }
 FORBIDDEN_STAT_FEATURES = {
+    *FORWARD_SUPERVISION_TARGETS,
     'forward_return',
     'label_end_ts',
     'ts_event',
@@ -449,7 +455,13 @@ class V19FeatureFactory:
                 f'Expected {EXPECTED_SCHEMA_VERSION}.'
             )
         infer_meta_feature_layout(self.meta_features)
-        leaked = sorted(set(self.stat_features) & FORBIDDEN_STAT_FEATURES)
+        requested = {str(col) for col in self.stat_features}
+        requested_raw = {
+            col[len(RAW_STAT_PREFIX):]
+            for col in requested
+            if col.startswith(RAW_STAT_PREFIX)
+        }
+        leaked = sorted((requested | requested_raw) & FORBIDDEN_STAT_FEATURES)
         if leaked:
             raise ValueError(
                 f'Stat feature schema contains forbidden leakage-prone columns: {leaked}'

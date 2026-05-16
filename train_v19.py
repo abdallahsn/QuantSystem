@@ -210,6 +210,8 @@ TREE_MODEL_SCALER_CLIP_RANGE: tuple[float, float] | None = None
 DEFAULT_LOB_MAX_AGE = '500ms'
 TREE_CLASS_WEIGHT_MAX = 2.5
 FORBIDDEN_MODEL_INPUT_COLS = {
+    'bid_wall_delta_fwd_k',
+    'ask_wall_delta_fwd_k',
     'forward_return',
     'label_end_ts',
     'ts_event',

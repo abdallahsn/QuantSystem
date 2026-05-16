@@ -15,6 +15,9 @@ import pandas as pd
 ARTIFACT_MANIFEST_NAME = "artifact_manifest.json"
 FINAL_FEATURE_DIR = "final"
 FINAL_FEATURE_PATTERN = "features_*.parquet"
+PARQUET_EXTENSIONS = {".parquet", ".pq", ".snappy"}
+PICKLE_EXTENSIONS = {".pkl", ".pickle"}
+CSV_EXTENSIONS = {".csv", ".gz", ".zst"}
 
 
 def _abs(path: str) -> str:
@@ -39,36 +42,50 @@ def _write_json(path: str, payload: dict) -> str:
     return path
 
 
+def _require_parquet_engine() -> str:
+    for engine in ("pyarrow", "fastparquet"):
+        try:
+            __import__(engine)
+            return engine
+        except Exception:
+            continue
+    raise ImportError(
+        "Parquet support requires pyarrow or fastparquet. "
+        "Install pyarrow, or write to a .pkl/.pickle path for explicit pickle artifacts."
+    )
+
+
 def read_table(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
-    if ext in {".parquet", ".pq", ".snappy"}:
+    if ext in PARQUET_EXTENSIONS:
+        _require_parquet_engine()
         return pd.read_parquet(path)
-    if ext in {".zst", ".gz"}:
+    if ext in CSV_EXTENSIONS:
         return pd.read_csv(path, low_memory=False, compression="infer")
-    if ext in {".pkl", ".pickle"}:
+    if ext in PICKLE_EXTENSIONS:
         return pd.read_pickle(path)
-    return pd.read_csv(path, low_memory=False)
+    raise ValueError(f"Unsupported table extension for read_table: {ext or '<none>'} ({path})")
 
 
 def write_table(df: pd.DataFrame, path: str, *, compression: str = "snappy") -> str:
     ext = os.path.splitext(path)[1].lower()
-    if ext in {".parquet", ".pq", ".snappy"}:
-        try:
-            df.to_parquet(path, index=False, compression=compression)
-        except Exception:
-            df.to_pickle(path)
+    if ext in PARQUET_EXTENSIONS:
+        _require_parquet_engine()
+        df.to_parquet(path, index=False, compression=compression)
         return path
-    if ext in {".pkl", ".pickle"}:
+    if ext in PICKLE_EXTENSIONS:
         df.to_pickle(path)
         return path
-    df.to_csv(path, index=False)
-    return path
+    if ext in CSV_EXTENSIONS:
+        df.to_csv(path, index=False, compression="infer")
+        return path
+    raise ValueError(f"Unsupported table extension for write_table: {ext or '<none>'} ({path})")
 
 
 def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.DataFrame]:
     path = _abs(path)
     if os.path.isdir(path):
-        supported = (".parquet", ".pq", ".snappy", ".csv", ".csv.gz", ".csv.zst", ".gz", ".zst")
+        supported = (".parquet", ".pq", ".snappy", ".csv", ".csv.gz", ".csv.zst", ".gz", ".zst", ".pkl", ".pickle")
         files = [
             _abs(os.path.join(path, name))
             for name in sorted(os.listdir(path))
@@ -82,7 +99,7 @@ def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.D
 
     ext = os.path.splitext(path)[1].lower()
     rows = int(chunk_rows or 0)
-    if ext in {".parquet", ".pq", ".snappy"}:
+    if ext in PARQUET_EXTENSIONS or ext in PICKLE_EXTENSIONS:
         df = read_table(path)
         if rows <= 0 or len(df) <= rows:
             yield df
@@ -176,7 +193,7 @@ def load_artifact_manifest(path_or_manifest: str) -> dict:
 
 def resolve_final_feature_paths(path_or_manifest: str) -> list[str]:
     path = _abs(path_or_manifest)
-    if os.path.isfile(path) and path.lower().endswith((".parquet", ".pq", ".snappy", ".csv", ".gz", ".zst")):
+    if os.path.isfile(path) and path.lower().endswith((".parquet", ".pq", ".snappy", ".csv", ".gz", ".zst", ".pkl", ".pickle")):
         return [path]
 
     manifest = load_artifact_manifest(path)

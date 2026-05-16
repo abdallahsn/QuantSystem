@@ -1,3 +1,15 @@
 {
-  "metrics": {}
+  "metrics": {
+    "n_folds": {"min": 3},
+    "total_trades": {"min": 30},
+    "mean_directional_f1": {"min": 0.35},
+    "mean_directional_precision": {"min": 0.35},
+    "mean_directional_recall": {"min": 0.25},
+    "mean_profit_factor": {"min": 1.05},
+    "mean_expectancy_dollars": {"min": 0.0},
+    "mean_ece": {"max": 0.12},
+    "max_drawdown_pct": {"max": 0.05},
+    "mean_stress_profit_factor": {"min": 1.0},
+    "mean_stress_expectancy_dollars": {"min": 0.0}
+  }
 }

@@ -52,6 +52,17 @@ def load_v19_config(path: str | None = None) -> dict:
     return cfg
 
 
+def default_release_gates_path_for_profile(profile: str | None = None) -> str:
+    """Return the release-gate file for a V19 profile.
+
+    V19 currently ships one conservative gate set for all profiles. Keeping this
+    resolver explicit lets readiness code record the intended profile contract
+    without hard-coding the path at the call site.
+    """
+    _ = profile
+    return DEFAULT_GATES_PATH
+
+
 def load_release_gates(path: str | None = None) -> dict:
     gates = _load_any(DEFAULT_GATES_PATH)
     if path:

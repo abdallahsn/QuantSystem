@@ -60,10 +60,21 @@ def _summarize_drift(models_dir: str) -> dict:
     }
 
 
+def _is_standard_gate_report(payload: dict) -> bool:
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get('passed'), bool)
+        and isinstance(payload.get('checks'), list)
+        and isinstance(payload.get('warnings'), list)
+        and isinstance(payload.get('source_report'), str)
+    )
+
+
 def _collect_fold_gate_status(full_walkforward_dir: str, folds: list[dict]) -> dict:
     integrity_reports = []
     training_reports = []
     missing_reports = []
+    malformed_reports = []
     for fold in folds:
         fold_dir = os.path.join(full_walkforward_dir, f"fold_{int(fold.get('fold', 0)):02d}")
         for rel_path, bucket in (
@@ -74,15 +85,30 @@ def _collect_fold_gate_status(full_walkforward_dir: str, folds: list[dict]) -> d
             path = os.path.join(fold_dir, rel_path)
             payload = _read_json(path)
             if payload:
-                bucket.append({'path': path, **payload})
+                if _is_standard_gate_report(payload):
+                    bucket.append({'path': path, **payload})
+                else:
+                    malformed_reports.append(path)
+                    bucket.append({'path': path, **payload, 'passed': False})
             else:
                 missing_reports.append(path)
-    integrity_passed = all(bool(report.get('passed', False)) for report in integrity_reports) if integrity_reports else False
-    training_passed = all(bool(report.get('passed', False)) for report in training_reports) if training_reports else False
+    integrity_passed = (
+        bool(integrity_reports)
+        and not missing_reports
+        and not malformed_reports
+        and all(bool(report.get('passed', False)) for report in integrity_reports)
+    )
+    training_passed = (
+        bool(training_reports)
+        and not missing_reports
+        and not malformed_reports
+        and all(bool(report.get('passed', False)) for report in training_reports)
+    )
     return {
         'integrity_reports_found': int(len(integrity_reports)),
         'training_reports_found': int(len(training_reports)),
         'missing_reports': missing_reports,
+        'malformed_reports': malformed_reports,
         'integrity_passed': bool(integrity_passed),
         'training_passed': bool(training_passed),
     }

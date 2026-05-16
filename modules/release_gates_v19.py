@@ -17,11 +17,48 @@ def _compare(metric_value: float, rule: dict) -> tuple[bool, str]:
 
 
 def evaluate_release_gates(metrics: dict, gates: dict) -> dict:
-    rules = gates.get('metrics', {})
+    rules = gates.get('metrics', {}) or {}
     results = []
     passed = True
     for metric_name, rule in rules.items():
-        value = float(metrics.get(metric_name, 0.0))
+        rule = rule or {}
+        if not isinstance(rule, dict):
+            passed = False
+            results.append({
+                'metric': metric_name,
+                'value': None,
+                'rule': rule,
+                'passed': False,
+                'reason': 'invalid_gate_rule',
+            })
+            continue
+
+        required = bool(rule.get('required', True))
+        if metric_name not in metrics or metrics.get(metric_name) is None:
+            ok = not required
+            results.append({
+                'metric': metric_name,
+                'value': None,
+                'rule': rule,
+                'passed': bool(ok),
+                'reason': 'optional_metric_missing' if ok else 'required_metric_missing',
+            })
+            passed = passed and ok
+            continue
+
+        try:
+            value = float(metrics.get(metric_name))
+        except Exception:
+            results.append({
+                'metric': metric_name,
+                'value': metrics.get(metric_name),
+                'rule': rule,
+                'passed': False,
+                'reason': 'metric_value_not_numeric',
+            })
+            passed = False
+            continue
+
         ok, reason = _compare(value, rule)
         results.append({
             'metric': metric_name,

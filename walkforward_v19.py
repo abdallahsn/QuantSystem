@@ -216,6 +216,8 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
             'max_drawdown_pct': 0.0,
             'total_trades': 0,
             'total_pnl_dollars': 0.0,
+            'mean_stress_profit_factor': 0.0,
+            'mean_stress_expectancy_dollars': 0.0,
         }
 
     def _backtest_block(report: dict) -> dict:
@@ -228,6 +230,10 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
         return {}
 
     blocks = [_backtest_block(report) for report in fold_reports]
+    stress_blocks = [
+        report.get('backtest_stress') if isinstance(report.get('backtest_stress'), dict) else {}
+        for report in fold_reports
+    ]
 
     return {
         'n_folds': int(len(fold_reports)),
@@ -245,7 +251,123 @@ def aggregate_fold_metrics(fold_reports: list[dict]) -> dict:
         'max_drawdown_pct': float(np.max([block.get('max_drawdown_pct', 0.0) for block in blocks])),
         'total_trades': int(np.sum([block.get('trades', 0) for block in blocks])),
         'total_pnl_dollars': float(np.sum([block.get('total_pnl_dollars', 0.0) for block in blocks])),
+        'mean_stress_profit_factor': float(np.mean([block.get('profit_factor', 0.0) for block in stress_blocks])),
+        'mean_stress_expectancy_dollars': float(np.mean([block.get('avg_trade_expectancy_dollars', 0.0) for block in stress_blocks])),
     }
+
+
+def _read_json(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_readiness_gate_report(
+    output_dir: str,
+    *,
+    filename: str,
+    passed: bool,
+    checks: list[dict],
+    warnings: list[str] | None = None,
+    source_report: str = '',
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    report = {
+        'passed': bool(passed),
+        'checks': list(checks or []),
+        'warnings': list(warnings or []),
+        'source_report': str(source_report or ''),
+    }
+    path = os.path.join(output_dir, filename)
+    with open(path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return path
+
+
+def _write_data_integrity_gate_report(dataset_dir: str) -> str:
+    source_path = os.path.join(dataset_dir, 'data_integrity_report.json')
+    report = _read_json(source_path)
+    warnings = list(report.get('warnings', []) or []) if report else ['data_integrity_report_missing_or_invalid']
+    checks = [
+        {
+            'name': 'data_integrity_report_present',
+            'passed': bool(report),
+            'detail': source_path,
+        },
+        {
+            'name': 'data_integrity_warnings_empty',
+            'passed': bool(report) and len(warnings) == 0,
+            'detail': warnings,
+        },
+    ]
+    passed = all(bool(check.get('passed', False)) for check in checks)
+    return _write_readiness_gate_report(
+        dataset_dir,
+        filename='data_integrity_gate_report.json',
+        passed=passed,
+        checks=checks,
+        warnings=warnings,
+        source_report=source_path,
+    )
+
+
+def _write_event_training_gate_report(model_dir: str, train_summary: dict) -> str:
+    manifest_path = str(train_summary.get('manifest') or os.path.join(model_dir, 'manifest.json'))
+    time_split_path = str(train_summary.get('time_split_report') or os.path.join(model_dir, 'time_split_report.json'))
+    schema_path = str(train_summary.get('feature_schema') or os.path.join(model_dir, 'feature_schema_v19.json'))
+    rows_event = int(train_summary.get('rows_event', 0) or 0)
+    meta_coverage = float(train_summary.get('meta_coverage_ratio', 0.0) or 0.0)
+    split_meta = train_summary.get('split_meta', {}) or {}
+    n_splits = int(split_meta.get('n_splits', 0) or 0)
+    checks = [
+        {
+            'name': 'manifest_present',
+            'passed': os.path.exists(manifest_path),
+            'detail': manifest_path,
+        },
+        {
+            'name': 'time_split_report_present',
+            'passed': os.path.exists(time_split_path),
+            'detail': time_split_path,
+        },
+        {
+            'name': 'feature_schema_present',
+            'passed': os.path.exists(schema_path),
+            'detail': schema_path,
+        },
+        {
+            'name': 'event_training_rows_positive',
+            'passed': rows_event > 0,
+            'detail': rows_event,
+        },
+        {
+            'name': 'chronological_splits_present',
+            'passed': n_splits > 0 or os.path.exists(time_split_path),
+            'detail': n_splits,
+        },
+        {
+            'name': 'meta_coverage_positive',
+            'passed': meta_coverage > 0.0,
+            'detail': meta_coverage,
+        },
+    ]
+    warnings = []
+    if meta_coverage < 0.80:
+        warnings.append(f'meta_coverage_ratio below 0.80: {meta_coverage:.4f}')
+    passed = all(bool(check.get('passed', False)) for check in checks)
+    return _write_readiness_gate_report(
+        model_dir,
+        filename='event_training_gate_report.json',
+        passed=passed,
+        checks=checks,
+        warnings=warnings,
+        source_report=manifest_path,
+    )
 
 
 def run_walkforward(
@@ -254,6 +376,7 @@ def run_walkforward(
     output_dir: str,
     config: dict,
     gates: dict,
+    config_path: str | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     walk_cfg = config.get('walkforward', {})
@@ -313,6 +436,7 @@ def run_walkforward(
             tail_rows=tail_rows,
             trim_to_score_window=True,
         )
+        train_integrity_gate_path = _write_data_integrity_gate_report(train_dir)
         train_summary = run_training_pipeline(
             csv_path=train_build['csv'],
             output_dir=model_dir,
@@ -332,6 +456,7 @@ def run_walkforward(
             quality_weight_weak=float(train_cfg.get('quality_weight_weak', 1.0)),
             config_snapshot=config,
         )
+        training_gate_path = _write_event_training_gate_report(model_dir, train_summary)
 
         test_build = build_replay_dataset(
             mbo_path=mbo_path,
@@ -362,6 +487,7 @@ def run_walkforward(
             external_scaler_path=os.path.join(model_dir, 'scaler_params.json'),
             fit_aux_models=False,
         )
+        test_integrity_gate_path = _write_data_integrity_gate_report(test_dir)
         test_df = _load_csv(test_build['csv'])
         test_visual = compute_eval_visual_embeddings(
             test_csv=test_build['csv'],
@@ -439,6 +565,11 @@ def run_walkforward(
             },
             'class_balance': class_counts,
             'train': train_summary,
+            'gate_reports': {
+                'train_data_integrity': train_integrity_gate_path,
+                'test_data_integrity': test_integrity_gate_path,
+                'event_training': training_gate_path,
+            },
             'backtest_base': backtest_base,
             'backtest_stress': backtest_stress,
             'release_blockers': blockers,
@@ -477,7 +608,12 @@ def run_walkforward(
         config=config,
         inputs={'mbo': mbo_path, 'mbp': mbp_path},
         metrics=aggregate,
-        extra={'release_gates': gate_report, 'windows': windows, 'release_blockers': release_blockers},
+        extra={
+            'release_gates': gate_report,
+            'windows': windows,
+            'release_blockers': release_blockers,
+            'config_path': config_path,
+        },
     )
 
     out = {
@@ -510,6 +646,7 @@ def main():
         output_dir=args.output,
         config=config,
         gates=gates,
+        config_path=args.config,
     )
     print("\n✅ Walk-forward complete")
     print(json.dumps(summary['aggregate'], indent=2))
