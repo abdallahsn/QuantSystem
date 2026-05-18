@@ -161,14 +161,10 @@ def main():
     p.add_argument('--direction_threshold_ticks', type=float, default=None)
     p.add_argument('--tp_mult', type=float, default=None)
     p.add_argument('--sl_mult', type=float, default=None)
-    p.add_argument('--max_horizon_steps', type=int, default=0,
-                   help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
-    p.add_argument('--allow_oracle_forward_return', action='store_true',
-                   help='dangerous: fall back to stored forward_return when no causal replay window is available')
-    p.add_argument('--disable_single_position_only', action='store_true',
-                   help='allow overlapping trades; default keeps one active position at a time')
-    p.add_argument('--cooldown_rows', type=int, default=0,
-                   help='rows to wait after closing a trade before opening a new one')
+    p.add_argument('--max_horizon_steps', type=int, default=0,help='optional cap on replay horizon in rows; 0 uses label_horizon_steps as-is')
+    p.add_argument('--allow_oracle_forward_return', action='store_true',help='dangerous: fall back to stored forward_return when no causal replay window is available')
+    p.add_argument('--disable_single_position_only', action='store_true',help='allow overlapping trades; default keeps one active position at a time')
+    p.add_argument('--cooldown_rows', type=int, default=0,help='rows to wait after closing a trade before opening a new one')
     args = p.parse_args()
 
     summary = run_raw_backtest(
