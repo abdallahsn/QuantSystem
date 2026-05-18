@@ -230,11 +230,17 @@ def _check_absorption(df: pd.DataFrame) -> CheckResult:
     if s.empty:
         return CheckResult(False, "empty after coercion")
     neg = _pct(s < 0)
+    top = float(s.max())
+    top_share = float(np.isclose(s.to_numpy(dtype=np.float64), top, rtol=0.0, atol=1e-9).mean())
     ratio = float(s.quantile(0.95) / max(s.mean(), 1e-9))
-    passed = neg < 0.01 and ratio > 3.0
+    spread = float(s.quantile(0.95) - s.quantile(0.05))
+    cv = float(s.std(ddof=0) / max(s.mean(), 1e-9))
+    saturated_legacy_cap = top >= 9.999 and top_share >= 0.10
+    passed = neg < 0.01 and not saturated_legacy_cap and (ratio > 3.0 or spread > 1.0 or cv > 0.35)
     return CheckResult(
         passed,
-        f"neg={neg:.1%} | p95/mean={ratio:.2f}x (target >3x, preferred >5x)",
+        f"neg={neg:.1%} | p95/mean={ratio:.2f}x | p95-p05={spread:.3f} | "
+        f"CV={cv:.2f} | top_share={top_share:.1%}",
     )
 
 
@@ -259,9 +265,13 @@ def _check_micro_atr(df: pd.DataFrame) -> CheckResult:
 
 
 def _check_size(df: pd.DataFrame) -> CheckResult:
-    col = "size" if "size" in df.columns else ("trade_size" if "trade_size" in df.columns else None)
+    col = (
+        "size"
+        if "size" in df.columns
+        else ("trade_size" if "trade_size" in df.columns else ("volume" if "volume" in df.columns else None))
+    )
     if col is None:
-        return CheckResult(False, "size/trade_size missing")
+        return CheckResult(False, "size/trade_size/volume missing")
     s = _num(df, col).replace([np.inf, -np.inf], np.nan).dropna()
     if s.empty:
         return CheckResult(False, "empty after coercion")

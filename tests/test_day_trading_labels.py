@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from prepare_day_trading import build_day_trading_labels
+from prepare_day_trading import build_day_trading_labels, label_by_outcome
 
 
 def _utc_ts(value):
@@ -83,3 +83,46 @@ def test_timeout_produces_neutral_and_horizon_end_ts():
     assert int(out.loc[0, "bias_label"]) == 2
     assert int(out.loc[0, "path_outcome"]) == 4
     assert _utc_ts(out.loc[0, "label_end_ts"]) == _utc_ts(df.loc[3, "ts_event"])
+
+
+def _event_bars(*, highs, lows, closes=None, opens=None, event_direction=1):
+    df = _bars(highs=highs, lows=lows, closes=closes, opens=opens)
+    df["is_event"] = 1
+    df["event_score"] = 0.9
+    df["event_direction"] = event_direction
+    df["kalman_direction"] = 0
+    return df
+
+
+def test_label_by_outcome_records_first_hit_end_ts_and_horizon_steps():
+    df = _event_bars(highs=[100.0, 101.2, 100.0, 100.0], lows=[100.0, 99.8, 100.0, 100.0])
+
+    out = label_by_outcome(df, default_tp_mult=0.5, default_sl_mult=1.0, default_max_bars=3, min_atr=0.1)
+
+    assert int(out.loc[0, "bias_label"]) == 0
+    assert int(out.loc[0, "path_outcome"]) == 0
+    assert int(out.loc[0, "label_horizon_steps"]) == 1
+    assert int(out.loc[0, "effective_horizon"]) == 1
+    assert _utc_ts(out.loc[0, "label_end_ts"]) == _utc_ts(df.loc[1, "ts_event"])
+
+
+def test_label_by_outcome_timeout_records_session_cap_end_ts():
+    df = _event_bars(highs=[100.0, 100.2, 100.2, 100.2], lows=[100.0, 99.8, 99.8, 99.8])
+
+    out = label_by_outcome(df, default_tp_mult=1.5, default_sl_mult=1.0, default_max_bars=3, min_atr=0.1)
+
+    assert int(out.loc[0, "bias_label"]) == 2
+    assert int(out.loc[0, "path_outcome"]) == 4
+    assert int(out.loc[0, "label_horizon_steps"]) == 3
+    assert _utc_ts(out.loc[0, "label_end_ts"]) == _utc_ts(df.loc[3, "ts_event"])
+
+
+def test_label_by_outcome_non_event_without_weak_conversion_is_zero_horizon():
+    df = _event_bars(highs=[100.0, 101.0, 101.0, 101.0], lows=[100.0, 99.0, 99.0, 99.0])
+    df["is_event"] = 0
+
+    out = label_by_outcome(df, default_tp_mult=0.5, default_sl_mult=1.0, default_max_bars=3, min_atr=0.1)
+
+    assert int(out.loc[0, "bias_label"]) == 2
+    assert int(out.loc[0, "label_horizon_steps"]) == 0
+    assert _utc_ts(out.loc[0, "label_end_ts"]) == _utc_ts(df.loc[0, "ts_event"])

@@ -171,16 +171,18 @@ class AbsorptionIntensityEngine:
                       self.min_price_move)
                       
         raw = d_cvd / d_price
-        self._aii_buf.append(raw)
-        
+
         if len(self._aii_buf) >= 20:
-            # Use robust center scaling to preserve spike structure instead of
-            # over-compressing around p95.
+            # Scale from prior observations only. log1p keeps extreme absorption
+            # usable without collapsing a whole tail into the old hard cap=10.
             med = float(np.median(self._aii_buf))
             scale = max(med, 1e-6)
-            return round(min(raw / scale, 10.0), 6)
+        else:
+            scale = 500.0
 
-        return round(min(raw / 500.0, 10.0), 6)
+        self._aii_buf.append(raw)
+        normalized = np.log1p(max(raw, 0.0) / scale)
+        return round(float(np.clip(normalized, 0.0, 25.0)), 6)
 
 
 class FastTapeSpeedTracker:

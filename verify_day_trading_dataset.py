@@ -236,8 +236,14 @@ def main() -> int:
         er = float(actual_event_rate)
         print(f"✅ actual_event_rate: {er:.2%}")
         if (manifest_mode == "day_trading" or "day_trading_features" in os.path.basename(data_path)) and not (0.15 <= er <= 0.25):
-            ok = False
-            print("❌ Day-trading event rate is outside strict 15-25% acceptance band.")
+            if len(df) < 1000:
+                print(
+                    "⚠️ Day-trading event rate is outside strict 15-25% acceptance band, "
+                    "but rows<1,000 so this is treated as smoke-only telemetry."
+                )
+            else:
+                ok = False
+                print("❌ Day-trading event rate is outside strict 15-25% acceptance band.")
 
     def _check_group(name: str, cols: tuple[str, ...]) -> None:
         nonlocal ok

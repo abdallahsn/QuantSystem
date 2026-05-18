@@ -7,7 +7,11 @@ from collections import deque
 # ══════════════════════════════════════════════════════════════════
 class KylesLambdaEngine:
     """
-    Kyle's Lambda = تكلفة تحريك السعر بوحدة حجم واحدة
+    Kyle's Lambda = تكلفة تحريك السعر بوحدة حجم واحدة.
+
+    output_mode="raw" keeps the legacy non-negative economic-unit lambda.
+    output_mode="zscore" emits a causal signed z-score of price impact, which
+    is the representation expected by the day-trading feature diagnostics.
     """
 
     def __init__(self, window: int = 50, output_mode: str = "raw"):
@@ -26,12 +30,15 @@ class KylesLambdaEngine:
         if len(self._prices) < 2:
             return 0.0
 
-        dp = abs(float(self._prices[-1]) - float(self._prices[-2]))
+        dp_signed = float(self._prices[-1]) - float(self._prices[-2])
+        dp = abs(dp_signed)
         dv = float(self._volumes[-1])
         
-        # λ = ΔP / V 
+        # λ = ΔP / V
         lam = dp / dv if dv > 0 else 0.0
-        self._lambdas.append(lam)
+        signed_lam = dp_signed / dv if dv > 0 else 0.0
+        stored_lam = signed_lam if self.output_mode == "zscore" else lam
+        self._lambdas.append(stored_lam)
 
         if self.output_mode == "zscore":
             # Optional stationary representation when explicitly requested.
@@ -39,7 +46,7 @@ class KylesLambdaEngine:
                 arr = np.array(self._lambdas, dtype=np.float64)
                 mean_lam = float(np.mean(arr))
                 std_lam = float(np.std(arr)) + 1e-8
-                z_score = (lam - mean_lam) / std_lam
+                z_score = (signed_lam - mean_lam) / std_lam
                 return round(float(np.clip(z_score, -4.0, 4.0)), 4)
             return 0.0
 

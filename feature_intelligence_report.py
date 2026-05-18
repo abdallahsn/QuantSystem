@@ -57,6 +57,16 @@ def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
 def _mi_score(x: pd.Series, y: np.ndarray) -> float:
     if mutual_info_classif is None:
         return float("nan")
+    arr = x.to_numpy(dtype=np.float64).reshape(-1, 1)
+    finite = arr[np.isfinite(arr)]
+    unique_count = len(np.unique(finite))
+    if unique_count <= 1:
+        return 0.0
+    discrete_feature = unique_count <= min(50, max(5, int(np.sqrt(max(len(finite), 1)))))
+    try:
+        return float(mutual_info_classif(arr, y, discrete_features=discrete_feature, random_state=42)[0])
+    except Exception:
+        return float("nan")
 
 
 def _spearman_no_scipy(x: pd.Series, y: np.ndarray) -> float:
@@ -64,13 +74,6 @@ def _spearman_no_scipy(x: pd.Series, y: np.ndarray) -> float:
     yr = pd.Series(y, index=x.index).rank(method="average")
     corr = xr.corr(yr, method="pearson")
     return float(corr) if pd.notna(corr) else 0.0
-    arr = x.to_numpy(dtype=np.float64).reshape(-1, 1)
-    if len(np.unique(arr[np.isfinite(arr)])) <= 1:
-        return 0.0
-    try:
-        return float(mutual_info_classif(arr, y, discrete_features=False, random_state=42)[0])
-    except Exception:
-        return float("nan")
 
 
 def build_report(df: pd.DataFrame, label_col: str) -> dict[str, Any]:

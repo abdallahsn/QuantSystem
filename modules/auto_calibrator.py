@@ -101,7 +101,7 @@ class AutoCalibrator:
             ),
             'fim': FastFIMDetector(threshold_multiplier=2.0),
             'spoofing': SpoofingDetector(large_mult=1.5),
-            'kyle': KylesLambdaEngine(window=50),
+            'kyle': KylesLambdaEngine(window=50, output_mode="zscore"),
             'hawkes': HawkesIntensityEngine(alpha=0.7, beta=0.5),
             'gaps': LiquidityGapsEngine(levels=10, gap_threshold=2.0),
             'vnet': VNETEngine(window=100, large_mult=2.0),

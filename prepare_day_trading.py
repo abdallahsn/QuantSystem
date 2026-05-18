@@ -241,18 +241,55 @@ def _causal_rate_mask(
     return (mask_s & (score_s >= threshold.astype(np.float64))).astype(bool)
 
 
+def _core_feature_rebuild_reason(df: pd.DataFrame, col: str) -> str | None:
+    if col not in df.columns:
+        return "missing"
+
+    s = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return "no finite values"
+
+    vals = s.to_numpy(dtype=np.float64)
+    std = float(np.std(vals))
+    if col == 'absorption_intensity':
+        top = float(np.max(vals))
+        q75 = float(np.quantile(vals, 0.75))
+        top_share = float(np.mean(np.isclose(vals, top, rtol=0.0, atol=1e-9)))
+        if top >= 9.999 and q75 >= 9.999 and top_share >= 0.10:
+            return "legacy cap saturation at 10"
+    elif col == 'kyle_lambda':
+        spread = float(np.quantile(vals, 0.95) - np.quantile(vals, 0.05))
+        non_negative = bool(np.min(vals) >= 0.0)
+        tiny_raw_scale = bool(np.max(np.abs(vals)) < 0.01 and spread < 0.10)
+        if std <= 1e-10:
+            return "near-flat values"
+        if non_negative and tiny_raw_scale:
+            return "legacy raw economic scale"
+
+    return None
+
+
 def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     """
     Reconstruct core tick-level microstructure features when raw MBO lacks them.
     Uses the same engine families as stage-1 refinery to avoid losing signal quality.
     """
-    missing = [c for c in CORE_MBO_REQUIRED_COLS if c not in df_mbo.columns]
-    if not missing:
+    rebuild_reasons = {
+        c: reason
+        for c in CORE_MBO_REQUIRED_COLS
+        if (reason := _core_feature_rebuild_reason(df_mbo, c)) is not None
+    }
+    if not rebuild_reasons:
         return df_mbo
 
+    reason_preview = ', '.join(
+        f"{col}={reason}" for col, reason in list(rebuild_reasons.items())[:5]
+    )
+    if len(rebuild_reasons) > 5:
+        reason_preview += f", +{len(rebuild_reasons) - 5} more"
     print(
         "  🧠 Core microstructure reconstruction: "
-        f"{len(missing)} missing columns -> rebuilding from raw ticks",
+        f"{len(rebuild_reasons)} columns -> rebuilding from raw ticks ({reason_preview})",
     )
 
     from modules.auto_calibrator import AutoCalibrator
@@ -285,7 +322,7 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     absorb = AbsorptionIntensityEngine(min_price_move=max(float(calibrator.min_price_move), 1e-8))
     cancel = CancelRatioEngine()
     mv = MicroVolatilityEngine()
-    kyle = KylesLambdaEngine(window=50)
+    kyle = KylesLambdaEngine(window=50, output_mode="zscore")
     hawkes = HawkesIntensityEngine()
     vnet = VNETEngine()
     fisher = FastFisherAlpha()
@@ -426,12 +463,12 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     }
 
     for col, arr in rebuilt_cols.items():
-        if col not in df_mbo.columns:
+        if col in rebuild_reasons or col not in df_mbo.columns:
             out[col] = pd.Series(arr, index=out.index).astype(np.float64)
 
     print(
         "  ✅ Core microstructure reconstructed "
-        f"(rows={len(out):,} | rebuilt_cols={sum(1 for c in rebuilt_cols if c not in df_mbo.columns)})",
+        f"(rows={len(out):,} | rebuilt_cols={sum(1 for c in rebuilt_cols if c in rebuild_reasons or c not in df_mbo.columns)})",
     )
     return out
 
@@ -475,10 +512,19 @@ def _tick_resample_optional(
     if col not in df.columns:
         return None
     s = pd.to_numeric(df[col], errors="coerce")
+    def _signed_absmax(x: pd.Series) -> float:
+        vals = pd.to_numeric(x, errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+        if vals.empty:
+            return np.nan
+        arr = vals.to_numpy(dtype=np.float64)
+        return float(arr[int(np.argmax(np.abs(arr)))])
+
     if how == "mean":
         out = s.resample(freq).mean()
     elif how == "max":
         out = s.resample(freq).max()
+    elif how == "absmax":
+        out = s.resample(freq).apply(_signed_absmax)
     elif how == "sum":
         out = s.resample(freq).sum()
     elif how == "last":
@@ -735,6 +781,8 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
         else pd.Series('', index=df.index, dtype='object')
     )
     size_s = pd.to_numeric(df[size_col], errors='coerce').fillna(0.0).astype(np.float64)
+    price_s = pd.to_numeric(df['price'], errors='coerce').replace([np.inf, -np.inf], np.nan).astype(np.float64)
+    valid_trade = action_s.isin(TRADE_ACTIONS) & (price_s > 0) & (size_s > 0)
 
     def _resample_num(col: str, how: str, default: float = 0.0) -> pd.Series:
         rs = _tick_resample_optional(df, freq, col, how)
@@ -742,24 +790,26 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
             return pd.Series(default, index=bars.index, dtype=np.float64)
         return pd.to_numeric(rs, errors='coerce').reindex(bars.index).fillna(default).astype(np.float64)
 
-    # OHLCV
-    bars = df['price'].resample(freq).agg(
+    # OHLCV must be execution-price based. Add/cancel/reset book events are still
+    # useful for microstructure features, but they are not tradable bar prices.
+    trade_price = price_s.where(valid_trade)
+    trade_size = size_s.where(valid_trade, 0.0)
+    bars = trade_price.resample(freq).agg(
         open='first', high='max', low='min', close='last'
     )
-    bars['volume'] = size_s.resample(freq).sum()
+    bars['volume'] = trade_size.resample(freq).sum()
 
     # CVD
     has_tick_cvd = 'cvd' in df.columns
     if has_tick_cvd:
         tick_cvd = pd.to_numeric(df['cvd'], errors='coerce').ffill().fillna(0.0).astype(np.float64)
     else:
-        is_trade = action_s.isin(TRADE_ACTIONS)
         # ملاحظة feed المشروع: side='A' يُعامل كـ buy aggressor و'B' كـ sell aggressor.
         is_buy = side_s.isin({'A', 'BUY', 'ASK'})
         is_sell = side_s.isin({'B', 'SELL', 'BID'})
         signed = np.zeros(len(df), dtype=np.float64)
-        signed[(is_trade & is_buy).to_numpy()] = size_s[(is_trade & is_buy)].to_numpy(dtype=np.float64)
-        signed[(is_trade & is_sell).to_numpy()] = -size_s[(is_trade & is_sell)].to_numpy(dtype=np.float64)
+        signed[(valid_trade & is_buy).to_numpy()] = size_s[(valid_trade & is_buy)].to_numpy(dtype=np.float64)
+        signed[(valid_trade & is_sell).to_numpy()] = -size_s[(valid_trade & is_sell)].to_numpy(dtype=np.float64)
         tick_cvd = pd.Series(signed, index=df.index, dtype=np.float64).cumsum()
     bars['cvd'] = tick_cvd.resample(freq).last().reindex(bars.index).ffill().fillna(0.0)
     bars['bar_cvd_delta'] = tick_cvd.resample(freq).agg(
@@ -773,8 +823,8 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
         bars['session_cvd'] = session_cvd.resample(freq).last().reindex(bars.index).fillna(0.0)
 
     # Order Flow (peak + dispersion داخل الشمعة)
-    bars['kyle_lambda'] = _resample_num('kyle_lambda', 'max', 0.0)
-    bars['hawkes_intensity'] = _resample_num('hawkes_intensity', 'max', 0.0)
+    bars['kyle_lambda'] = _resample_num('kyle_lambda', 'absmax', 0.0)
+    bars['hawkes_intensity'] = _resample_num('hawkes_intensity', 'last', 0.0)
     bars['absorption_intensity'] = _resample_num('absorption_intensity', 'max', 0.0)
     bars['cancel_ratio'] = _resample_num('cancel_ratio', 'max', 0.0)
     bars['absorption_std'] = _resample_num('absorption_intensity', 'max', 0.0)
@@ -828,10 +878,7 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
     bars['anomaly'] = _resample_num('anomaly', 'max', 0.0)
 
     # Tick VWAP كنقطة أساس لـ micro_price (قبل الفلاتر؛ يكمّله apply_bar_level_catboost_parities لاحقًا)
-    turnover = (
-        pd.to_numeric(df['price'], errors='coerce').fillna(0)
-        * size_s
-    ).resample(freq).sum()
+    turnover = (trade_price.fillna(0.0) * trade_size).resample(freq).sum()
     bars['_turn_sum'] = turnover.astype(np.float64)
     vol_f = pd.to_numeric(bars['volume'], errors='coerce').astype(np.float64).clip(lower=1e-9)
     bars['micro_price'] = bars['_turn_sum'] / vol_f
@@ -855,15 +902,23 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = '5min') -> pd.DataFr
             bars[col] = rs
 
     # Buy/Sell
-    buy_vol = size_s[side_s.isin({'A', 'BUY', 'ASK'})].resample(freq).sum()
-    sell_vol = size_s[side_s.isin({'B', 'SELL', 'BID'})].resample(freq).sum()
+    buy_vol = (
+        size_s[valid_trade & side_s.isin({'A', 'BUY', 'ASK'})]
+        .resample(freq).sum()
+        .reindex(bars.index).fillna(0.0)
+    )
+    sell_vol = (
+        size_s[valid_trade & side_s.isin({'B', 'SELL', 'BID'})]
+        .resample(freq).sum()
+        .reindex(bars.index).fillna(0.0)
+    )
     bars['buy_volume']  = buy_vol
     bars['sell_volume'] = sell_vol
     total = (buy_vol + sell_vol).clip(lower=1)
     bars['buy_ratio']   = (buy_vol / total).fillna(0.5)
 
     # Tick count
-    bars['tick_count'] = df['price'].resample(freq).count()
+    bars['tick_count'] = trade_price.resample(freq).count()
 
     # جسر السيولة الهجين: أسماء صريحة (num_trades, avg_trade_size, …)
     bars = attach_hybrid_liquidity_bridge(bars, df, freq)
@@ -1551,7 +1606,13 @@ def detect_microstructure_events(
             target_rate=target,
             floor=min_floor,
         )
-        threshold = np.maximum(fixed_threshold.to_numpy(dtype=np.float32), causal_threshold.to_numpy(dtype=np.float32))
+        threshold = (
+            causal_threshold.astype(np.float64)
+            .mul(scale)
+            .add(shift)
+            .clip(min_floor, 0.95)
+            .to_numpy(dtype=np.float32)
+        )
     else:
         threshold = fixed_threshold.to_numpy(dtype=np.float32)
 
@@ -1669,7 +1730,12 @@ def label_by_outcome(
         signal_quality (int8):   0=ضعيف, 1=جيد, 2=ممتاز (جلسة لندن/overlap)
         forward_return (float32): عائد نهاية الأفق (للتشخيص فقط)
     """
-    df = df.copy().sort_values('ts_event').reset_index(drop=True)
+    df = df.copy()
+    df['ts_event'] = pd.to_datetime(df['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    if df['ts_event'].isna().any():
+        bad = int(df['ts_event'].isna().sum())
+        raise ValueError(f"label_by_outcome requires valid ts_event values; invalid rows={bad:,}")
+    df = df.sort_values('ts_event').reset_index(drop=True)
     n = len(df)
 
     # ── arrays الخروج ─────────────────────────────────────────────────────────
@@ -1678,7 +1744,7 @@ def label_by_outcome(
     neutral_reason = np.full(n, NEUTRAL_REASON_NONE, dtype=np.int8)
     trade_duration = np.zeros(n, dtype=np.int16)
     signal_quality = np.zeros(n, dtype=np.int8)
-    forward_return = np.zeros(n, dtype=np.float32)
+    label_end_idx = np.arange(n, dtype=np.int32)
 
     # ── arrays السعر ──────────────────────────────────────────────────────────
     close  = pd.to_numeric(df['close'], errors='coerce').to_numpy(dtype=np.float64)
@@ -1737,12 +1803,11 @@ def label_by_outcome(
         atr_i = max(float(atr[i]), min_atr)
         entry = float(close[i])
         sess_end = _session_end(i, max_bars_r)
-        fwd_idx = min(i + max_bars_r, n - 1)
-        forward_return[i] = float((close[fwd_idx] - entry) / max(entry, 1e-8))
 
         if not is_ev_arr[i]:
             # ليس حدثاً: افتراضياً NEUTRAL، ويمكن (اختياريًا) تحويله لاتجاه ضعيف إذا الحركة واضحة.
             if weak_event_to_directional:
+                label_end_idx[i] = int(sess_end)
                 move_px = float(close[sess_end] - entry) if sess_end >= i else 0.0
                 move_thr = float(max(weak_event_min_move_atr, 0.0)) * atr_i
                 trade_duration[i] = max(0, sess_end - i)
@@ -1840,6 +1905,7 @@ def label_by_outcome(
             bias_label[i]     = 2
             path_outcome[i]   = 4
             trade_duration[i] = max(0, sess_end - i)
+            label_end_idx[i] = int(sess_end)
             if (not allow_long) or (not allow_short):
                 neutral_reason[i] = NEUTRAL_REASON_KALMAN
             else:
@@ -1847,8 +1913,8 @@ def label_by_outcome(
         else:
             ev_type, ev_j = first_ev
             trade_duration[i] = ev_j - i
+            label_end_idx[i] = int(ev_j)
             sq = 2 if london_ok[i] else 1
-
             if ev_type == 'long_tp':
                 bias_label[i]   = 0   # LONG ✅
                 path_outcome[i] = 0
@@ -1882,7 +1948,13 @@ def label_by_outcome(
     df['neutral_reason'] = neutral_reason
     df['trade_duration'] = trade_duration
     df['signal_quality'] = signal_quality
-    df['forward_return'] = forward_return
+    label_end_idx = np.clip(label_end_idx, 0, max(n - 1, 0)).astype(np.int32)
+    horizon_steps = (label_end_idx - np.arange(n, dtype=np.int32)).clip(min=0).astype(np.int32)
+    denom = np.maximum(np.abs(close), 1e-8)
+    df['forward_return'] = ((close[label_end_idx] - close) / denom).astype(np.float32)
+    df['label_end_ts'] = pd.to_datetime(df['ts_event'].iloc[label_end_idx].to_numpy())
+    df['label_horizon_steps'] = horizon_steps
+    df['effective_horizon'] = horizon_steps
 
     # event_flag: فاز بـ TP فقط (للتدريب الفعلي)
     df['event_flag'] = (
