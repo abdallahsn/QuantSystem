@@ -105,6 +105,9 @@ DEEPLOB_MAX_EVENTS_DEFAULT = 5_000_000
 DEEPLOB_MAX_TENSORS_DEFAULT = 25_000
 DEEPLOB_MAX_GB_DEFAULT = 0.30
 LOB_EVENT_SAMPLE_DEFAULT = 100_000
+LOB_EMIT_MODE_TRAIN_EVENTS = 'train_events'
+LOB_EMIT_MODE_DIRECTIONAL_ALL = 'directional_all'
+SUPPORTED_LOB_EMIT_MODES = {LOB_EMIT_MODE_TRAIN_EVENTS, LOB_EMIT_MODE_DIRECTIONAL_ALL}
 FUTURES_CONTRACT_RE = re.compile(r"^(?P<root>.+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{1,4})$", re.IGNORECASE)
 
 try:
@@ -2814,12 +2817,17 @@ def _select_event_rich_lob_emit_positions(
     lob_mbp_src: pd.DataFrame,
     max_events: int = LOB_EVENT_SAMPLE_DEFAULT,
     max_positions: int | None = None,
+    emit_mode: str = LOB_EMIT_MODE_TRAIN_EVENTS,
 ) -> tuple[np.ndarray, dict]:
     if (
         df_labeled is None or len(df_labeled) == 0 or
         lob_mbp_src is None or len(lob_mbp_src) == 0
     ):
         return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
+
+    emit_mode = str(emit_mode or LOB_EMIT_MODE_TRAIN_EVENTS).strip().lower()
+    if emit_mode not in SUPPORTED_LOB_EMIT_MODES:
+        emit_mode = LOB_EMIT_MODE_TRAIN_EVENTS
 
     event_col = 'train_event_flag' if 'train_event_flag' in df_labeled.columns else 'event_flag'
     label_cols = ['ts_event', 'event_flag', 'train_event_flag', 'bias_label', 'signal_quality']
@@ -2833,10 +2841,15 @@ def _select_event_rich_lob_emit_positions(
     candidates['train_event_flag'] = pd.to_numeric(candidates.get('train_event_flag', candidates['event_flag']), errors='coerce').fillna(0).astype(np.int8)
     candidates['bias_label'] = pd.to_numeric(candidates.get('bias_label', DIR_NEUTRAL), errors='coerce').fillna(DIR_NEUTRAL).astype(np.int8)
     candidates['signal_quality'] = pd.to_numeric(candidates.get('signal_quality', 0), errors='coerce').fillna(0).astype(np.int8)
-    candidates = candidates[
-        (candidates[event_col] == 1) &
-        (candidates['bias_label'] != DIR_NEUTRAL)
-    ].reset_index(drop=True)
+    if emit_mode == LOB_EMIT_MODE_DIRECTIONAL_ALL:
+        candidates = candidates[candidates['bias_label'] != DIR_NEUTRAL].reset_index(drop=True)
+        emit_source = 'bias_label'
+    else:
+        candidates = candidates[
+            (candidates[event_col] == 1) &
+            (candidates['bias_label'] != DIR_NEUTRAL)
+        ].reset_index(drop=True)
+        emit_source = event_col
     if len(candidates) == 0:
         return np.array([], dtype=np.int32), {'selected_events': 0, 'selected_emit_positions': 0}
 
@@ -2898,7 +2911,8 @@ def _select_event_rich_lob_emit_positions(
 
     meta = {
         'directional_events_available': int(len(candidates)),
-        'event_col': event_col,
+        'event_col': emit_source,
+        'emit_mode': emit_mode,
         'strong_available': int(len(strong)),
         'weak_available': int(len(weak)),
         'selected_events': int(len(selected)),
@@ -3466,6 +3480,7 @@ def run_refinery(
     training_event_target_rate: float = DEFAULT_TRAINING_EVENT_TARGET_RATE,
     training_event_score_threshold: float | None = None,
     lob_event_sample: int = LOB_EVENT_SAMPLE_DEFAULT,
+    lob_emit_mode: str = LOB_EMIT_MODE_TRAIN_EVENTS,
     external_scaler_path: str | None = None,
     fit_aux_models: bool = True,
     tp_mult: float = DEFAULT_V19_TP_MULT,
@@ -3574,6 +3589,12 @@ def run_refinery(
             else "OFF — legacy causal TP; rely on decision policy / backtest gates for cost realism."
         )
     )
+    lob_emit_mode = str(lob_emit_mode or LOB_EMIT_MODE_TRAIN_EVENTS).strip().lower()
+    if lob_emit_mode not in SUPPORTED_LOB_EMIT_MODES:
+        raise ValueError(
+            f"Unsupported lob_emit_mode={lob_emit_mode!r}; expected one of {sorted(SUPPORTED_LOB_EMIT_MODES)}"
+        )
+    print(f"  👁️ LOB emit mode: {lob_emit_mode}")
 
     mbp_exists = os.path.exists(mbp_path) and os.path.getsize(mbp_path) > 0
     deeplob_enabled = bool(mbp_exists and _load_deeplob_components())
@@ -3986,6 +4007,7 @@ def run_refinery(
                 'effective_max_tensors': int(effective_max_tensors),
                 'max_gb': lob_limits['max_gb'],
                 'lob_event_sample': int(lob_limits['lob_event_sample']),
+                'lob_emit_mode': lob_emit_mode,
                 'mbo_rows': mbo_rows,
                 'mbp_rows': mbp_rows,
                 'total_events': total_lob_events,
@@ -4014,6 +4036,7 @@ def run_refinery(
                     lob_mbp_index,
                     max_events=sample_cap,
                     max_positions=effective_max_tensors if effective_max_tensors > 0 else None,
+                    emit_mode=lob_emit_mode,
                 )
                 planned_tensors = int(len(emit_positions))
                 planned_tensor_bytes = int(planned_tensors * tensor_bytes)
@@ -4358,6 +4381,10 @@ if __name__=='__main__':
                    help='optional fixed score threshold for train_event_flag selection')
     p.add_argument('--lob_event_sample', type=int, default=int(_refinery_defaults.get('lob_event_sample', LOB_EVENT_SAMPLE_DEFAULT)),
                    help='Max event-rich emit positions for LOB tensors')
+    p.add_argument('--lob_emit_mode',
+                   choices=sorted(SUPPORTED_LOB_EMIT_MODES),
+                   default=str(_refinery_defaults.get('lob_emit_mode', LOB_EMIT_MODE_TRAIN_EVENTS)),
+                   help='LOB tensor emit source: train_events keeps the selected event view; directional_all covers all LONG/SHORT labels.')
     p.add_argument('--tp_mult', type=float, default=float(_refinery_defaults.get('tp_mult', DEFAULT_V19_TP_MULT)),
                    help=f'TP multiplier applied to dynamic threshold (default: {DEFAULT_V19_TP_MULT:.1f})')
     p.add_argument('--sl_mult', type=float, default=float(_refinery_defaults.get('sl_mult', 1.0)),
@@ -4427,6 +4454,7 @@ if __name__=='__main__':
                  training_event_target_rate=a.training_event_target_rate,
                  training_event_score_threshold=a.training_event_score_threshold,
                  lob_event_sample=a.lob_event_sample,
+                 lob_emit_mode=a.lob_emit_mode,
                  tp_mult=a.tp_mult,
                  sl_mult=a.sl_mult,
                  adaptive_horizon=a.adaptive_horizon,
