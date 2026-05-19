@@ -625,18 +625,39 @@ def collect_one_run(root: Path, scan_final: bool) -> dict[str, Any]:
     }
 
 
+def _integrity_hard_failure(integrity: dict[str, Any]) -> bool:
+    final = integrity.get("final") or {}
+    if (as_int(final.get("missing_ts_rows"), 0) or 0) > 0:
+        return True
+    if (as_int(final.get("non_monotonic_ts_steps"), 0) or 0) > 0:
+        return True
+    if (as_int(final.get("price_nonpositive_rows"), 0) or 0) > 0:
+        return True
+    for section_name in ["mbo", "mbp"]:
+        section = ((integrity.get("inputs") or {}).get(section_name) or {})
+        for part_name in ["raw", "normalized"]:
+            part = section.get(part_name) or {}
+            if (as_int(part.get("missing_ts_rows"), 0) or 0) > 0:
+                return True
+            if (as_int(part.get("non_monotonic_ts_steps"), 0) or 0) > 0:
+                return True
+            if (as_int(part.get("price_nonpositive_rows"), 0) or 0) > 0:
+                return True
+    return False
+
+
 def diagnose(row: dict[str, Any], integrity: dict[str, Any], contract: dict[str, Any], drift: dict[str, Any]) -> dict[str, Any]:
-    issues: list[str] = []
-    severities: list[str] = []
+    findings: list[tuple[str, str]] = []
 
     def add(level: str, msg: str) -> None:
-        severities.append(level)
-        issues.append(msg)
+        findings.append((level, msg))
 
     if contract and contract.get("passed") is False:
         add("Critical", f"contract consistency failed: {contract.get('failure_reason')}")
-    if len(integrity.get("warnings") or []) > 0:
+    if len(integrity.get("warnings") or []) > 0 and _integrity_hard_failure(integrity):
         add("High", f"data integrity warnings={len(integrity.get('warnings') or [])}")
+    elif len(integrity.get("warnings") or []) > 0:
+        add("Low", "duplicate timestamps present; verify stable tie-ordering, but no missing/non-monotonic timestamps detected")
     if as_float(row.get("event_view_pct"), 1.0) is not None and (as_float(row.get("event_view_pct"), 1.0) or 0) < 0.05:
         add("Medium", "event training view is very small vs full data")
     if as_float(row.get("stage1_coverage_ratio"), 1.0) is not None and (as_float(row.get("stage1_coverage_ratio"), 1.0) or 0) < 0.90:
@@ -659,8 +680,9 @@ def diagnose(row: dict[str, Any], integrity: dict[str, Any], contract: dict[str,
         add("Medium", f"dead features detected: {len(drift.get('dead_features_3m') or [])}")
 
     order = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
-    risk_level = max(severities, key=lambda x: order.get(x, 0)) if severities else "Low"
-    return {"risk_level": risk_level, "issues": issues}
+    findings.sort(key=lambda item: order.get(item[0], 0), reverse=True)
+    risk_level = findings[0][0] if findings else "Low"
+    return {"risk_level": risk_level, "issues": [msg for _, msg in findings]}
 
 
 def fmt(value: Any) -> str:
