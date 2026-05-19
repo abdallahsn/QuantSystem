@@ -117,6 +117,13 @@ def read_json(path: Path) -> dict[str, Any]:
         return {"_read_error": str(exc)}
 
 
+def first_existing_json(paths: list[Path]) -> tuple[dict[str, Any], str | None]:
+    for path in paths:
+        if path.exists():
+            return read_json(path), str(path.parent)
+    return {}, None
+
+
 def read_text(path: Path) -> str:
     if not path.exists():
         return ""
@@ -203,6 +210,51 @@ def resolve_runs(args_runs: list[str], patterns: list[str]) -> list[Path]:
             seen.add(key)
             roots.append(root)
     return roots
+
+
+def artifact_root_from_path(path_value: Any) -> Path | None:
+    if not path_value:
+        return None
+    try:
+        path = Path(str(path_value)).expanduser()
+    except Exception:
+        return None
+    if path.name.lower() == "final":
+        return path.parent.resolve()
+    if path.parent.name.lower() == "final":
+        return path.parent.parent.resolve()
+    if path.suffix.lower() == ".parquet":
+        return path.parent.resolve()
+    return path.resolve() if path.is_dir() else path.parent.resolve()
+
+
+def candidate_report_roots(root: Path, train_manifest: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+
+    def add(candidate: Path | None) -> None:
+        if candidate is None:
+            return
+        resolved = candidate.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+
+    add(root)
+    inputs = train_manifest.get("inputs") or {}
+    for key in ["csv", "data", "artifact", "features"]:
+        add(artifact_root_from_path(inputs.get(key)))
+    for key in ["lob", "lob_ts"]:
+        lob_root = artifact_root_from_path(inputs.get(key))
+        if lob_root is not None:
+            if lob_root.name.lower() == "features":
+                add(lob_root)
+                add(lob_root.parent)
+            else:
+                add(lob_root)
+    return roots
+
+
+def read_report_from_roots(roots: list[Path], filename: str) -> tuple[dict[str, Any], str | None]:
+    return first_existing_json([root / filename for root in roots])
 
 
 def collect_values_by_key(obj: Any, key: str) -> list[Any]:
@@ -434,11 +486,12 @@ def summarize_stage1(stage1: dict[str, Any]) -> dict[str, Any]:
 
 def collect_one_run(root: Path, scan_final: bool) -> dict[str, Any]:
     train_manifest = read_json(root / "manifest.json")
-    artifact_manifest = read_json(root / "artifact_manifest.json")
-    label_quality = read_json(root / "label_quality_report.json")
-    data_integrity = read_json(root / "data_integrity_report.json")
-    contract = read_json(root / "contract_consistency_report.json")
-    feature_drift = read_json(root / "feature_coverage_drift_report.json")
+    report_roots = candidate_report_roots(root, train_manifest)
+    artifact_manifest, artifact_report_root = read_report_from_roots(report_roots, "artifact_manifest.json")
+    label_quality, label_report_root = read_report_from_roots(report_roots, "label_quality_report.json")
+    data_integrity, integrity_report_root = read_report_from_roots(report_roots, "data_integrity_report.json")
+    contract, contract_report_root = read_report_from_roots(report_roots, "contract_consistency_report.json")
+    feature_drift, drift_report_root = read_report_from_roots(report_roots, "feature_coverage_drift_report.json")
     stage1 = read_json(root / "stage1_v19_metrics.json")
     calibration = read_json(root / "calibration_report.json")
     time_split = read_json(root / "time_split_report.json")
@@ -483,6 +536,7 @@ def collect_one_run(root: Path, scan_final: bool) -> dict[str, Any]:
     row = {
         "run": root.name,
         "root": str(root),
+        "source_report_root": label_report_root or artifact_report_root,
         "kind": train_manifest.get("kind") or artifact_manifest.get("kind"),
         "sample_weight_mode": metrics.get("sample_weight_mode") or config.get("sample_weight_mode"),
         "stage1_target": metrics.get("stage1_target") or config.get("stage1_target"),
@@ -543,6 +597,14 @@ def collect_one_run(root: Path, scan_final: bool) -> dict[str, Any]:
         "reports": {
             "train_manifest": train_manifest,
             "artifact_manifest": artifact_manifest,
+            "report_roots": [str(path) for path in report_roots],
+            "report_sources": {
+                "artifact_manifest": artifact_report_root,
+                "label_quality_report": label_report_root,
+                "data_integrity_report": integrity_report_root,
+                "contract_consistency_report": contract_report_root,
+                "feature_coverage_drift_report": drift_report_root,
+            },
             "label_quality_summary": label_summary,
             "data_integrity": data_integrity,
             "contract_consistency": contract,
@@ -752,6 +814,27 @@ def build_markdown_report(results: list[dict[str, Any]]) -> str:
                 lines.append(f"- {issue}")
         else:
             lines.append("- No major automatic flags.")
+        lines.append("")
+
+    lines.extend(["## Data Integrity Warning Details", ""])
+    for result in results:
+        run = result["summary"]["run"]
+        warnings = (result["reports"].get("data_integrity") or {}).get("warnings") or []
+        contract = result["reports"].get("contract_consistency") or {}
+        sources = result["reports"].get("report_sources") or {}
+        lines.append(f"### {run}")
+        lines.append(f"- report source: `{sources.get('data_integrity_report') or 'missing'}`")
+        if contract:
+            lines.append(
+                f"- contract passed: `{contract.get('passed')}` | "
+                f"expected: `{contract.get('expected_symbol')}` | "
+                f"detected: `{contract.get('detected_symbol')}`"
+            )
+        if warnings:
+            for warning in warnings:
+                lines.append(f"- {warning}")
+        else:
+            lines.append("- No integrity warnings found.")
         lines.append("")
 
     lines.extend(
