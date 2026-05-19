@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from prepare_day_trading import build_day_trading_labels, label_by_outcome
+from prepare_day_trading import _median_numeric_for_mask, build_day_trading_labels, label_by_outcome
 
 
 def _utc_ts(value):
@@ -126,3 +126,11 @@ def test_label_by_outcome_non_event_without_weak_conversion_is_zero_horizon():
     assert int(out.loc[0, "bias_label"]) == 2
     assert int(out.loc[0, "label_horizon_steps"]) == 0
     assert _utc_ts(out.loc[0, "label_end_ts"]) == _utc_ts(df.loc[0, "ts_event"])
+
+
+def test_horizon_manifest_helper_can_report_train_event_median_separately():
+    values = pd.Series([0, 0, 2, 4, 6])
+    train_mask = pd.Series([False, False, True, True, False])
+
+    assert _median_numeric_for_mask(values, pd.Series(True, index=values.index), default=4) == 2
+    assert _median_numeric_for_mask(values, train_mask, default=4) == 3

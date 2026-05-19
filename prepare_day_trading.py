@@ -1249,6 +1249,15 @@ def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> 
     }
 
 
+def _median_numeric_for_mask(values, mask, *, default: float = 0.0) -> float:
+    vals = pd.to_numeric(pd.Series(values), errors='coerce').replace([np.inf, -np.inf], np.nan)
+    mask_s = pd.Series(mask, index=vals.index).fillna(False).astype(bool)
+    subset = vals.loc[mask_s].dropna()
+    if subset.empty:
+        return float(default)
+    return float(subset.median())
+
+
 def _estimate_signal_half_life_median(
     df: pd.DataFrame,
     *,
@@ -2501,11 +2510,27 @@ def run_day_trading_refinery(
 
     mbp_bar_cov_stats = _coverage_stats(df_out.get('mbp_bar_coverage', 0.0), low_threshold=0.30)
     mbp_roll_cov_stats = _coverage_stats(df_out.get('mbp_roll_lob_coverage', 0.0), low_threshold=0.50)
-    effective_horizon_median = float(
-        pd.to_numeric(df_out.get('effective_horizon', horizon_bars), errors='coerce')
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(horizon_bars)
-        .median()
+    horizon_values = df_out.get('effective_horizon', pd.Series(horizon_bars, index=df_out.index))
+    train_event_mask = (
+        pd.to_numeric(df_out.get('train_event_flag', 0), errors='coerce').fillna(0).astype(np.int8) == 1
+    )
+    detected_event_mask = (
+        pd.to_numeric(df_out.get('is_event', 0), errors='coerce').fillna(0).astype(np.int8) == 1
+    )
+    effective_horizon_median = _median_numeric_for_mask(
+        horizon_values,
+        pd.Series(True, index=df_out.index),
+        default=float(horizon_bars),
+    )
+    effective_horizon_train_event_median = _median_numeric_for_mask(
+        horizon_values,
+        train_event_mask,
+        default=float(horizon_bars),
+    )
+    effective_horizon_detected_event_median = _median_numeric_for_mask(
+        horizon_values,
+        detected_event_mask,
+        default=float(horizon_bars),
     )
     signal_half_life_median = _estimate_signal_half_life_median(df_out)
     print(
@@ -2559,8 +2584,10 @@ def run_day_trading_refinery(
         'version'                     : 'v19-event-gate',
         'freq'                        : freq,
         'horizon_bars_default'        : horizon_bars,
-        'label_horizon_source'        : 'day_trading.horizon_bars',
+        'label_horizon_source'        : 'regime_max_bars_with_horizon_fallback',
         'effective_horizon_median'    : effective_horizon_median,
+        'effective_horizon_train_event_median': effective_horizon_train_event_median,
+        'effective_horizon_detected_event_median': effective_horizon_detected_event_median,
         'signal_half_life_median'     : signal_half_life_median,
         'tp_atr_mult_default'         : tp_atr_mult,
         'sl_atr_mult_default'         : sl_atr_mult,
