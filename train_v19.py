@@ -592,6 +592,11 @@ def _fit_long_isotonic_calibrator(
     return calibrator, report
 
 
+def _oof_isotonic_enabled() -> bool:
+    """OOF fold calibration is opt-in because isotonic can overfit time folds."""
+    return os.environ.get('QS_ENABLE_OOF_ISOTONIC', '').strip().lower() in {'1', 'true', 'yes'}
+
+
 def _apply_long_calibrator(calibrator: IsotonicRegression | None, probs: np.ndarray) -> np.ndarray:
     arr = np.asarray(probs, dtype=np.float32)
     if calibrator is None or arr.ndim != 2 or arr.shape[1] < 2:
@@ -2146,7 +2151,14 @@ def stage1_oof_meta(
                 N_CB_PROBS,
                 classes=present_classes,
             )
-            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+            if _oof_isotonic_enabled():
+                calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+            else:
+                calibrator_report = {
+                    'enabled': False,
+                    'reason': 'oof_isotonic_disabled_by_default',
+                    'rows': int(len(inner_val)),
+                }
         preds = _apply_long_calibrator(calibrator, raw_preds)
         test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
         pred_labels = np.argmax(preds, axis=1)
@@ -2401,7 +2413,14 @@ def stage1_oof_meta(
                 N_XGB_PROBS,
                 classes=present_classes,
             )
-            calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+            if _oof_isotonic_enabled():
+                calibrator, calibrator_report = _fit_long_isotonic_calibrator(y[inner_val], val_raw[:, 0])
+            else:
+                calibrator_report = {
+                    'enabled': False,
+                    'reason': 'oof_isotonic_disabled_by_default',
+                    'rows': int(len(inner_val)),
+                }
         preds = _apply_long_calibrator(calibrator, raw_preds)
         test_metrics = _calibration_metrics(y[test_idx], raw_preds, preds)
         pred_labels = np.argmax(preds, axis=1)

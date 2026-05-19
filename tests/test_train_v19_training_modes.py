@@ -7,6 +7,7 @@ from train_v19 import (
     TRAIN_MODE_DIRECTIONAL_ALL,
     TRAIN_MODE_EVENT_BINARY,
     _fit_long_isotonic_calibrator,
+    _oof_isotonic_enabled,
     _apply_long_calibrator,
     _stable_sort_by_ts_event,
     build_event_training_view,
@@ -98,3 +99,10 @@ def test_stable_ts_sort_preserves_duplicate_timestamp_order():
     sorted_df = _stable_sort_by_ts_event(df)
 
     assert sorted_df["row_id"].tolist() == [1, 2, 0, 3]
+
+
+def test_oof_isotonic_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("QS_ENABLE_OOF_ISOTONIC", raising=False)
+    assert _oof_isotonic_enabled() is False
+    monkeypatch.setenv("QS_ENABLE_OOF_ISOTONIC", "1")
+    assert _oof_isotonic_enabled() is True
