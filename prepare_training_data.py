@@ -624,11 +624,51 @@ SETUP_SPOOFING   = 1
 SETUP_OBI        = 2
 SETUP_MIXED      = 3
 
+UNKNOWN_CONTRACT_TOKENS = {"", "NAN", "NONE", "NULL", "<NA>", "UNKNOWN"}
+CONTRACT_META_COLUMNS = [
+    "symbol",
+    "contract_symbol",
+    "contract_root",
+    "contract_month_code",
+    "contract_year_suffix",
+]
+
 def _first_present_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     for col in candidates:
         if col in df.columns:
             return col
     return None
+
+
+def _clean_contract_token(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    token = str(value).strip()
+    if token.upper() in UNKNOWN_CONTRACT_TOKENS:
+        return None
+    return token
+
+
+def _contract_meta_from_row(row) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    symbol = None
+    for col in ("symbol", "raw_symbol", "instrument_id"):
+        symbol = _clean_contract_token(getattr(row, col, None))
+        if symbol:
+            break
+    if symbol:
+        meta["symbol"] = symbol
+
+    for col in CONTRACT_META_COLUMNS[1:]:
+        value = _clean_contract_token(getattr(row, col, None))
+        if value:
+            meta[col] = value
+    return meta
 
 
 def _coerce_naive_timestamp_series(values, *, context: str) -> pd.Series:
@@ -1145,8 +1185,12 @@ def _symbol_count_map_from_integrity(integrity: dict | None) -> dict[str, int]:
 def _frame_symbol_count_map(df: pd.DataFrame) -> tuple[str | None, dict[str, int]]:
     if 'symbol' in df.columns:
         col = 'symbol'
+    elif 'raw_symbol' in df.columns:
+        col = 'raw_symbol'
     elif 'instrument_id' in df.columns:
         col = 'instrument_id'
+    elif 'contract_symbol' in df.columns:
+        col = 'contract_symbol'
     else:
         return None, {}
     counts = (
@@ -1158,14 +1202,39 @@ def _frame_symbol_count_map(df: pd.DataFrame) -> tuple[str | None, dict[str, int
     return col, {str(key): int(value) for key, value in counts.items()}
 
 
+def _clean_symbol_counts(symbol_counts: dict[str, int]) -> dict[str, int]:
+    cleaned: dict[str, int] = {}
+    for key, value in (symbol_counts or {}).items():
+        token = _clean_contract_token(key)
+        if not token:
+            continue
+        try:
+            count = int(value)
+        except Exception:
+            continue
+        if count > 0:
+            cleaned[token] = cleaned.get(token, 0) + count
+    return cleaned
+
+
+def _single_detected_symbol(symbol_counts: dict[str, int]) -> str:
+    cleaned = _clean_symbol_counts(symbol_counts)
+    return next(iter(cleaned.keys())) if len(cleaned) == 1 else ''
+
+
 def _assert_single_contract(
     *,
     symbol_counts: dict[str, int],
     context: str,
     expected_symbol: str = '',
 ) -> None:
-    cleaned = {str(key): int(value) for key, value in (symbol_counts or {}).items() if int(value) > 0}
+    cleaned = _clean_symbol_counts(symbol_counts)
     expected = str(expected_symbol or '').strip()
+    if expected and not cleaned:
+        raise RuntimeError(
+            "❌ Contract/symbol metadata is missing after V19 processing. "
+            f"context={context} | expected={expected}"
+        )
     if len(cleaned) <= 1:
         if expected and cleaned:
             only_symbol = next(iter(cleaned.keys()))
@@ -1222,13 +1291,25 @@ def _write_contract_consistency_report(
     continuous_contract: dict | None = None,
 ) -> str:
     expected = str(expected_symbol or '').strip()
-    final_clean = {str(k): int(v) for k, v in (final_symbol_counts or {}).items() if int(v) > 0}
+    final_clean = _clean_symbol_counts(final_symbol_counts or {})
     detected_symbol = next(iter(final_clean.keys())) if len(final_clean) == 1 else None
     continuous = continuous_contract or {}
     continuous_enabled = bool(continuous.get('enabled', False))
     continuous_root = str(continuous.get('root') or '').strip()
     expected_effective = continuous_root or expected
-    passed = len(final_clean) <= 1 and (not expected_effective or detected_symbol == expected_effective)
+    passed = (
+        len(final_clean) == 1 and detected_symbol == expected_effective
+        if expected_effective
+        else len(final_clean) <= 1
+    )
+    if not final_clean:
+        failure_reason = 'final_contract_metadata_missing'
+    elif len(final_clean) > 1:
+        failure_reason = 'mixed_final_contracts'
+    elif expected_effective and detected_symbol != expected_effective:
+        failure_reason = 'final_contract_mismatch'
+    else:
+        failure_reason = None
     report = {
         'generated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
         'mode': 'continuous_contract_root' if continuous_enabled else 'single_contract_required',
@@ -1238,6 +1319,7 @@ def _write_contract_consistency_report(
         'detected_symbol': detected_symbol,
         'continuous_contract': continuous,
         'passed': bool(passed),
+        'failure_reason': failure_reason,
     }
     path = os.path.join(output_dir, 'contract_consistency_report.json')
     with open(path, 'w') as f:
@@ -1982,9 +2064,11 @@ def _process_mbo_chunk(args):
 
             # 🔴 تحديث الـ VWAP
             cur_vwap, v_zscore, v_slope, sess_cvd = vwap_eng.update(ts, price, float(size), is_buy)
+            contract_meta = _contract_meta_from_row(row)
 
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
+                **contract_meta,
                 '__emit': int(getattr(row, '__emit', 1) or 0),
                 '__chunk_id': int(getattr(row, '__chunk_id', -1) or -1),
                 'cvd':cvd,
@@ -2162,9 +2246,11 @@ def _process_mbo_sequential(df_mbo, engines, cal_params):
             vnet_val                 = vnet.update(price, size, side)
 
             cur_vwap, v_zscore, v_slope, sess_cvd = vwap_eng.update(ts, price, float(size), is_buy)
+            contract_meta = _contract_meta_from_row(row)
 
             out.append({
                 'ts_event':ts, 'price':price, 'size':size, 'action':action, 'side':side,
+                **contract_meta,
                 '__emit': int(getattr(row, '__emit', 1) or 0),
                 '__chunk_id': int(getattr(row, '__chunk_id', -1) or -1),
                 'cvd':cvd,
@@ -3535,16 +3621,18 @@ def run_refinery(
         mbp_rows=int(sum(int(r.get('rows', 0)) for r in mbp_records)),
     )
     input_symbol_counts = _symbol_count_map_from_integrity(mbo_integrity)
+    detected_input_symbol = _single_detected_symbol(input_symbol_counts)
+    expected_final_symbol = continuous_contract_root or symbol or detected_input_symbol
     _assert_single_contract(
         symbol_counts=input_symbol_counts,
         context='canonical_mbo_input',
-        expected_symbol=symbol,
+        expected_symbol=continuous_contract_root or symbol,
     )
     if mbp_integrity is not None:
         _assert_single_contract(
             symbol_counts=_symbol_count_map_from_integrity(mbp_integrity),
             context='canonical_mbp_input',
-            expected_symbol=symbol,
+            expected_symbol=continuous_contract_root or symbol,
         )
     max_phase_a_shards = max(len(mbo_records), len(mbp_records) if mbp_records else 0)
     if max_phase_a_shards <= 1 and effective_workers > 1:
@@ -4062,7 +4150,7 @@ def run_refinery(
     _assert_single_contract(
         symbol_counts=final_symbol_counts,
         context='final_labeled_artifact',
-        expected_symbol=continuous_contract_root or symbol,
+        expected_symbol=expected_final_symbol,
     )
 
     split_meta = {}
@@ -4179,7 +4267,7 @@ def run_refinery(
     print(f"  ✅ Data integrity report: {integrity_report_path}")
     contract_report_path = _write_contract_consistency_report(
         output_dir=output_dir,
-        expected_symbol=continuous_contract_root or symbol,
+        expected_symbol=expected_final_symbol,
         input_symbol_counts=input_symbol_counts,
         final_symbol_counts=final_symbol_counts,
         continuous_contract=continuous_contract,
