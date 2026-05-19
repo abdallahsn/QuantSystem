@@ -56,6 +56,31 @@ def test_feature_fold_metrics_detect_predictive_feature():
     assert fold_rows
     assert split_reports[audit.VIEW_DIRECTIONAL_ALL]["n_splits"] >= 1
     assert by_feature["cvd"]["auc_edge_mean"] > 0.99
+    assert by_feature["cvd"]["train_signed_auc_mean"] > 0.99
     assert by_feature["obi"]["auc_edge_mean"] > 0.99
+    assert by_feature["obi"]["train_signed_auc_mean"] > 0.99
     assert by_feature["cvd"]["top_side"] == "long"
     assert by_feature["obi"]["top_side"] == "short"
+
+
+def test_train_signed_auc_penalizes_direction_flip():
+    df = _audit_frame()
+    half = len(df) // 2
+    y_long = (df["bias_label"].to_numpy(dtype=np.int8) == audit.DIR_LONG).astype(float)
+    flipping_feature = y_long.copy()
+    flipping_feature[half:] = 1.0 - flipping_feature[half:]
+    df["flip_feature"] = flipping_feature
+
+    _, summary_rows, _ = audit.compute_feature_fold_metrics(
+        audit.stable_sort_by_ts(df),
+        ["flip_feature"],
+        [audit.VIEW_DIRECTIONAL_ALL],
+        n_folds=3,
+        test_size=0.20,
+        embargo_pct=0.01,
+        min_train_pct=0.20,
+    )
+    row = summary_rows[0]
+
+    assert row["auc_edge_mean"] > 0.99
+    assert row["train_signed_auc_mean"] < 0.50

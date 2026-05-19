@@ -439,24 +439,39 @@ def compute_feature_fold_metrics(
         split_reports[view] = split_info
         y_label = pd.to_numeric(view_df["bias_label"], errors="coerce").fillna(DIR_NEUTRAL).astype(np.int8)
         y_long = (y_label.to_numpy(dtype=np.int8) == DIR_LONG).astype(np.int8)
+        feature_arrays = {
+            feature: numeric_series(view_df, feature).to_numpy(dtype=np.float64)
+            for feature in features
+        }
         for fold_no, (train_idx, test_idx) in enumerate(splits, start=1):
+            train_idx = np.asarray(train_idx, dtype=np.int64)
             test_idx = np.asarray(test_idx, dtype=np.int64)
+            y_tr = y_long[train_idx]
             y_te = y_long[test_idx]
             pos = int(np.sum(y_te == 1))
             neg = int(np.sum(y_te == 0))
             if pos == 0 or neg == 0:
                 continue
             for feature in features:
-                x = numeric_series(view_df, feature).to_numpy(dtype=np.float64)[test_idx]
-                finite = np.isfinite(x)
-                unique = int(len(np.unique(x[finite]))) if finite.any() else 0
+                x_all = feature_arrays[feature]
+                x_tr = x_all[train_idx]
+                x_te = x_all[test_idx]
+                finite = np.isfinite(x_te)
+                unique = int(len(np.unique(x_te[finite]))) if finite.any() else 0
                 if unique <= 1:
                     auc = None
                     ic = None
+                    train_auc = None
+                    train_signed_auc = None
+                    train_signal_side = None
                 else:
-                    auc = binary_auc(y_te, x)
+                    train_auc = binary_auc(y_tr, x_tr)
+                    train_signal_side = None if train_auc is None else ("long" if train_auc >= 0.5 else "short")
+                    signed_x_te = x_te if (train_auc is not None and train_auc >= 0.5) else -x_te
+                    train_signed_auc = None if train_auc is None else binary_auc(y_te, signed_x_te)
+                    auc = binary_auc(y_te, x_te)
                     signed_y = np.where(y_te == 1, 1.0, -1.0)
-                    ic = spearman_ic(x, signed_y)
+                    ic = spearman_ic(x_te, signed_y)
                 auc_edge = None if auc is None else float(max(auc, 1.0 - auc))
                 fold_rows.append({
                     "view": view,
@@ -469,6 +484,9 @@ def compute_feature_fold_metrics(
                     "unique_values": unique,
                     "ic": ic,
                     "abs_ic": None if ic is None else abs(float(ic)),
+                    "train_auc_long": train_auc,
+                    "train_signal_side": train_signal_side,
+                    "train_signed_auc": train_signed_auc,
                     "auc_long": auc,
                     "auc_edge": auc_edge,
                     "signal_side": None if auc is None else ("long" if auc >= 0.5 else "short"),
@@ -481,13 +499,24 @@ def compute_feature_fold_metrics(
             valid_auc = pd.to_numeric(group["auc_edge"], errors="coerce").dropna()
             valid_ic = pd.to_numeric(group["abs_ic"], errors="coerce").dropna()
             signed_ic = pd.to_numeric(group["ic"], errors="coerce").dropna()
+            train_signed_auc = pd.to_numeric(group["train_signed_auc"], errors="coerce").dropna()
             sides = group["signal_side"].dropna()
             top_side = sides.value_counts().idxmax() if len(sides) else None
             side_stability = float((sides == top_side).mean()) if len(sides) and top_side else None
+            train_sides = group["train_signal_side"].dropna()
+            train_top_side = train_sides.value_counts().idxmax() if len(train_sides) else None
+            train_side_stability = (
+                float((train_sides == train_top_side).mean())
+                if len(train_sides) and train_top_side else None
+            )
             summary_rows.append({
                 "view": str(view),
                 "feature": str(feature),
                 "valid_folds": int(max(len(valid_auc), len(valid_ic))),
+                "train_signed_auc_mean": float(train_signed_auc.mean()) if len(train_signed_auc) else None,
+                "train_signed_auc_min": float(train_signed_auc.min()) if len(train_signed_auc) else None,
+                "train_signed_auc_max": float(train_signed_auc.max()) if len(train_signed_auc) else None,
+                "train_signed_auc_gt_50_pct": float((train_signed_auc > 0.5).mean()) if len(train_signed_auc) else None,
                 "auc_edge_mean": float(valid_auc.mean()) if len(valid_auc) else None,
                 "auc_edge_min": float(valid_auc.min()) if len(valid_auc) else None,
                 "auc_edge_max": float(valid_auc.max()) if len(valid_auc) else None,
@@ -496,9 +525,12 @@ def compute_feature_fold_metrics(
                 "signed_ic_mean": float(signed_ic.mean()) if len(signed_ic) else None,
                 "top_side": top_side,
                 "side_stability": side_stability,
+                "train_top_side": train_top_side,
+                "train_side_stability": train_side_stability,
             })
         summary_rows.sort(
             key=lambda r: (
+                -1 if r["train_signed_auc_mean"] is None else -float(r["train_signed_auc_mean"]),
                 -1 if r["auc_edge_mean"] is None else -float(r["auc_edge_mean"]),
                 -1 if r["abs_ic_mean"] is None else -float(r["abs_ic_mean"]),
             )
@@ -521,8 +553,16 @@ def build_risk_flags(label_report: dict[str, Any], feature_summary: list[dict[st
         by_view.setdefault(str(row.get("view")), []).append(row)
     for view, rows in by_view.items():
         best_auc = max((float(r["auc_edge_mean"]) for r in rows if r.get("auc_edge_mean") is not None), default=0.5)
+        best_train_signed_auc = max(
+            (float(r["train_signed_auc_mean"]) for r in rows if r.get("train_signed_auc_mean") is not None),
+            default=0.5,
+        )
         if best_auc < 0.53:
             flags.append(f"{view}: no feature has stable fold AUC edge >= 0.53")
+        if best_train_signed_auc < 0.53:
+            flags.append(f"{view}: no feature has train-signed OOS AUC >= 0.53")
+        if best_auc >= 0.56 and best_train_signed_auc < 0.53:
+            flags.append(f"{view}: raw separability exists, but train-learned direction does not transfer")
     for row in feature_summary[:10]:
         if row.get("side_stability") is not None and float(row["side_stability"]) < 0.67:
             flags.append(f"{row['view']}/{row['feature']}: signal side flips across folds")
@@ -588,16 +628,18 @@ def write_markdown(report: dict[str, Any], path: Path, top_n: int) -> None:
     for view, rows in by_view.items():
         lines.append(f"### {view}")
         lines.append("")
-        lines.append("| feature | folds | auc_edge_mean | auc_edge_min | abs_ic_mean | top_side | side_stability |")
-        lines.append("| --- | ---: | ---: | ---: | ---: | --- | ---: |")
+        lines.append("| feature | folds | train_signed_auc | train_min | auc_edge_mean | auc_edge_min | abs_ic_mean | train_side | test_edge_side |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |")
         for row in rows[:top_n]:
             lines.append(
                 f"| `{row['feature']}` | {row['valid_folds']} | "
+                f"{None if row.get('train_signed_auc_mean') is None else round(float(row['train_signed_auc_mean']), 4)} | "
+                f"{None if row.get('train_signed_auc_min') is None else round(float(row['train_signed_auc_min']), 4)} | "
                 f"{None if row.get('auc_edge_mean') is None else round(float(row['auc_edge_mean']), 4)} | "
                 f"{None if row.get('auc_edge_min') is None else round(float(row['auc_edge_min']), 4)} | "
                 f"{None if row.get('abs_ic_mean') is None else round(float(row['abs_ic_mean']), 4)} | "
-                f"{row.get('top_side')} | "
-                f"{None if row.get('side_stability') is None else round(float(row['side_stability']), 3)} |"
+                f"{row.get('train_top_side')} ({None if row.get('train_side_stability') is None else round(float(row['train_side_stability']), 3)}) | "
+                f"{row.get('top_side')} ({None if row.get('side_stability') is None else round(float(row['side_stability']), 3)}) |"
             )
         lines.append("")
 
@@ -617,6 +659,7 @@ def write_markdown(report: dict[str, Any], path: Path, top_n: int) -> None:
         "## How To Read This",
         "",
         "- `auc_edge_mean` is `max(AUC, 1-AUC)`, so 0.50 means no directional separation and 0.55+ starts to be interesting.",
+        "- `train_signed_auc` is stricter: the feature direction is chosen from the train fold only, then evaluated on the future test fold.",
         "- `abs_ic_mean` is fold-wise absolute Spearman IC against LONG(+1)/SHORT(-1).",
         "- A feature with high mean but low `side_stability` is not production-safe; it flips meaning by time.",
         "- If all views stay below ~0.53 AUC edge, inspect label construction before training deeper models.",
@@ -707,6 +750,7 @@ def main() -> int:
             top = view_rows[0]
             print(
                 f"- top {view}: {top['feature']} "
+                f"train_signed_auc={top.get('train_signed_auc_mean')} "
                 f"auc_edge_mean={top.get('auc_edge_mean')} abs_ic_mean={top.get('abs_ic_mean')}"
             )
     print(f"risk_flags={len(risk_flags)}")
