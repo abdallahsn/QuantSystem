@@ -163,6 +163,8 @@ def _resolve_seq_len_from_v19_config(
 
 SCHEMA_VERSION = 'v19-event-binary'
 TRAIN_MODE_EVENT_BINARY = 'event_binary'
+TRAIN_MODE_DIRECTIONAL_ALL = 'directional_all'
+SUPPORTED_TRAINING_MODES = {TRAIN_MODE_EVENT_BINARY, TRAIN_MODE_DIRECTIONAL_ALL}
 # CatBoost/XGBoost row weights — see _quality_sample_weights(..., mode=...)
 SAMPLE_WEIGHT_MODE_COMBINED = 'combined'
 SAMPLE_WEIGHT_MODE_GEOMETRIC = 'geometric'
@@ -499,32 +501,93 @@ def _fit_long_isotonic_calibrator(
     y_bias = np.asarray(y_bias, dtype=np.int32)
     p_long = _safe_prob(p_long)
     mask = np.isin(y_bias, [0, 1])
-    if int(mask.sum()) < 32:
+    rows = int(mask.sum())
+    if rows < 64:
         return None, {
             'enabled': False,
-            'reason': 'insufficient_directional_oof_rows',
-            'rows': int(mask.sum()),
+            'reason': 'insufficient_directional_calibration_rows',
+            'rows': rows,
         }
-    y_long = (y_bias[mask] == 0).astype(np.int32)
+    p_dir = p_long[mask]
+    y_dir = y_bias[mask]
+    y_long = (y_dir == 0).astype(np.int32)
     if np.unique(y_long).size < 2:
         return None, {
             'enabled': False,
             'reason': 'single_class_directional_oof_rows',
-            'rows': int(mask.sum()),
+            'rows': rows,
         }
+    if np.unique(np.round(p_dir, 6)).size < 2:
+        return None, {
+            'enabled': False,
+            'reason': 'constant_calibration_probabilities',
+            'rows': rows,
+        }
+
+    # Guard against isotonic overfitting: fit on the older half of the
+    # calibration window, accept only if it improves the newer half.
+    split = max(32, rows // 2)
+    split = min(split, rows - 32)
+    fit_p = p_dir[:split]
+    fit_y = y_long[:split]
+    eval_p = p_dir[split:]
+    eval_y_long = y_long[split:]
+    eval_y_bias = y_dir[split:]
+    if np.unique(fit_y).size < 2 or np.unique(eval_y_long).size < 2:
+        return None, {
+            'enabled': False,
+            'reason': 'calibration_guard_single_class_split',
+            'rows': rows,
+            'fit_rows': int(len(fit_y)),
+            'eval_rows': int(len(eval_y_long)),
+        }
+
+    guard_calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+    guard_calibrator.fit(fit_p, fit_y)
+    guard_eval = np.asarray(guard_calibrator.transform(eval_p), dtype=np.float64)
+    raw_probs_eval = np.c_[1.0 - eval_p, eval_p]
+    cal_probs_eval = np.c_[1.0 - guard_eval, guard_eval]
+    raw_brier = float(np.mean((eval_p - eval_y_long) ** 2))
+    calibrated_brier = float(np.mean((guard_eval - eval_y_long) ** 2))
+    raw_nll = float(log_loss(eval_y_long, raw_probs_eval, labels=[0, 1]))
+    calibrated_nll = float(log_loss(eval_y_long, cal_probs_eval, labels=[0, 1]))
+    raw_ece = _binary_ece(eval_y_bias, eval_p)
+    calibrated_ece = _binary_ece(eval_y_bias, guard_eval)
+    brier_tol = 1e-5
+    nll_tol = 1e-5
+    accepted = (
+        calibrated_brier <= raw_brier - brier_tol
+        and calibrated_nll <= raw_nll - nll_tol
+    )
+    if not accepted:
+        return None, {
+            'enabled': False,
+            'reason': 'calibration_guard_rejected',
+            'rows': rows,
+            'fit_rows': int(len(fit_y)),
+            'eval_rows': int(len(eval_y_long)),
+            'raw_brier': raw_brier,
+            'calibrated_brier': calibrated_brier,
+            'raw_ece': raw_ece,
+            'calibrated_ece': calibrated_ece,
+            'raw_nll': raw_nll,
+            'calibrated_nll': calibrated_nll,
+        }
+
     calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
-    calibrated = calibrator.fit_transform(p_long[mask], y_long)
-    raw_probs = np.c_[1.0 - p_long[mask], p_long[mask]]
-    cal_probs = np.c_[1.0 - calibrated, calibrated]
+    calibrator.fit(p_dir, y_long)
     report = {
         'enabled': True,
-        'rows': int(mask.sum()),
-        'raw_brier': float(np.mean((p_long[mask] - y_long) ** 2)),
-        'calibrated_brier': float(np.mean((calibrated - y_long) ** 2)),
-        'raw_ece': _binary_ece(y_bias[mask], p_long[mask]),
-        'calibrated_ece': _binary_ece(y_bias[mask], calibrated),
-        'raw_nll': float(log_loss(y_long, raw_probs, labels=[0, 1])),
-        'calibrated_nll': float(log_loss(y_long, cal_probs, labels=[0, 1])),
+        'reason': 'calibration_guard_accepted',
+        'rows': rows,
+        'fit_rows': int(len(fit_y)),
+        'eval_rows': int(len(eval_y_long)),
+        'raw_brier': raw_brier,
+        'calibrated_brier': calibrated_brier,
+        'raw_ece': raw_ece,
+        'calibrated_ece': calibrated_ece,
+        'raw_nll': raw_nll,
+        'calibrated_nll': calibrated_nll,
     }
     return calibrator, report
 
@@ -776,7 +839,7 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
     label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
     if not ts_event.is_monotonic_increasing:
         print("  ⚠️ Input rows were not monotonic by ts_event — sorting chronologically before training")
-        df = df.assign(ts_event=ts_event, label_end_ts=label_end).sort_values('ts_event').reset_index(drop=True)
+        df = _stable_sort_by_ts_event(df.assign(ts_event=ts_event, label_end_ts=label_end))
         ts_event = _time_series(df, 'ts_event')
         label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
     invalid_horizon = (label_end < ts_event).to_numpy(dtype=bool)
@@ -830,12 +893,13 @@ def build_event_training_view(
     train_frac: float = 0.80,
     split_time: pd.Timestamp | str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    if mode != TRAIN_MODE_EVENT_BINARY:
+    mode = str(mode or TRAIN_MODE_EVENT_BINARY).strip().lower()
+    if mode not in SUPPORTED_TRAINING_MODES:
         raise ValueError(f'Unsupported training mode: {mode}')
 
     out = df.copy()
     if 'ts_event' in out.columns:
-        out = out.sort_values('ts_event').reset_index(drop=True)
+        out = _stable_sort_by_ts_event(out)
     if 'mbp_bar_coverage' in out.columns:
         mbp_cov = pd.to_numeric(out['mbp_bar_coverage'], errors='coerce').fillna(0.0)
         cov_mask = mbp_cov >= 0.30
@@ -859,17 +923,26 @@ def build_event_training_view(
 
     directional_mask = out['bias_label'].isin([0, 1])
     event_col = 'train_event_flag' if 'train_event_flag' in out.columns else 'event_flag'
-    event_mask = (out[event_col] == 1) & directional_mask
+    if mode == TRAIN_MODE_DIRECTIONAL_ALL:
+        event_col = 'bias_label'
+        event_mask = directional_mask
+        fallback_reason = 'directional_all_requested'
+        print(
+            "  🧪 Event Training View mode=directional_all: "
+            "using all LONG/SHORT rows and excluding NEUTRAL."
+        )
+    else:
+        event_mask = (out[event_col] == 1) & directional_mask
+        fallback_reason = None
 
-    fallback_reason = None
-    if not event_mask.any() and event_col != 'event_flag':
+    if mode == TRAIN_MODE_EVENT_BINARY and not event_mask.any() and event_col != 'event_flag':
         fallback_mask = (out['event_flag'] == 1) & directional_mask
         if fallback_mask.any():
             event_col = 'event_flag'
             event_mask = fallback_mask
             fallback_reason = 'fallback_to_event_flag'
 
-    if not event_mask.any() and directional_mask.any():
+    if mode == TRAIN_MODE_EVENT_BINARY and not event_mask.any() and directional_mask.any():
         event_col = 'bias_label'
         event_mask = directional_mask
         fallback_reason = 'fallback_to_directional_rows'
@@ -1266,6 +1339,16 @@ def _time_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.
             + f": rows={int(invalid.sum())} sample_indices={sample}"
         )
     return s.reset_index(drop=True)
+
+
+def _stable_sort_by_ts_event(df: pd.DataFrame, *, reset_index: bool = True) -> pd.DataFrame:
+    """Chronological sort that preserves feed order for duplicate timestamps."""
+    if 'ts_event' not in df.columns:
+        return df.reset_index(drop=True) if reset_index else df
+    order_col = '__stable_row_order__'
+    out = df.assign(**{order_col: np.arange(len(df), dtype=np.int64)})
+    out = out.sort_values(['ts_event', order_col], kind='mergesort').drop(columns=[order_col])
+    return out.reset_index(drop=True) if reset_index else out
 
 
 def _parse_optional_timestamp(value) -> pd.Timestamp | None:
@@ -2763,11 +2846,13 @@ def _lob_event_timestamp_overlap_stats(
     row_df = pd.DataFrame({
         'ts_event': row_ts,
         'row_idx': np.arange(len(df), dtype=np.int32),
-    }).sort_values('ts_event')
+    })
+    row_df = _stable_sort_by_ts_event(row_df, reset_index=False)
     lob_df = pd.DataFrame({
         'ts_event': pd.to_datetime(pd.Series(lob_timestamps).iloc[:n_lob], utc=True, errors='coerce').dt.tz_localize(None),
         'tensor_idx': np.arange(n_lob, dtype=np.int32),
-    }).dropna(subset=['ts_event']).sort_values('ts_event')
+    }).dropna(subset=['ts_event'])
+    lob_df = _stable_sort_by_ts_event(lob_df, reset_index=False)
     if len(row_df) == 0 or len(lob_df) == 0:
         return {
             'tolerance': str(tolerance),
@@ -2832,15 +2917,17 @@ def _align_lob_to_rows(
     lob_df = pd.DataFrame({
         'ts_event': pd.to_datetime(pd.Series(lob_timestamps).iloc[:n_lob], utc=True, errors='coerce').dt.tz_localize(None),
         'tensor_idx': np.arange(n_lob, dtype=np.int32),
-    }).dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    }).dropna(subset=['ts_event'])
+    lob_df = _stable_sort_by_ts_event(lob_df)
 
+    row_df_sorted = _stable_sort_by_ts_event(row_df, reset_index=False)
     row_merged = pd.merge_asof(
-        row_df.sort_values('ts_event'),
+        row_df_sorted,
         lob_df,
         on='ts_event',
         direction='backward',
         tolerance=pd.Timedelta(max_age),
-    ).sort_values('row_idx')
+    ).sort_values('row_idx', kind='mergesort')
 
     row_to_tensor = row_merged['tensor_idx'].fillna(-1).astype(np.int32).values
 
@@ -2865,7 +2952,7 @@ def _align_lob_to_rows(
     tensor_target_seen = np.zeros(n_lob, dtype=bool)
     tensor_rows = pd.merge_asof(
         lob_df,
-        row_df.sort_values('ts_event'),
+        row_df_sorted,
         on='ts_event',
         direction='backward',
         tolerance=pd.Timedelta(max_age),
@@ -4542,7 +4629,12 @@ def main():
         help='visual depth encoder for stage2/stage3: lob_transformer (late fusion) or deeplob',
     )
     p.add_argument('--catboost_device', default='auto', choices=['auto', 'cpu', 'gpu'], help='device selection for CatBoost stage')
-    p.add_argument('--training_mode', default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)))
+    p.add_argument(
+        '--training_mode',
+        default=str(defaults.get('mode', TRAIN_MODE_EVENT_BINARY)),
+        choices=sorted(SUPPORTED_TRAINING_MODES),
+        help='event_binary=selected directional train_event rows; directional_all=all LONG/SHORT rows, excluding NEUTRAL',
+    )
     p.add_argument('--quality_weight_strong', type=float, default=float(defaults.get('quality_weight_strong', 2.0)))
     p.add_argument('--quality_weight_weak', type=float, default=float(defaults.get('quality_weight_weak', 1.0)))
     p.add_argument(
