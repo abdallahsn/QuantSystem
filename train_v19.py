@@ -103,6 +103,13 @@ from modules.regime_classifier import (
     REGIME_ONE_HOT_COLS,
     RegimeClassifier,
 )
+from modules.validation_v19 import (
+    assert_label_timestamps,
+    summarize_label_distribution,
+    validate_market_data_frame,
+    validate_time_splits,
+    write_validation_report,
+)
 
 try:
     from catboost import CatBoostClassifier, CatBoostRegressor, Pool
@@ -825,6 +832,12 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         )
 
     df = _sanitize_df(df)
+    market_report = validate_market_data_frame(df, context='load_training_csv', strict=False)
+    if market_report.get('issues'):
+        print(
+            "  ⚠️ Data validation issues before training: "
+            f"{market_report.get('issues')[:5]}"
+        )
     raw_cols = [f'{RAW_STAT_PREFIX}{col}' for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' in df.columns]
     if len(raw_cols) < len(CATBOOST_ADVISOR_FEATURES):
         missing = [col for col in CATBOOST_ADVISOR_FEATURES if f'{RAW_STAT_PREFIX}{col}' not in df.columns]
@@ -847,13 +860,7 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
         df = _stable_sort_by_ts_event(df.assign(ts_event=ts_event, label_end_ts=label_end))
         ts_event = _time_series(df, 'ts_event')
         label_end = _time_series(df, 'label_end_ts', fallback='ts_event')
-    invalid_horizon = (label_end < ts_event).to_numpy(dtype=bool)
-    if np.any(invalid_horizon):
-        bad_rows = np.flatnonzero(invalid_horizon)[:5].tolist()
-        raise ValueError(
-            "❌ Found label_end_ts earlier than ts_event. "
-            f"rows={int(np.sum(invalid_horizon))} sample_indices={bad_rows}"
-        )
+    assert_label_timestamps(df, context='load_training_csv')
     print(
         "  🕒 Timestamp Range: "
         f"ts_event=[{ts_event.iloc[0]} → {ts_event.iloc[-1]}] | "
@@ -886,7 +893,8 @@ def load_training_csv(csv_path: str) -> pd.DataFrame:
             f"  📌 Label stability: mean={float(ls.mean()):.3f} | min={float(ls.min()):.3f}"
         )
     print(f"  Shape: {df.shape}")
-    print(f"  Labels: {df['bias_label'].value_counts().to_dict()}")
+    label_report = summarize_label_distribution(df, context='load_training_csv')
+    print(f"  Labels: {label_report['class_counts']} | warnings={label_report['warnings']}")
     return df
 
 
@@ -1718,6 +1726,13 @@ def build_time_splits(
             f"rows={n:,} train={len(train_idx):,} test={len(test_idx):,} "
             f"(requested_folds={requested_n_folds} ignored)"
         )
+        split_validation = validate_time_splits(
+            splits,
+            t0,
+            t1,
+            context='build_time_splits.tiny_fallback',
+            strict=True,
+        )
         return splits, t0, t1, {
             'dynamic_embargo_rows': 0,
             'effective_embargo_pct': 0.0,
@@ -1725,6 +1740,7 @@ def build_time_splits(
             'requested_n_folds': int(requested_n_folds),
             'effective_requested_n_folds': 1,
             'tiny_fallback': True,
+            'split_validation': split_validation,
         }
     directional_h = pd.to_numeric(
         df.loc[df['bias_label'].isin([0, 1]), 'label_horizon_steps']
@@ -1766,12 +1782,20 @@ def build_time_splits(
     )
     if not splits:
         raise RuntimeError('❌ تعذر بناء time splits صالحة لـ V19')
+    split_validation = validate_time_splits(
+        splits,
+        t0,
+        t1,
+        context='build_time_splits',
+        strict=True,
+    )
     return splits, t0, t1, {
         'dynamic_embargo_rows': int(dynamic_embargo_rows),
         'effective_embargo_pct': float(effective_embargo_pct),
         'embargo_horizon_quantile': float(embargo_horizon_quantile),
         'requested_n_folds': int(requested_n_folds),
         'effective_requested_n_folds': int(effective_requested_folds),
+        'split_validation': split_validation,
     }
 
 
@@ -4127,6 +4151,17 @@ def run_training_pipeline(
     )
 
     df_loaded = load_training_csv(csv_path)
+    full_label_report_path = write_validation_report(
+        summarize_label_distribution(df_loaded, context='run_training_pipeline.full_artifact'),
+        output_dir,
+        'label_distribution_full_report.json',
+    )
+    full_market_report_path = write_validation_report(
+        validate_market_data_frame(df_loaded, context='run_training_pipeline.full_artifact', strict=False),
+        output_dir,
+        'data_validation_full_report.json',
+    )
+    print(f"  🧾 Validation reports: {full_label_report_path}, {full_market_report_path}")
     source_contract = _load_source_refinery_contract(csv_path)
     use_source_split_time = bool(training_profile_info.get('use_source_split_time', True))
     effective_split_time = split_time if split_time is not None else (
@@ -4168,6 +4203,12 @@ def run_training_pipeline(
         train_frac=train_frac,
         split_time=training_window.get('split_time'),
     )
+    event_label_report_path = write_validation_report(
+        summarize_label_distribution(event_df, context='run_training_pipeline.event_training_view'),
+        output_dir,
+        'label_distribution_event_training_report.json',
+    )
+    print(f"  🧾 Event label distribution report: {event_label_report_path}")
     # ── DIAGNOSTIC BLOCK — احذفه بعد التشخيص ──
     print("\n" + "=" * 50)
     print("🔍 DIAGNOSTIC REPORT")

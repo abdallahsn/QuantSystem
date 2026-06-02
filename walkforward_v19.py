@@ -17,6 +17,12 @@ from modules.config_v19 import load_release_gates, load_v19_config
 from modules.manifest_v19 import write_manifest
 from modules.raw_replay_v19 import build_replay_dataset, normalize_ts, read_market_data
 from modules.release_gates_v19 import evaluate_release_gates, save_gate_report
+from modules.feature_artifact_v19 import load_feature_artifact
+from modules.validation_v19 import (
+    assert_no_label_leakage,
+    summarize_label_distribution,
+    write_validation_report,
+)
 from train_v19 import _align_lob_to_rows, _load_lob_inputs, _resolve_visual_model_type, run_training_pipeline
 
 try:
@@ -437,6 +443,30 @@ def run_walkforward(
             trim_to_score_window=True,
         )
         train_integrity_gate_path = _write_data_integrity_gate_report(train_dir)
+        train_guard_df = load_feature_artifact(
+            train_build['csv'],
+            columns=['ts_event', 'label_end_ts', 'bias_label', 'train_event_flag'],
+        )
+        leakage_guard = assert_no_label_leakage(
+            train_guard_df,
+            cutoff_ts=window['test_start'],
+            context=f'walkforward.{fold_name}.train_cutoff',
+        )
+        leakage_guard_path = write_validation_report(
+            leakage_guard,
+            train_dir,
+            'walkforward_train_leakage_guard.json',
+        )
+        train_label_report_path = write_validation_report(
+            summarize_label_distribution(train_guard_df, context=f'walkforward.{fold_name}.train_artifact'),
+            train_dir,
+            'label_distribution_train_report.json',
+        )
+        print(
+            "  ✅ Walk-forward train guard: "
+            f"max_label_end_ts={leakage_guard['max_label_end_ts']} < test_start={window['test_start']} | "
+            f"reports={leakage_guard_path}, {train_label_report_path}"
+        )
         train_summary = run_training_pipeline(
             csv_path=train_build['csv'],
             output_dir=model_dir,
@@ -489,6 +519,12 @@ def run_walkforward(
         )
         test_integrity_gate_path = _write_data_integrity_gate_report(test_dir)
         test_df = _load_csv(test_build['csv'])
+        test_label_report_path = write_validation_report(
+            summarize_label_distribution(test_df, context=f'walkforward.{fold_name}.test_artifact'),
+            test_dir,
+            'label_distribution_test_report.json',
+        )
+        print(f"  🧾 Test label distribution report: {test_label_report_path}")
         test_visual = compute_eval_visual_embeddings(
             test_csv=test_build['csv'],
             test_lob=test_build['lob'],

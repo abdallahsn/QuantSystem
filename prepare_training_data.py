@@ -426,20 +426,20 @@ def _print_step_progress(
     print(text, flush=True)
 
 
-def _require_causal_label_runtime(label_mode: str) -> None:
+def _require_causal_label_runtime(label_mode: str, *, allow_legacy_session_labels: bool = False) -> None:
     mode = str(label_mode or '').strip().lower()
     if mode != 'v19':
         return
     if V19_LABELS_AVAILABLE:
         return
-    if os.environ.get('QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS', '').strip() == '1':
-        print("  ⚠️ Fallback session labeling allowed by QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1")
+    if bool(allow_legacy_session_labels):
+        print("  ⚠️ Legacy fallback session labeling explicitly enabled for diagnostics only.")
         return
     source = V19_LABELS_SOURCE or 'unavailable'
     detail = f'{V19_LABELS_IMPORT_ERROR}' if V19_LABELS_IMPORT_ERROR is not None else 'missing runtime'
     raise RuntimeError(
         f"❌ Causal label runtime required for {mode.upper()} is unavailable "
-        f"({source}: {detail}). Set QUANTSYSTEM_ALLOW_FALLBACK_SESSION_LABELS=1 "
+        f"({source}: {detail}). Pass --allow_legacy_session_labels "
         "only إذا كنت تقبل fallback غير سببي لأغراض التشخيص فقط."
     )
 
@@ -3509,6 +3509,7 @@ def run_refinery(
     config_path: str | None = None,
     enforce_economic_tp_floor: bool | None = None,
     continuous_contract_root: str = '',
+    allow_legacy_session_labels: bool = False,
     **legacy_kwargs,
 ):
     _configure_stdio_utf8()
@@ -3543,7 +3544,7 @@ def run_refinery(
         f"window={max(int(regime_window), 10)}"
     )
 
-    _require_causal_label_runtime(label_mode)
+    _require_causal_label_runtime(label_mode, allow_legacy_session_labels=allow_legacy_session_labels)
     if legacy_kwargs:
         print(
             "  ⚠️ Ignoring legacy refinery args not supported by the current V19 runtime: "
@@ -3952,6 +3953,11 @@ def run_refinery(
         )
         pipeline_tracker.finish(rows=int(len(df_labeled)))
     else:
+        if str(label_mode or '').strip().lower() == 'v19' and not bool(allow_legacy_session_labels):
+            raise RuntimeError(
+                "❌ V19 causal labels are required. Refusing legacy session labels because they can use "
+                "future session/day information. Use --allow_legacy_session_labels only for diagnostics."
+            )
         print("\n⚙️  Step 4 — Fallback Session Labeling...")
         pipeline_tracker.start("Step 4 — Fallback Session Labeling", rows=int(len(df_merged)))
         if V19_LABELS_IMPORT_ERROR is not None:
@@ -4266,6 +4272,7 @@ def run_refinery(
             'merge_tolerance_ms': int(merge_tolerance_ms),
             'step4_min_parallel_rows': int(step4_min_parallel_rows),
             'continuous_contract_root': continuous_contract_root or None,
+            'allow_legacy_session_labels': bool(allow_legacy_session_labels),
         },
         inputs={
             'mbo': os.path.abspath(mbo_path),
@@ -4438,6 +4445,11 @@ if __name__=='__main__':
     p.add_argument('--soft_label_sl_std', '--soft_label_sl_jitter', dest='soft_label_sl_std', type=float,
                    default=float(_soft_defaults.get('sl_std', 0.10)),
                    help='relative std used to perturb SL in Monte Carlo mode')
+    p.add_argument(
+        '--allow_legacy_session_labels',
+        action='store_true',
+        help='Diagnostics only: allow the legacy non-causal session-label fallback if V19 labels are unavailable.',
+    )
     a  = p.parse_args()
     cs = None if a.chunk_rows == 0 else a.chunk_rows
     run_refinery(mbo_path=a.mbo, mbp_path=a.mbp, symbol=a.symbol, output_dir=a.output,
@@ -4478,4 +4490,5 @@ if __name__=='__main__':
                  config_path=a.config,
                  enforce_economic_tp_floor=a.enforce_economic_tp_floor,
                  continuous_contract_root=a.continuous_contract_root,
+                 allow_legacy_session_labels=a.allow_legacy_session_labels,
     )

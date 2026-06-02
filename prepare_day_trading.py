@@ -40,6 +40,12 @@ except Exception:
 from modules.context_features import compute_daily_weekly_levels
 from modules.tick_intrabar_slices import enrich_bars_with_intrabar
 from modules.intrabar_mbp_microstructure import enrich_bars_with_intrabar_mbp
+from modules.validation_v19 import (
+    assert_label_timestamps,
+    summarize_label_distribution,
+    validate_market_data_frame,
+    write_validation_report,
+)
 
 # ─── Regime Configuration (Section 9) ────────────────────────────────────────
 try:
@@ -1556,7 +1562,9 @@ def detect_microstructure_events(
     df = df.copy()
 
     def _zscore(series: pd.Series) -> pd.Series:
-        roll = series.rolling(EVENT_ZSCORE_WINDOW, min_periods=EVENT_ZSCORE_MIN_PERIODS)
+        # Causal baseline: current bar is scored against prior bars only.
+        history = series.shift(1)
+        roll = history.rolling(EVENT_ZSCORE_WINDOW, min_periods=EVENT_ZSCORE_MIN_PERIODS)
         return ((series - roll.mean()) / (roll.std() + 1e-9)).fillna(0.0)
 
     # ── حساب Z-scores ────────────────────────────────────────────────────────
@@ -2264,12 +2272,23 @@ def run_day_trading_refinery(
     weak_event_min_move_atr: float = 0.35,
     sl_to_opposite: bool = False,
     include_weak_directional_in_train: bool = False,
+    research_label_overrides: bool = False,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
     المخرج جاهز مباشرة لـ train_v19.py
     """
     os.makedirs(output_dir, exist_ok=True)
+    unsafe_label_flags = {
+        'weak_event_to_directional': bool(weak_event_to_directional),
+        'sl_to_opposite': bool(sl_to_opposite),
+        'include_weak_directional_in_train': bool(include_weak_directional_in_train),
+    }
+    if any(unsafe_label_flags.values()) and not bool(research_label_overrides):
+        raise ValueError(
+            "Refusing aggressive day-trading label overrides in production mode: "
+            f"{unsafe_label_flags}. Pass --research_label_overrides only for research runs."
+        )
 
     print("\n" + "="*65)
     print("📊 Day Trading Refinery — QuantSystem V19")
@@ -2312,6 +2331,11 @@ def run_day_trading_refinery(
         df_mbo = pd.concat(chunks, ignore_index=True)
     df_mbo['ts_event'] = pd.to_datetime(df_mbo['ts_event'])
     df_mbo = df_mbo.sort_values('ts_event').reset_index(drop=True)
+    mbo_input_validation = validate_market_data_frame(
+        df_mbo,
+        context='prepare_day_trading.mbo_input',
+        strict=False,
+    )
     mbo_dup_ts = int(df_mbo['ts_event'].duplicated().sum())
     mbo_key_cols = [c for c in ('ts_event', 'action', 'side', 'price', 'size', 'order_id') if c in df_mbo.columns]
     mbo_dup_key = int(df_mbo.duplicated(subset=mbo_key_cols).sum()) if mbo_key_cols else 0
@@ -2347,6 +2371,11 @@ def run_day_trading_refinery(
         if df_mbp is not None:
             df_mbp['ts_event'] = pd.to_datetime(df_mbp['ts_event'])
             df_mbp = df_mbp.sort_values('ts_event').reset_index(drop=True)
+            mbp_input_validation = validate_market_data_frame(
+                df_mbp,
+                context='prepare_day_trading.mbp_input',
+                strict=False,
+            )
             mbp_dup_ts = int(df_mbp['ts_event'].duplicated().sum())
             mbp_key_cols = [c for c in ('ts_event', 'bid_px_00', 'ask_px_00', 'bid_sz_00', 'ask_sz_00') if c in df_mbp.columns]
             mbp_dup_key = int(df_mbp.duplicated(subset=mbp_key_cols).sum()) if mbp_key_cols else 0
@@ -2356,6 +2385,13 @@ def run_day_trading_refinery(
                     f"(duplicate_key_rows={mbp_dup_key:,}; snapshots kept for intrabar aggregation)"
                 )
             print(f"  ✅ {len(df_mbp):,} mbp rows | {df_mbp['ts_event'].min()} → {df_mbp['ts_event'].max()}")
+    else:
+        mbp_input_validation = {
+            'context': 'prepare_day_trading.mbp_input',
+            'rows': 0,
+            'issues': [{'severity': 'medium', 'code': 'missing_optional_mbp'}],
+            'passed': True,
+        }
 
     # ── 2. Aggregate → Bars ───────────────────────────────────────
     print(f"\n⏱️  تجميع في {freq} bars...")
@@ -2489,15 +2525,23 @@ def run_day_trading_refinery(
     df_raw = pd.DataFrame(raw_cols, index=df_final.index)
     df_out = pd.concat([df_final, df_raw], axis=1)
 
-    # تأكد من وجود الأعمدة المطلوبة لـ train_v19.py
-    required_cols = ['ts_event', 'label_end_ts', 'bias_label', 'signal_quality',
-                     'forward_return', 'event_flag', 'train_event_flag',
-                     'soft_label', 'label_confidence', 'soft_sample_weight',
-                     'is_event', 'event_score', 'event_direction', 'path_outcome', 'trade_duration',
-                     'neutral_reason', 'kalman_direction', 'regime_label', 'regime_cluster']
-    for col in required_cols:
+    # Critical target/time columns must exist. Optional metadata is filled only with an explicit report.
+    critical_cols = ['ts_event', 'label_end_ts', 'bias_label']
+    missing_critical = [col for col in critical_cols if col not in df_out.columns]
+    if missing_critical:
+        raise ValueError(f"Missing required train_v19 columns after day-trading prep: {missing_critical}")
+    optional_required_cols = ['signal_quality',
+                              'forward_return', 'event_flag', 'train_event_flag',
+                              'soft_label', 'label_confidence', 'soft_sample_weight',
+                              'is_event', 'event_score', 'event_direction', 'path_outcome', 'trade_duration',
+                              'neutral_reason', 'kalman_direction', 'regime_label', 'regime_cluster']
+    filled_optional_cols = []
+    for col in optional_required_cols:
         if col not in df_out.columns:
             df_out[col] = 0
+            filled_optional_cols.append(col)
+    if filled_optional_cols:
+        print(f"  ⚠️ Optional train_v19 metadata filled with 0: {filled_optional_cols}")
 
     # السعر المرجعي للباك تست والمحرك
     if 'price' not in df_out.columns and 'close' in df_out.columns:
@@ -2505,8 +2549,36 @@ def run_day_trading_refinery(
 
     out_path = os.path.join(output_dir, 'day_trading_features.parquet')
     df_out.to_parquet(out_path, index=False)
+    label_timestamp_report_path = write_validation_report(
+        assert_label_timestamps(df_out, context='prepare_day_trading.artifact'),
+        output_dir,
+        'label_timestamp_report.json',
+    )
+    label_distribution_report_path = write_validation_report(
+        summarize_label_distribution(df_out, context='prepare_day_trading.artifact'),
+        output_dir,
+        'label_distribution_full_report.json',
+    )
+    artifact_market_report_path = write_validation_report(
+        {
+            'mbo_input': mbo_input_validation,
+            'mbp_input': mbp_input_validation,
+            'artifact': validate_market_data_frame(
+                df_out,
+                context='prepare_day_trading.artifact',
+                strict=False,
+            ),
+            'filled_optional_train_v19_columns': filled_optional_cols,
+        },
+        output_dir,
+        'data_validation_full_report.json',
+    )
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
+    print(
+        "   Validation reports: "
+        f"{label_timestamp_report_path}, {label_distribution_report_path}, {artifact_market_report_path}"
+    )
 
     mbp_bar_cov_stats = _coverage_stats(df_out.get('mbp_bar_coverage', 0.0), low_threshold=0.30)
     mbp_roll_cov_stats = _coverage_stats(df_out.get('mbp_roll_lob_coverage', 0.0), low_threshold=0.50)
@@ -2605,6 +2677,13 @@ def run_day_trading_refinery(
         'weak_event_min_move_atr'     : float(weak_event_min_move_atr),
         'sl_to_opposite'              : bool(sl_to_opposite),
         'include_weak_directional_in_train': bool(include_weak_directional_in_train),
+        'research_label_overrides'      : bool(research_label_overrides),
+        'filled_optional_train_v19_columns': filled_optional_cols,
+        'validation_reports'            : {
+            'label_timestamp': label_timestamp_report_path,
+            'label_distribution': label_distribution_report_path,
+            'data_validation': artifact_market_report_path,
+        },
         'rows'                        : len(df_out),
         'mbo_duplicate_ts_rows'       : mbo_dup_ts,
         'mbo_duplicate_key_rows'      : mbo_dup_key,
@@ -2722,6 +2801,11 @@ if __name__ == '__main__':
         help='أدخل الاتجاهات الناتجة من weak-event ضمن train_event_flag.',
     )
     p.add_argument(
+        '--research_label_overrides',
+        action='store_true',
+        help='Allow aggressive research-only label overrides such as weak_event_to_directional or sl_to_opposite.',
+    )
+    p.add_argument(
         '--strict_train_pool',
         action='store_true',
         help='يضيق train_event_flag: جلسات نشطة فقط + ATR >= 0.5× الوسيط (اتجاهي = فوز TP فقط)',
@@ -2748,4 +2832,5 @@ if __name__ == '__main__':
         weak_event_min_move_atr=args.weak_event_min_move_atr,
         sl_to_opposite=args.sl_to_opposite,
         include_weak_directional_in_train=args.include_weak_directional_in_train,
+        research_label_overrides=args.research_label_overrides,
     )

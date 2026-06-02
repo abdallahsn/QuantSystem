@@ -55,15 +55,47 @@ def _require_parquet_engine() -> str:
     )
 
 
-def read_table(path: str) -> pd.DataFrame:
+def _existing_columns_for_table(path: str, columns: list[str] | None) -> list[str] | None:
+    if columns is None:
+        return None
+    wanted = [str(col) for col in columns]
     ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in CSV_EXTENSIONS:
+            header = pd.read_csv(path, nrows=0, compression="infer").columns.tolist()
+            available = set(str(col) for col in header)
+            return [col for col in wanted if col in available]
+        if ext in PARQUET_EXTENSIONS:
+            try:
+                import pyarrow.parquet as pq
+                available = set(str(col) for col in pq.read_schema(path).names)
+                return [col for col in wanted if col in available]
+            except Exception:
+                try:
+                    from fastparquet import ParquetFile
+                    available = set(str(col) for col in ParquetFile(path).columns)
+                    return [col for col in wanted if col in available]
+                except Exception:
+                    return wanted
+    except Exception:
+        return wanted
+    return wanted
+
+
+def read_table(path: str, *, columns: list[str] | None = None) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    keep_columns = _existing_columns_for_table(path, columns)
     if ext in PARQUET_EXTENSIONS:
         _require_parquet_engine()
-        return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=keep_columns)
     if ext in CSV_EXTENSIONS:
-        return pd.read_csv(path, low_memory=False, compression="infer")
+        return pd.read_csv(path, low_memory=False, compression="infer", usecols=keep_columns)
     if ext in PICKLE_EXTENSIONS:
-        return pd.read_pickle(path)
+        df = pd.read_pickle(path)
+        if keep_columns is not None:
+            keep = [col for col in keep_columns if col in df.columns]
+            df = df.loc[:, keep]
+        return df
     raise ValueError(f"Unsupported table extension for read_table: {ext or '<none>'} ({path})")
 
 
@@ -82,7 +114,12 @@ def write_table(df: pd.DataFrame, path: str, *, compression: str = "snappy") -> 
     raise ValueError(f"Unsupported table extension for write_table: {ext or '<none>'} ({path})")
 
 
-def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.DataFrame]:
+def iter_table_chunks(
+    path: str,
+    chunk_rows: int | None = None,
+    *,
+    columns: list[str] | None = None,
+) -> Iterable[pd.DataFrame]:
     path = _abs(path)
     if os.path.isdir(path):
         supported = (".parquet", ".pq", ".snappy", ".csv", ".csv.gz", ".csv.zst", ".gz", ".zst", ".pkl", ".pickle")
@@ -94,13 +131,13 @@ def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.D
         if not files:
             raise FileNotFoundError(f"No supported table files found under directory: {path}")
         for file_path in files:
-            yield from iter_table_chunks(file_path, chunk_rows)
+            yield from iter_table_chunks(file_path, chunk_rows, columns=columns)
         return
 
     ext = os.path.splitext(path)[1].lower()
     rows = int(chunk_rows or 0)
     if ext in PARQUET_EXTENSIONS or ext in PICKLE_EXTENSIONS:
-        df = read_table(path)
+        df = read_table(path, columns=columns)
         if rows <= 0 or len(df) <= rows:
             yield df
             return
@@ -108,11 +145,13 @@ def iter_table_chunks(path: str, chunk_rows: int | None = None) -> Iterable[pd.D
             yield df.iloc[start:start + rows].copy()
         return
 
+    keep_columns = _existing_columns_for_table(path, columns)
     reader = pd.read_csv(
         path,
         low_memory=False,
         chunksize=None if rows <= 0 else rows,
         compression="infer" if ext in {".zst", ".gz"} else None,
+        usecols=keep_columns,
     )
     if isinstance(reader, pd.DataFrame):
         yield reader
@@ -236,10 +275,7 @@ def load_feature_artifact(
     shard_paths = resolve_final_feature_paths(path_or_manifest)
     frames: list[pd.DataFrame] = []
     for shard_path in shard_paths:
-        frame = read_table(shard_path)
-        if columns is not None:
-            keep = [col for col in columns if col in frame.columns]
-            frame = frame.loc[:, keep]
+        frame = read_table(shard_path, columns=columns)
         frames.append(frame)
     if not frames:
         return pd.DataFrame(columns=columns or [])

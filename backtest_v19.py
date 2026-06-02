@@ -44,6 +44,7 @@ from modules.feature_artifact_v19 import (
     resolve_artifact_root,
 )
 from modules.slippage_model import SlippageModel, position_size_from_prediction
+from modules.validation_v19 import validate_backtest_realism_config, write_validation_report
 from predict_v19 import V19PredictionEngine
 
 try:
@@ -1210,7 +1211,29 @@ def run_causal_backtest(
     long_only: bool = False,
     lob_tensors: np.ndarray | None = None,
     row_to_lob_tensor: np.ndarray | None = None,
+    strict_backtest_realism: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    realism_report = validate_backtest_realism_config(
+        {
+            'tick_size': tick_size,
+            'tick_value': tick_value,
+            'round_trip_cost_pips': round_trip_cost_pips,
+            'commission_per_side': commission_per_side,
+            'min_spread_ticks': min_spread_ticks,
+            'min_slippage_ticks': min_slippage_ticks,
+            'spread_multiplier': spread_multiplier,
+            'max_size': max_size,
+            'latency_rows': latency_rows,
+        },
+        context=f'run_causal_backtest.{scenario_name}',
+        strict=bool(strict_backtest_realism),
+    )
+    if realism_report.get('warnings') or realism_report.get('errors'):
+        print(
+            "  ⚠️ Backtest realism check: "
+            f"warnings={realism_report.get('warnings', [])} errors={realism_report.get('errors', [])}",
+            flush=True,
+        )
     engine = V19PredictionEngine(
         models_dir,
         run_mode='backtest',
@@ -1568,6 +1591,7 @@ def run_causal_backtest(
         'long_only': bool(long_only),
         'max_horizon_steps': None if max_horizon_steps is None else int(max_horizon_steps),
         'replay_horizon_steps': None if replay_horizon_steps is None else int(replay_horizon_steps),
+        'backtest_realism': realism_report,
     }
     if 'true_bias' in results_df.columns and 'direction_probs' in results_df.columns and len(results_df):
         directional = results_df[results_df['true_bias'].isin([0, 1])].copy()
@@ -1586,6 +1610,7 @@ def run_causal_backtest(
         summary['ece'] = 0.0
 
     os.makedirs(output_dir, exist_ok=True)
+    write_validation_report(realism_report, output_dir, 'backtest_realism_report.json')
     results_df.to_csv(os.path.join(output_dir, 'backtest_v19_results.csv'), index=False)
     trades_df.to_csv(os.path.join(output_dir, 'backtest_v19_trades.csv'), index=False)
     with open(os.path.join(output_dir, 'backtest_v19_summary.json'), 'w') as f:
@@ -1680,6 +1705,11 @@ def main():
     p.add_argument('--max_size', type=int, default=5)
     p.add_argument('--starting_equity', type=float, default=100000.0)
     p.add_argument('--latency_rows', type=int, default=1)
+    p.add_argument(
+        '--strict_backtest_realism',
+        action='store_true',
+        help='fail when backtest costs/latency are optimistic instead of only writing warnings',
+    )
     p.add_argument('--max_daily_loss_pct', type=float, default=0.02)
     p.add_argument('--direction_threshold_ticks', type=float, default=1.0)
     p.add_argument('--tp_mult', type=float, default=1.5)
@@ -1908,6 +1938,7 @@ def main():
         policy_min_edge=args.policy_min_edge,
         skip_event_gate=args.skip_event_gate,
         long_only=args.long_only,
+        strict_backtest_realism=args.strict_backtest_realism,
     )
     summary['oos_guard'] = oos_guard
     summary['entrydata'] = entrydata_diag

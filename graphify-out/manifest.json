@@ -1,8 +1,8 @@
 {
   "/Users/abdallah/Downloads/QS_FINAL/backtest_v19.py": {
-    "mtime": 1778512211.8646324,
-    "ast_hash": "a72e811f215cab4f8a2e459e217513d3",
-    "semantic_hash": "a72e811f215cab4f8a2e459e217513d3"
+    "mtime": 1780415396.4478583,
+    "ast_hash": "db7eaa82d0f3589abe0326df68850692",
+    "semantic_hash": "db7eaa82d0f3589abe0326df68850692"
   },
   "/Users/abdallah/Downloads/QS_FINAL/build_lean_model.py": {
     "mtime": 1778067245.0,
@@ -120,9 +120,9 @@
     "semantic_hash": "e59e66d89f8b3dfc2732f8f20fc32086"
   },
   "/Users/abdallah/Downloads/QS_FINAL/modules/feature_artifact_v19.py": {
-    "mtime": 1778945226.6587498,
-    "ast_hash": "deabe9714fd191b8b56f730b8afd3af4",
-    "semantic_hash": "deabe9714fd191b8b56f730b8afd3af4"
+    "mtime": 1780415286.3179224,
+    "ast_hash": "7876292a802fbe5a1d8ddda017ead9b3",
+    "semantic_hash": "7876292a802fbe5a1d8ddda017ead9b3"
   },
   "/Users/abdallah/Downloads/QS_FINAL/modules/feature_factory_v19.py": {
     "mtime": 1778945278.9466646,
@@ -495,13 +495,23 @@
     "semantic_hash": "0f6e5abb4cbed9be983404815410af88"
   },
   "/Users/abdallah/Downloads/QS_FINAL/train_v19.py": {
-    "mtime": 1779209686.8895717,
-    "ast_hash": "a274eab6aa9cb32e0fba4d0d14668254",
-    "semantic_hash": "a274eab6aa9cb32e0fba4d0d14668254"
+    "mtime": 1780415319.0880063,
+    "ast_hash": "737d1f92524abdb31397dc1c162eb583",
+    "semantic_hash": "737d1f92524abdb31397dc1c162eb583"
   },
   "/Users/abdallah/Downloads/QS_FINAL/walkforward_v19.py": {
-    "mtime": 1778945347.3695505,
-    "ast_hash": "170b8654079902fd9528d64ed66d8662",
-    "semantic_hash": "170b8654079902fd9528d64ed66d8662"
+    "mtime": 1780415335.6952133,
+    "ast_hash": "441d120a8d31f57ff7ad9f411a65fc15",
+    "semantic_hash": "441d120a8d31f57ff7ad9f411a65fc15"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/validation_v19.py": {
+    "mtime": 1780415265.0406446,
+    "ast_hash": "2a8e70a3de3c0a31b4027f05b988fc86",
+    "semantic_hash": "2a8e70a3de3c0a31b4027f05b988fc86"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/validation_v19_smoke.py": {
+    "mtime": 1780415428.3540733,
+    "ast_hash": "dff8575ff9091a588ee79de751b10a5e",
+    "semantic_hash": "dff8575ff9091a588ee79de751b10a5e"
   }
 }
