@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from audit_mbo_mbp_data import (
+    from tools.diagnostics.audit_mbo_mbp_data import (
         _audit_dataset,
         _coerce_market_schema,
         _compare_mbo_mbp,
@@ -49,8 +49,8 @@ try:
         _parse_contract_symbol,
         _read_one,
     )
-except Exception as exc:  # pragma: no cover - this repo ships audit_mbo_mbp_data.py
-    raise SystemExit(f"Cannot import audit helpers from audit_mbo_mbp_data.py: {exc}") from exc
+except Exception as exc:  # pragma: no cover - this repo ships audit helpers
+    raise SystemExit(f"Cannot import audit helpers from tools.diagnostics.audit_mbo_mbp_data: {exc}") from exc
 
 
 HELPER_COLUMNS = {"__source_file", "__source_row", "__ingest_order"}
@@ -92,7 +92,7 @@ def _json_dump(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _audit_command(mbo_dir: Path, mbp_dir: Path | None, cfg: CleanConfig) -> str:
-    parts = ["python", "audit_mbo_mbp_data.py", "--mbo", str(mbo_dir)]
+    parts = ["python", "-m", "tools.diagnostics.audit_mbo_mbp_data", "--mbo", str(mbo_dir)]
     if mbp_dir is not None:
         parts.extend(["--mbp", str(mbp_dir)])
     if cfg.tick_size is not None:
@@ -827,7 +827,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--trim-to-overlap", action="store_true", help="Trim MBO/MBP to their shared post-clean time overlap.")
     parser.add_argument("--gap-threshold", default="1h", help="Gap threshold used by optional post audit.")
     parser.add_argument("--top-n", type=int, default=10, help="Examples to retain in audit reports.")
-    parser.add_argument("--audit-after", action="store_true", help="Run audit_mbo_mbp_data.py logic on cleaned output.")
+    parser.add_argument("--audit-after", action="store_true", help="Run tools.diagnostics.audit_mbo_mbp_data logic on cleaned output.")
     return parser.parse_args(argv)
 
 

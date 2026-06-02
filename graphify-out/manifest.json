@@ -1,0 +1,507 @@
+{
+  "/Users/abdallah/Downloads/QS_FINAL/backtest_v19.py": {
+    "mtime": 1778512211.8646324,
+    "ast_hash": "a72e811f215cab4f8a2e459e217513d3",
+    "semantic_hash": "a72e811f215cab4f8a2e459e217513d3"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/build_lean_model.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "18b21e425b9083eb640fd853877a4ba2",
+    "semantic_hash": "18b21e425b9083eb640fd853877a4ba2"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/clean_mbo_mbp_data.py": {
+    "mtime": 1779366942.7968688,
+    "ast_hash": "ffa70729614376061a39bb32aae12a05",
+    "semantic_hash": "ffa70729614376061a39bb32aae12a05"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/convert_rich_csv_to_parquet.py": {
+    "mtime": 1779366920.9439523,
+    "ast_hash": "3935f86aa5bc07ce5b2d55e9c1b8208e",
+    "semantic_hash": "3935f86aa5bc07ce5b2d55e9c1b8208e"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/diagnose_tf_gpu_libs.sh": {
+    "mtime": 1778067245.0,
+    "ast_hash": "5df1d66d253e8c6d8148b3a58f1ff172",
+    "semantic_hash": "5df1d66d253e8c6d8148b3a58f1ff172"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/extract_quarterly_contract.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "b819c36cbed9af190e3a632139de3c70",
+    "semantic_hash": "b819c36cbed9af190e3a632139de3c70"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/fix_tf_gpu_symlinks.sh": {
+    "mtime": 1778067245.0,
+    "ast_hash": "51c8a006dcb9f45585a8f2fb25f5f97e",
+    "semantic_hash": "51c8a006dcb9f45585a8f2fb25f5f97e"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/install_tf_gpu_cu12.sh": {
+    "mtime": 1779366875.7273328,
+    "ast_hash": "078c50753aaad1885826a88039526a42",
+    "semantic_hash": "078c50753aaad1885826a88039526a42"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/live_predictor.py": {
+    "mtime": 1778512187.9573736,
+    "ast_hash": "b664961a9c3c60926ff9ea81ecaf53e9",
+    "semantic_hash": "b664961a9c3c60926ff9ea81ecaf53e9"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/__init__.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "23a2bca50a549581d7bd55058134b754",
+    "semantic_hash": "23a2bca50a549581d7bd55058134b754"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/auto_calibrator.py": {
+    "mtime": 1779106497.2261372,
+    "ast_hash": "54165451b69b1dd0b02eef609e35c116",
+    "semantic_hash": "54165451b69b1dd0b02eef609e35c116"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/autoencoder_extractor.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "7dfcf47a087dfcd316e79fd5c07f235b",
+    "semantic_hash": "7dfcf47a087dfcd316e79fd5c07f235b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/catboost_5m_report.py": {
+    "mtime": 1778488617.0,
+    "ast_hash": "31b0afab62a878d8eedbeefd453dda86",
+    "semantic_hash": "31b0afab62a878d8eedbeefd453dda86"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/catboost_brain.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "8c193c89d0bcb7c21c6cbcf1bc0e2b3d",
+    "semantic_hash": "8c193c89d0bcb7c21c6cbcf1bc0e2b3d"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/catboost_brain2.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "f97917fbeccc359abe56f6fc738b90a8",
+    "semantic_hash": "f97917fbeccc359abe56f6fc738b90a8"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/catboost_brain3.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "72222e67d98edcea2ab937e46e7f7b82",
+    "semantic_hash": "72222e67d98edcea2ab937e46e7f7b82"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/config_v19.py": {
+    "mtime": 1778945233.7743595,
+    "ast_hash": "4ffd5a8462a8c2c2255d643f686cf3e0",
+    "semantic_hash": "4ffd5a8462a8c2c2255d643f686cf3e0"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/context_features.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "73f87c09c44e34eb0e1933db62db0a3c",
+    "semantic_hash": "73f87c09c44e34eb0e1933db62db0a3c"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/decision_policy_v19.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "58764db01f81a91b50dc2a783d1af101",
+    "semantic_hash": "58764db01f81a91b50dc2a783d1af101"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/deeplob_cnn.py": {
+    "mtime": 1778397866.0,
+    "ast_hash": "a7c1486dab2a6aaea8a022b72504717e",
+    "semantic_hash": "a7c1486dab2a6aaea8a022b72504717e"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/dynamic_labels.py": {
+    "mtime": 1778080841.0,
+    "ast_hash": "8d1505145624d245a69e7eb9ef5da767",
+    "semantic_hash": "8d1505145624d245a69e7eb9ef5da767"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/dynamic_labels2.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "165d35fa71f99b8d7ab5d0149e53ef42",
+    "semantic_hash": "165d35fa71f99b8d7ab5d0149e53ef42"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/dynamic_target.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "5c91649d92b60564fe9cd797294c0521",
+    "semantic_hash": "5c91649d92b60564fe9cd797294c0521"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/failsafe_v19.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "e59e66d89f8b3dfc2732f8f20fc32086",
+    "semantic_hash": "e59e66d89f8b3dfc2732f8f20fc32086"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/feature_artifact_v19.py": {
+    "mtime": 1778945226.6587498,
+    "ast_hash": "deabe9714fd191b8b56f730b8afd3af4",
+    "semantic_hash": "deabe9714fd191b8b56f730b8afd3af4"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/feature_factory_v19.py": {
+    "mtime": 1778945278.9466646,
+    "ast_hash": "e4b1c9af15f7f31240a3d112e7615717",
+    "semantic_hash": "e4b1c9af15f7f31240a3d112e7615717"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/fim_anomaly.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "eb6c5fa58705ead7881e6f7cf55c779e",
+    "semantic_hash": "eb6c5fa58705ead7881e6f7cf55c779e"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/fisher_alpha.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "a8b0ea73cae4ba0c8d3fd9747cb02b69",
+    "semantic_hash": "a8b0ea73cae4ba0c8d3fd9747cb02b69"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/fractional_diff.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "31d2924d197f85093017fc1d9e9687a0",
+    "semantic_hash": "31d2924d197f85093017fc1d9e9687a0"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/gpu_config.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "a8cc317f9e483d41029429879b4b2632",
+    "semantic_hash": "a8cc317f9e483d41029429879b4b2632"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/html_reporter.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "b3d6817ac1c45e9618ac12e0e55e8c95",
+    "semantic_hash": "b3d6817ac1c45e9618ac12e0e55e8c95"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/intrabar_mbp_microstructure.py": {
+    "mtime": 1778578441.8518453,
+    "ast_hash": "bfe210aa2c77c9d245937a84becfd175",
+    "semantic_hash": "bfe210aa2c77c9d245937a84becfd175"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/intrabar_microstructure.py": {
+    "mtime": 1778397866.0,
+    "ast_hash": "ed91fca28474a53efdcb71ed2e9b316b",
+    "semantic_hash": "ed91fca28474a53efdcb71ed2e9b316b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/labels_v19.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "b7a4327e6ea5393a2ad7d2fc78db5929",
+    "semantic_hash": "b7a4327e6ea5393a2ad7d2fc78db5929"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/live_predictor.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "8c079b11eb0250fa77d87c66b64cf0b7",
+    "semantic_hash": "8c079b11eb0250fa77d87c66b64cf0b7"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/lob_transformer.py": {
+    "mtime": 1778498344.0,
+    "ast_hash": "e1ee4a1a1fa4a0a43f82a19b135bd7fa",
+    "semantic_hash": "e1ee4a1a1fa4a0a43f82a19b135bd7fa"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/logging_v19.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "ff5b3428571eafc0889c6f9a7447d229",
+    "semantic_hash": "ff5b3428571eafc0889c6f9a7447d229"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/lstm_brain.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "27d364c45f2ae7cde3f30f4bef5ee880",
+    "semantic_hash": "27d364c45f2ae7cde3f30f4bef5ee880"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/manifest_v19.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "7eb90280973251aef3d2416843f3386c",
+    "semantic_hash": "7eb90280973251aef3d2416843f3386c"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/market_research_features.py": {
+    "mtime": 1779106438.0078485,
+    "ast_hash": "31da03d900ccbaa439b2c448eca632a4",
+    "semantic_hash": "31da03d900ccbaa439b2c448eca632a4"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/mc_label_weights.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "be94ab27f0cdfbb707a66b0a7a8cc02b",
+    "semantic_hash": "be94ab27f0cdfbb707a66b0a7a8cc02b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/meta_learner.py": {
+    "mtime": 1778498359.0,
+    "ast_hash": "6e78099dd252dbbbe39b7efe6a4b8728",
+    "semantic_hash": "6e78099dd252dbbbe39b7efe6a4b8728"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/micro_volatility.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "bdc21b9bf39697026a2658bc66d4c251",
+    "semantic_hash": "bdc21b9bf39697026a2658bc66d4c251"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/microstructure.py": {
+    "mtime": 1779106424.3144352,
+    "ast_hash": "1847ff0eebc6b546a62f4badbde82877",
+    "semantic_hash": "1847ff0eebc6b546a62f4badbde82877"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/monitoring_v19.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "a9b6910280e13568657aa0000a8aca89",
+    "semantic_hash": "a9b6910280e13568657aa0000a8aca89"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/online_learning.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "cf5c7923385b3489ee5005e40522175b",
+    "semantic_hash": "cf5c7923385b3489ee5005e40522175b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/oof_stacking.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "62ba4992646057f81e3a9b37fc932443",
+    "semantic_hash": "62ba4992646057f81e3a9b37fc932443"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/orderbook.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "9f0f22d3f7ffa540373e2998d5b581c8",
+    "semantic_hash": "9f0f22d3f7ffa540373e2998d5b581c8"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/preprocessing_v19.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "6ff1df15b916c1a8039448bdf2067aa1",
+    "semantic_hash": "6ff1df15b916c1a8039448bdf2067aa1"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/purging_embargo.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "10b8a62321a691b5fd9f7b8f19b61d8b",
+    "semantic_hash": "10b8a62321a691b5fd9f7b8f19b61d8b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/range_state_machine.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "1c8021b8bda70b9fef3cd9f4d7e893ab",
+    "semantic_hash": "1c8021b8bda70b9fef3cd9f4d7e893ab"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/raw_replay_v19.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "de868a08b63f02c272014781af0de406",
+    "semantic_hash": "de868a08b63f02c272014781af0de406"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/refinery_compare_5m_report.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "684c11ee05832a68eb36c85dca5fdc28",
+    "semantic_hash": "684c11ee05832a68eb36c85dca5fdc28"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/regime_classifier.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "e7e8244cc2072de1b791975d5df5786b",
+    "semantic_hash": "e7e8244cc2072de1b791975d5df5786b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/regime_config.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "cd52eeeaa7f7320c8c748e3fed80379a",
+    "semantic_hash": "cd52eeeaa7f7320c8c748e3fed80379a"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/release_gates_v19.py": {
+    "mtime": 1778945268.1222868,
+    "ast_hash": "9798ca96cb154b3571a02f1c95f7a615",
+    "semantic_hash": "9798ca96cb154b3571a02f1c95f7a615"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/session_features.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "6c4ebb6046f2b9ac5fb44ab55d7de214",
+    "semantic_hash": "6c4ebb6046f2b9ac5fb44ab55d7de214"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/signal_tracker.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "8d22cfa0068625f9805778439974e737",
+    "semantic_hash": "8d22cfa0068625f9805778439974e737"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/slippage_model.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "eea20088fd83b74669d26dec692cb2b3",
+    "semantic_hash": "eea20088fd83b74669d26dec692cb2b3"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/soft_label_engine.py": {
+    "mtime": 1778312534.0,
+    "ast_hash": "2f8c2005701522e845ebb83e90160f09",
+    "semantic_hash": "2f8c2005701522e845ebb83e90160f09"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/structural_context_labels_v19.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "2516673db87321ad7fb493dc4eff5021",
+    "semantic_hash": "2516673db87321ad7fb493dc4eff5021"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/tick_intrabar_slices.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "e634f77098566ae6fde1ceaa1c7f7fa3",
+    "semantic_hash": "e634f77098566ae6fde1ceaa1c7f7fa3"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/unsupervised_layer.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "5b7ec5056e5f55b2d95517f4f05e50ac",
+    "semantic_hash": "5b7ec5056e5f55b2d95517f4f05e50ac"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/modules/walk_forward.py": {
+    "mtime": 1778067246.0,
+    "ast_hash": "3cf19a073573eb5aba7f1340f54d97c7",
+    "semantic_hash": "3cf19a073573eb5aba7f1340f54d97c7"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/monitor_v19.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "02b390774b6dc372463210f79d07512d",
+    "semantic_hash": "02b390774b6dc372463210f79d07512d"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/online_learning.py": {
+    "mtime": 1778400200.0,
+    "ast_hash": "49c7449e446e9beb5ad797d9e282e5b5",
+    "semantic_hash": "49c7449e446e9beb5ad797d9e282e5b5"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/paper_v19.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "892f86e1fb7478d58be8de70c8c3ae19",
+    "semantic_hash": "892f86e1fb7478d58be8de70c8c3ae19"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/patch_backtest_v19_daytrade.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "e6056d72a490d16b710b9be122f35b8b",
+    "semantic_hash": "e6056d72a490d16b710b9be122f35b8b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/predict_v19.py": {
+    "mtime": 1778496776.0,
+    "ast_hash": "c07fbba0260e4027d870fb39b7476093",
+    "semantic_hash": "c07fbba0260e4027d870fb39b7476093"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/prepare_day_trading.py": {
+    "mtime": 1779195262.3581402,
+    "ast_hash": "0cb9d4305e1598f55594b48b9cf6f5b2",
+    "semantic_hash": "0cb9d4305e1598f55594b48b9cf6f5b2"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/prepare_training_data.py": {
+    "mtime": 1779211683.153711,
+    "ast_hash": "01c4d1b23e9c2aeb9fa8c80b1eb83eda",
+    "semantic_hash": "01c4d1b23e9c2aeb9fa8c80b1eb83eda"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/raw_backtest_v19.py": {
+    "mtime": 1779013872.0093656,
+    "ast_hash": "02d866c7649603013ec4afbc807ef122",
+    "semantic_hash": "02d866c7649603013ec4afbc807ef122"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/readiness_v19.py": {
+    "mtime": 1778945363.1523168,
+    "ast_hash": "976e2bef4f721056f8d0a1eb5618f088",
+    "semantic_hash": "976e2bef4f721056f8d0a1eb5618f088"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/regime_config.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "f6720362a0a4e160d1c0f1d2d1655ed6",
+    "semantic_hash": "f6720362a0a4e160d1c0f1d2d1655ed6"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/repair_tf215_cuda12_env.sh": {
+    "mtime": 1778067245.0,
+    "ast_hash": "c0b579c54a040f6bdb7accd6920c8106",
+    "semantic_hash": "c0b579c54a040f6bdb7accd6920c8106"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/shadow_v19.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "918b6878738349b174f481890d35d055",
+    "semantic_hash": "918b6878738349b174f481890d35d055"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/stage1_refinery.py": {
+    "mtime": 1778927446.0117567,
+    "ast_hash": "d4bd2be2c2198253bca319062a3305ef",
+    "semantic_hash": "d4bd2be2c2198253bca319062a3305ef"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/stage2_catboost.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "20b6f97d48ec4d78c2e730549796d9fb",
+    "semantic_hash": "20b6f97d48ec4d78c2e730549796d9fb"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/stage3_train.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "2d507545d8f6689accedede439bc6cbd",
+    "semantic_hash": "2d507545d8f6689accedede439bc6cbd"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/__init__.py": {
+    "mtime": 1779366840.7169807,
+    "ast_hash": "decf8d9b4a5a8b00a1393e3bdc094dfd",
+    "semantic_hash": "decf8d9b4a5a8b00a1393e3bdc094dfd"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/__init__.py": {
+    "mtime": 1779366840.7173855,
+    "ast_hash": "2a2d68f3a198538d8342c65f3fe9ec91",
+    "semantic_hash": "2a2d68f3a198538d8342c65f3fe9ec91"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/analyze_thresholds.py": {
+    "mtime": 1778961578.940998,
+    "ast_hash": "db97679cc29f64521c04f6fddb450de3",
+    "semantic_hash": "db97679cc29f64521c04f6fddb450de3"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/audit_mbo_mbp_data.py": {
+    "mtime": 1779366942.8009999,
+    "ast_hash": "551bbd244860843ab464420c84b8daa1",
+    "semantic_hash": "551bbd244860843ab464420c84b8daa1"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/audit_v19_labels_features.py": {
+    "mtime": 1779215292.5698736,
+    "ast_hash": "7be0bb4e8cc95a8a7deded3c74189b3a",
+    "semantic_hash": "7be0bb4e8cc95a8a7deded3c74189b3a"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/compare_v19_experiments.py": {
+    "mtime": 1779206599.1648452,
+    "ast_hash": "1e5c130f66cc7f87a53a964e49fd52e7",
+    "semantic_hash": "1e5c130f66cc7f87a53a964e49fd52e7"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/deep_validation.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "f23e4cc29348a119b8c753a362c2f950",
+    "semantic_hash": "f23e4cc29348a119b8c753a362c2f950"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/deeplob_refinery_smoke.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "0b752fb728a4ccf634514460aecbb40d",
+    "semantic_hash": "0b752fb728a4ccf634514460aecbb40d"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/feature_intelligence_report.py": {
+    "mtime": 1779106587.840861,
+    "ast_hash": "8c0932545bddde184c2e2b9786b1424a",
+    "semantic_hash": "8c0932545bddde184c2e2b9786b1424a"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/find_training_artifacts.py": {
+    "mtime": 1778485956.0,
+    "ast_hash": "8ad8b3e539c74e73803791a90a669666",
+    "semantic_hash": "8ad8b3e539c74e73803791a90a669666"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/label_visualizer_5m.py": {
+    "mtime": 1779366942.7995741,
+    "ast_hash": "ce2c92a3079f48880923d8158a6c9a8b",
+    "semantic_hash": "ce2c92a3079f48880923d8158a6c9a8b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/output_report.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "d061f1d812b71c6145532d46b80f03bb",
+    "semantic_hash": "d061f1d812b71c6145532d46b80f03bb"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/plot_5m_catboost.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "fff0e1e8debfc6f65b5249482888c73b",
+    "semantic_hash": "fff0e1e8debfc6f65b5249482888c73b"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/plot_best_soft_label_lob_heatmap.py": {
+    "mtime": 1778229825.0,
+    "ast_hash": "6d557e1bcf42c878f473df9c42b45745",
+    "semantic_hash": "6d557e1bcf42c878f473df9c42b45745"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/plot_refinery_compare_5m.py": {
+    "mtime": 1778067245.0,
+    "ast_hash": "8272c56b297fee8a98fd7ecd6087921d",
+    "semantic_hash": "8272c56b297fee8a98fd7ecd6087921d"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/plot_v19_power_dashboard.py": {
+    "mtime": 1779366875.7203043,
+    "ast_hash": "d9ac49b5126f5e07cfe65e93b8a2ae4d",
+    "semantic_hash": "d9ac49b5126f5e07cfe65e93b8a2ae4d"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/server_sanity_check.py": {
+    "mtime": 1779366875.7211254,
+    "ast_hash": "d4f631ee32a5055e43e2a0c0464a0af9",
+    "semantic_hash": "d4f631ee32a5055e43e2a0c0464a0af9"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/smoke_day_trading_hardening.py": {
+    "mtime": 1779366875.7190957,
+    "ast_hash": "6841a9288fe100ebd0e3e30279fdefed",
+    "semantic_hash": "6841a9288fe100ebd0e3e30279fdefed"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/stage1_signal_sanity.py": {
+    "mtime": 1779366875.7170935,
+    "ast_hash": "1a699e573c252fc32824128f543e7964",
+    "semantic_hash": "1a699e573c252fc32824128f543e7964"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/tools/diagnostics/verify_day_trading_dataset.py": {
+    "mtime": 1779107028.4892006,
+    "ast_hash": "0f6e5abb4cbed9be983404815410af88",
+    "semantic_hash": "0f6e5abb4cbed9be983404815410af88"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/train_v19.py": {
+    "mtime": 1779209686.8895717,
+    "ast_hash": "a274eab6aa9cb32e0fba4d0d14668254",
+    "semantic_hash": "a274eab6aa9cb32e0fba4d0d14668254"
+  },
+  "/Users/abdallah/Downloads/QS_FINAL/walkforward_v19.py": {
+    "mtime": 1778945347.3695505,
+    "ast_hash": "170b8654079902fd9528d64ed66d8662",
+    "semantic_hash": "170b8654079902fd9528d64ed66d8662"
+  }
+}

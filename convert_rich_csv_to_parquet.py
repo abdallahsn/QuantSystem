@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert rich MBO/MBP CSV files to Parquet and build a threshold-analysis
-feature parquet accepted by analyze_thresholds.py.
+feature parquet accepted by tools.diagnostics.analyze_thresholds.
 
 Default outputs:
   - rich_mbo.parquet
@@ -11,7 +11,7 @@ Default outputs:
 
 Example:
   python3 convert_rich_csv_to_parquet.py
-  python3 analyze_thresholds.py --parquet rich_threshold_features.parquet --no-plots
+  python3 -m tools.diagnostics.analyze_thresholds --parquet rich_threshold_features.parquet --no-plots
 """
 
 from __future__ import annotations
@@ -366,7 +366,7 @@ def build_threshold_features(mbo: pd.DataFrame, mbp: pd.DataFrame, *, freq: str)
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Convert rich_mbo.csv/rich_mbp.csv to parquet and build analyze_thresholds.py input."
+        description="Convert rich_mbo.csv/rich_mbp.csv to parquet and build tools.diagnostics.analyze_thresholds input."
     )
     parser.add_argument("--mbo", default=str(root / "rich_mbo.csv"), help="Input MBO CSV path.")
     parser.add_argument("--mbp", default=str(root / "rich_mbp.csv"), help="Input MBP CSV path.")
@@ -378,7 +378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--features-out",
         default="rich_threshold_features.parquet",
-        help="Output OHLC+ATR feature parquet filename/path for analyze_thresholds.py.",
+        help="Output OHLC+ATR feature parquet filename/path for tools.diagnostics.analyze_thresholds.",
     )
     parser.add_argument("--report-out", default="rich_conversion_report.json", help="Output conversion report JSON.")
     return parser.parse_args()
@@ -440,7 +440,7 @@ def main() -> None:
     print(f"Feature time range        : {features['ts_event'].iloc[0]} -> {features['ts_event'].iloc[-1]}")
     print()
     print("Next:")
-    print(f"  python3 analyze_thresholds.py --parquet {features_out} --no-plots")
+    print(f"  python3 -m tools.diagnostics.analyze_thresholds --parquet {features_out} --no-plots")
 
 
 if __name__ == "__main__":

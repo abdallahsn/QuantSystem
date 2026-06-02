@@ -88,4 +88,4 @@ fi
 
 echo
 echo "Running sanity check..."
-"$PYTHON_BIN" server_sanity_check.py
+"$PYTHON_BIN" "$ROOT_DIR/tools/diagnostics/server_sanity_check.py"

@@ -51,7 +51,7 @@ bash repair_tf215_cuda12_env.sh
 يعيد تثبيت TensorFlow 2.15 وحزم CUDA 12.2 المتوافقة ثم يتحقق من GPU.
 
 ```bash
-python server_sanity_check.py
+python -m tools.diagnostics.server_sanity_check
 ```
 
 يفحص نسخة Python، المتطلبات، TensorFlow، GPU، وبعض أدوات النظام.
@@ -156,7 +156,7 @@ python prepare_day_trading.py --mbo /path/to/mbo_parquet_or_dir --mbp /path/to/m
 - `--strict_train_pool`: تضييق train_event_flag لجلسات نشطة وATR كاف.
 
 ```bash
-python verify_day_trading_dataset.py --data pipeline_day_trading/features/day_trading_features.parquet --lob pipeline_day_trading/features/lob_tensors.npy --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy
+python -m tools.diagnostics.verify_day_trading_dataset --data pipeline_day_trading/features/day_trading_features.parquet --lob pipeline_day_trading/features/lob_tensors.npy --lob_ts pipeline_day_trading/features/lob_tensor_timestamps.npy
 ```
 
 يفحص artifact day-trading قبل التدريب.
@@ -513,7 +513,7 @@ python readiness_v19.py \
 ## 10) Visualization / Reports
 
 ```bash
-python label_visualizer_5m.py \
+python -m tools.diagnostics.label_visualizer_5m \
   --features outputs_v19/final/training_features_ready.csv \
   --mbo /path/to/mbo.csv \
   --mbp /path/to/mbp.csv \
@@ -533,7 +533,7 @@ python label_visualizer_5m.py \
 - `--future_bars`: عدد شموع مستقبلية لفحص label quality بصريًا.
 
 ```bash
-python plot_5m_catboost.py \
+python -m tools.diagnostics.plot_5m_catboost \
   --csv outputs_v19/final/training_features_ready.csv \
   --models_dir outputs_v19_train \
   --output outputs_v19_plots \
@@ -551,7 +551,7 @@ python plot_5m_catboost.py \
 - `--raw_only`: عرض raw CatBoost فقط بدون policy/RSM.
 
 ```bash
-python plot_refinery_compare_5m.py \
+python -m tools.diagnostics.plot_refinery_compare_5m \
   --mbo /path/to/mbo.csv \
   --refinery_csv outputs_v19/final/training_features_ready.csv \
   --output outputs_v19/refinery_compare_5m
@@ -569,7 +569,7 @@ python plot_refinery_compare_5m.py \
 - `--start`, `--end`: نافذة زمنية.
 
 ```bash
-python plot_best_soft_label_lob_heatmap.py \
+python -m tools.diagnostics.plot_best_soft_label_lob_heatmap \
   --pipeline outputs_v19 \
   --out outputs_v19/best_soft_label_lob.png
 ```
@@ -584,7 +584,7 @@ python plot_best_soft_label_lob_heatmap.py \
 - `--no-price-path`: لا ترسم مسار السعر.
 
 ```bash
-python plot_v19_power_dashboard.py \
+python -m tools.diagnostics.plot_v19_power_dashboard \
   --pipeline outputs_v19 \
   --models-dir outputs_v19_train \
   --out outputs_v19/power_dashboard.png \
@@ -605,7 +605,7 @@ python plot_v19_power_dashboard.py \
 - `--no-lob`: عدم رسم LOB heatmap.
 
 ```bash
-python output_report.py
+python -m tools.diagnostics.output_report
 ```
 
 ينشئ/يطبع تقرير مخرجات حسب منطق السكربت. افحص الكود قبل الاعتماد لأنه لا يملك CLI options واضحة.
@@ -615,7 +615,7 @@ python output_report.py
 ## 11) أدوات مساعدة
 
 ```bash
-python find_training_artifacts.py /path/to/QS_FINAL --max-files 5000
+python -m tools.diagnostics.find_training_artifacts /path/to/QS_FINAL --max-files 5000
 ```
 
 يبحث عن ملفات training/artifacts داخل مجلد.
@@ -643,7 +643,7 @@ python extract_quarterly_contract.py /path/to/databento.csv \
 - `--chunksize`: حجم القراءة streaming.
 
 ```bash
-python deeplob_refinery_smoke.py \
+python -m tools.diagnostics.deeplob_refinery_smoke \
   --mbo sample_mbo.csv \
   --mbp sample_mbp10.csv \
   --output outputs_deeplob_smoke
@@ -707,13 +707,13 @@ python -m py_compile \
   walkforward_v19.py \
   live_predictor.py \
   online_learning.py \
-  verify_day_trading_dataset.py
+  tools/diagnostics/verify_day_trading_dataset.py
 ```
 
 يفحص syntax للملفات الأساسية.
 
 ```bash
-python verify_day_trading_dataset.py \
+python -m tools.diagnostics.verify_day_trading_dataset \
   --data pipeline_day_trading/features/day_trading_features.parquet \
   --lob pipeline_day_trading/features/lob_tensors.npy
 ```

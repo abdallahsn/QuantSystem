@@ -45,7 +45,6 @@ QS_FINAL/
 ├── stage1_refinery.py
 ├── prepare_training_data.py
 ├── prepare_day_trading.py
-├── verify_day_trading_dataset.py
 ├── train_v19.py
 ├── stage2_catboost.py
 ├── stage3_train.py
@@ -57,10 +56,13 @@ QS_FINAL/
 ├── paper_v19.py
 ├── live_predictor.py
 ├── online_learning.py
-├── find_training_artifacts.py
-├── plot_v19_power_dashboard.py
-├── plot_best_soft_label_lob_heatmap.py
 ├── readiness_v19.py
+├── tools/
+│   └── diagnostics/
+│       ├── verify_day_trading_dataset.py
+│       ├── find_training_artifacts.py
+│       ├── plot_v19_power_dashboard.py
+│       └── plot_best_soft_label_lob_heatmap.py
 └── modules/
     ├── feature_artifact_v19.py
     ├── feature_factory_v19.py
@@ -198,7 +200,7 @@ python prepare_day_trading.py \
 فحص artifact الشموع قبل التدريب:
 
 ```bash
-python verify_day_trading_dataset.py \
+python -m tools.diagnostics.verify_day_trading_dataset \
   --data pipeline_day_trading/features/day_trading_features.parquet \
   --lob pipeline_day_trading/features/lob_tensors.npy
 ```
@@ -428,13 +430,13 @@ signal, confidence, debug = run_bar_pipeline(
 البحث عن artifacts داخل المشروع:
 
 ```bash
-python find_training_artifacts.py /path/to/QS_FINAL
+python -m tools.diagnostics.find_training_artifacts /path/to/QS_FINAL
 ```
 
 رسم dashboard لقوة الإشارة وLOB:
 
 ```bash
-python plot_v19_power_dashboard.py \
+python -m tools.diagnostics.plot_v19_power_dashboard \
   --pipeline outputs_v19 \
   --out outputs_v19/power_dashboard.png \
   --freq 5min
@@ -443,7 +445,7 @@ python plot_v19_power_dashboard.py \
 رسم heatmap حول أفضل soft label:
 
 ```bash
-python plot_best_soft_label_lob_heatmap.py \
+python -m tools.diagnostics.plot_best_soft_label_lob_heatmap \
   --pipeline outputs_v19 \
   --out outputs_v19/best_soft_label_lob.png
 ```
@@ -468,13 +470,13 @@ python -m py_compile \
   walkforward_v19.py \
   live_predictor.py \
   online_learning.py \
-  verify_day_trading_dataset.py
+  tools/diagnostics/verify_day_trading_dataset.py
 ```
 
 فحص artifact day-trading:
 
 ```bash
-python verify_day_trading_dataset.py \
+python -m tools.diagnostics.verify_day_trading_dataset \
   --data pipeline_day_trading/features/day_trading_features.parquet \
   --lob pipeline_day_trading/features/lob_tensors.npy
 ```
@@ -591,7 +593,7 @@ python backtest_v19.py \
 لمسار day-trading:
 
 1. شغل `prepare_day_trading.py`.
-2. شغل `verify_day_trading_dataset.py`.
+2. شغل `python -m tools.diagnostics.verify_day_trading_dataset`.
 3. درب بـ `train_v19.py` مع `--lob` و`--lob_ts` إذا كانت موجودة.
 4. شغل `backtest_v19.py` مع horizon متوافق مع manifest.
 5. اختبر `--long_only` أو `--fixed_horizon` فقط كتجارب واضحة وموسومة في النتائج.
@@ -622,4 +624,3 @@ python backtest_v19.py \
 6. قيم trading metrics مع الحساسية للتكاليف.
 7. فضل تحسينات صغيرة قابلة للتحقق.
 8. اربط كل تغيير بأمر verification واضح.
-
