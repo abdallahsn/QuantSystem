@@ -1,0 +1,48 @@
+version: v20
+
+data:
+  instrument: 6B
+  tick_size: 0.0001
+  chunk_rows: 500000
+  require_mbp: true
+  strict_contract: true
+
+features:
+  levels: 10
+  include_mlofi: true
+  include_lob_core: true
+  rolling_windows: [20, 50, 100, 200]
+  tensors:
+    time_steps: 50
+    price_levels: 20
+    channels: 3
+
+labels:
+  method: triple_barrier
+  horizon_rows: 150
+  tp_vol_mult: 1.5
+  sl_vol_mult: 1.0
+  round_trip_cost_ticks: 1.0
+  spread_cost_mult: 1.0
+  separate_tradeability_label: true
+
+training:
+  split_method: purged_walkforward
+  n_folds: 5
+  initial_train_frac: 0.5
+  test_frac: 0.1
+  embargo_rows: 50
+  metrics:
+    - precision_recall_f1_per_class
+    - confusion_matrix
+    - calibration
+    - expected_value
+
+backtest:
+  tick_value: 6.25
+  commission_per_side: 0.75
+  min_spread_ticks: 1.0
+  min_slippage_ticks: 0.5
+  latency_rows: 1
+  fill_model: queue_decay
+  strict_realism: true

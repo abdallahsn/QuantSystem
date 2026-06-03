@@ -1,0 +1,24 @@
+version: v20
+
+data_quality:
+  max_invalid_timestamp_rows: 0
+  max_crossed_book_rows: 0
+  max_missing_bbo_share: 0.01
+
+labels:
+  require_label_end_ts: true
+  max_neutral_share: 0.98
+  max_long_short_imbalance: 20.0
+
+splits:
+  require_purged_label_end: true
+  require_no_index_overlap: true
+
+backtest:
+  min_trades: 30
+  min_profit_factor: 1.05
+  min_expectancy_dollars: 0.0
+  max_drawdown_pct: 0.05
+  require_costs: true
+  require_latency: true
+  require_fill_model: true
