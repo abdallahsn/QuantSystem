@@ -1,4 +1,5 @@
 from argparse import Namespace
+import json
 
 import pandas as pd
 
@@ -104,3 +105,18 @@ def test_prepare_v20_dry_run_reports_without_final_artifact(tmp_path):
     assert (out / "data_validation_report.json").exists()
     assert not (out / "features.parquet").exists()
     assert not (out / "final").exists()
+
+
+def test_prepare_v20_dry_run_handles_empty_symbol_filter(tmp_path):
+    mbo_path, mbp_path = _write_synthetic_feeds(tmp_path, rows=20)
+    output = tmp_path / "empty_symbol"
+    summary = run(_args(tmp_path, mbo_path, mbp_path, dry_run=True, output=str(output), symbol="6BM6"))
+
+    assert summary["dry_run"]
+    assert not summary["passed"]
+    with open(output / "data_validation_report.json", encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["row_counts"]["mbp_rows_after_filters"] == 0
+    assert "empty_mbp_after_filters" in report["mbp_quality"]["warnings"]
+    assert report["mbp"]["pre_filter_value_counts"]["symbol"]["6B"] == 20
+    assert not (output / "features.parquet").exists()

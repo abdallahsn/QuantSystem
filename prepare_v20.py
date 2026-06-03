@@ -218,6 +218,7 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
     rows_seen = 0
     chunks = 0
     frames: list[pd.DataFrame] = []
+    source_columns: list[str] = []
     report: dict = {
         "path": os.path.abspath(path),
         "feed_type": feed.value,
@@ -234,6 +235,7 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
         "invalid_size_rows": 0,
         "symbol_counts": {},
         "contract_counts": {},
+        "pre_filter_value_counts": {},
         "warnings": [],
         "passed": bool(schema.passed),
     }
@@ -244,6 +246,8 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
             chunk = chunk.iloc[: max(sample_rows - rows_seen, 0)].copy()
         if chunk.empty:
             continue
+        if not source_columns:
+            source_columns = [str(col) for col in chunk.columns]
         chunks += 1
         rows_seen += int(len(chunk))
 
@@ -272,6 +276,11 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
             strict=False,
         )
         report["validation_reports"].append(validation)
+        for col in SYMBOL_COLUMNS:
+            if col in cleaned.columns:
+                counts = report["pre_filter_value_counts"].setdefault(col, {})
+                for key, value in cleaned[col].astype(str).value_counts(dropna=False).items():
+                    counts[str(key)] = int(counts.get(str(key), 0) + int(value))
         cleaned = _filter_time_and_symbol(cleaned, args, report)
         if not cleaned.empty:
             frames.append(cleaned)
@@ -280,11 +289,13 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
         df = pd.concat(frames, ignore_index=True)
         df = df.sort_values("ts_event").reset_index(drop=True)
     else:
-        df = pd.DataFrame()
+        df = pd.DataFrame(columns=source_columns)
     report["rows_seen"] = int(rows_seen)
     report["rows_after_cleaning"] = int(sum(r.get("output_rows", 0) for r in report["clean_reports"]))
     report["rows_after_filters"] = int(len(df))
     report["chunks_seen"] = int(chunks)
+    for col, counts in list(report["pre_filter_value_counts"].items()):
+        report["pre_filter_value_counts"][col] = dict(sorted(counts.items(), key=lambda item: item[1], reverse=True)[:20])
     for col in SYMBOL_COLUMNS:
         if col in df.columns:
             counts = _top_counts(df, col)
@@ -304,6 +315,20 @@ def _load_feed(path: str, *, feed: FeedType, args: argparse.Namespace) -> Loaded
 
 def _reject_invalid_mbp_rows(mbp: pd.DataFrame, *, tick_size: float) -> tuple[pd.DataFrame, dict]:
     out = mbp.copy()
+    if out.empty or "ts_event" not in out.columns:
+        return out, {
+            "input_rows": int(len(mbp)),
+            "missing_or_nonpositive_bbo_rows": 0,
+            "crossed_book_rows": 0,
+            "spread_lt_tick_rows": 0,
+            "negative_size_rows": 0,
+            "null_size_values_filled_zero": 0,
+            "rows_rejected": int(len(mbp)),
+            "output_rows": 0,
+            "tick_size": float(tick_size),
+            "passed": False,
+            "warnings": ["empty_mbp_after_filters" if out.empty else "missing_ts_event_column"],
+        }
     bid = _num(out, "bid_px_00", default=np.nan)
     ask = _num(out, "ask_px_00", default=np.nan)
     spread = ask - bid
@@ -330,6 +355,8 @@ def _reject_invalid_mbp_rows(mbp: pd.DataFrame, *, tick_size: float) -> tuple[pd
         "rows_rejected": int((~keep).sum()),
         "output_rows": int(keep.sum()),
         "tick_size": float(tick_size),
+        "passed": bool(keep.sum() > 0),
+        "warnings": [],
     }
     out = out.loc[keep].sort_values("ts_event").reset_index(drop=True)
     return out, report
@@ -401,6 +428,28 @@ def _build_mbo_flow_state(mbo: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 def _align_mbo_to_mbp(mbp: pd.DataFrame, mbo_state: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     left = mbp.sort_values("ts_event").reset_index(drop=True).copy()
+    if left.empty:
+        left["mbo_state_ts"] = pd.NaT
+        for col in (
+            "mbo_signed_trade_size",
+            "mbo_buy_trade_size",
+            "mbo_sell_trade_size",
+            "mbo_trade_count",
+            "mbo_last_trade_price",
+            "mbo_cvd",
+            "mbo_cum_buy_volume",
+            "mbo_cum_sell_volume",
+            "mbo_cum_trade_count",
+        ):
+            left[col] = 0.0
+        return left, {
+            "method": "empty_mbp_feature_clock",
+            "rows": 0,
+            "matched_rows": 0,
+            "match_rate": 0.0,
+            "mbo_state_age_ms": {},
+            "warnings": ["empty_mbp_feature_clock"],
+        }
     if mbo_state.empty:
         left["mbo_state_ts"] = pd.NaT
         for col in (
