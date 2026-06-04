@@ -22,7 +22,7 @@ class ArtifactWriteResult:
         return asdict(self)
 
 
-def _feature_columns(df: pd.DataFrame) -> tuple[str, ...]:
+def _feature_columns(df: pd.DataFrame, compatibility_only: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
     forbidden = {
         "ts_event",
         "ts_recv",
@@ -36,14 +36,22 @@ def _feature_columns(df: pd.DataFrame) -> tuple[str, ...]:
         "tradeability_label",
         "event_flag",
         "train_event_flag",
+        "signal_quality",
+        "conf_label",
         "forward_return",
         "realized_return",
         "label_outcome",
         "barrier_hit_type",
+        "soft_label",
+        "soft_sample_weight",
+        "soft_label_confidence",
+        "mc_sample_weight",
+        "label_stability",
         "symbol",
         "contract_symbol",
         "instrument_id",
     }
+    forbidden.update(str(col) for col in (compatibility_only or ()))
     return tuple(str(col) for col in df.columns if str(col) not in forbidden and not str(col).startswith("label_"))
 
 
@@ -60,9 +68,11 @@ def write_feature_artifact(
     contract: str | None = None,
     date_range: dict | None = None,
     metadata_columns: tuple[str, ...] | list[str] | None = None,
+    compatibility_only_feature_columns: tuple[str, ...] | list[str] | None = None,
     tick_size: float | None = None,
     horizon: int | None = None,
     label_params: dict | None = None,
+    mbo_flow_features_reliable: bool | None = None,
     git_commit: str | None = None,
     extra: dict | None = None,
 ) -> ArtifactWriteResult:
@@ -77,7 +87,8 @@ def write_feature_artifact(
         symbol=symbol,
         contract=contract,
         date_range=dict(date_range or {}),
-        feature_columns=_feature_columns(df),
+        feature_columns=_feature_columns(df, compatibility_only_feature_columns),
+        compatibility_only_feature_columns=tuple(str(col) for col in (compatibility_only_feature_columns or ())),
         metadata_columns=tuple(str(col) for col in (metadata_columns or ())),
         shards=tuple(shards),
         reports=dict(reports or {}),
@@ -85,6 +96,7 @@ def write_feature_artifact(
         tick_size=tick_size,
         horizon=horizon,
         label_params=dict(label_params or {}),
+        mbo_flow_features_reliable=mbo_flow_features_reliable,
         git_commit=git_commit,
         extra={
             **dict(extra or {}),

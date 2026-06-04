@@ -2,21 +2,60 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # Local environments
 .venv/
 venv/
+env/
+ENV/
 
 # Local OS/editor noise
 .DS_Store
 .idea/
+.vscode/
 
 # Local test/build caches
 .pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Generated training/runtime artifacts
 catboost_info/
 outputs/
+output/
+outputs_*/
+outputs-*/
+outputs_phase*/
+outputs_v*/
+*_train_check/
 pipeline_*/
+artifacts/
+checkpoints/
+runs/
+wandb/
+mlruns/
 *_run.log
 *.log
+
+# Local model artifacts/checkpoints
+*.cbm
+*.keras
+*.h5
+*.hdf5
+*.joblib
+*.pkl
+*.onnx
+
+# Large local market-data drops. Keep committed fixtures tracked; these rules
+# prevent accidental commits of real Databento files copied into the repo root.
+mbo*.csv
+mbp*.csv
+*.dbn
+*.dbn.zst
+*.pcap

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +41,10 @@ from validation.artifact_schema import validate_artifact_schema
 SCHEMA_VERSION = "v20.0"
 LEVELS = 10
 ROLLING_WINDOWS = (5, 20, 50, 100)
+MBO_STALE_WARNING_P95_MS = 30_000.0
+MBO_STALE_CRITICAL_P95_MS = 120_000.0
+CONCAT_ROWS_WARNING = 5_000_000
+CONCAT_MEMORY_WARNING_GB = 8.0
 TRADE_ACTIONS = {"T", "F", "TRADE", "FILL"}
 BUY_SIDE_VALUES = {"A", "ASK", "BUY", "BID_LIFT"}
 SELL_SIDE_VALUES = {"B", "BID", "SELL", "ASK_HIT"}
@@ -70,6 +75,13 @@ LABEL_COLUMNS = (
     "label_barrier_upper",
     "label_barrier_lower",
     "label_neutral_abs",
+    "signal_quality",
+    "conf_label",
+    "soft_label",
+    "soft_sample_weight",
+    "soft_label_confidence",
+    "mc_sample_weight",
+    "label_stability",
 )
 
 # V19 imports these names from prepare_training_data.py. Keep a local copy here
@@ -181,6 +193,126 @@ def _git_commit() -> str | None:
         return out.strip() or None
     except Exception:
         return None
+
+
+def _current_rss_gb() -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 ** 3)
+    except Exception:
+        pass
+    try:
+        import resource
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if os.name == "posix" and rss > 10_000_000:
+            return rss / (1024.0 ** 3)
+        return rss / (1024.0 ** 2)
+    except Exception:
+        return None
+
+
+def _enforce_memory_guard(args: argparse.Namespace, *, stage: str, report: dict | None = None) -> None:
+    limit = float(getattr(args, "max_memory_gb", 0.0) or 0.0)
+    current = _current_rss_gb()
+    if report is not None:
+        report.setdefault("memory_checkpoints", []).append({"stage": stage, "rss_gb": current, "limit_gb": limit or None})
+    if limit > 0 and current is not None and current > limit:
+        raise MemoryError(f"prepare_v20 memory guard exceeded at {stage}: rss_gb={current:.3f} > max_memory_gb={limit:.3f}")
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    if not os.path.exists(path):
+        return total
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return int(total)
+
+
+def _file_size_report(output_dir: str) -> dict:
+    files: list[dict] = []
+    for root, _, names in os.walk(output_dir):
+        for name in sorted(names):
+            path = os.path.join(root, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            files.append({
+                "path": os.path.relpath(path, output_dir),
+                "bytes": int(size),
+                "mb": float(size / (1024.0 ** 2)),
+            })
+    total = sum(item["bytes"] for item in files)
+    return {"total_bytes": int(total), "total_mb": float(total / (1024.0 ** 2)), "files": files}
+
+
+def _catboost_dependency_report() -> dict:
+    try:
+        import catboost
+
+        return {
+            "available": True,
+            "version": getattr(catboost, "__version__", None),
+            "install_command": None,
+            "message": "CatBoost is importable in the current Python environment.",
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "version": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "install_command": "python -m pip install catboost",
+            "requirements_command": "python -m pip install -r requirements.txt",
+            "message": "CatBoost is required for train_v19.py --phase catboost sanity training.",
+        }
+
+
+def _dataframe_memory_gb(df: pd.DataFrame | None) -> float:
+    if df is None:
+        return 0.0
+    try:
+        return float(df.memory_usage(deep=True).sum()) / (1024.0 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _mbo_flow_reliability_report(alignment_report: dict) -> dict:
+    age = alignment_report.get("mbo_state_age_ms") or {}
+    p95 = age.get("p95")
+    match_rate = float(alignment_report.get("match_rate", 0.0) or 0.0)
+    warnings = list(alignment_report.get("warnings") or [])
+    critical = list(alignment_report.get("critical") or [])
+    reliable = bool(match_rate >= 0.95 and p95 is not None and float(p95) <= MBO_STALE_WARNING_P95_MS and not critical)
+    stale = not reliable
+    return {
+        "mbo_flow_features_reliable": reliable,
+        "mbo_flow_features_stale": stale,
+        "reliability_rule": "reliable iff match_rate>=0.95 and mbo_state_age_ms.p95<=30s and no critical freshness warnings",
+        "mbo_dependent_features": [
+            "cvd",
+            "mbo_cvd",
+            "mbo_signed_trade_size_since_prev_mbp",
+            "mbo_buy_trade_size_since_prev_mbp",
+            "mbo_sell_trade_size_since_prev_mbp",
+            "mbo_trade_count_since_prev_mbp",
+            "vnet",
+            "cvd_momentum",
+            "cvd_price_divergence",
+            "hawkes_intensity",
+            "kyle_lambda",
+        ],
+        "mbp_mlofi_features_reliable": True,
+        "mbp_mlofi_note": "MLOFI is computed from MBP snapshots, so it is not made stale by MBO trade-state age.",
+        "warnings": warnings,
+        "critical": critical,
+    }
 
 
 def _filter_time_and_symbol(df: pd.DataFrame, args: argparse.Namespace, report: dict) -> pd.DataFrame:
@@ -448,7 +580,10 @@ def _align_mbo_to_mbp(mbp: pd.DataFrame, mbo_state: pd.DataFrame) -> tuple[pd.Da
             "matched_rows": 0,
             "match_rate": 0.0,
             "mbo_state_age_ms": {},
+            "mbo_state_age_thresholds": {},
+            "mbo_flow_features_reliable": False,
             "warnings": ["empty_mbp_feature_clock"],
+            "critical": ["empty_mbp_feature_clock"],
         }
     if mbo_state.empty:
         left["mbo_state_ts"] = pd.NaT
@@ -464,7 +599,17 @@ def _align_mbo_to_mbp(mbp: pd.DataFrame, mbo_state: pd.DataFrame) -> tuple[pd.Da
             "mbo_cum_trade_count",
         ):
             left[col] = 0.0
-        return left, {"method": "empty_mbo_state", "matched_rows": 0, "match_rate": 0.0, "rows": int(len(left))}
+        return left, {
+            "method": "empty_mbo_state",
+            "matched_rows": 0,
+            "match_rate": 0.0,
+            "rows": int(len(left)),
+            "mbo_state_age_ms": {},
+            "mbo_state_age_thresholds": {},
+            "mbo_flow_features_reliable": False,
+            "warnings": ["empty_mbo_state"],
+            "critical": ["empty_mbo_state"],
+        }
 
     right = mbo_state.sort_values("mbo_state_ts").reset_index(drop=True)
     aligned = pd.merge_asof(
@@ -490,25 +635,51 @@ def _align_mbo_to_mbp(mbp: pd.DataFrame, mbo_state: pd.DataFrame) -> tuple[pd.Da
     aligned["mbo_last_trade_price"] = pd.to_numeric(aligned.get("mbo_last_trade_price"), errors="coerce")
     matched = int(aligned["mbo_state_ts"].notna().sum())
     warnings: list[str] = []
+    critical: list[str] = []
     age_ms_stats = {}
+    age_thresholds = {}
     if matched:
         age_ms = (_coerce_ts(aligned.loc[aligned["mbo_state_ts"].notna(), "ts_event"]) - _coerce_ts(aligned.loc[aligned["mbo_state_ts"].notna(), "mbo_state_ts"])).dt.total_seconds() * 1000.0
+        age_values = age_ms.to_numpy(dtype=np.float64)
+        total_rows = max(len(aligned), 1)
         age_ms_stats = {
+            "min": float(age_ms.min()),
             "median": float(age_ms.median()),
+            "p90": float(age_ms.quantile(0.90)),
             "p95": float(age_ms.quantile(0.95)),
+            "p99": float(age_ms.quantile(0.99)),
             "max": float(age_ms.max()),
         }
-        if age_ms_stats["p95"] > 1000.0:
-            warnings.append("mbo_state_age_p95_gt_1s")
+        age_thresholds = {
+            "rows_unmatched": int(len(aligned) - matched),
+            "pct_unmatched": float((len(aligned) - matched) / total_rows),
+            "pct_age_gt_1s": float(np.sum(age_values > 1_000.0) / total_rows),
+            "pct_age_gt_5s": float(np.sum(age_values > 5_000.0) / total_rows),
+            "pct_age_gt_10s": float(np.sum(age_values > 10_000.0) / total_rows),
+            "pct_age_gt_30s": float(np.sum(age_values > 30_000.0) / total_rows),
+            "pct_age_gt_60s": float(np.sum(age_values > 60_000.0) / total_rows),
+            "denominator_rows": int(len(aligned)),
+            "matched_rows": matched,
+        }
+        if age_ms_stats["p95"] > MBO_STALE_WARNING_P95_MS:
+            warnings.append("mbo_state_age_p95_gt_30s")
+        if age_ms_stats["p95"] > MBO_STALE_CRITICAL_P95_MS:
+            critical.append("mbo_state_age_p95_gt_120s")
         if age_ms_stats["max"] > 60_000.0:
             warnings.append("mbo_state_age_max_gt_60s")
+    else:
+        critical.append("no_mbo_state_matches")
+    mbo_reliable = bool(matched > 0 and not critical and age_ms_stats and age_ms_stats["p95"] <= MBO_STALE_WARNING_P95_MS and matched / max(len(aligned), 1) >= 0.95)
     report = {
         "method": "pd.merge_asof_backward",
         "rows": int(len(aligned)),
         "matched_rows": matched,
         "match_rate": float(matched / max(len(aligned), 1)),
         "mbo_state_age_ms": age_ms_stats,
+        "mbo_state_age_thresholds": age_thresholds,
+        "mbo_flow_features_reliable": mbo_reliable,
         "warnings": warnings,
+        "critical": critical,
         "first_mbp_ts": str(aligned["ts_event"].min()) if len(aligned) else None,
         "last_mbp_ts": str(aligned["ts_event"].max()) if len(aligned) else None,
         "first_mbo_state_ts": str(right["mbo_state_ts"].min()) if len(right) else None,
@@ -683,6 +854,9 @@ def _build_features(aligned: pd.DataFrame, *, tick_size: float) -> tuple[pd.Data
     features = features.copy()
 
     features["price"] = features["mid_price"].astype(np.float32)
+    features["open"] = features["mid_price"].astype(np.float32)
+    features["high"] = features["mid_price"].astype(np.float32)
+    features["low"] = features["mid_price"].astype(np.float32)
     features["close"] = features["mid_price"].astype(np.float32)
     features["micro_price"] = features["microprice"].astype(np.float32)
     features["obi"] = features["order_book_imbalance"].astype(np.float32)
@@ -715,6 +889,14 @@ def _label_frame(features: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.D
     )
     labeled = build_triple_barrier_labels(features, cfg)
     labels = labeled[[col for col in LABEL_COLUMNS if col in labeled.columns]].copy()
+    tradeable = pd.to_numeric(labels.get("tradeability_label", 0), errors="coerce").fillna(0).astype(np.int8)
+    labels["signal_quality"] = tradeable
+    labels["conf_label"] = tradeable
+    labels["soft_label"] = np.float32(0.5)
+    labels["soft_sample_weight"] = np.float32(1.0)
+    labels["soft_label_confidence"] = np.float32(0.0)
+    labels["mc_sample_weight"] = np.float32(1.0)
+    labels["label_stability"] = np.float32(1.0)
     truncated = int((pd.to_numeric(labels["label_horizon_steps"], errors="coerce").fillna(0) < int(args.horizon)).sum())
     report = {
         "config": cfg.to_dict(),
@@ -726,8 +908,23 @@ def _label_frame(features: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.D
     return labels, report
 
 
-def _feature_columns(df: pd.DataFrame) -> list[str]:
+def _compatibility_only_feature_columns(feature_report: dict) -> list[str]:
+    placeholders = (
+        feature_report.get("v19_compatibility_features", {}).get("placeholder_zero_v19_features", [])
+        if isinstance(feature_report, dict)
+        else []
+    )
+    columns: list[str] = []
+    for name in placeholders:
+        text = str(name)
+        columns.append(text)
+        columns.append(f"raw__{text}")
+    return sorted(set(columns))
+
+
+def _feature_columns(df: pd.DataFrame, *, exclude: list[str] | tuple[str, ...] | set[str] | None = None) -> list[str]:
     forbidden = set(METADATA_COLUMNS) | set(LABEL_COLUMNS)
+    forbidden.update(str(col) for col in (exclude or ()))
     return [str(col) for col in df.columns if str(col) not in forbidden and not str(col).startswith("label_")]
 
 
@@ -766,6 +963,124 @@ def _write_artifact_parts(
         "artifact_manifest_json": os.path.abspath(manifest_result.manifest_path),
         "manifest_json": os.path.abspath(manifest_path),
         "final_feature_shards": manifest_result.to_dict().get("shards", []),
+    }
+
+
+def _write_date_partitions(
+    output_dir: str,
+    combined: pd.DataFrame,
+    *,
+    feature_columns: list[str],
+    label_columns: list[str],
+    metadata_columns: list[str],
+) -> list[dict]:
+    if "ts_event" not in combined.columns or combined.empty:
+        return []
+    partitions: list[dict] = []
+    root = os.path.join(output_dir, "partitions")
+    dates = _coerce_ts(combined["ts_event"]).dt.strftime("%Y-%m-%d")
+    for date_value in sorted(dates.dropna().unique()):
+        mask = dates == date_value
+        part_dir = os.path.join(root, f"date={date_value}")
+        os.makedirs(part_dir, exist_ok=True)
+        rows = int(mask.sum())
+        features_path = write_table(combined.loc[mask, feature_columns].copy(), os.path.join(part_dir, "features.parquet"))
+        labels_path = write_table(combined.loc[mask, label_columns].copy(), os.path.join(part_dir, "labels.parquet"))
+        metadata_path = write_table(combined.loc[mask, metadata_columns].copy(), os.path.join(part_dir, "metadata.parquet"))
+        partitions.append({
+            "date": str(date_value),
+            "rows": rows,
+            "features": os.path.abspath(features_path),
+            "labels": os.path.abspath(labels_path),
+            "metadata": os.path.abspath(metadata_path),
+        })
+    return partitions
+
+
+def _build_scalability_report(
+    *,
+    args: argparse.Namespace,
+    started_perf: float,
+    data_report: dict,
+    aligned: pd.DataFrame,
+    features: pd.DataFrame | None = None,
+    labels: pd.DataFrame | None = None,
+    combined: pd.DataFrame | None = None,
+    artifact_paths: dict | None = None,
+) -> dict:
+    elapsed = float(time.perf_counter() - started_perf)
+    aligned_rows = int(len(aligned))
+    feature_rows = int(len(features)) if features is not None else 0
+    combined_rows = int(len(combined)) if combined is not None else 0
+    combined_mem_gb = _dataframe_memory_gb(combined)
+    aligned_mem_gb = _dataframe_memory_gb(aligned)
+    features_mem_gb = _dataframe_memory_gb(features)
+    labels_mem_gb = _dataframe_memory_gb(labels)
+    max_memory_gb = float(getattr(args, "max_memory_gb", 0.0) or 0.0)
+    warnings: list[str] = []
+    critical: list[str] = []
+
+    concat_rows = combined_rows or aligned_rows
+    concat_mem = combined_mem_gb or (aligned_mem_gb + features_mem_gb + labels_mem_gb)
+    if concat_rows > CONCAT_ROWS_WARNING:
+        warnings.append("concat_row_count_gt_5m")
+    if concat_mem > CONCAT_MEMORY_WARNING_GB:
+        warnings.append("concat_memory_estimate_gt_8gb")
+    if max_memory_gb > 0 and concat_mem > 0.70 * max_memory_gb:
+        warnings.append("concat_memory_estimate_gt_70pct_of_max_memory")
+
+    rows_per_day = None
+    estimates = {}
+    date_range = data_report.get("row_counts", {})
+    if combined is not None and "ts_event" in combined.columns and len(combined):
+        ts = _coerce_ts(combined["ts_event"])
+        span_days = max(float((ts.max() - ts.min()).total_seconds()) / 86_400.0, 1.0)
+        rows_per_day = float(len(combined) / span_days)
+        bytes_per_row = _dir_size_bytes(args.output) / max(len(combined), 1) if os.path.exists(args.output) else 0.0
+        for days in (30, 90, 180):
+            est_rows = int(rows_per_day * days)
+            estimates[f"{days}d"] = {
+                "estimated_rows": est_rows,
+                "estimated_artifact_gb": float(est_rows * bytes_per_row / (1024.0 ** 3)),
+                "estimated_concat_memory_gb": float((combined_mem_gb / max(len(combined), 1)) * est_rows) if combined_mem_gb else None,
+            }
+    recommendation = "OK for current run. Validate real multi-day MBP coverage before scaling."
+    if warnings or concat_rows > CONCAT_ROWS_WARNING:
+        recommendation = "Use day/date partitioned streaming before 3-6 month preparation."
+    if estimates.get("180d", {}).get("estimated_concat_memory_gb") and estimates["180d"]["estimated_concat_memory_gb"] > max(max_memory_gb, CONCAT_MEMORY_WARNING_GB):
+        recommendation = "3-6 month preparation requires partitioned streaming before full run."
+
+    if getattr(args, "max_rows", 0) and aligned_rows > int(args.max_rows):
+        critical.append("max_rows_exceeded")
+
+    artifact_size = _file_size_report(args.output) if artifact_paths is not None else {"total_bytes": 0, "total_mb": 0.0, "files": []}
+    return {
+        "generated_at": _utc_now(),
+        "elapsed_seconds": elapsed,
+        "process_rss_gb": _current_rss_gb(),
+        "max_memory_gb": max_memory_gb or None,
+        "row_estimates_after_filter": {
+            "mbo_rows_after_filters": int(data_report.get("row_counts", {}).get("mbo_rows_after_filters", 0)),
+            "mbp_rows_after_filters": int(data_report.get("row_counts", {}).get("mbp_rows_after_filters", 0)),
+            "feature_clock_rows": aligned_rows,
+            "feature_rows_written": feature_rows,
+            "combined_rows_written": combined_rows,
+        },
+        "memory_estimates_gb": {
+            "aligned_frame": aligned_mem_gb,
+            "features_frame": features_mem_gb,
+            "labels_frame": labels_mem_gb,
+            "combined_frame": combined_mem_gb,
+            "concat_estimate": concat_mem,
+        },
+        "artifact_size": artifact_size,
+        "rows_per_day_estimate": rows_per_day,
+        "scale_estimates": estimates,
+        "concat_step_is_bottleneck": bool(warnings),
+        "warnings": warnings,
+        "critical": critical,
+        "recommendation": recommendation,
+        "passed": bool(not critical),
     }
 
 
@@ -812,19 +1127,24 @@ def _train_v19_compatibility_report(output_dir: str, combined: pd.DataFrame, com
     except Exception as exc:
         loader_error = str(exc)
     placeholder = compat_report.get("v19_compatibility_features", {}).get("placeholder_zero_v19_features", [])
+    compatibility_only = _compatibility_only_feature_columns(compat_report)
     report = {
         "generated_at": _utc_now(),
         "loader": "modules.feature_artifact_v19.load_feature_artifact",
         "loader_ok": loader_ok,
         "loader_error": loader_error,
+        "catboost_dependency": _catboost_dependency_report(),
         "loaded_rows": loaded_rows,
         "minimal_columns_present": required_present,
         "v19_stat_features_present": v19_present,
         "v19_raw_stat_features_present": raw_present,
         "placeholder_zero_v19_features": placeholder,
+        "compatibility_only_feature_columns": compatibility_only,
+        "placeholder_features_excluded_from_training": bool(compatibility_only),
         "warning": (
             "Artifact is loadable by train_v19. Placeholder compatibility columns are causal zeros where "
-            "V20 preparation does not yet implement the exact V19 heuristic feature."
+            "V20 preparation does not yet implement the exact V19 heuristic feature. These columns are "
+            "excluded from canonical v20 feature_columns and kept only for V19 loader compatibility."
             if placeholder
             else None
         ),
@@ -848,6 +1168,7 @@ def _selected_symbol_contract(df: pd.DataFrame, requested_symbol: str | None) ->
 
 
 def run(args: argparse.Namespace) -> dict:
+    started_perf = time.perf_counter()
     if getattr(args, "validation_only", False):
         args.dry_run = True
     os.makedirs(args.output, exist_ok=True)
@@ -857,6 +1178,7 @@ def run(args: argparse.Namespace) -> dict:
     mbp_clean, mbp_quality = _reject_invalid_mbp_rows(mbp_loaded.frame, tick_size=float(args.tick_size))
     mbo_state, mbo_flow_report = _build_mbo_flow_state(mbo_loaded.frame)
     aligned, alignment_report = _align_mbo_to_mbp(mbp_clean, mbo_state)
+    mbo_reliability = _mbo_flow_reliability_report(alignment_report)
 
     data_report = {
         "generated_at": _utc_now(),
@@ -868,27 +1190,47 @@ def run(args: argparse.Namespace) -> dict:
         "mbp_quality": mbp_quality,
         "mbo_flow": mbo_flow_report,
         "alignment": alignment_report,
+        "feature_reliability": mbo_reliability,
         "row_counts": {
             "mbo_rows_after_filters": int(len(mbo_loaded.frame)),
             "mbp_rows_after_filters": int(len(mbp_loaded.frame)),
             "mbp_rows_after_quality": int(len(mbp_clean)),
             "aligned_rows": int(len(aligned)),
         },
+        "row_estimate_after_date_symbol_filter": {
+            "mbo": int(len(mbo_loaded.frame)),
+            "mbp": int(len(mbp_loaded.frame)),
+            "feature_clock": int(len(aligned)),
+        },
         "warnings": [],
+        "critical": [],
     }
     if int(mbp_quality["rows_rejected"]) > 0:
         data_report["warnings"].append("mbp_rows_rejected_for_invalid_bbo_or_size")
     if float(alignment_report.get("match_rate", 0.0)) < 0.50:
         data_report["warnings"].append("low_mbo_to_mbp_alignment_match_rate")
     data_report["warnings"].extend(alignment_report.get("warnings", []))
-    data_report["passed"] = bool(len(aligned) > 0 and mbp_quality["output_rows"] > 0)
+    data_report["critical"].extend(alignment_report.get("critical", []))
+    max_rows = int(getattr(args, "max_rows", 0) or 0)
+    if max_rows > 0 and len(aligned) > max_rows:
+        data_report["critical"].append("max_rows_exceeded")
+        data_report["warnings"].append("max_rows_guard_triggered")
+    try:
+        _enforce_memory_guard(args, stage="after_alignment", report=data_report)
+    except MemoryError as exc:
+        data_report["critical"].append("max_memory_gb_exceeded_after_alignment")
+        data_report["warnings"].append(str(exc))
+    data_report["passed"] = bool(len(aligned) > 0 and mbp_quality["output_rows"] > 0 and "max_rows_exceeded" not in data_report["critical"] and "max_memory_gb_exceeded_after_alignment" not in data_report["critical"])
     data_report_path = _write_json_report(data_report, args.output, "data_validation_report.json")
+    scalability_report = _build_scalability_report(args=args, started_perf=started_perf, data_report=data_report, aligned=aligned)
+    scalability_report_path = _write_json_report(scalability_report, args.output, "scalability_report.json")
 
     if args.dry_run:
         summary = {
             "generated_at": _utc_now(),
             "dry_run": True,
             "data_validation_report": data_report_path,
+            "scalability_report": scalability_report_path,
             "artifact_written": False,
             "passed": bool(data_report["passed"]),
         }
@@ -899,6 +1241,13 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError("prepare_v20 data validation failed before feature generation")
 
     features, feature_report = _build_features(aligned, tick_size=float(args.tick_size))
+    feature_report["feature_reliability"] = mbo_reliability
+    try:
+        _enforce_memory_guard(args, stage="after_features", report=feature_report)
+    except MemoryError as exc:
+        feature_report.setdefault("critical", []).append("max_memory_gb_exceeded_after_features")
+        feature_report.setdefault("warnings", []).append(str(exc))
+        feature_report["passed"] = False
     if not feature_report["passed"]:
         _write_json_report(feature_report, args.output, "feature_validation_report.json")
         raise RuntimeError(f"prepare_v20 feature validation failed: {feature_report['critical_nulls']}")
@@ -906,8 +1255,20 @@ def run(args: argparse.Namespace) -> dict:
     labels, label_report = _label_frame(features, args)
     combined = pd.concat([features.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
     combined = combined.sort_values("ts_event").reset_index(drop=True)
+    try:
+        _enforce_memory_guard(args, stage="after_combined", report=feature_report)
+    except MemoryError as exc:
+        feature_report.setdefault("critical", []).append("max_memory_gb_exceeded_after_combined")
+        feature_report.setdefault("warnings", []).append(str(exc))
+        feature_report["passed"] = False
+        _write_json_report(feature_report, args.output, "feature_validation_report.json")
+        raise
     metadata_cols = [col for col in METADATA_COLUMNS if col in combined.columns]
-    feature_cols = _feature_columns(combined)
+    compatibility_only_cols = _compatibility_only_feature_columns(feature_report)
+    feature_cols = _feature_columns(combined, exclude=compatibility_only_cols)
+    feature_report["compatibility_only_feature_columns"] = compatibility_only_cols
+    feature_report["placeholder_features_excluded_from_training"] = bool(compatibility_only_cols)
+    feature_report["canonical_feature_columns"] = feature_cols
 
     label_dist_report = summarize_label_distribution(combined, context="prepare_v20.artifact")
     leakage_report = _build_leakage_report(combined, feature_cols)
@@ -924,6 +1285,7 @@ def run(args: argparse.Namespace) -> dict:
         "label_distribution_report": "label_distribution_report.json",
         "leakage_precheck_report": "leakage_precheck_report.json",
         "train_v19_compatibility_report": "train_v19_compatibility_report.json",
+        "scalability_report": "scalability_report.json",
     }
     symbol, contract = _selected_symbol_contract(combined, getattr(args, "symbol", None))
     date_range = {
@@ -938,6 +1300,15 @@ def run(args: argparse.Namespace) -> dict:
         "round_trip_cost_ticks": float(args.round_trip_cost_ticks),
         "spread_cost_mult": float(args.spread_cost_mult),
     }
+    partition_records = []
+    if bool(getattr(args, "write_partitions", False)):
+        partition_records = _write_date_partitions(
+            args.output,
+            combined,
+            feature_columns=list(features.columns),
+            label_columns=list(labels.columns),
+            metadata_columns=metadata_cols,
+        )
     manifest_result = write_feature_artifact(
         combined,
         args.output,
@@ -949,6 +1320,9 @@ def run(args: argparse.Namespace) -> dict:
             "strict": bool(args.strict),
             "sample_rows": int(args.sample_rows or 0),
             "chunk_rows": int(args.chunk_rows or 0),
+            "max_rows": max_rows or None,
+            "max_memory_gb": float(getattr(args, "max_memory_gb", 0.0) or 0.0) or None,
+            "write_partitions": bool(getattr(args, "write_partitions", False)),
         },
         reports=reports,
         inputs={"mbo": os.path.abspath(args.mbo), "mbp": os.path.abspath(args.mbp)},
@@ -960,6 +1334,8 @@ def run(args: argparse.Namespace) -> dict:
         tick_size=float(args.tick_size),
         horizon=int(args.horizon),
         label_params=label_params,
+        mbo_flow_features_reliable=bool(mbo_reliability["mbo_flow_features_reliable"]),
+        compatibility_only_feature_columns=compatibility_only_cols,
         git_commit=_git_commit(),
         extra={
             "schema_version": SCHEMA_VERSION,
@@ -968,15 +1344,31 @@ def run(args: argparse.Namespace) -> dict:
             "metadata_parquet": "metadata.parquet",
             "label_columns": list(labels.columns),
             "feature_columns": feature_cols,
+            "compatibility_only_feature_columns": compatibility_only_cols,
+            "placeholder_features_excluded_from_training": bool(compatibility_only_cols),
+            "mbo_flow_features_reliable": bool(mbo_reliability["mbo_flow_features_reliable"]),
+            "feature_reliability": mbo_reliability,
+            "date_partitions": partition_records,
         },
     )
     artifact_paths = _write_artifact_parts(args.output, features, labels, combined, metadata_cols, manifest_result)
 
     train_compat_report = _train_v19_compatibility_report(args.output, combined, feature_report)
+    scalability_report = _build_scalability_report(
+        args=args,
+        started_perf=started_perf,
+        data_report=data_report,
+        aligned=aligned,
+        features=features,
+        labels=labels,
+        combined=combined,
+        artifact_paths=artifact_paths,
+    )
     _write_json_report(feature_report, args.output, "feature_validation_report.json")
     _write_json_report(label_dist_report, args.output, "label_distribution_report.json")
     _write_json_report(leakage_report, args.output, "leakage_precheck_report.json")
     _write_json_report(train_compat_report, args.output, "train_v19_compatibility_report.json")
+    _write_json_report(scalability_report, args.output, "scalability_report.json")
 
     summary = {
         "generated_at": _utc_now(),
@@ -984,7 +1376,8 @@ def run(args: argparse.Namespace) -> dict:
         "rows": int(len(combined)),
         "paths": artifact_paths,
         "reports": {name: os.path.abspath(os.path.join(args.output, filename)) for name, filename in reports.items()},
-        "passed": bool(data_report["passed"] and feature_report["passed"] and leakage_report["passed"] and train_compat_report["passed"]),
+        "mbo_flow_features_reliable": bool(mbo_reliability["mbo_flow_features_reliable"]),
+        "passed": bool(data_report["passed"] and feature_report["passed"] and leakage_report["passed"] and train_compat_report["passed"] and scalability_report["passed"]),
         "train_v19_compatible": bool(train_compat_report["passed"]),
     }
     _write_json_report(summary, args.output, "prepare_v20_summary.json")
@@ -1012,7 +1405,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spread_cost_mult", type=float, default=1.0, help="Spread contribution to label barrier floor")
     p.add_argument("--chunk_rows", type=int, default=500_000, help="CSV read chunk size")
     p.add_argument("--sample_rows", type=int, default=0, help="Limit rows per input feed for smoke tests")
+    p.add_argument("--max_rows", type=int, default=0, help="Guardrail: refuse artifact generation if filtered MBP feature rows exceed this count")
+    p.add_argument("--max_memory_gb", type=float, default=0.0, help="Optional process-memory guard; 0 disables it")
     p.add_argument("--rows_per_shard", type=int, default=250_000, help="Rows per final/features_*.parquet shard")
+    p.add_argument("--write_partitions", action="store_true", help="Also write date-partitioned feature/label/metadata parquet files")
     p.add_argument("--dry_run", action="store_true", help="Run validation/alignment checks without writing train artifacts")
     p.add_argument("--validation_only", action="store_true", help="Deprecated alias for --dry_run")
     p.add_argument("--strict", action="store_true", help="Fail on validation warnings that block production training")

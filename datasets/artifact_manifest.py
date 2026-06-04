@@ -25,6 +25,7 @@ class ArtifactManifest:
     contract: str | None = None
     date_range: dict = field(default_factory=dict)
     feature_columns: tuple[str, ...] = ()
+    compatibility_only_feature_columns: tuple[str, ...] = ()
     label_columns: tuple[str, ...] = ("bias_label", "direction_label", "tradeability_label")
     metadata_columns: tuple[str, ...] = ()
     timestamp_columns: tuple[str, ...] = ("ts_event", "label_end_ts")
@@ -32,6 +33,7 @@ class ArtifactManifest:
     tick_size: float | None = None
     horizon: int | None = None
     label_params: dict = field(default_factory=dict)
+    mbo_flow_features_reliable: bool | None = None
     git_commit: str | None = None
     shards: tuple[dict, ...] = ()
     reports: dict = field(default_factory=dict)

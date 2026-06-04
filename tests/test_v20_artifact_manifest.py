@@ -56,7 +56,10 @@ def test_v20_manifest_contains_required_phase2_contract(tmp_path):
             spread_cost_mult=0.0,
             chunk_rows=20,
             sample_rows=0,
+            max_rows=0,
+            max_memory_gb=0.0,
             rows_per_shard=100,
+            write_partitions=False,
             dry_run=False,
             validation_only=False,
             strict=False,
@@ -73,6 +76,11 @@ def test_v20_manifest_contains_required_phase2_contract(tmp_path):
     assert manifest["horizon"] == 5
     assert manifest["label_end_ts_column"] == "label_end_ts"
     assert "feature_columns" in manifest
+    assert "absorption_intensity" not in manifest["feature_columns"]
+    assert "raw__absorption_intensity" not in manifest["feature_columns"]
+    assert "absorption_intensity" in manifest["compatibility_only_feature_columns"]
+    assert "raw__absorption_intensity" in manifest["compatibility_only_feature_columns"]
+    assert manifest["extra"]["placeholder_features_excluded_from_training"]
     assert "label_columns" in manifest
     assert "metadata_columns" in manifest
     assert "final_feature_shards" in manifest["extra"]

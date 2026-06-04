@@ -6,6 +6,19 @@ Phase 2 does not refactor training. Production training still uses
 
 ## Prepare Then Train
 
+Check CatBoost before running the V19 sanity train:
+
+```bash
+python3 - <<'PY'
+try:
+    import catboost
+    print("CatBoost OK", catboost.__version__)
+except Exception as exc:
+    print("CatBoost missing:", exc)
+    print("Install with: python -m pip install catboost")
+PY
+```
+
 Prepare one day:
 
 ```bash
@@ -37,6 +50,19 @@ with open("outputs/v20_1d/train_v19_compatibility_report.json") as f:
     report = json.load(f)
 print(report["passed"], report["loader_ok"], report["placeholder_zero_v19_features"])
 PY
+```
+
+Calibrate label parameters before training if directional labels are too rare:
+
+```bash
+python3 label_calibration_v20.py \
+  --artifact outputs/v20_1d \
+  --output outputs/v20_1d \
+  --tick_size 0.0001 \
+  --horizons 50,100,200 \
+  --tp_mults 0.5,0.75,1.0,1.5 \
+  --sl_mults 0.5,0.75,1.0 \
+  --neutral_mults 0.1,0.2,0.3,0.45
 ```
 
 ## Scale Commands
@@ -81,5 +107,6 @@ Always inspect these before training:
 - `train_v19_compatibility_report.json`: V19 loader result and placeholder feature list.
 
 Placeholder V19 columns are explicit causal zeros for V19 heuristic features not
-implemented in V20 Phase 2. They make `train_v19.py` loadable, but Phase 3
-should decide whether to keep, replace, or remove that legacy feature surface.
+implemented in V20 Phase 2. They make `train_v19.py` loadable, but they are
+excluded from canonical v20 `feature_columns` and listed as
+`compatibility_only_feature_columns`.

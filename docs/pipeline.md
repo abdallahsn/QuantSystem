@@ -35,6 +35,8 @@ raw Databento MBO + raw Databento MBP-10
 - `label_distribution_report.json`
 - `leakage_precheck_report.json`
 - `train_v19_compatibility_report.json`
+- `label_calibration_report.json` and `label_calibration_grid.csv` when
+  `label_calibration_v20.py` is run after artifact generation
 - `prepare_v20_summary.json`
 
 ## Safety Notes
@@ -51,8 +53,42 @@ Features are causal by construction:
 Rows dropped or rejected during cleaning are counted in
 `data_validation_report.json`. Stale MBO alignment is reported through
 `alignment.mbo_state_age_ms` and warnings such as `mbo_state_age_p95_gt_1s`.
+Placeholder V19 compatibility columns remain in parquet artifacts for loader
+compatibility, but they are marked as `compatibility_only_feature_columns` and
+excluded from canonical v20 `feature_columns`.
 
 ## Commands
+
+Real Databento readiness checks:
+
+```bash
+python3 prepare_v20.py \
+  --mbo /workspace/QuantSystem/mbo2.csv \
+  --mbp /workspace/QuantSystem/mbp2.csv \
+  --output outputs_v20_real_1day \
+  --symbol 6BH5 \
+  --start 2025-01-15 \
+  --end 2025-01-16 \
+  --chunk_rows 100000 \
+  --max_memory_gb 8 \
+  --write_partitions
+```
+
+```bash
+python3 prepare_v20.py \
+  --mbo /workspace/QuantSystem/mbo2.csv \
+  --mbp /workspace/QuantSystem/mbp2.csv \
+  --output outputs_v20_real_7day \
+  --symbol 6BH5 \
+  --start 2025-01-15 \
+  --end 2025-01-22 \
+  --chunk_rows 100000 \
+  --max_memory_gb 8 \
+  --write_partitions
+```
+
+Use `--max_rows` as a guard, not as a sampler. Use `--sample_rows` for smoke
+samples.
 
 Dry run:
 
@@ -77,6 +113,19 @@ python3 prepare_v20.py \
   --sample_rows 1000 \
   --horizon 50 \
   --tick_size 0.0001
+```
+
+Label calibration grid on the prepared sample:
+
+```bash
+python3 label_calibration_v20.py \
+  --artifact outputs/v20_sample_1000 \
+  --output outputs/v20_sample_1000 \
+  --tick_size 0.0001 \
+  --horizons 50,100,200 \
+  --tp_mults 0.5,0.75,1.0,1.5 \
+  --sl_mults 0.5,0.75,1.0 \
+  --neutral_mults 0.1,0.2,0.3,0.45
 ```
 
 One day:

@@ -59,7 +59,10 @@ def _args(tmp_path, mbo_path, mbp_path, **overrides):
         "spread_cost_mult": 0.0,
         "chunk_rows": 25,
         "sample_rows": 0,
+        "max_rows": 0,
+        "max_memory_gb": 0.0,
         "rows_per_shard": 50,
+        "write_partitions": False,
         "dry_run": False,
         "validation_only": False,
         "strict": False,
@@ -85,15 +88,25 @@ def test_prepare_v20_writes_trainable_artifact(tmp_path):
         "label_distribution_report.json",
         "leakage_precheck_report.json",
         "train_v19_compatibility_report.json",
+        "scalability_report.json",
     ):
         assert (out / name).exists(), name
 
     loaded = load_feature_artifact(str(out))
     assert len(loaded) == 80
-    assert {"ts_event", "label_end_ts", "bias_label", "train_event_flag", "mlofi_sum", "raw__cvd"}.issubset(loaded.columns)
+    assert {"ts_event", "label_end_ts", "bias_label", "train_event_flag", "mlofi_sum", "raw__cvd", "open", "high", "low", "soft_sample_weight", "mc_sample_weight"}.issubset(loaded.columns)
     assert pd.to_datetime(loaded["label_end_ts"]).ge(pd.to_datetime(loaded["ts_event"])).all()
+    assert float(loaded[["open", "high", "low"]].min().min()) > 0.0
+    assert float(loaded["soft_sample_weight"].min()) == 1.0
+    assert float(loaded["mc_sample_weight"].min()) == 1.0
     matched = loaded.loc[pd.to_datetime(loaded["mbo_state_ts"], errors="coerce").notna()]
     assert pd.to_datetime(matched["mbo_state_ts"]).le(pd.to_datetime(matched["ts_event"])).all()
+    with open(out / "manifest.json", encoding="utf-8") as f:
+        manifest = json.load(f)
+    assert "mbo_flow_features_reliable" in manifest
+    with open(out / "scalability_report.json", encoding="utf-8") as f:
+        scalability = json.load(f)
+    assert scalability["row_estimates_after_filter"]["feature_clock_rows"] == 80
 
 
 def test_prepare_v20_dry_run_reports_without_final_artifact(tmp_path):
@@ -119,4 +132,24 @@ def test_prepare_v20_dry_run_handles_empty_symbol_filter(tmp_path):
     assert report["row_counts"]["mbp_rows_after_filters"] == 0
     assert "empty_mbp_after_filters" in report["mbp_quality"]["warnings"]
     assert report["mbp"]["pre_filter_value_counts"]["symbol"]["6B"] == 20
+    assert not (output / "features.parquet").exists()
+
+
+def test_prepare_v20_max_rows_guard_reports_before_artifact(tmp_path):
+    mbo_path, mbp_path = _write_synthetic_feeds(tmp_path, rows=20)
+    output = tmp_path / "max_rows"
+
+    try:
+        run(_args(tmp_path, mbo_path, mbp_path, output=str(output), max_rows=10))
+    except RuntimeError as exc:
+        assert "data validation failed" in str(exc)
+    else:
+        raise AssertionError("max_rows guard should refuse artifact generation")
+
+    with open(output / "data_validation_report.json", encoding="utf-8") as f:
+        report = json.load(f)
+    assert "max_rows_exceeded" in report["critical"]
+    with open(output / "scalability_report.json", encoding="utf-8") as f:
+        scalability = json.load(f)
+    assert "max_rows_exceeded" in scalability["critical"]
     assert not (output / "features.parquet").exists()
